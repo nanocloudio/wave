@@ -1,0 +1,21 @@
+/.context/
+/target/
+# Wave has no root cargo workspace, so a host crate no longer shares the root
+# `target/` — each builds its own. Unanchored so it catches every one of them
+# (`tools/wave-bench/target/`, `tests/harness/target/`, and any future crate).
+target/
+/deps/
+/.idea/
+/.vscode/
+.DS_Store
+*.log
+*.tmp
+
+
+# Shadow-tracked (see standards/test-tracking.md) — versioned in
+# .git-shadow/, never pushed to this repo's remote. `benches/` and `fuzz/`
+# are omitted until those tiers exist; add them here and in
+# .git-shadow/info/exclude together if they are introduced.
+/tests/
+/examples/
+/.git-shadow/

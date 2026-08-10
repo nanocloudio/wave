@@ -1,0 +1,71 @@
+# Standalone, not a member of anything: Wave has no root cargo workspace. The
+# only other host crate is `tests/harness`, which declares its own `[workspace]`
+# for a different reason (it must not leak the modules' `host-test` feature into
+# the PIC build). Keeping this table means `cargo` stops walking up the tree
+# rather than adopting whatever workspace sits above the checkout.
+[workspace]
+
+[package]
+name = "wave-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Off-DUT load harness for Wave: open-loop multi-protocol generator (wave-loadgen). Mirrors lattice-bench."
+
+# std-only by design. Two independent reasons, both load-bearing:
+#
+#  1. It is the driver-host tool. It never runs on fluxor, and it must build on
+#     an offline Pi. Networking is raw `std::net`; JSON, the latency histogram,
+#     and every protocol client are hand-rolled.
+#
+#  2. ORACLE INDEPENDENCE. This harness measures Wave. It must therefore share
+#     no code with Wave — not `modules/common`, not the module `wire_*` files. A
+#     load test built from the DUT's own parser cannot fail on a shared codec
+#     defect: the bug cancels out on both sides and the run goes green. So the
+#     SHA-1, Base64, HPACK, and frame codecs in `src/` are deliberate
+#     re-implementations, and the fact that they interoperate with Wave's is
+#     itself a cross-validation. Never "simplify" this by depending on
+#     modules/common.
+#
+# Consequence: adding a third-party crate here needs the same scrutiny. `rustls`
+# was added 2026-07-29 and passes it: it is a third-party TLS stack, not a
+# re-implementation of anything in Wave, so the codecs oracle independence
+# actually rests on — HTTP/1.1, HPACK, h2 frames, RFC 6455, gRPC framing —
+# remain this crate's own. TLS is transport; a shared TLS bug surfaces as a
+# handshake failure, not as a codec defect that cancels out on both sides.
+# Without it the rig could only ever be driven in plaintext, which is not the
+# shape production runs in — see .context/perf_benchmarks.md §5 "No TLS".
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+
+# Tool-shaped package: prints JSON to stdout, unwraps on arg parsing. Mirrors
+# lattice-bench's [lints] override rather than inheriting the workspace's.
+[lints.rust]
+unsafe_code               = "forbid"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+
+allow_attributes                = "deny"
+allow_attributes_without_reason = "deny"
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+unwrap_used       = "allow"
+expect_used       = "allow"
+panic             = "allow"
+print_stdout      = "allow"
+print_stderr      = "allow"
+disallowed_macros = "allow"
+
+[lib]
+name = "wave_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wave-loadgen"
+path = "src/bin/loadgen.rs"

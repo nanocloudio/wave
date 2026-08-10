@@ -1,0 +1,59 @@
+version = "1.0.1"
+# timer_class: ping/idle timers read wall-clock (dev_millis).
+timer_class = "wall_clock"
+hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
+
+# WsFrame ↔ OctetStream adapter.
+#
+# Bridges between the WebSocket-frame envelope used by
+# `foundation/http`'s `ws_in` / `ws_out` ports and the raw byte stream
+# expected by transport-agnostic carriers such as
+# `foundation/remote_channel`. Lets any byte-stream module ride a
+# WebSocket without touching WS framing.
+#
+# Wire layout (mirrors `modules/foundation/http/server/ws.rs` ws_emit_fanout_frame):
+#   [conn_id u32 LE][opcode u8][fin u8][payload_len u16 LE][payload]
+#
+# Flow:
+#   tx_in  (OctetStream)  →  tx_out (WsFrame)  →  http.ws_in  → browser
+#   browser → http.ws_out  →  rx_in  (WsFrame) →  rx_out (OctetStream)
+#
+# The adapter tracks the active client connection's `conn_id` from
+# the most recently observed inbound frame and stamps it on outbound
+# frames. Single connection at a time: a second client connecting
+# replaces the first. Multi-connection routing is a session-layer
+# concern handled above this layer.
+
+[[ports]]
+name = "tx_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "rx_in"
+direction = "input"
+content_type = "WsFrame"
+
+[[ports]]
+name = "tx_out"
+direction = "output"
+content_type = "WsFrame"
+
+[[ports]]
+name = "rx_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Module-scope observability. Optional 3rd output (out[2]); wired to
+# `observe.telemetry` when the debug stack's observe overlay is on. Emits
+# cumulative byte counters; no-op when unwired. See ../standards/observability.md.
+[[ports]]
+name = "telemetry"
+index = 2
+direction = "output"
+content_type = "Telemetry"
+
+[observability]
+# bytes_in  = payload delivered inbound to rx_out (browser → app)
+# bytes_out = WsFrame bytes sent outbound to tx_out (app → browser)
+metrics = ["bytes_in", "bytes_out"]

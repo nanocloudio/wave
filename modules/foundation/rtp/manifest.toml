@@ -1,0 +1,53 @@
+version = "1.0.1"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# timer_class: this module reads no clock at all — verified, it calls neither
+# `dev_millis` nor `dev_micros`. Transmit is DATA-driven: it accumulates G.711
+# on `g711` and emits a packet every `ptime_bytes`, with the RTP timestamp
+# advancing by sample count, not by elapsed time. Receive is packet-driven.
+# Output is therefore a function of input, not of when the module runs, which
+# is exactly `agnostic`. The real-time pacing of the stream belongs to whoever
+# feeds `g711` (the codec/source) and to `sip`'s playout clock — not here.
+# NOTE this is an EXPLICIT attestation, not the absent-field default: absent
+# means "assume step-counted" and blocks admission to a variable-cadence
+# domain (RFC adaptive_tick §8 rule 2). If a future revision ever paces
+# transmission itself, this must be revisited before it is `agnostic` again.
+timer_class = "agnostic"
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+
+[[ports]]
+name = "g711"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+
+[[ports]]
+name = "packets"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "endpoint"
+direction = "ctrl_input"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability — exempt (see ../standards/observability.md §6).
+[observability]
+exempt = "application-layer demo — byte throughput is observed at the foundation transport (ip/quic/http) it rides"
+
+[test]
+harness = "tests/harness.rs"

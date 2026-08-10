@@ -1,0 +1,186 @@
+version = "2.0.1"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# timer_class: every deadline this module holds is read from wall-clock
+# `dev_millis` — the client connect timeout (client.rs / client_h2.rs
+# CONNECT_TIMEOUT_MS) and the proxy dial/retry deadline (server.rs). Nothing
+# counts scheduler passes as time, so a variable cadence changes only WHEN a
+# deadline is sampled, never whether it is correct. Positively attested rather
+# than left absent: an unattested module is assumed step-counted and is refused
+# admission to a mechanism-(b) (variable-cadence) domain (RFC adaptive_tick §8
+# rule 2), which is a placement restriction this module does not need.
+timer_class = "wall_clock"
+
+# Ingress anchor role (rfc_workload_ingress §2, rfc_protocols.md §8.1):
+# in proxy mode on a leased TCP port the http fmod is the client-visible
+# stream transport attachment. Declared so the `continuity` config
+# validator (class edge_anchored) accepts an http-fronted edge; the
+# tls-fronted 443 edge additionally requires `transport.anchor.stream.secure`
+# on the tls module in front. `.secure` is an orthogonal child, so the
+# cleartext http anchor declares the base `transport.anchor.stream`.
+capabilities = ["transport.anchor.stream"]
+
+# Feature-set variants (RFC module_variants). `full` (default) emits the
+# unsuffixed http.fmod with every protocol generation; `http-web.fmod` drops
+# HTTP/2 + HTTP/3 (h2/hpack/wire_h2/client_h2 + h3/qpack/wire_h3) for embedded
+# targets that serve single-connection HTTP/1 (+WebSocket). Measured saving:
+# 105 794 -> 66 146 B on rp2350 (-37%), 243 690 -> 175 546 B on bcm2712 (-28%).
+# Sizes are gated by tools/ci/fmod_size_budget.sh so they cannot drift silently.
+#
+# `h1` and `ws` are declared markers — always compiled. A `min` (h1-only)
+# variant needs the ws seams gated first (rfc_module_variants.md §9 O1: ws
+# scatter is ~10x h2's — 181 references in server.rs alone), and the prize looks
+# small: the ws-attributable NAMED symbols in http-web.elf total ~1.2 KiB of its
+# 66 KiB, the rest being inlined into the shared request path. Worth doing only
+# against a specific flash target that the `web` variant misses.
+[[variant]]
+name = "web"
+features = ["h1", "ws"]
+
+# h1 + h2 + ws — everything but HTTP/3.
+#
+# This variant was added, measured out BYTE-IDENTICAL to `full`, removed, and is
+# now back — because the fact underneath it changed. While h3 had no transport
+# nothing called it, `--gc-sections` dropped the whole layer, and excluding it
+# saved zero bytes. Now that `h3.rs` is reachable from `module_step` (the mux
+# pump), it is real code in the artefact and excluding it is a real saving.
+# The measured delta is in the module README, and `tools/ci/fmod_size_budget.sh`
+# holds both sizes.
+[[variant]]
+name = "h2"
+features = ["h1", "h2", "ws"]
+
+
+[[variant]]
+name = "full"
+features = ["h1", "h2", "ws", "h3"]
+default = true
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+# Sized to absorb 8 KiB CMD_SEND payloads (the staging cap on aarch64)
+# plus in-flight headroom; embedded workloads stage 1600-byte payloads
+# on a 2 KiB budget.
+buffer_size = { default = 2048, bcm2712 = 16384 }
+
+[[ports]]
+name = "variables"
+index = 1
+direction = "input"
+content_type = "FmpMessage"
+buffer_size = 256
+
+[[ports]]
+name = "file_data"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+buffer_size = { default = 2048, bcm2712 = 16384 }
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+buffer_size = { default = 2048, bcm2712 = 16384 }
+
+[[ports]]
+name = "file_ctrl"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 256
+
+# WebSocket fan-out — populated only when a route uses
+# HANDLER_WEBSOCKET_FANOUT (handler value 5). On such routes the upgraded
+# connection's frames are routed externally as WsFrame records on these
+# ports instead of being echoed internally. Routes that use the existing
+# HANDLER_WEBSOCKET (4) ignore these channels and keep echoing.
+[[ports]]
+name = "ws_out"
+index = 2
+direction = "output"
+content_type = "WsFrame"
+
+[[ports]]
+name = "ws_in"
+index = 3
+direction = "input"
+content_type = "WsFrame"
+# WsFrame envelopes from ws_stream: [conn_id u32][opcode][fin][len u16]
+# [payload] — payload up to 65535 B, so the full envelope is ~65 KiB.
+# Channel writes are all-or-nothing: a default ring silently rejects
+# every envelope. aarch64 pipelines two envelopes; embedded fits
+# exactly one plus header.
+buffer_size = { default = 65600, bcm2712 = 131072 }
+
+# Compiled-route subscription sink (rfc_dynamic_routes). The graph self-wires
+# `routes_sink` (out[4]) -> `routes_changes` (in[4]) so the store's
+# namespace.change SUBSCRIBE for the `/dataplane/edge/` prefix has a
+# module-owned sink.
+[[ports]]
+name = "routes_changes"
+index = 4
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "routes_sink"
+index = 4
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# Dynamic-listener subscription self-edge (rfc_workload_ingress §4.2).
+# A SECOND table_consumer: the graph self-wires `listeners_sink` (out[5])
+# -> `listeners_changes` (in[5]) so the store's namespace.change SUBSCRIBE
+# for `listeners_prefix` (e.g. /dataplane/edge-listeners/) has a
+# module-owned sink. Each added `<port> = proto=tcp;tls=<0|1>` row drives a
+# mid-life CMD_BIND of the pooled port; a removed row tears the listener
+# down. Both ports are inert unless `listeners_prefix` is configured.
+[[ports]]
+name = "listeners_changes"
+index = 5
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "listeners_sink"
+index = 5
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Read-only grant on the compiled route prefix. A table consumer holds
+# a storage.namespace READ grant and nothing else (§6): it SUBSCRIBEs +
+# CHANGES the `/dataplane/edge/` prefix and never writes the store —
+# degradation goes to telemetry (http.routes.dropped), not a store key.
+[[resources]]
+requires_contract = "storage.namespace"
+access = "read"
+
+# HANDLER_FS_FILE routes serve files by path through the FS_CONTRACT
+# (`fat32` on bare-metal, `linux_fs_dispatch` on the host). Granting
+# `fs` enables `provider_call(-1, FS_OPEN, ...)`.
+[[resources]]
+requires_contract = "fs"
+access = "read"
+
+[observability]
+# id 2 = routes_dropped (http.routes.dropped): dynamic-route arena /
+# backend-set overflow (rfc_dynamic_routes §2.5).
+# id 3 = proxy_retries (http.proxy.retries), id 4 = proxy_5xx
+# (http.proxy.5xx): proxy-relay failover / terminal 5xx
+# (rfc_workload_ingress §3).
+metrics = ["bytes_in", "bytes_out", "routes_dropped", "proxy_retries", "proxy_5xx"]
+# Span 0: one `http.server.request` span per request (head parsed -> response
+# drained), SERVER kind. Minted only when a telemetry consumer is subscribed
+# (zero-cost otherwise). Keepalive re-latches the span per request.
+spans = ["http.server.request"]

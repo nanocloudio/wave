@@ -1,0 +1,68 @@
+version = "1.0.1"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# timer_class: both of this module's clocks are wall-clock `dev_millis` — the
+# RFC 3261 T1 retransmit timer (500 ms, in-transaction states) and the jitter
+# buffer's `ptime` playout cadence. Playout in particular MUST track real time
+# rather than scheduler passes: a relaxed tick that stretched it would stretch
+# the audio. Reading the wall clock is what makes that safe under a variable
+# cadence, and declaring it is what lets the validator know (RFC adaptive_tick
+# §8 rule 2 — absent means "assume step-counted" and blocks admission).
+timer_class = "wall_clock"
+
+# SIP voice-signalling user-agent. Owns two datagram endpoints — SIP signalling
+# (in[0]/out[0]) and RTP receive/jitter (in[1]/out[1]) — emits playout µ-law on
+# out[2], and drives the separate `rtp` transmitter over out[3]. Logic is the
+# tested modules/common sip_core/sip_dialog/jitter_core; this is the wrapper.
+
+[[ports]]
+name = "sip_net_in"
+index = 0
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "sip_net_out"
+index = 0
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 640
+
+[[ports]]
+name = "rtp_net_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "rtp_net_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ulaw_out"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "rtp_ctrl"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "call"
+direction = "ctrl_input"
+content_type = "FmpMessage"
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "signalling module — media throughput is observed at the rtp transport"
+
+[test]
+harness = "tests/harness.rs"

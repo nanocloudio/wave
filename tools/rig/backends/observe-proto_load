@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""`observe.proto_load` rig backend — the protocol-agnostic load probe.
+
+Conclave plan T3.6.1. Successor to Fluxor's `observe-https_load`, which is
+HTTPS-only and lives in the Fluxor tree. The split here is deliberate:
+
+  * FLUXOR owns the capability NAME (`observe.proto_load` in
+    `tools/src/rig/vocab.rs`) and the byte-stream matcher path.
+  * WAVE owns the PROTOCOL knowledge, because Wave owns the protocols. A rig
+    backend is just an executable named `<surface>-<name>` on the discovery
+    path, so the probe can live beside the modules it exercises rather than
+    forcing Fluxor to grow a protocol implementation per protocol Wave adds.
+
+Wire contract (`fluxor/docs/architecture/rig-backend-protocol.md`): read one
+JSON `BackendInvocation` on stdin (which is then closed), write newline-
+delimited JSON events to stdout until exit. Byte payloads are base64 so the log
+stays `cat`-safe.
+
+Binding fields, from the profile's `[observe.proto_load]` section:
+
+    host        str   "addr:port" of the DUT (required)
+    protocols   str   comma-separated: h1,h2c,ws,grpc,h3 (default "h1")
+                      `h3` is driven by aioquic in-process rather than by
+                      wave-loadgen, which has no QUIC client. It is a
+                      FUNCTIONAL phase — request/response, multiplexing and an
+                      RFC 9220 tunnel — not a rate ladder.
+    tls         bool  drive over TLS                    (default false)
+    rate        int   offered requests/sec per protocol (default 50)
+    duration    int   seconds per protocol              (default 10)
+    conns       int   concurrent connections            (default 4)
+    path        str   request path                      (default "/")
+    <proto>_path str  per-protocol path override, e.g. `ws_path = "/ws"`.
+                      Needed because a WebSocket route and an HTTP route are
+                      different paths on the same listener, so one `path` for
+                      every protocol cannot be right.
+    authority   str   :authority / Host header          (default host)
+    payload     int   request payload bytes             (default 0)
+    warmup      int   seconds excluded from the rate    (default 1)
+    pre_boot_wait int seconds to sleep BEFORE probing    (default 45)
+                      Observers attach BEFORE `power.cycle`, so without this the
+                      probe connects to the PREVIOUS kernel, which is still
+                      listening, and then loses it mid-run when the board
+                      actually resets. Must exceed off_hold + boot_delay +
+                      VPU/TFTP. Same reason `[observe.https_load]` carries
+                      pre_boot_wait_s.
+    loadgen     str   path to the wave-loadgen binary   (default: repo target)
+
+PER-SCENARIO OVERRIDES. The rig has no scenario-level binding overrides — a
+profile has ONE `[observe.proto_load]` section — but a functional scenario and a
+load scenario need different envelopes from the same capability. So any key may
+be prefixed with a scenario name and that wins for that scenario only:
+
+    rate = 40                                 # functional default
+    "pi5_wave_protocol_load.rate"  = 200      # load scenario only
+    "pi5_wave_protocol_load.conns" = 8
+
+Resolution order per key: `<scenario>.<key>`, then `<key>`, then the built-in
+default. The scenario name comes from the invocation context, so nothing has to
+be kept in sync by hand.
+
+Every line the probe emits is prefixed `[proto_load] `, so a scenario's
+`[[pass]]` / `[[fail]]` regexes key on that the way the HTTPS suite keys on
+`[https_load]`. The prefix is added HERE rather than in wave-bench so the
+binary stays a plain CLI usable off-rig.
+"""
+
+import base64
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+VALID_PROTOCOLS = ("h1", "h2c", "ws", "grpc", "h3", "h3load", "sip")
+
+# h3 is the one protocol wave-loadgen cannot drive: it has no QUIC client, and
+# adding one would mean a QUIC implementation in the load generator — the very
+# duplication docs/architecture/http3-ownership.md argues against. aioquic is an
+# independent implementation already used by tools/e2e/h3_server.sh, so the rig probe
+# borrows the same oracle rather than growing a second one.
+H3_PROTOCOL = "h3"
+H3_LOAD_PROTOCOL = "h3load"
+SIP_PROTOCOL = "sip"
+
+
+def emit(obj):
+    """One NDJSON event, flushed — the core reads this stream live."""
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def emit_line(text):
+    """A human-readable line, as a base64 `bytes` event the matcher can regex."""
+    emit({"kind": "bytes", "data": base64.b64encode((text + "\n").encode()).decode()})
+
+
+def note(text):
+    # `message`, not `text` — the field name is the rig transport's, and a note
+    # with the wrong key is dropped as a malformed event rather than reported.
+    # Every note this probe emitted was being discarded that way, including the
+    # one naming the loadgen binary and target, which is the first thing you
+    # want when a run drives the wrong host.
+    emit({"kind": "note", "message": text})
+
+
+def fail(text):
+    """Non-fatal per the protocol, but also emitted as a matchable line so a
+    scenario can pin it with a [[fail]] rule instead of only seeing an
+    exit code."""
+    emit({"kind": "error", "message": text})
+    emit_line(f"[proto_load] FATAL {text}")
+
+
+# Set once from the invocation context so every lookup can consult the
+# scenario-scoped key without threading it through each call site.
+SCENARIO = ""
+
+
+def binding_get(binding, key, default=None):
+    """`<scenario>.<key>` wins over `<key>`, which wins over `default`."""
+    if SCENARIO:
+        scoped = f"{SCENARIO}.{key}"
+        if scoped in binding:
+            return binding[scoped]
+    return binding.get(key, default)
+
+
+def binding_str(binding, key, default=None):
+    v = binding_get(binding, key, default)
+    return None if v is None else str(v)
+
+
+def binding_int(binding, key, default):
+    v = binding_get(binding, key, default)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def binding_bool(binding, key, default=False):
+    v = binding_get(binding, key, default)
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def resolve_loadgen(binding):
+    """Find wave-loadgen: explicit binding, then PATH, then the repo build."""
+    explicit = binding_str(binding, "loadgen")
+    if explicit:
+        return explicit if os.path.isfile(explicit) else None
+    found = shutil.which("wave-loadgen")
+    if found:
+        return found
+    # tools/rig/backends/<this> -> repo root. realpath, NOT abspath: the backend
+    # is discovered through a symlink in ~/.local/share/fluxor/backends/, and
+    # abspath would resolve the repo relative to THAT directory and find
+    # nothing.
+    repo = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    )
+    # `tools/load/wave-bench` declares its own `[workspace]`: Wave has no root crate,
+    # so cargo writes the binary under the crate's OWN target dir. The old
+    # `<repo>/target/<profile>` guess named a workspace that no longer exists,
+    # which surfaced as "wave-loadgen not found" rather than as a layout change.
+    # Built from components, so a repo-wide search-and-replace over path strings
+    # does NOT catch a move — this line needs updating by hand if tools/ is
+    # reorganised again.
+    for base in (os.path.join(repo, "tools", "load", "wave-bench", "target"),):
+        for profile in ("release", "debug"):
+            cand = os.path.join(base, profile, "wave-loadgen")
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def wait_for_host(host, timeout_s):
+    """Poll until `host` accepts a TCP connection, or `timeout_s` elapses.
+
+    Reports progress every 5 s so a scenario log shows the wait rather than an
+    unexplained gap, and so a timeout is distinguishable from a hang.
+    """
+    addr, _, port = host.rpartition(":")
+    try:
+        target = (addr, int(port))
+    except ValueError:
+        return False
+    emit_line(f"[proto_load] waiting up to {timeout_s}s for {host}")
+    deadline = time.monotonic() + timeout_s
+    last_note = 0.0
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(target, timeout=1.0):
+                waited = timeout_s - int(deadline - time.monotonic())
+                emit_line(f"[proto_load] {host} listening after ~{waited}s")
+                return True
+        except OSError:
+            pass
+        now = time.monotonic()
+        if now - last_note >= 5.0:
+            emit_line(f"[proto_load] still waiting for {host} "
+                      f"({int(deadline - now)}s left)")
+            last_note = now
+        time.sleep(0.25)
+    return False
+
+
+def wait_for_h3_host(host, timeout_s):
+    """Poll until the DUT completes a QUIC handshake, or `timeout_s` elapses.
+
+    The h3 counterpart of `wait_for_host`. There is no TCP listener to connect
+    to, and a bare UDP send proves nothing (UDP sockets connect unconditionally),
+    so readiness here means a completed handshake — the first thing that
+    actually requires the DUT to be up.
+    """
+    addr, _, port = host.rpartition(":")
+    emit_line(f"[proto_load] waiting up to {timeout_s}s for quic on {host}")
+    try:
+        import asyncio, ssl
+        from aioquic.asyncio.client import connect
+        from aioquic.quic.configuration import QuicConfiguration
+    except ImportError as exc:
+        emit_line(f"[proto_load] FATAL aioquic unavailable: {exc}")
+        return False
+
+    async def once():
+        cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
+        cfg.verify_mode = ssl.CERT_NONE
+        async with connect(addr, int(port), configuration=cfg) as c:
+            # Entering the context manager does not by itself prove the
+            # handshake completed, so ask for something only a live peer can
+            # answer: `wait_connected` resolves when the QUIC handshake is done.
+            await c.wait_connected()
+            return True
+
+    deadline = time.monotonic() + timeout_s
+    last_note = 0.0
+    while time.monotonic() < deadline:
+        try:
+            asyncio.run(asyncio.wait_for(once(), timeout=4))
+            waited = timeout_s - int(deadline - time.monotonic())
+            emit_line(f"[proto_load] {host} answering quic after ~{waited}s")
+            return True
+        except Exception as exc:  # noqa: BLE001 — any failure means "not yet"
+            # Report the FIRST failure kind once: a silent catch-all here hid a
+            # TypeError (a bad kwarg) behind "the DUT never bound the port",
+            # which points the reader at the board instead of the probe.
+            if last_note == 0.0:
+                emit_line(f"[proto_load] quic probe not ready yet: "
+                          f"{type(exc).__name__}: {exc}")
+        now = time.monotonic()
+        if now - last_note >= 5.0:
+            emit_line(f"[proto_load] still waiting for quic on {host} "
+                      f"({int(deadline - now)}s left)")
+            last_note = now
+        time.sleep(0.5)
+    return False
+
+
+def run_h3(binding):
+    """Drive the DUT's HTTP/3 surface with aioquic.
+
+    Functional, not a ladder: it asserts that a routed body comes back, that
+    two requests multiplex on one connection, and that RFC 9220 extended
+    CONNECT opens a WebSocket tunnel. A number here would be a number about
+    aioquic and this driver host, not about the DUT.
+    """
+    host = binding_str(binding, "host")
+    addr, _, port = host.rpartition(":")
+    path = binding_str(binding, "h3_path") or binding_str(binding, "path", "/")
+    ws_path = binding_str(binding, "h3_ws_path", "/ws")
+    expect = binding_str(binding, "h3_expect", "")
+
+    try:
+        import asyncio, ssl
+        from aioquic.asyncio.client import connect
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        from aioquic.quic.configuration import QuicConfiguration
+        from aioquic.h3.connection import H3Connection
+        from aioquic.h3.events import HeadersReceived, DataReceived
+    except ImportError as exc:
+        emit_line(f"[proto_load] phase=h3 ERR aioquic unavailable on the driver host: {exc}")
+        return False
+
+    def mask_frame(opcode, payload):
+        m = b"\x37\xfa\x21\x3d"
+        return bytes([0x80 | opcode, 0x80 | len(payload)]) + m + bytes(
+            b ^ m[i % 4] for i, b in enumerate(payload))
+
+    class Client(QuicConnectionProtocol):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.http = H3Connection(self._quic, enable_webtransport=True)
+            self.resp = {}
+            self.ws = b""
+            self.ws_event = asyncio.Event()
+            self.expect_n = 0
+            self.done = asyncio.Event()
+
+        def quic_event_received(self, event):
+            for ev in self.http.handle_event(event):
+                sid = ev.stream_id
+                if sid == getattr(self, "ws_stream", None):
+                    if isinstance(ev, DataReceived):
+                        self.ws += ev.data
+                        self.ws_event.set()
+                    continue
+                r = self.resp.setdefault(sid, {"status": None, "body": b"", "done": False})
+                if isinstance(ev, HeadersReceived):
+                    r["status"] = dict(ev.headers).get(b":status")
+                elif isinstance(ev, DataReceived):
+                    r["body"] += ev.data
+                if getattr(ev, "stream_ended", False):
+                    r["done"] = True
+                if sum(1 for v in self.resp.values() if v["done"]) >= self.expect_n:
+                    self.done.set()
+
+        async def get_many(self, authority, paths):
+            self.expect_n = len(paths)
+            ids = {}
+            for p in paths:
+                sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+                ids[sid] = p
+                self.http.send_headers(sid, [
+                    (b":method", b"GET"), (b":scheme", b"https"),
+                    (b":authority", authority.encode()), (b":path", p.encode()),
+                ], end_stream=True)
+            self.transmit()
+            try:
+                await asyncio.wait_for(self.done.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+            return {ids[s]: v for s, v in self.resp.items() if s in ids}
+
+        async def ws_echo(self, authority, path, message):
+            sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+            self.ws_stream = sid
+            self.http.send_headers(sid, [
+                (b":method", b"CONNECT"), (b":protocol", b"websocket"),
+                (b":scheme", b"https"), (b":authority", authority.encode()),
+                (b":path", path.encode()),
+            ], end_stream=False)
+            self.transmit()
+            await asyncio.sleep(0.5)
+            self.http.send_data(sid, mask_frame(0x1, message.encode()), end_stream=False)
+            self.transmit()
+            try:
+                await asyncio.wait_for(self.ws_event.wait(), timeout=8)
+            except asyncio.TimeoutError:
+                pass
+            return self.ws
+
+    async def drive():
+        cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
+        cfg.verify_mode = ssl.CERT_NONE
+        authority = binding_str(binding, "authority", addr)
+        # Two requests on ONE connection: multiplexing is why HTTP/3 exists, so
+        # a phase that only ever issued one would not be testing it.
+        async with connect(addr, int(port), configuration=cfg,
+                           create_protocol=Client) as c:
+            got = await c.get_many(authority, [path, ws_path if False else "/health"])
+        async with connect(addr, int(port), configuration=cfg,
+                           create_protocol=Client) as c2:
+            frame = await c2.ws_echo(authority, ws_path, "rig tunnel")
+        return got, frame
+
+    try:
+        got, frame = asyncio.run(drive())
+    except Exception as exc:  # noqa: BLE001 — any failure is a phase failure
+        emit_line(f"[proto_load] phase=h3 ERR {type(exc).__name__}: {exc}")
+        return False
+
+    main_resp = got.get(path, {})
+    status = main_resp.get("status")
+    body = main_resp.get("body", b"")
+    health = got.get("/health", {})
+
+    if status != b"200":
+        emit_line(f"[proto_load] phase=h3 committed=0 failed=1 rejected=0 "
+                  f"connect_errors=0 ERR status={status!r}")
+        return False
+    if expect and expect.encode() not in body:
+        emit_line(f"[proto_load] phase=h3 committed=0 failed=1 rejected=0 "
+                  f"connect_errors=0 ERR body={body[:60]!r} lacks {expect!r}")
+        return False
+    if health.get("status") != b"200":
+        emit_line(f"[proto_load] phase=h3 committed=1 failed=1 rejected=0 "
+                  f"connect_errors=0 ERR multiplexed request unanswered")
+        return False
+    if len(frame) < 2 or (frame[0] & 0x0F) != 0x1 or (frame[1] & 0x80) != 0:
+        # opcode 1 = TEXT and a SERVER frame is never masked (RFC 6455 5.1).
+        emit_line(f"[proto_load] phase=h3 committed=2 failed=1 rejected=0 "
+                  f"connect_errors=0 ERR ws frame={frame[:8]!r}")
+        return False
+
+    emit_line("[proto_load] phase=h3 committed=3 rejected=0 rc=0 OK "
+              "(routed + multiplexed + rfc9220 tunnel)")
+    return True
+
+
+def run_sip(binding):
+    """Place a call against the DUT and assert audio comes back.
+
+    Runs `tools/peers/sip_ua.py` — a PEER, not an oracle. No independent SIP
+    implementation is installable on this host, so byte-level correctness stays
+    with the L0 vectors (pinned against the origin implementation) and this
+    phase asserts the system property they cannot reach: the call is answered,
+    the answer's SDP names a port audio actually arrives on, audio comes back,
+    and BYE ends it.
+    """
+    host = binding_str(binding, "host")
+    addr, _, port = host.rpartition(":")
+    local_ip = binding_str(binding, "sip_local_ip", "")
+    if not local_ip:
+        emit_line("[proto_load] phase=sip ERR sip_local_ip not set — the UA must "
+                  "advertise an address the DUT can send audio to")
+        return False
+    # realpath, NOT abspath — the same trap `resolve_loadgen` documents above:
+    # this backend is reached through a symlink in ~/.local/share/fluxor/, so
+    # abspath resolves the repo relative to THAT directory and finds nothing.
+    # It cost a rig cycle, reported as "the DUT did not answer".
+    ua = binding_str(binding, "sip_ua") or os.path.normpath(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                     "sip_ua.py"))
+    if not os.path.isfile(ua):
+        emit_line(f"[proto_load] phase=sip ERR the UA is not at {ua} "
+                  "(set `sip_ua` in the rig profile to override)")
+        return False
+    argv = [
+        sys.executable, ua, "diag", addr, str(port), local_ip,
+        str(binding_int(binding, "sip_local_port", 5061)),
+        str(binding_int(binding, "sip_local_rtp_port", 5010)),
+        "--frames", str(binding_int(binding, "sip_frames", 50)),
+    ]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        emit_line(f"[proto_load] phase=sip ERR {type(exc).__name__}: {exc}")
+        return False
+
+    out = proc.stdout or ""
+    for line in out.splitlines():
+        if line.strip():
+            emit_line(f"[proto_load] sip: {line.strip()}")
+    # Surface stderr too. Echoing only stdout hid a UA that died before printing
+    # anything and reported it as "call not answered" — pointing at the board
+    # instead of at the probe, which is the failure mode this file keeps having.
+    err = (proc.stderr or "").strip()
+    if err:
+        for line in err.splitlines()[-6:]:
+            emit_line(f"[proto_load] sip: stderr: {line.strip()}")
+    if proc.returncode != 0 and not out.strip():
+        emit_line(f"[proto_load] phase=sip ERR the UA exited {proc.returncode} "
+                  "without output")
+        return False
+
+    if "SIP-RESPONSE 200" not in out:
+        emit_line("[proto_load] phase=sip committed=0 failed=1 rejected=0 "
+                  "connect_errors=0 ERR call not answered")
+        return False
+    rtp_in = 0
+    for line in out.splitlines():
+        if line.startswith("RTP-SENT"):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    rtp_in = int(parts[3])
+                except ValueError:
+                    rtp_in = 0
+    if rtp_in <= 0:
+        emit_line("[proto_load] phase=sip committed=1 failed=1 rejected=0 "
+                  "connect_errors=0 ERR no audio returned from the DUT")
+        return False
+    if "BYE-ANSWERED" not in out:
+        emit_line("[proto_load] phase=sip committed=2 failed=1 rejected=0 "
+                  "connect_errors=0 ERR BYE not answered")
+        return False
+
+    emit_line(f"[proto_load] phase=sip committed=3 rejected=0 rc=0 OK "
+              f"(answered + {rtp_in} rtp back + bye)")
+    return True
+
+
+def run_h3_load(binding):
+    """Offered-rate load over HTTP/3, with wave-bench's discipline.
+
+    OPEN LOOP: requests are issued on a fixed-interval schedule, never
+    "send, wait, send". A closed loop paces itself to the server and reports a
+    tail that describes the harness.
+
+    COORDINATED-OMISSION CORRECTED: each request's latency is measured from its
+    INTENDED send time, so a stall shows as a growing tail rather than as a
+    silently reduced rate.
+
+    HARNESS_BOUND: below 90% of the offered rate the generator declares the run
+    its own fault and the tail must not be quoted. That matters more here than
+    it does for wave-bench, because this generator is PYTHON — aioquic on the
+    driver host is a plausible bottleneck well before the DUT is, and a number
+    that describes the client is worse than no number.
+    """
+    host = binding_str(binding, "host")
+    addr, _, port = host.rpartition(":")
+    path = binding_str(binding, "h3_path") or binding_str(binding, "path", "/")
+    rate = binding_int(binding, "h3_rate", 50)
+    duration = binding_int(binding, "h3_duration", 10)
+    conns = binding_int(binding, "h3_conns", 1)
+    warmup = binding_int(binding, "h3_warmup", 1)
+
+    try:
+        import asyncio, ssl, statistics, time as _t
+        from aioquic.asyncio.client import connect
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        from aioquic.quic.configuration import QuicConfiguration
+        from aioquic.h3.connection import H3Connection
+        from aioquic.h3.events import HeadersReceived, DataReceived
+    except ImportError as exc:
+        emit_line(f"[proto_load] phase=h3load ERR aioquic unavailable: {exc}")
+        return False
+
+    class LoadClient(QuicConnectionProtocol):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.http = H3Connection(self._quic)
+            self.pending = {}
+
+        def quic_event_received(self, event):
+            for ev in self.http.handle_event(event):
+                w = self.pending.get(ev.stream_id)
+                if w is None:
+                    continue
+                if isinstance(ev, HeadersReceived):
+                    w["status"] = dict(ev.headers).get(b":status")
+                if getattr(ev, "stream_ended", False) and not w["fut"].done():
+                    w["fut"].set_result(_t.perf_counter())
+
+        async def one(self, authority, path, intended):
+            sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
+            fut = asyncio.get_event_loop().create_future()
+            self.pending[sid] = {"fut": fut, "status": None}
+            self.http.send_headers(sid, [
+                (b":method", b"GET"), (b":scheme", b"https"),
+                (b":authority", authority.encode()), (b":path", path.encode()),
+            ], end_stream=True)
+            self.transmit()
+            try:
+                done_at = await asyncio.wait_for(fut, timeout=5)
+            except asyncio.TimeoutError:
+                return None, None
+            # Latency from the INTENDED send time, not from the actual one.
+            return (done_at - intended) * 1e6, self.pending[sid]["status"]
+
+    async def drive():
+        cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
+        cfg.verify_mode = ssl.CERT_NONE
+        authority = binding_str(binding, "authority", addr)
+        lat, committed, failed = [], 0, 0
+        clients = []
+        for _ in range(max(1, conns)):
+            cm = connect(addr, int(port), configuration=cfg, create_protocol=LoadClient)
+            clients.append((cm, await cm.__aenter__()))
+        try:
+            per_conn_rate = max(1.0, rate / len(clients))
+            interval = 1.0 / per_conn_rate
+            start = _t.perf_counter()
+            deadline = start + duration
+            warm_until = start + warmup
+            inflight = []
+
+            async def issue(c, intended):
+                nonlocal committed, failed
+                delay = intended - _t.perf_counter()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                us, status = await c.one(authority, path, intended)
+                if us is None or status != b"200":
+                    failed += 1
+                    return
+                committed += 1
+                if intended >= warm_until:
+                    lat.append(us)
+
+            n = 0
+            while True:
+                intended = start + n * interval
+                if intended >= deadline:
+                    break
+                for _, c in clients:
+                    inflight.append(asyncio.create_task(issue(c, intended)))
+                n += 1
+                if len(inflight) >= 256:
+                    await asyncio.gather(*inflight, return_exceptions=True)
+                    inflight = []
+            if inflight:
+                await asyncio.gather(*inflight, return_exceptions=True)
+            elapsed = _t.perf_counter() - start
+        finally:
+            for cm, _ in clients:
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+        return lat, committed, failed, elapsed
+
+    try:
+        lat, committed, failed, elapsed = asyncio.run(drive())
+    except Exception as exc:  # noqa: BLE001
+        emit_line(f"[proto_load] phase=h3load ERR {type(exc).__name__}: {exc}")
+        return False
+
+    achieved = committed / elapsed if elapsed > 0 else 0.0
+    offered = float(rate)
+    if not lat or committed == 0:
+        emit_line(f"[proto_load] phase=h3load committed=0 failed={failed} "
+                  f"rejected=0 connect_errors=0 ERR nothing completed")
+        return False
+
+    lat.sort()
+    def pct(p):
+        return lat[min(len(lat) - 1, int(len(lat) * p))]
+
+    verdict = "DUT_ATTRIBUTABLE" if achieved >= 0.9 * offered else "HARNESS_BOUND"
+    emit_line(
+        f"[proto_load] phase=h3load offered={offered:.0f} achieved={achieved:.1f} "
+        f"committed={committed} failed={failed} "
+        f"p50={pct(0.50):.0f}us p99={pct(0.99):.0f}us verdict={verdict}"
+    )
+    if verdict == "HARNESS_BOUND":
+        # Below 90% of offered the generator is the constraint. Say so instead
+        # of quoting a tail that describes aioquic on the driver host.
+        emit_line("[proto_load] phase=h3load WARN generator-bound — the tail "
+                  "above describes this driver host, not the DUT")
+    if failed:
+        emit_line(f"[proto_load] phase=h3load committed={committed} failed={failed} "
+                  f"rejected=0 connect_errors=0 ERR")
+        return False
+    emit_line(f"[proto_load] phase=h3load committed={committed} rejected=0 rc=0 OK")
+    return True
+
+
+def run_protocol(loadgen, proto, binding):
+    """Drive one protocol; return True if the run completed cleanly."""
+    host = binding_str(binding, "host")
+    # Per-protocol path first: a WebSocket endpoint and an HTTP route live at
+    # different paths on the SAME listener, so a single `path` for every
+    # protocol is wrong by construction. Driving ws at an HTTP route fails the
+    # upgrade and reports connect_errors, which reads like a broken DUT.
+    path = binding_str(binding, f"{proto}_path") or binding_str(binding, "path", "/")
+    argv = [
+        loadgen,
+        "--host", host,
+        "--protocol", proto,
+        "--rate", str(binding_int(binding, "rate", 50)),
+        "--duration", str(binding_int(binding, "duration", 10)),
+        "--conns", str(binding_int(binding, "conns", 4)),
+        "--path", path,
+        "--payload", str(binding_int(binding, "payload", 0)),
+        "--warmup", str(binding_int(binding, "warmup", 1)),
+    ]
+    authority = binding_str(binding, "authority")
+    if authority:
+        argv += ["--authority", authority]
+    if binding_bool(binding, "tls"):
+        argv.append("--tls")
+
+    emit_line(f"[proto_load] phase={proto} start host={host} path={path} "
+              f"tls={binding_bool(binding, 'tls')}")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as e:
+        fail(f"could not exec {loadgen}: {e}")
+        return False
+
+    # Stream the probe's output through as it arrives, so a scenario watching
+    # for a stall sees partial progress rather than nothing until exit.
+    #
+    # Also capture the machine-readable summary. The exit code alone is NOT a
+    # verdict: wave-loadgen exits 0 whenever it ran to completion, including a
+    # run where every single request was rejected. Trusting rc here would
+    # report `any_err=false` for a total failure, which is exactly the kind of
+    # green-on-broken a rig suite must never produce.
+    summary = None
+    for line in proc.stdout:
+        line = line.rstrip()
+        emit_line(f"[proto_load] phase={proto} {line}")
+        if line.startswith("{") and '"schema":"wave-loadgen/' in line:
+            try:
+                summary = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+    rc = proc.wait()
+
+    if rc != 0:
+        emit_line(f"[proto_load] phase={proto} rc={rc} ERR")
+        return False
+
+    if summary is None:
+        emit_line(f"[proto_load] phase={proto} ERR no summary emitted — "
+                  "the probe exited 0 without reporting a result")
+        return False
+
+    committed = summary.get("committed", 0)
+    failed = summary.get("failed", 0)
+    rejected = summary.get("rejected", 0)
+    connect_errors = summary.get("connect_errors", 0)
+    if committed == 0 or failed or connect_errors:
+        emit_line(
+            f"[proto_load] phase={proto} committed={committed} failed={failed} "
+            f"rejected={rejected} connect_errors={connect_errors} ERR"
+        )
+        return False
+    if rejected:
+        # Rejected-but-some-committed is back-pressure, not a broken run. Say so
+        # loudly and let the scenario decide with its own rule.
+        emit_line(f"[proto_load] phase={proto} WARN rejected={rejected} "
+                  f"(committed={committed}) — offered rate exceeds capacity")
+
+    emit_line(f"[proto_load] phase={proto} committed={committed} rejected={rejected} rc=0 OK")
+    return True
+
+
+def main():
+    try:
+        invocation = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError) as e:
+        # stdout must stay valid NDJSON even on a malformed invocation.
+        emit({"kind": "error", "message": f"malformed BackendInvocation: {e}"})
+        return 2
+
+    binding = invocation.get("binding", {}) or {}
+    context = invocation.get("context", {}) or {}
+
+    global SCENARIO
+    SCENARIO = str(context.get("scenario_name", "") or "")
+
+    host = binding_str(binding, "host")
+    if not host:
+        fail("binding has no `host` — set it in the rig profile's "
+             "[observe.proto_load] section as \"addr:port\"")
+        return 2
+
+    protocols = [
+        p.strip()
+        for p in binding_str(binding, "protocols", "h1").split(",")
+        if p.strip()
+    ]
+    unknown = [p for p in protocols if p not in VALID_PROTOCOLS]
+    if unknown:
+        fail(f"unknown protocol(s) {unknown}; valid: {list(VALID_PROTOCOLS)}")
+        return 2
+
+    loadgen = resolve_loadgen(binding)
+    if not loadgen:
+        fail("no wave-loadgen binary found. Build it with "
+             "`cargo build --release -p wave-bench`, put it on PATH, or set "
+             "`loadgen` in the [observe.proto_load] binding")
+        return 2
+
+    note(f"proto_load: {loadgen} -> {host}, protocols={protocols}, "
+         f"scenario={context.get('scenario_name', '?')}")
+    emit({"kind": "ready"})
+
+    # The DUT is power-cycled around this attach, so it will not be listening
+    # yet. Waiting here rather than failing keeps the boot race out of every
+    # scenario that uses the capability.
+    # Ride out the power cycle FIRST. The observer is attached before
+    # power.cycle, so the DUT is still serving the previous kernel at this
+    # point: probing now succeeds against the wrong image and then fails
+    # mid-phase when the board resets under it. Measured on pi5-a: the probe
+    # saw "listening after ~1s", ran h1 against the old kernel, and reported
+    # committed=0 failed=4 when the reset landed.
+    pre_boot_wait = binding_int(binding, "pre_boot_wait", 45)
+    if pre_boot_wait > 0:
+        emit_line(f"[proto_load] pre_boot_wait {pre_boot_wait}s (riding out the "
+                  "power cycle so the probe cannot measure the previous kernel)")
+        time.sleep(pre_boot_wait)
+
+    boot_wait = binding_int(binding, "boot_wait", 45)
+    # An h3-only DUT binds UDP and nothing else, so a TCP connect can never
+    # succeed and the readiness probe must speak QUIC instead. Getting this
+    # wrong reads as "the DUT never bound the port" on a board that is serving
+    # perfectly.
+    if protocols == [SIP_PROTOCOL]:
+        # A SIP DUT binds UDP only and answers nothing until it is INVITEd, so
+        # there is no cheap readiness probe: the call IS the probe. Sleep the
+        # boot budget instead of reporting "never bound the port" about a board
+        # that is up.
+        emit_line(f"[proto_load] sip: waiting {boot_wait}s for the DUT to boot")
+        time.sleep(boot_wait)
+        ready = True
+    else:
+        ready = (wait_for_h3_host(host, boot_wait)
+                 if all(p in (H3_PROTOCOL, H3_LOAD_PROTOCOL) for p in protocols)
+                 else wait_for_host(host, boot_wait))
+    if not ready:
+        fail(f"{host} did not accept a connection within {boot_wait}s — "
+             "the DUT never bound the port")
+        emit_line("[proto_load] ERR boot_wait_timeout")
+        return 1
+
+    all_ok = True
+    for proto in protocols:
+        if proto == H3_PROTOCOL:
+            all_ok &= run_h3(binding)
+            continue
+        if proto == H3_LOAD_PROTOCOL:
+            all_ok &= run_h3_load(binding)
+            continue
+        if proto == SIP_PROTOCOL:
+            all_ok &= run_sip(binding)
+            continue
+        if not run_protocol(loadgen, proto, binding):
+            all_ok = False
+
+    emit_line(f"[proto_load] done protocols={','.join(protocols)} any_err={str(not all_ok).lower()} ")
+    return 0 if all_ok else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # SIGTERM/SIGINT is the normal end of a transport backend's life.
+        sys.exit(0)

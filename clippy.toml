@@ -1,0 +1,22 @@
+# Clippy configuration for the PIC module sources.
+#
+# `msrv` is the load-bearing key. `fluxor ci` clippies `modules/**` directly with
+# `clippy-driver` (there is no root manifest to lint instead, since the workspace
+# and `crates/wave-cores` were retired on 2026-08-08), and clippy-driver reads
+# THIS file — not a `Cargo.toml`. Without the key clippy assumes the installed
+# toolchain, which changes which lints fire in both directions: too low and it
+# rejects APIs the modules already use, too high and it demands newer ones.
+#
+# WHY 1.87 AND NOT THE 1.81 IN ../standards/lints.md §0. That standard sets a FLOOR
+# ("`rust-version` must be `>= 1.81`"), and Wave's module sources are already
+# past it: `http` uses `u64::is_multiple_of` (stable 1.87) in four places —
+# h2.rs:876, h3.rs:818, mod.rs:717, mod.rs:756. That was never caught because the
+# retired root `Cargo.toml` declared `rust-version = "1.81"` for the CARGO
+# crates, and `modules/**` are not cargo crates: nothing ever checked them
+# against it. So 1.87 is not a relaxation, it is the first honest statement of
+# what the modules have required for some time. Lowering it back to 1.81 would
+# mean rewriting working device code to satisfy a number no build enforced.
+#
+# Raise this only alongside a deliberate decision about which silicon toolchains
+# must still build Wave.
+msrv = "1.87"

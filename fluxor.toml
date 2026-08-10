@@ -1,0 +1,80 @@
+# Wave project configuration consumed by the `fluxor` CLI.
+# See ~/Development/nanocloudio/standards/{ci,tests,fluxor-modules,dependencies}.md.
+
+[project]
+name    = "wave"
+version = "0.0.1"
+
+# fluxor provides the module SDK source (abi.rs, runtime.rs, params.rs,
+# varint.rs, wasm_entry.rs, the PIC linker script) materialised into
+# target/fluxor/fluxor-abi/sdk/, plus the `fluxor-linux` runtime binary. Wave's
+# modules `include!` that SDK; Wave never vendors a second copy of it.
+[dependencies]
+fluxor = "0.0.1"
+
+[required]
+fluxor = { abi = 1 }
+
+[ci]
+# Silicon targets `fluxor modules build --all` produces artefacts for. Which
+# modules build for which silicon is decided per module by `manifest.toml`'s
+# `hardware_targets` (`websocket` and `smtp` are bcm2712-only, `ws_stream` is
+# portable, `http`/`rtp`/`sip` are rp2350 + bcm2712 — rtp gained bcm2712 on
+# 2026-08-03, see T3.6.5). The two bcm2712-only modules are both OUTBOUND
+# connectors, which is why rp2350 can serve WebSocket but not dial one; that is
+# an unexamined default rather than a requirement. `linux` is a *runtime* host,
+# not a silicon, so it is not listed here; the Linux path is exercised by
+# `tools/e2e/linux_graph.sh`.
+targets = ["rp2350", "bcm2712", "wasm"]
+
+# No `[ci.cargo]`. Wave has NO root cargo workspace: it was retired on
+# 2026-08-08 along with `crates/wave-cores`, because the shared cores are
+# `include!`d by the modules rather than linked, so the crate around them bought
+# nothing but a second place for a core to live on after every module stopped
+# mounting it. The cores now sit in `modules/common/` and the vector suites reach
+# the same sources through the module rlibs. The only host crates left are
+# `tests/harness` and `tools/load/wave-bench`, each standing alone with its own
+# `[workspace]`.
+#
+# `host_tools_crate` would be the wrong tool for either of them:
+#   * `tests/harness` is already phase 4's job — `cargo-test (harness)` is
+#     built in and keys off the directory existing (ci.rs:308), so naming it here
+#     would run those ~27s of suites TWICE per CI run.
+#   * `tools/load/wave-bench` holds no tests to run in phase 2; what it needs is to be
+#     BUILT and linted, which tools/ci/host_crates.sh does below.
+# With the key absent and no root manifest, phase 2 is omitted rather than
+# skipped (ci.rs:245) — the work it would have done is covered, not dropped.
+
+# No `[[ci.lints.exemption]]`: the opt-in audit it feeds matches exemptions
+# against workspace-member paths and is omitted entirely without a root manifest
+# (ci.rs:146). `tools/load/wave-bench` still inlines its relaxed `[lints]` mirror —
+# there is simply no workspace left for it to have opted out of.
+
+[ci.test]
+# Three project gates, run in order at CI phase 3.5 (after the strict module
+# build):
+#   1. ci-shadow-guard.sh — shadow-checkout hard-fail (test-tracking.md §7):
+#      tests/ is shadow-tracked in .git-shadow/, so a primary-only checkout has
+#      zero files there and the test phases would pass vacuously.
+#   2. host_crates_e2e.sh — phases 1.1/1.2 fmt-check and clippy the PIC module
+#      sources directly when there is no root manifest, which is new coverage —
+#      but it leaves the two host crates linted by nothing, and
+#      `tools/load/wave-bench` built by nothing. This gate is that.
+#   3. fmod_size_budget.sh — the variant split's whole point is fitting smaller
+#      devices, which is a claim about BYTES; enforced here, after the module
+#      build, so a variant cannot quietly stop being smaller than its superset.
+scripts = [
+  "tools/ci/shadow_guard.sh",
+  "tools/ci/host_crates.sh",
+  "tools/ci/fmod_size_budget.sh",
+]
+
+[ci.hygiene]
+# `modules/**` are no_std PIC objects that cannot host a test harness, so inline
+# tests there are a real error — including `modules/common/*_core.rs`, which are
+# `include!`d verbatim into those objects. The cores' vectors live in
+# `tests/harness/tests/`, which is ordinary host Rust;
+# `tests/harness/tests/project_contract.rs` is what keeps the cores
+# `include!`-safe (no inner attributes, no test module).
+forbid_inline_tests = ["modules"]
+mode                = "strict"
