@@ -487,7 +487,15 @@ pub(crate) unsafe fn finish_response(s: &mut HttpState) {
         cur.recv_len = leftover as u16;
         cur.recv_parsed = 0;
         cur.req_path_len = 0;
+        // Per-REQUEST, not per-connection: a keep-alive connection serves
+        // many, and a stale HEAD would suppress the body of the GET after it.
+        cur.req_method = super::super::wire::method::METHOD_NONE;
         cur.matched_route = -1;
+    }
+    // Release this request's decoded body, for the same reason: the next
+    // request on this connection must not inherit the previous one's payload.
+    super::reqbody::reset_body(s);
+    if let Some(cur) = cur_slot_mut(s) {
         cur.header_end_off = 0;
         cur.tmpl_pos = 0;
         cur.send_offset = 0;

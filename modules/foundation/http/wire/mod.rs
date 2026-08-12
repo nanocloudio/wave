@@ -24,6 +24,14 @@ pub(crate) mod huffman {
     include!("../../../common/huffman_core.rs");
 }
 
+// Method vocabulary — shared by h1, h2 and h3, so it is NOT feature-gated per
+// generation. `h1` is always compiled, and every variant that adds a generation
+// adds another consumer of the same table.
+#[cfg(not(feature = "host-test"))]
+pub(crate) mod method;
+#[cfg(feature = "host-test")]
+pub mod method;
+
 #[cfg(not(feature = "host-test"))]
 pub(crate) mod h1;
 #[cfg(feature = "host-test")]

@@ -4,6 +4,8 @@
 //! no module state: each function takes raw byte slices so the same
 //! routines serve both the server and client state machines.
 
+use super::method;
+
 /// Decide whether the response to a parsed request head should
 /// keep the connection open. RFC 9112 §9.3 default rules:
 ///   HTTP/1.1 + no `Connection: close`        → keep-alive
@@ -182,13 +184,18 @@ pub unsafe fn find_header_end(buf: &[u8], len: usize) -> Option<usize> {
     None
 }
 
-/// Parse an HTTP/1 request line (`GET /path HTTP/1.x\r\n`) out of `src`
-/// and copy the path bytes into `dst`. Returns the path length on
+/// Parse an HTTP/1 request line (`METHOD /path HTTP/1.x\r\n`) out of `src`
+/// and copy the path bytes into `dst`. Returns `(method, path_len)` on
 /// success or `None` if the line is malformed, truncated, or too short
 /// to contain the minimum viable request.
 ///
-/// GET is the only method this server accepts; non-GET requests fall
-/// through to a 400 reply.
+/// The method is returned rather than enforced. An unrecognised-but-well-formed
+/// token yields [`method::METHOD_NONE`] with the path still parsed, so the
+/// caller can answer **501 Not Implemented** — which is what RFC 9110 §9.1 asks
+/// for — instead of the 400 that a parse failure would produce. Only a
+/// genuinely malformed line (no method token, no space-delimited path, a path
+/// that does not start with `/`) is `None`. The recognised tokens are
+/// `wire::method`'s, the same table h2 and h3 resolve against.
 ///
 /// # Safety
 /// `src` must be valid for reads of `src_len` bytes; `dst` must be
@@ -199,29 +206,53 @@ pub unsafe fn parse_request_line(
     src_len: usize,
     dst: *mut u8,
     dst_cap: usize,
-) -> Option<usize> {
+) -> Option<(u8, usize)> {
+    // Shortest viable line: `GET / HTTP/1.0\r\n` — 14 bytes before the CRLF.
     if src_len < 14 {
         return None;
     }
-    if *src != b'G' || *src.add(1) != b'E' || *src.add(2) != b'T' || *src.add(3) != b' ' {
+
+    // 1) Method token: bytes up to the first space. Bounded by
+    //    MAX_METHOD_SCAN so a pathological line without a space cannot walk
+    //    the whole buffer before failing. The bound is wider than the
+    //    recognised table on purpose — see `method::MAX_METHOD_SCAN`, which
+    //    is what keeps "unimplemented" (501) distinct from "malformed" (400).
+    let mut m_end = 0usize;
+    let scan_cap = (method::MAX_METHOD_SCAN + 1).min(src_len);
+    while m_end < scan_cap && *src.add(m_end) != b' ' {
+        m_end += 1;
+    }
+    if m_end == 0 || m_end >= scan_cap {
         return None;
     }
+    let mut tok = [0u8; method::MAX_METHOD_SCAN];
+    let mut i = 0;
+    while i < m_end {
+        tok[i] = *src.add(i);
+        i += 1;
+    }
+    let verb = method::method_from_token(&tok[..m_end]);
 
-    let mut path_end = 4usize;
+    // 2) Path: from just past the space to the next space. An origin-form
+    //    target must start with `/` (RFC 9112 §3.2.1); authority-form and
+    //    asterisk-form belong to CONNECT and OPTIONS *, neither of which this
+    //    server routes.
+    let path_start = m_end + 1;
+    let mut path_end = path_start;
     while path_end < src_len && *src.add(path_end) != b' ' {
         path_end += 1;
     }
-    if path_end <= 4 || *src.add(4) != b'/' {
+    if path_end <= path_start || *src.add(path_start) != b'/' {
         return None;
     }
 
-    let plen = (path_end - 4).min(dst_cap);
+    let plen = (path_end - path_start).min(dst_cap);
     let mut i = 0;
     while i < plen {
-        *dst.add(i) = *src.add(4 + i);
+        *dst.add(i) = *src.add(path_start + i);
         i += 1;
     }
-    Some(plen)
+    Some((verb, plen))
 }
 
 /// Write a minimal HTTP/1.1 response status line plus a
@@ -309,6 +340,183 @@ pub unsafe fn write_error_response(
     put!(body);
 
     off
+}
+
+// ── Request body framing ──────────────────────────────────────────────────
+//
+// RFC 9112 §6 decides how long a request body is, and the order matters:
+// `Transfer-Encoding` beats `Content-Length` when both appear, and a request
+// carrying both is a smuggling vector rather than a merely ambiguous message.
+// Everything here is a pure read over the parsed head — the server state
+// machine owns what to DO about each answer.
+
+/// How the body of a request is delimited.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BodyFraming {
+    /// No body: neither framing header is present.
+    None,
+    /// `Content-Length: n` — exactly `n` more bytes.
+    Length(u64),
+    /// `Transfer-Encoding: chunked` — a sequence of size-prefixed chunks
+    /// terminated by a zero-size chunk.
+    Chunked,
+    /// The framing headers contradict each other, or a value is unparseable.
+    /// Must be answered 400 and the connection closed — RFC 9112 §6.3 is
+    /// explicit that a server MUST NOT guess, because a proxy guessing
+    /// differently is exactly how request smuggling works.
+    Invalid,
+}
+
+/// Decide how a request's body is framed, from its parsed head.
+pub fn body_framing(head: &[u8]) -> BodyFraming {
+    let te = find_header(head, b"transfer-encoding");
+    let cl = find_header(head, b"content-length");
+
+    if let Some(te) = te {
+        // Both present: reject. RFC 9112 §6.1 says Transfer-Encoding
+        // overrides Content-Length, and §6.3 says a message with both "ought
+        // to be handled as an error" — the disagreement between two
+        // intermediaries about which to honour is the smuggle.
+        if cl.is_some() {
+            return BodyFraming::Invalid;
+        }
+        // Only `chunked`, and only as the final encoding, is supported. The
+        // value is a comma-separated list; `chunked` must come last.
+        let mut last: &[u8] = b"";
+        for part in te.split(|c| *c == b',') {
+            let mut a = 0usize;
+            let mut b = part.len();
+            while a < b && (part[a] == b' ' || part[a] == b'\t') {
+                a += 1;
+            }
+            while b > a && (part[b - 1] == b' ' || part[b - 1] == b'\t') {
+                b -= 1;
+            }
+            last = &part[a..b];
+        }
+        if last.eq_ignore_ascii_case(b"chunked") {
+            return BodyFraming::Chunked;
+        }
+        return BodyFraming::Invalid;
+    }
+
+    match cl {
+        None => BodyFraming::None,
+        Some(v) => {
+            if v.is_empty() {
+                return BodyFraming::Invalid;
+            }
+            let mut n: u64 = 0;
+            for c in v {
+                if !c.is_ascii_digit() {
+                    return BodyFraming::Invalid;
+                }
+                // A length that cannot fit a u64 is not a length. Saturating
+                // here would silently accept a truncated value.
+                n = match n
+                    .checked_mul(10)
+                    .and_then(|n| n.checked_add((*c - b'0') as u64))
+                {
+                    Some(n) => n,
+                    None => return BodyFraming::Invalid,
+                };
+            }
+            BodyFraming::Length(n)
+        }
+    }
+}
+
+/// Whether the client asked for a `100 Continue` interim response before
+/// sending its body (RFC 9110 §10.1.1).
+///
+/// Not a nicety: `docker push` and `curl -T` on a large upload both send
+/// `Expect: 100-continue` and WAIT. A server that ignores the header answers
+/// nothing until the client's timeout expires, which presents as a hang rather
+/// than as an error.
+pub fn expects_continue(head: &[u8]) -> bool {
+    match find_header(head, b"expect") {
+        Some(v) => v.eq_ignore_ascii_case(b"100-continue"),
+        None => false,
+    }
+}
+
+/// Result of parsing one chunk header line from a chunked body.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ChunkHeader {
+    /// Parsed: this chunk carries `size` bytes, and the header line occupied
+    /// `consumed` bytes (through its CRLF). `size == 0` is the terminating
+    /// chunk.
+    Ok { size: u64, consumed: usize },
+    /// The line is incomplete — more bytes needed before it can be parsed.
+    Need,
+    /// Malformed size line. 400, and close.
+    Bad,
+}
+
+/// Longest chunk-size line accepted, including any `;ext=val` parameters and
+/// the CRLF. A chunked sender that needs more than this to say how big the
+/// next chunk is, is not one worth accommodating — and without the cap, a
+/// stream of garbage without a CRLF is scanned in full on every tick.
+pub const MAX_CHUNK_LINE: usize = 64;
+
+/// Parse a chunk-size line: `1a2b[;ext]\r\n` (RFC 9112 §7.1).
+///
+/// Chunk extensions are parsed and DISCARDED. No extension has a registered
+/// meaning, but a sender is allowed to emit them, and treating one as a
+/// malformed size would reject a legal stream.
+pub fn parse_chunk_header(buf: &[u8]) -> ChunkHeader {
+    let cap = buf.len().min(MAX_CHUNK_LINE);
+    let mut i = 0usize;
+    // Hex digits.
+    let mut size: u64 = 0;
+    let mut digits = 0usize;
+    while i < cap {
+        let c = buf[i];
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => break,
+        };
+        size = match size.checked_mul(16).and_then(|s| s.checked_add(d as u64)) {
+            Some(s) => s,
+            None => return ChunkHeader::Bad,
+        };
+        digits += 1;
+        i += 1;
+    }
+    if digits == 0 {
+        // Not a hex digit in first position: either malformed, or we have not
+        // yet received anything to judge.
+        return if buf.is_empty() {
+            ChunkHeader::Need
+        } else {
+            ChunkHeader::Bad
+        };
+    }
+    // Optional extensions, then CRLF.
+    while i < cap && buf[i] != b'\r' {
+        i += 1;
+    }
+    if i >= cap {
+        // Ran out of buffer looking for the CRLF. Only "need more" if we
+        // stopped because the buffer ended, not because the cap did.
+        return if buf.len() <= MAX_CHUNK_LINE {
+            ChunkHeader::Need
+        } else {
+            ChunkHeader::Bad
+        };
+    }
+    if i + 1 >= buf.len() {
+        return ChunkHeader::Need;
+    }
+    if buf[i + 1] != b'\n' {
+        return ChunkHeader::Bad;
+    }
+    ChunkHeader::Ok {
+        size,
+        consumed: i + 2,
+    }
 }
 
 /// Outcome of parsing an HTTP `Range:` header value against a known

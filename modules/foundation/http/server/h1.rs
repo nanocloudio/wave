@@ -48,6 +48,8 @@ use super::response::{
     build_error, build_error_416, build_header, build_header_fs_full, build_header_fs_partial,
     build_header_with_len,
 };
+#[cfg(feature = "app")]
+use super::routes::HANDLER_APP;
 use super::routes::{
     content_type_from_path, match_route, Route, HANDLER_FILE, HANDLER_FS_FILE, HANDLER_FS_LIST,
     HANDLER_GRPC, HANDLER_PROXY, HANDLER_STATIC, HANDLER_STREAM, HANDLER_TEMPLATE,
@@ -61,6 +63,9 @@ use super::ws::{
 // The h2 helpers are gated with the state they touch: `http-web` links no
 // `H2State`, so importing them unconditionally breaks that variant while the
 // all-features host build stays green.
+#[cfg(feature = "app")]
+use super::app;
+use super::reqbody;
 use super::{
     active_slot_count, alloc_free_slot, close_net_conn, cur_conn_id, cur_fs_fd, cur_fs_sent,
     cur_fs_total, cur_matched_route, cur_phase, cur_recv_buf_mut_ptr, cur_recv_buf_ptr,
@@ -76,8 +81,39 @@ use super::{
 #[cfg(feature = "h2")]
 use super::{cur_h2_mut, ensure_h2_state};
 
+/// Stage `HTTP/1.1 100 Continue` in `send_buf` and mark the slot so
+/// `Phase::RecvBody` flushes it before reading a byte of body.
+///
+/// An interim response is not a response: it does not end the request, carries
+/// no body, and is followed by the real status line on the same connection
+/// (RFC 9110 §15.2). So it is written straight into `send_buf` rather than
+/// through `build_header*`, none of which can express "more to follow".
+unsafe fn stage_interim_continue(s: &mut HttpState) {
+    const INTERIM: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+    let dst = cur_send_buf_mut_ptr(s);
+    if dst.is_null() {
+        return;
+    }
+    let n = INTERIM.len().min(SEND_BUF_SIZE);
+    core::ptr::copy_nonoverlapping(INTERIM.as_ptr(), dst, n);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+        cur.send_len = n as u16;
+        cur.body_continue = 1;
+    }
+}
+
 pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
     drain_variables(s);
+
+    // Application responses are drained once per step, before any slot runs.
+    // Deliberately NOT per-slot: `resp_in` is one channel feeding every
+    // connection in `Phase::AwaitApp`, so a per-slot read would let whichever
+    // slot stepped first consume an envelope addressed to a different one.
+    // `drain_responses` routes by `(conn_id, stream_id)` and composes onto the
+    // slot that asked, whichever slot happens to be current.
+    #[cfg(feature = "app")]
+    app::drain_responses(s);
 
     // Background-drain inbound network messages during phases that
     // don't already poll `net_in_chan` themselves. Without this the
@@ -399,8 +435,21 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         None
                     };
                     match plen {
-                        Some(n) => {
+                        // A well-formed line whose method this server does not
+                        // implement is 501, not 400: the request is not
+                        // malformed, it asks for something unsupported (RFC
+                        // 9110 §9.1). The parser reports the distinction by
+                        // returning METHOD_NONE with the path intact.
+                        Some((verb, _)) if verb == wire::method::METHOD_NONE => {
+                            build_error(s, b"501 Not Implemented", b"Not Implemented\n");
                             if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::DrainSend;
+                            }
+                            return 0;
+                        }
+                        Some((verb, n)) => {
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.req_method = verb;
                                 cur.req_path_len = n as u8;
                                 cur.recv_parsed = 1;
                             }
@@ -472,10 +521,53 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     } else {
                         None
                     };
+                    // Decide the body BEFORE dispatch, because the answer can
+                    // be the whole response: contradictory framing is 400, an
+                    // over-cap length is 413, and a body-bearing method with no
+                    // framing at all is 411. Each of those is a refusal that
+                    // must happen without ever routing the request.
+                    let plan = reqbody::plan_body(s, head);
+                    let refusal: Option<(&[u8], &[u8])> = match plan {
+                        reqbody::BodyPlan::Invalid => Some((b"400 Bad Request", b"Bad Request\n")),
+                        reqbody::BodyPlan::TooLarge => {
+                            Some((b"413 Content Too Large", b"Content Too Large\n"))
+                        }
+                        reqbody::BodyPlan::LengthRequired => {
+                            Some((b"411 Length Required", b"Length Required\n"))
+                        }
+                        reqbody::BodyPlan::None | reqbody::BodyPlan::Read { .. } => None,
+                    };
+                    if let Some((status, body)) = refusal {
+                        build_error(s, status, body);
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.header_end_off = head_len as u16;
+                            cur.phase = Phase::DrainSend;
+                        }
+                        return 0;
+                    }
+                    // The head STAYS in `recv_buf`, and the body reader
+                    // consumes from `header_end_off` onward. Shifting the head
+                    // away would be simpler arithmetic and would destroy the
+                    // one copy of the request headers there is — which
+                    // `HANDLER_APP` forwards verbatim to the application, since
+                    // a gateway cannot know which of them the application's API
+                    // is defined in terms of.
+                    let body_follows = matches!(plan, reqbody::BodyPlan::Read { .. });
+                    let wants_continue = matches!(
+                        plan,
+                        reqbody::BodyPlan::Read {
+                            continue_first: true
+                        }
+                    );
+
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.keepalive = if keepalive { 1 } else { 0 };
                         cur.header_end_off = head_len as u16;
-                        cur.phase = Phase::DispatchRoute;
+                        cur.phase = if body_follows {
+                            Phase::RecvBody
+                        } else {
+                            Phase::DispatchRoute
+                        };
                         let flags = match header_ctx {
                             Some((tid, pid, flags)) => {
                                 cur.span_trace_id = tid;
@@ -500,6 +592,14 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 != 0;
                         cur.span_start_us = if sampled { span_now } else { 0 };
                     }
+                    // `Expect: 100-continue` — stage the interim response now.
+                    // The client is WAITING for it and will not send the body
+                    // until it arrives, so deferring this to the body reader
+                    // would deadlock: the reader waits for bytes the client is
+                    // withholding pending a response the reader has not sent.
+                    if wants_continue {
+                        stage_interim_continue(s);
+                    }
                     return 2;
                 } else if cur_recv_len(s) as usize >= RECV_BUF_SIZE {
                     let l = cur_recv_len(s) as usize;
@@ -514,6 +614,132 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                 }
             }
+        }
+
+        Phase::RecvBody => {
+            // A staged `100 Continue` must reach the wire before the body is
+            // read — see `stage_interim_continue`.
+            if cur_slot(s).map(|c| c.body_continue).unwrap_or(0) != 0 {
+                let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
+                if remaining > 0 {
+                    let sent = net_send(
+                        s,
+                        cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
+                        remaining,
+                    );
+                    if sent > 0 {
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.send_offset += sent as u16;
+                        }
+                    }
+                    return 2;
+                }
+                // Drained. Clear the interim response out of `send_buf` so the
+                // real response is composed into an empty buffer.
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.body_continue = 0;
+                    cur.send_offset = 0;
+                    cur.send_len = 0;
+                }
+            }
+
+            match reqbody::step_recv_body(s) {
+                reqbody::BodyStep::Done => {
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DispatchRoute;
+                    }
+                    return 2;
+                }
+                reqbody::BodyStep::NeedMore => {
+                    // The peer hung up mid-body. The request will never be
+                    // complete, so there is nothing to answer — close rather
+                    // than dispatch a truncated body as if it were whole.
+                    if cur_slot(s).map(|c| c.peer_closed).unwrap_or(0) != 0 {
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::CloseConn;
+                        }
+                        return 2;
+                    }
+                    return 0;
+                }
+                reqbody::BodyStep::Bad => {
+                    build_error(s, b"400 Bad Request", b"Bad Request\n");
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.keepalive = 0;
+                        cur.phase = Phase::DrainSend;
+                    }
+                    return 0;
+                }
+                reqbody::BodyStep::TooLarge => {
+                    // Close rather than keep-alive: the rest of the body is
+                    // still arriving and this server has stopped reading it,
+                    // so there is no way to find the next request boundary.
+                    build_error(s, b"413 Content Too Large", b"Content Too Large\n");
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.keepalive = 0;
+                        cur.phase = Phase::DrainSend;
+                    }
+                    return 0;
+                }
+            }
+        }
+
+        #[cfg(not(feature = "app"))]
+        Phase::AwaitApp => {
+            // Unreachable without the feature (nothing dispatches HANDLER_APP),
+            // but the variant is kept so phase numbering stays identical across
+            // builds. Fail closed, as H2Active does.
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::CloseConn;
+            }
+            return 0;
+        }
+        #[cfg(feature = "app")]
+        Phase::AwaitApp => {
+            // Responses are drained centrally (`app::drain_responses`, once per
+            // step) rather than polled per slot: one channel feeds every
+            // waiting connection, and a per-slot read would let whichever slot
+            // stepped first consume an envelope addressed to another.
+            //
+            // So this arm only handles the case the drain cannot: nothing came
+            // back in time.
+            if let Some(idx) = current_slot_index(s) {
+                if app::app_deadline_passed(s, idx) {
+                    // Mid-stream, the response head and part of its body are
+                    // already on the wire. A 504 here would append a second
+                    // status line INSIDE the first response's body, which the
+                    // client would read as content. Closing is the only honest
+                    // signal left: it surfaces as the truncated transfer it is.
+                    let streaming = cur_slot(s).map(|c| c.app_streaming != 0).unwrap_or(false);
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.app_pending = 0;
+                        cur.app_streaming = 0;
+                        cur.app_deadline_ms = 0;
+                        cur.keepalive = 0;
+                    }
+                    if streaming {
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::CloseConn;
+                        }
+                        return 2;
+                    }
+                    build_error(s, b"504 Gateway Timeout", b"Gateway Timeout\n");
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DrainSend;
+                    }
+                    return 0;
+                }
+            }
+            // Peer hung up while the application was still thinking: nothing
+            // to deliver the answer to.
+            if cur_slot(s).map(|c| c.peer_closed).unwrap_or(0) != 0 {
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.app_pending = 0;
+                    cur.phase = Phase::CloseConn;
+                }
+                return 2;
+            }
+            return 0;
         }
 
         Phase::DispatchRoute => {
@@ -891,6 +1117,54 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::AwaitFsStat;
+                    }
+                }
+                #[cfg(feature = "app")]
+                HANDLER_APP => {
+                    // Hand the whole request to the application module. The
+                    // head is still in `recv_buf` — the body reader consumed
+                    // only what followed it — so the headers can be forwarded
+                    // verbatim.
+                    let head_len = cur_slot(s).map(|c| c.header_end_off as usize).unwrap_or(0);
+                    let head = core::slice::from_raw_parts(cur_recv_buf_ptr(s), head_len);
+                    match app::emit_request(s, head) {
+                        app::EmitResult::Sent => {
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.app_pending = 1;
+                                cur.app_stream_id = 0;
+                                cur.phase = Phase::AwaitApp;
+                            }
+                        }
+                        // The ring is momentarily full. Stay in DispatchRoute
+                        // and retry — the application is alive, just behind.
+                        app::EmitResult::Full => return 0,
+                        // Both remaining cases are configuration errors that no
+                        // retry will fix: a route declaring HANDLER_APP with
+                        // nothing wired to `req_out`, or a `max_body_kib`
+                        // larger than the ring that must carry it. 503 names
+                        // the server as the broken party, which is accurate.
+                        app::EmitResult::Unwired => {
+                            build_error(
+                                s,
+                                b"503 Service Unavailable",
+                                b"No application wired to req_out\n",
+                            );
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::DrainSend;
+                            }
+                            return 0;
+                        }
+                        app::EmitResult::TooLarge => {
+                            build_error(
+                                s,
+                                b"503 Service Unavailable",
+                                b"Request exceeds the req_out ring\n",
+                            );
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::DrainSend;
+                            }
+                            return 0;
+                        }
                     }
                 }
                 HANDLER_FS_LIST => {
@@ -1510,6 +1784,39 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     HANDLER_FILE
                 };
 
+                // HEAD: the headers just drained are the whole response (RFC
+                // 9110 §9.3.2 — identical headers to the equivalent GET,
+                // `Content-Length` included, body suppressed). Skipping
+                // straight to DrainSend is not merely an optimisation: writing
+                // the body after a `Content-Length` the client will not read
+                // leaves those bytes in the stream, where a keep-alive
+                // connection reads them as the head of the NEXT response.
+                //
+                // Any body-side resource opened during dispatch has to be
+                // released here rather than by the renderer that will now never
+                // run — the fd explicitly, `file_chan` and the cache retain by
+                // DrainSend itself.
+                let head_only = cur_slot(s)
+                    .map(|c| !wire::method::method_sends_response_body(c.req_method))
+                    .unwrap_or(false);
+                if head_only {
+                    if cur_fs_fd(s) >= 0 {
+                        ((*s.syscalls).provider_call)(
+                            cur_fs_fd(s),
+                            0x0903, // FS_CLOSE
+                            core::ptr::null_mut(),
+                            0,
+                        );
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.fs_fd = -1;
+                        }
+                    }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DrainSend;
+                    }
+                    return 2;
+                }
+
                 match handler {
                     HANDLER_STATIC | HANDLER_TEMPLATE | HANDLER_FILE | HANDLER_STREAM
                     | HANDLER_FS_FILE => {
@@ -1628,6 +1935,21 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
+                // A streamed application response is not finished when this
+                // chunk drains — more envelopes are coming for the same
+                // request. Returning to AwaitApp rather than finishing is what
+                // lets a body exceed `send_buf`, which is the difference
+                // between serving an API and serving artefacts.
+                if cfg!(feature = "app")
+                    && cur_slot(s).map(|c| c.app_streaming != 0).unwrap_or(false)
+                {
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.send_len = 0;
+                        cur.send_offset = 0;
+                        cur.phase = Phase::AwaitApp;
+                    }
+                    return 2;
+                }
                 finish_response(s);
                 return 0;
             }

@@ -70,6 +70,21 @@ pub(crate) const HANDLER_FS_LIST: u8 = 8;
 /// framework. HTTP/2 only: gRPC has no HTTP/1 binding.
 pub(crate) const HANDLER_GRPC: u8 = 10;
 
+/// Hand the request to a downstream module and serve whatever it returns.
+///
+/// The counterpart to `HANDLER_WEBSOCKET_FANOUT` for ordinary request/response
+/// HTTP: the request goes out on `req_out` as an `HttpRequest` envelope and the
+/// answer comes back on `resp_in` as an `HttpResponse`, correlated by
+/// `(conn_id, stream_id)`. This module keeps owning HTTP; the application keeps
+/// owning what the request means.
+///
+/// Method-AGNOSTIC by design, and for the same reason `HANDLER_GRPC` is: the
+/// route table matches on path, and `docs/specification.md` places method
+/// dispatch with the application. A route declaring this handler receives GET,
+/// PUT, DELETE and everything else alike, and answering 405 to the ones it does
+/// not implement is the application's call, not the gateway's.
+pub(crate) const HANDLER_APP: u8 = 11;
+
 /// WebSocket fan-out for SESSION protocols: identical wiring to
 /// `HANDLER_WEBSOCKET_FANOUT` (Upgrade accepted, inbound → `ws_out`,
 /// outbound ← `ws_in`) but retention replay is suppressed — a new
@@ -195,7 +210,16 @@ pub(crate) unsafe fn match_route_path(s: &HttpState, req: *const u8, plen: usize
         }
         // Prefix match: requires the route path to end with '/' AND
         // the request to be strictly longer. Skips short root '/'.
-        let route_is_prefix = rlen >= 2 && *path_ptr.add(rlen - 1) == b'/';
+        //
+        // ...except for HANDLER_APP, where a bare `/` IS a catch-all. The
+        // exclusion exists because a bare `/` static route would swallow
+        // `/favicon.ico` and answer it with the wrong body — a hazard that
+        // needs a route to have a fixed body in the first place. An
+        // application route has none: it forwards the path and the
+        // application decides, so "everything under /" is a coherent and
+        // useful configuration rather than an accident.
+        let route_is_prefix =
+            (rlen >= 2 || route.handler == HANDLER_APP) && *path_ptr.add(rlen - 1) == b'/';
         if route_is_prefix && plen > rlen && rlen > best_len {
             let mut j = 0;
             let mut ok = true;

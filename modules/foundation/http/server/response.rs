@@ -98,6 +98,146 @@ pub(crate) unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type
     }
 }
 
+/// Stage the head for an application-supplied response (`HANDLER_APP`).
+///
+/// Differs from every other builder here in that the STATUS is data: it arrives
+/// as a number in an `HttpResponse` envelope rather than being chosen from a
+/// fixed set of literals. It is rendered as three digits with a reason phrase
+/// omitted — RFC 9112 §4 makes the phrase optional, and inventing one for a
+/// status this module has no opinion about would be worse than leaving it out.
+///
+/// `extra` is the application's own header block: complete `Name: value\r\n`
+/// lines, appended verbatim. The application owns response semantics, so it
+/// owns `Location`, `WWW-Authenticate`, `Docker-Content-Digest` and anything
+/// else its API defines. The four headers `is_framing_header` names are NOT the
+/// application's to set — they describe this connection's framing and content,
+/// which this module emits from the envelope's own fields — so any copies in
+/// `extra` are dropped rather than duplicated onto the wire.
+pub(crate) unsafe fn build_app_header(
+    s: &mut HttpState,
+    status: u16,
+    content_type: &[u8],
+    content_length: u32,
+    extra: &[u8],
+) {
+    let keepalive = cur_slot(s).map(|c| c.keepalive != 0).unwrap_or(false);
+    let dst = cur_send_buf_mut_ptr(s);
+    let cap = SEND_BUF_SIZE;
+    let mut off = 0usize;
+
+    off = put_bytes(dst, cap, off, b"HTTP/1.1 ");
+    let s3 = status.min(999);
+    let digits = [
+        b'0' + (s3 / 100) as u8,
+        b'0' + ((s3 / 10) % 10) as u8,
+        b'0' + (s3 % 10) as u8,
+    ];
+    off = put_bytes(dst, cap, off, &digits);
+    off = put_bytes(dst, cap, off, b"\r\nConnection: ");
+    off = put_bytes(
+        dst,
+        cap,
+        off,
+        if keepalive { b"keep-alive" } else { b"close" },
+    );
+    off = put_bytes(dst, cap, off, b"\r\nContent-Type: ");
+    off = put_bytes(dst, cap, off, content_type);
+    off = put_bytes(dst, cap, off, b"\r\nContent-Length: ");
+    off = put_u32_decimal(dst, cap, off, content_length);
+    off = put_bytes(dst, cap, off, b"\r\n");
+
+    // Application headers, line by line, skipping any that would contradict
+    // the framing headers above.
+    off = put_app_headers(dst, cap, off, extra);
+
+    off = put_bytes(dst, cap, off, b"\r\n");
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+        cur.send_len = off as u16;
+    }
+}
+
+/// Stage an application response head with NO `Content-Length` — the body's
+/// end is the connection's end.
+///
+/// Used when an application streams a body across several envelopes without
+/// declaring a total. Like `build_header`, it is close-delimited and therefore
+/// clears keep-alive; the caller does that before calling, because it must also
+/// be reflected in the `Connection:` header written here.
+pub(crate) unsafe fn build_app_header_open_ended(
+    s: &mut HttpState,
+    status: u16,
+    content_type: &[u8],
+    extra: &[u8],
+) {
+    let dst = cur_send_buf_mut_ptr(s);
+    let cap = SEND_BUF_SIZE;
+    let mut off = 0usize;
+
+    off = put_bytes(dst, cap, off, b"HTTP/1.1 ");
+    let s3 = status.min(999);
+    off = put_bytes(
+        dst,
+        cap,
+        off,
+        &[
+            b'0' + (s3 / 100) as u8,
+            b'0' + ((s3 / 10) % 10) as u8,
+            b'0' + (s3 % 10) as u8,
+        ],
+    );
+    off = put_bytes(dst, cap, off, b"\r\nConnection: close\r\nContent-Type: ");
+    off = put_bytes(dst, cap, off, content_type);
+    off = put_bytes(dst, cap, off, b"\r\n");
+    off = put_app_headers(dst, cap, off, extra);
+    off = put_bytes(dst, cap, off, b"\r\n");
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_offset = 0;
+        cur.send_len = off as u16;
+    }
+}
+
+/// Append an application's header block line by line, dropping any line that
+/// would contradict the framing headers this module emits.
+unsafe fn put_app_headers(dst: *mut u8, cap: usize, mut off: usize, extra: &[u8]) -> usize {
+    let mut line_start = 0usize;
+    let mut i = 0usize;
+    while i < extra.len() {
+        let at_end = i + 1 >= extra.len();
+        let is_crlf = i + 1 < extra.len() && extra[i] == b'\r' && extra[i + 1] == b'\n';
+        if is_crlf || at_end {
+            let line_end = if is_crlf { i } else { extra.len() };
+            let line = &extra[line_start..line_end];
+            if !line.is_empty() && !is_framing_header(line) {
+                off = put_bytes(dst, cap, off, line);
+                off = put_bytes(dst, cap, off, b"\r\n");
+            }
+            i = if is_crlf { i + 2 } else { extra.len() };
+            line_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    off
+}
+
+/// Whether a header line names something this module, not the application,
+/// decides: the three framing headers plus `Content-Type`, which arrives as its
+/// own envelope field. Emitting the application's copy alongside our own would
+/// leave two `Content-Length` values on the wire — which RFC 9112 §6.3 treats
+/// exactly as it treats a `Content-Length`/`Transfer-Encoding` conflict.
+fn is_framing_header(line: &[u8]) -> bool {
+    let name_end = match line.iter().position(|c| *c == b':') {
+        Some(i) => i,
+        None => return true, // not a header line at all; drop it
+    };
+    let name = &line[..name_end];
+    name.eq_ignore_ascii_case(b"content-length")
+        || name.eq_ignore_ascii_case(b"connection")
+        || name.eq_ignore_ascii_case(b"transfer-encoding")
+        || name.eq_ignore_ascii_case(b"content-type")
+}
+
 /// Like `build_header` but also emits a `Content-Length: <n>` header.
 /// Used for responses whose body length is known up-front (e.g. the
 /// FS_CONTRACT path queries `FS_STAT` for the file size before

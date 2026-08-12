@@ -9,7 +9,8 @@
 #
 #   tools/e2e/linux_graph.sh              # plaintext
 #   tools/e2e/linux_graph.sh --tls        # TLS-terminated (tls -> http)
-#   tools/e2e/linux_graph.sh --all        # both, sequentially
+#   tools/e2e/linux_graph.sh --app        # HANDLER_APP fan-out to a real module
+#   tools/e2e/linux_graph.sh --all        # all three, sequentially
 #
 # Exits non-zero on the first failure and prints the runtime log tail, so a
 # green line means the graph actually served bytes.
@@ -20,6 +21,7 @@ FLUXOR_ROOT="${FLUXOR_ROOT:-$ROOT/../fluxor}"
 RUNTIME="${WAVE_LINUX_RUNTIME:-$FLUXOR_ROOT/target/aarch64-unknown-linux-gnu/debug/fluxor-linux}"
 
 PLAIN_PORT=18081
+APP_PORT=18082
 TLS_PORT=18443
 BODY_MARK="wave linux graph"
 
@@ -185,6 +187,114 @@ run_tls() {
   echo "PASS tls"
 }
 
+# ── HANDLER_APP: the request/response fan-out to a real graph node ──────────
+#
+# Everything above proves the gateway can answer from its own configuration.
+# This proves it can answer from a module that did not exist when the route was
+# written — which is the difference between serving files and serving an API.
+#
+# The far side is `modules/fixtures/http_echo_app`, which reflects the method,
+# path and body it was handed. Asserting on that reflection rather than on a
+# status code is deliberate: a 200 alone would also be produced by a gateway
+# that answered by itself and never consulted anyone.
+run_app() {
+  boot_graph "examples/linux/wave_http_app.yaml" "wave_http_app" "$APP_PORT"
+  local base="http://127.0.0.1:$APP_PORT"
+
+  # The gateway still answers its own routes, in the same graph, on the same
+  # listener — so a failure below is about the fan-out and not about the graph.
+  assert_serves "$base/static" "served by the gateway" \
+    "app: a config route still answers alongside" --http1.1
+
+  # GET: method and path cross the port pair intact, and the FULL path arrives,
+  # not just the part after the matched prefix.
+  assert_serves "$base/app/hello" "method=GET path=/app/hello" \
+    "app: GET reaches the application with its whole path" --http1.1
+
+  # PUT with a body: the request-body path, end to end.
+  assert_serves "$base/app/blobs" "method=PUT path=/app/blobs body=hello-from-curl" \
+    "app: a PUT body reaches the application" \
+    --http1.1 -X PUT --data-binary "hello-from-curl"
+
+  # Methods beyond GET, dispatched from the shared vocabulary.
+  assert_serves "$base/app/x" "method=DELETE" \
+    "app: DELETE is dispatched, not refused" --http1.1 -X DELETE
+  assert_serves "$base/app/x" "method=PATCH" \
+    "app: PATCH is dispatched, not refused" \
+    --http1.1 -X PATCH --data-binary "p"
+
+  # `Expect: 100-continue`. curl sends it for a large enough body and WAITS; a
+  # server that ignored it would hang here rather than fail fast.
+  local big
+  big="$(head -c 2000 /dev/zero | tr '\0' 'z')"
+  assert_serves "$base/app/expect" "method=POST" \
+    "app: a 100-continue upload completes" \
+    --http1.1 -H "Expect: 100-continue" -X POST --data-binary "$big"
+
+  # The application's status is forwarded verbatim, including ones the gateway
+  # would never choose for itself.
+  assert_status "$base/app/status/404" "404" \
+    "app: an application 404 is forwarded" --http1.1
+  assert_status "$base/app/status/201" "201" \
+    "app: an application 201 is forwarded" --http1.1
+  assert_status "$base/app/status/503" "503" \
+    "app: an application 503 is forwarded" --http1.1
+
+  # A streamed body larger than the connection's send buffer. This is the
+  # artefact case: 4 x 2 KiB across four envelopes, which no single response
+  # could carry.
+  assert_stream_size "$base/app/stream" 8192 "app: a streamed body exceeds send_buf"
+
+  # HEAD: answered, with the headers a GET would carry and no body.
+  assert_head_without_body "$base/app/hello" "app: HEAD is answered without a body"
+
+  # h2c over the same listener, same application: an application module must
+  # not be able to tell which generation carried the request.
+  assert_serves "$base/app/hello" "method=GET path=/app/hello" \
+    "app: h2c reaches the same application" --http2-prior-knowledge
+  assert_serves "$base/app/blobs" "method=PUT path=/app/blobs body=h2-body" \
+    "app: an h2 PUT body reaches the application" \
+    --http2-prior-knowledge -X PUT --data-binary "h2-body"
+
+  stop_graph
+  echo "PASS app fan-out (h1, h2c, bodies, streaming, statuses)"
+}
+
+# Assert a response body is exactly `want` bytes. Size rather than content,
+# because the point of a streamed body is that all of it arrives — a truncation
+# that kept the first chunk would satisfy any substring check.
+assert_stream_size() {
+  local url="$1" want="$2" label="$3"
+  local got
+  got="$(curl --silent --show-error --max-time 20 --http1.1 "$url" 2>"$WORK/curl.err" | wc -c)" \
+    || fail "$label: curl failed — $(cat "$WORK/curl.err")"
+  [ "$got" = "$want" ] || fail "$label: expected $want bytes, got $got"
+  echo "  ok   $label ($got bytes)"
+}
+
+# HEAD must return the headers a GET would — Content-Length included — and no
+# body. curl --head reports only the head, so the body is checked by asking for
+# the transferred size.
+assert_head_without_body() {
+  local url="$1" label="$2"
+  local head size
+  head="$(curl --silent --show-error --max-time 10 --http1.1 --head "$url" 2>"$WORK/curl.err")" \
+    || fail "$label: curl failed — $(cat "$WORK/curl.err")"
+  case "$head" in
+    *"200"*) ;;
+    *) fail "$label: expected 200, got: ${head%%$'\r'*}" ;;
+  esac
+  case "$head" in
+    *"Content-Length:"*) ;;
+    *) fail "$label: HEAD must report the Content-Length its GET would" ;;
+  esac
+  size="$(curl --silent --show-error --max-time 10 --http1.1 --head \
+    -o /dev/null -w '%{size_download}' "$url" 2>"$WORK/curl.err")" \
+    || fail "$label: curl failed — $(cat "$WORK/curl.err")"
+  [ "$size" = "0" ] || fail "$label: HEAD carried $size body bytes"
+  echo "  ok   $label"
+}
+
 main() {
   need curl
   need fluxor
@@ -194,8 +304,9 @@ main() {
   case "${1:---plain}" in
     --plain) run_plaintext ;;
     --tls)   run_tls ;;
-    --all)   run_plaintext; run_tls ;;
-    *) echo "usage: $0 [--plain|--tls|--all]" >&2; exit 2 ;;
+    --app)   run_app ;;
+    --all)   run_plaintext; run_app; run_tls ;;
+    *) echo "usage: $0 [--plain|--app|--tls|--all]" >&2; exit 2 ;;
   esac
 }
 

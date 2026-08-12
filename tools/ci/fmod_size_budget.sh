@@ -24,18 +24,26 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MODE="${1:-}"
 
 # target|artefact|ceiling bytes|measured on
+#
+# Two things drive the http sizes apart. Request-body ingestion
+# (modules/foundation/http/server/reqbody.rs) is in every variant including
+# `web`, since a server that does not consume a POST body leaves those bytes to
+# be read as the next request on a keep-alive connection. HANDLER_APP
+# (modules/foundation/http/server/app.rs) is behind the `app` feature, which
+# `web` does not carry, so the flash-constrained variant does not pay for a
+# handler that forwards to a module the device does not run.
 BUDGETS="
-rp2350|http.fmod|127000|117652 (2026-08-07, +11.9K when h3 became reachable)
-rp2350|http-h2.fmod|114000|105644 (2026-08-07)
-rp2350|http-web.fmod|72000|66356 (2026-08-07)
-rp2350|rtp.fmod|4600|4128 (2026-08-07)
-rp2350|sip.fmod|13500|12391 (2026-08-07)
+rp2350|http.fmod|137000|126744 (2026-08-12, +9.1K for request bodies + app fan-out)
+rp2350|http-h2.fmod|119000|110760 (2026-08-12, +5.1K)
+rp2350|http-web.fmod|78000|71816 (2026-08-12, +5.5K for request bodies; no app)
+rp2350|rtp.fmod|4600|4192 (2026-08-12)
+rp2350|sip.fmod|13500|12831 (2026-08-12)
 rp2350|ws_stream.fmod|3000|2717 (2026-08-07)
-bcm2712|http.fmod|278000|257500 (2026-08-07, +13.8K when h3 became reachable)
-bcm2712|http-h2.fmod|263000|243796 (2026-08-07)
-bcm2712|http-web.fmod|190000|175380 (2026-08-07)
+bcm2712|http.fmod|291000|269704 (2026-08-12, +12.2K for request bodies + app fan-out)
+bcm2712|http-h2.fmod|270000|250032 (2026-08-12, +6.2K)
+bcm2712|http-web.fmod|196000|181208 (2026-08-12, +5.8K for request bodies; no app)
 bcm2712|smtp.fmod|6300|5713 (2026-08-07)
-bcm2712|websocket.fmod|12700|11680 (2026-08-07)
+bcm2712|websocket.fmod|12700|10912 (2026-08-12)
 "
 
 # subset|superset|target — the subset must be strictly smaller.

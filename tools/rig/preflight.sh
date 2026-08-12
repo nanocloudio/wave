@@ -42,9 +42,9 @@ check_backends() {
     [ -e "$b" ] || missing+=("$(basename "$b")")
   done
   # Recovery names the symlink, because that is what a backend IS: a link in
-  # the shared backend dir pointing at the script in this repo. The advice here
-  # used to be `make install-rig-backends`, a target Fluxor's Makefile does not
-  # have — so the one instruction the guard offered could not be followed.
+  # the shared backend dir pointing at the script in this repo. It must be a
+  # command the reader can actually run — advice naming a make target that does
+  # not exist is worse than no advice.
   [ "${#missing[@]}" -eq 0 ] || die "rig backend symlink(s) dangling: ${missing[*]}" \
     "A backend is a symlink in $dir pointing at its script." \
     "Wave's own backend is restored with:" \
@@ -72,10 +72,9 @@ check_artifact() {
 # with no certificate, and fails at the first handshake — reported as a load
 # phase with zero commits, which reads as a DUT fault.
 #
-# That is not hypothetical: these paths are under /tmp by convention
-# (examples/web_server/README.md), so a host reboot or a tmp sweep silently
-# disarms every HTTPS and h3 scenario. Fail at the recipe instead, naming the
-# openssl lines that regenerate them.
+# These paths are under /tmp by convention (examples/web_server/README.md), so a
+# host reboot or a tmp sweep silently disarms every HTTPS and h3 scenario. Fail
+# at the recipe instead, naming the openssl lines that regenerate them.
 check_embeds() {
   local config="$1" missing=() f
   [ -f "$config" ] || die "no such config: $config"

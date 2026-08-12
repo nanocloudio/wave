@@ -46,7 +46,22 @@ macro_rules! server_mod {
 
 // Subsystems of the core: each owns one concern and is driven by the
 // per-generation front ends below.
-server_mod!(body, cache, listeners, params, proxy, response, routes, ws);
+server_mod!(
+    // Application fan-out is feature-gated: the `web` variant exists for
+    // rp2350 flash, and a handler that forwards to a module the device does
+    // not run is pure cost there. Every other variant carries it.
+    #[cfg(feature = "app")]
+    app,
+    body,
+    cache,
+    listeners,
+    params,
+    proxy,
+    reqbody,
+    response,
+    routes,
+    ws,
+);
 
 // What the core itself needs back from them. Short by design: everything else
 // flows the other way, from a subsystem reaching into the slot helpers below.
@@ -177,6 +192,14 @@ pub(crate) enum Phase {
     WaitAccept = 4,
     RecvRequest = 5,
     DispatchRoute = 6,
+    /// Reading a request body, between the head and dispatch. Entered only
+    /// when the framing headers say there is one; drains a staged
+    /// `100 Continue` first, then decodes until the body is whole.
+    RecvBody = 23,
+    /// `HANDLER_APP`: the request is out on `req_out` and this slot is
+    /// waiting for the matching `HttpResponse`. Leaves for `SendHeaders`
+    /// when one arrives, or for a 504 when `app::APP_TIMEOUT_MS` elapses.
+    AwaitApp = 24,
     SendHeaders = 7,
     SendBody = 8,
     DrainSend = 9,
@@ -234,6 +257,13 @@ pub(crate) struct ConnSlot {
     pub(crate) matched_route: i8,
     pub(crate) recv_parsed: u8,
     pub(crate) req_path_len: u8,
+    /// Method of the request currently being served, as a
+    /// `wire::method::METHOD_*` value. Set in `Phase::RecvRequest`,
+    /// consumed by dispatch (HEAD suppresses the response body) and by
+    /// the body reader. Reset to `METHOD_NONE` per request, not per
+    /// connection: a keep-alive connection serves many, and a stale
+    /// method would suppress the body of the GET that followed a HEAD.
+    pub(crate) req_method: u8,
     pub(crate) peer_closed: u8,
     /// Keep-alive for the current request. Derived in
     /// `Phase::RecvRequest` from the version + `Connection:` header,
@@ -275,6 +305,54 @@ pub(crate) struct ConnSlot {
     pub(crate) fs_fd: i32,
     pub(crate) fs_total: u32,
     pub(crate) fs_sent: u32,
+
+    // ── Request body ingestion ─────────────────────────────────────
+    //
+    // Set from the framing headers when the head completes; driven by
+    // `Phase::RecvBody` until the body is whole. See `server::reqbody`.
+    /// `reqbody::BODY_MODE_*` — how this request's body is delimited.
+    pub(crate) body_mode: u8,
+    /// `reqbody::CHUNK_*` — sub-state within a chunked body.
+    pub(crate) chunk_state: u8,
+    /// 1 while a `100 Continue` is staged in `send_buf` and has not yet
+    /// drained. The body must not be read until it has: the client is
+    /// waiting for it before sending anything.
+    pub(crate) body_continue: u8,
+    /// Bytes still expected in the current framing unit — the whole body
+    /// under `Content-Length`, or the current chunk under `chunked`.
+    pub(crate) body_remaining: u64,
+    /// Decoded body bytes accumulated so far. Checked against the cap on
+    /// every append, not just against the declared length, because a
+    /// chunked sender declares nothing up front.
+    pub(crate) body_len: u32,
+    /// Heap-allocated decoded body. Null until the first body byte is
+    /// accepted, so a connection serving only GETs never pays for it.
+    /// Freed by `free_slot` and at the end of each request.
+    pub(crate) body_buf: *mut u8,
+    pub(crate) body_cap: u32,
+
+    // ── HANDLER_APP correlation ────────────────────────────────────
+    /// 1 while this slot has a request out on `req_out` and is waiting for
+    /// the matching `HttpResponse`. Cleared when one arrives, on timeout,
+    /// and by `free_slot`.
+    pub(crate) app_pending: u8,
+    /// The stream this slot's pending request belongs to. Always 0 under
+    /// h1 — a connection carries one request at a time — and a real
+    /// stream id under h2, where it is the half of the correlation key
+    /// that `conn_id` cannot supply.
+    pub(crate) app_stream_id: u16,
+    /// `dev_millis` value past which the pending request is answered 504.
+    /// 0 when nothing is pending. See `app::APP_TIMEOUT_MS`.
+    pub(crate) app_deadline_ms: u64,
+    /// 1 while a multi-envelope application response is mid-flight: the head
+    /// has been sent and more body envelopes are expected.
+    ///
+    /// This is what lets a route serve a body larger than `send_buf`, which is
+    /// the difference between serving an API and serving artefacts — a
+    /// container layer does not fit in a connection buffer, and never will.
+    /// While it is set, `Phase::DrainSend` returns to `AwaitApp` for the next
+    /// chunk instead of finishing the response.
+    pub(crate) app_streaming: u8,
 
     pub(crate) req_path: [u8; MAX_PATH],
     /// Heap-allocated request buffer. Allocated by
@@ -488,6 +566,14 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
         slot.ws_frag_total = 0;
         slot.ws_frag_offset = 0;
     }
+    // Same hazard for a request body in flight when the peer hangs up
+    // mid-upload: the zero-fill below would clear the pointer and leak it.
+    if !slot.body_buf.is_null() {
+        heap_free(&*sys, slot.body_buf);
+        slot.body_buf = core::ptr::null_mut();
+        slot.body_cap = 0;
+        slot.body_len = 0;
+    }
     // Zero the rest of the slot then re-set sentinels.
     let p = slot as *mut ConnSlot as *mut u8;
     core::ptr::write_bytes(p, 0, core::mem::size_of::<ConnSlot>());
@@ -552,12 +638,28 @@ pub(crate) struct ServerState {
     /// `WsFrame` records to be queued back as outbound WS frames.
     /// `-1` if the port is unwired.
     pub(crate) ws_in_chan: i32,
+    /// Output channel for `req_out` (manifest port out[6]). Carries
+    /// `HttpRequest` envelopes when a route uses `HANDLER_APP`.
+    /// `-1` if the port is unwired.
+    pub(crate) app_out_chan: i32,
+    /// Input channel for `resp_in` (manifest port in[6]). Carries the
+    /// `HttpResponse` envelopes that answer them. `-1` if unwired.
+    pub(crate) app_in_chan: i32,
 
     pub(crate) port: u16,
     /// Bytes currently consumed in `body_pool`. u32 so the pool
     /// can grow past 64 KiB for hosts that configure many or
     /// large templates.
     pub(crate) body_pool_used: u32,
+    /// Largest request body this server will accept, in bytes. Configured by
+    /// the `max_body_kib` param; zero means the built-in default.
+    ///
+    /// A cap rather than a limit-free read is what "bounded body handling"
+    /// means: the buffer is heap-allocated per connection, so an uncapped
+    /// server lets any client decide how much of the device's memory to take.
+    /// Over the cap is 413, which is a refusal the client can act on — unlike
+    /// a truncation, which it cannot detect.
+    pub(crate) max_body: u32,
 
     pub(crate) route_count: u8,
     /// Configured at boot in `post_params` based on the wired routes.
@@ -1033,6 +1135,8 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.out_chan = -1;
     s.server.ws_out_chan = -1;
     s.server.ws_in_chan = -1;
+    s.server.app_out_chan = -1;
+    s.server.app_in_chan = -1;
     s.server.latest_fanout_slot = -1;
     // Dynamic-route subscription: sink resolved lazily on first pump.
     // The arena, shadow, and TableConsumer are zero-init (kernel
@@ -1112,6 +1216,13 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     s.server.ws_in_chan = dev_channel_port(sys, 0, 3);
     s.server.out_chan = dev_channel_port(sys, 1, 1);
     s.server.ws_out_chan = dev_channel_port(sys, 1, 2);
+    //   in[6]  = resp_in           (HttpResponse, HANDLER_APP only)
+    //   out[6] = req_out           (HttpRequest, HANDLER_APP only)
+    #[cfg(feature = "app")]
+    {
+        s.server.app_in_chan = dev_channel_port(sys, 0, 6);
+        s.server.app_out_chan = dev_channel_port(sys, 1, 6);
+    }
 
     if s.server.route_count == 0 {
         let r0 = &mut *s.server.routes.as_mut_ptr().add(0);

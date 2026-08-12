@@ -11,6 +11,7 @@ upgrade path, and the gRPC-over-HTTP/2 composition.
 | Server | HTTP/2 (h2c + ALPN) | Implemented, on silicon, load-tested |
 | Server | WebSocket (RFC 6455 upgrade + fan-out) | Implemented, on silicon |
 | Server | gRPC (HEADERS/DATA/trailers) | Implemented, verified against `grpcio` |
+| Server | Application fan-out (`HANDLER_APP`) | Implemented on h1 + h2, driven by `tools/e2e/linux_graph.sh --app` |
 | Client | HTTP/1 | Implemented — speaks **HTTP/1.0** (see deviations) |
 | Client | HTTP/2, incl. gRPC and WS-over-h2 (RFC 8441) | Implemented |
 | Server | HTTP/3 | Implemented — served end to end over `quic`, verified against aioquic |
@@ -66,6 +67,42 @@ Tags are wire positions: append, never renumber.
 
 `timer_class = "wall_clock"` — the client connect timeout and the proxy dial and
 retry deadlines all read `dev_millis`. Nothing counts scheduler passes as time.
+
+## Methods and request bodies
+
+The server recognises `GET HEAD POST PUT PATCH DELETE OPTIONS CONNECT` on both
+h1 and h2, from one table (`wire/method.rs`). A well-formed request naming
+anything else is **501**, not 400 — the bytes were fine, the method is not
+implemented. One table for both generations is what makes a request mean the
+same thing whichever carried it, which `http_interop.rs` asserts from both
+sides.
+
+Request bodies are read and bounded: `Content-Length`, `Transfer-Encoding:
+chunked`, and `Expect: 100-continue` (which `docker push` and `curl -T` send and
+then WAIT for). A message carrying BOTH framing headers is refused with 400
+rather than resolved in favour of one — RFC 9112 §6.3, and the reason is request
+smuggling, not tidiness. Over `max_body_kib` is 413 on h1 and RST_STREAM on h2.
+
+A body is consumed even when the matched route has no use for it: bytes left in
+the receive buffer are read as the beginning of the next request on a keep-alive
+connection.
+
+## Application fan-out
+
+`HANDLER_APP` (route key `app: true`) forwards a matched request to a downstream
+graph node on `req_out` and serves its `resp_in` answer. The module keeps HTTP;
+the application keeps what the request means — the split
+`docs/specification.md` draws.
+
+Envelope layouts, correlation, backpressure, streaming and the required
+`buffer_group:` on both edges are documented in
+[`docs/architecture/http_multiconn.md`](../../../docs/architecture/http_multiconn.md).
+A worked graph is `examples/linux/wave_http_app.yaml`, driven end to end by
+`tools/e2e/linux_graph.sh --app`.
+
+Behind the `app` feature, so the `web` variant does not carry it — an rp2350
+serving h1 from config should not pay for a handler that forwards to a module it
+does not run.
 
 ## Declared deviations
 

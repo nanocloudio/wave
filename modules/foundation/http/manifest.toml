@@ -48,12 +48,12 @@ features = ["h1", "ws"]
 # holds both sizes.
 [[variant]]
 name = "h2"
-features = ["h1", "h2", "ws"]
+features = ["h1", "h2", "ws", "app"]
 
 
 [[variant]]
 name = "full"
-features = ["h1", "h2", "ws", "h3"]
+features = ["h1", "h2", "ws", "h3", "app"]
 default = true
 
 [[ports]]
@@ -153,6 +153,38 @@ index = 5
 direction = "output"
 content_type = "OctetStream"
 buffer_size = 4096
+
+# HTTP application fan-out — populated only when a route uses HANDLER_APP
+# (handler value 11). The symmetric counterpart to ws_out/ws_in: there, this
+# module owns the WebSocket envelope and a downstream module owns the
+# application protocol inside it; here it owns HTTP framing, connection state
+# and bounded body handling, and a downstream module owns what the request
+# MEANS. `docs/specification.md` already put "HTTP application resources,
+# authorization, webhook meaning, business handlers" outside Wave — these two
+# ports are how something else holds them.
+#
+# Requests carry `[conn_id u16][stream_id u16][method u8][flags u8]
+# [path_len u16][hdr_len u16][body_len u16]` then the path, the raw header
+# block and the decoded body. `stream_id` rides beside `conn_id` because HTTP/2
+# multiplexes many requests over one connection; correlating on conn_id alone
+# misroutes as soon as a client opens parallel streams.
+[[ports]]
+name = "req_out"
+index = 6
+direction = "output"
+content_type = "HttpRequest"
+# One request envelope: bounded by the configured max_body plus the head. The
+# default sizing carries a 16 KiB body; a graph ingesting artefacts raises both
+# this and `max_body_kib` together, since a body larger than the ring can never
+# be written to it.
+buffer_size = { default = 8192, bcm2712 = 65536 }
+
+[[ports]]
+name = "resp_in"
+index = 6
+direction = "input"
+content_type = "HttpResponse"
+buffer_size = { default = 8192, bcm2712 = 65536 }
 
 [[resources]]
 requires_contract = "channel"

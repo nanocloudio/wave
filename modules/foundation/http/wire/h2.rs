@@ -230,6 +230,36 @@ pub unsafe fn write_ping_ack(dst: *mut u8, opaque: *const u8) -> usize {
     FRAME_HEADER_LEN + 8
 }
 
+/// Decode the optional PADDED prefix on a DATA frame payload, returning the
+/// offset and length of the actual body bytes.
+///
+/// The HEADERS counterpart below also handles PRIORITY; DATA has no such flag
+/// (RFC 7540 §6.1), so a shared helper would accept a frame layout that does
+/// not exist. Padding is transport filler and never part of the body — a server
+/// that accumulated it would hand an application bytes the client never sent,
+/// and would disagree with the `Content-Length` the client computed.
+///
+/// Rejects a pad length that does not leave room for itself, per §6.1's
+/// requirement to treat that as a connection error.
+pub unsafe fn data_payload_extent(
+    payload: *const u8,
+    payload_len: u32,
+    flags: u8,
+) -> Result<(usize, u32), ()> {
+    if (flags & FLAG_PADDED) == 0 {
+        return Ok((0, payload_len));
+    }
+    if payload_len < 1 {
+        return Err(());
+    }
+    let pad = *payload as u32;
+    // The pad-length byte itself plus the padding must fit inside the payload.
+    if pad + 1 > payload_len {
+        return Err(());
+    }
+    Ok((1, payload_len - pad - 1))
+}
+
 /// Decode the optional PADDED + PRIORITY prefixes on a HEADERS frame
 /// payload. Returns the byte offset where the actual header block
 /// fragment starts, the fragment length, and `Err(())` on malformed

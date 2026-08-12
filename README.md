@@ -119,9 +119,15 @@ own `[workspace]`.
 
 ## Tests
 
-Two lanes, both run by `make test` and both `fluxor ci` phases, so neither can
-quietly stop running. Counts come from the command, not from this page. One lane
-ships with this repository and one does not.
+Two test lanes plus the project's runtime gate, all three run by `make test` and
+all three `fluxor ci` phases, so none can quietly stop running. Counts come from
+the command, not from this page. One lane ships with this repository and one does
+not.
+
+(The harness lane is the reason `fluxor test` learned to look for
+`tests/harness/`: this project has no root `Cargo.toml`, so nothing else in the
+verb's shape reaches it, and a `make test` that skipped it would have reported
+green over every integration suite here.)
 
 **Module lane — in this repository.** A module's own core vectors live beside it in
 `modules/foundation/<name>/tests/`, declared by `[test] harness` in its
@@ -141,9 +147,21 @@ GitHub remote, so rig topology and unoptimised performance numbers stay off a
 public history without losing version control over them.
 
 For contributors holding that repo: shadow edits are invisible to `git status` on
-the primary, so run `make shadow-status` alongside it out of habit. `fluxor ci`
-hard-fails when the shadow checkout is missing rather than reporting green having
-run nothing.
+the primary, so run `git shadow status` alongside it out of habit
+(`git shadow log --oneline -20` for recent history). `fluxor ci` hard-fails when
+the shadow checkout is missing rather than reporting green having run nothing.
+
+Staging **new** files needs `-f` — the primary `.gitignore` outranks the shadow
+exclude — and MUST keep the exclude pathspec, or `-f` force-adds every cargo blob
+under `tests/harness/target/`:
+
+```sh
+git shadow add -Af tests examples ':(exclude)*target/*'
+```
+
+These are single git commands, so they are not make targets
+(`../standards/make.md` §1: a target that renames one command is bloat). The
+Makefile is the lifecycle alone.
 
 ## Documentation
 

@@ -68,6 +68,7 @@
 //! | 8  | fs_list | List a directory as one-shot JSON, built at request time |
 //! | 9  | websocket_session | Fan-out with per-session isolation — no replay across sessions |
 //! | 10 | grpc | gRPC unary: length-prefixed message echo + `grpc-status: 0` trailer |
+//! | 11 | app | Hand the request to a downstream module via `req_out`/`resp_in` |
 //!
 //! WebSocket and HTTP routes share the same TCP/TLS listen socket: the
 //! connection arrives, the request is parsed as HTTP/1, and routes
@@ -90,6 +91,7 @@
 //! | 3     | path        | str  | "/"     | URL path (client mode)                              |
 //! | 4     | host_ip     | u32  | 0       | Target IP (client mode)                             |
 //! | 10-45 | route_N_*   | —    | —       | Route params (server mode)                          |
+//! | 101   | max_body_kib | u16 | 0       | Request-body cap in KiB (0 = 64 KiB default)        |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -289,6 +291,19 @@ mod params_def {
     // route in the test, which is exactly what the test is for.
     100, h3, u8, 0
         => |s, d, len| { s.h3_mode = p_u8(d, len, 0, 0); };
+
+    // Largest request body accepted, in KiB. 0 (default) = the built-in
+    // `reqbody::DEFAULT_MAX_BODY`. Tag 101 because 0-9 are taken, 10-89 belong
+    // to the route block, 90/91 are the table prefixes, 92/93 must stay
+    // undefined for `bounds_saturation.rs`, and 100 is h3.
+    //
+    // KiB rather than bytes because the TLV element is length-prefixed and a
+    // one-byte value covering 1 KiB-255 KiB is more useful across that range
+    // than a one-byte byte-count covering 255 B.
+    101, max_body_kib, u16, 0
+        => |s, d, len| {
+            s.server.max_body = (p_u16(d, len, 0, 0) as u32).saturating_mul(1024);
+        };
 
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };

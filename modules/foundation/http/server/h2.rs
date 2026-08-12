@@ -39,6 +39,8 @@
 //!   with `GOAWAY(FRAME_SIZE_ERROR)`.
 
 use super::super::connection::{NET_BUF_SIZE, NET_CMD_SEND};
+#[cfg(feature = "app")]
+use super::routes::HANDLER_APP;
 use super::routes::{
     HANDLER_FILE, HANDLER_GRPC, HANDLER_STATIC, HANDLER_TEMPLATE, HANDLER_WEBSOCKET,
 };
@@ -70,6 +72,7 @@ const RECV_WINDOW_THRESHOLD: i32 = 32768;
 /// or peer WINDOW_UPDATE deltas.
 const SEND_WINDOW_INITIAL: i32 = 65535;
 use super::super::wire::h2 as h2w;
+use super::super::wire::method;
 use super::super::wire::ws;
 use super::super::HttpState;
 use super::super::{
@@ -121,8 +124,9 @@ pub(crate) enum SlotState {
 pub(crate) struct StreamSlot {
     pub(crate) id: u32,
     pub(crate) state: SlotState,
-    /// 1 = body-less (GET/HEAD), 2 = extended CONNECT, 3 = body-bearing
-    /// (POST/PUT/PATCH/DELETE).
+    /// The request's method as a `wire::method::METHOD_*` value — the same
+    /// vocabulary h1 uses, so a request means the same thing on either
+    /// generation.
     pub(crate) method_kind: u8,
     pub(crate) end_stream_in: u8,
     pub(crate) req_path_len: u8,
@@ -149,6 +153,28 @@ pub(crate) struct StreamSlot {
     /// we emit DATA on this stream; bumped by peer's per-stream
     /// WINDOW_UPDATE.
     pub(crate) send_window: i32,
+
+    // ── Request body + application fan-out ─────────────────────────
+    //
+    // Per-STREAM, not per-connection: h2 multiplexes many requests over
+    // one connection, so a body or a pending application request held on
+    // the ConnSlot would be overwritten by whichever stream arrived next.
+    /// Decoded request body, accumulated from DATA frames. Null until the
+    /// first body byte, freed by `free_slot`.
+    pub(crate) body_buf: *mut u8,
+    pub(crate) body_len: u32,
+    pub(crate) body_cap: u32,
+    /// The request's non-pseudo header fields, re-serialised as
+    /// `name: value\r\n` lines during HPACK decode. HANDLER_APP forwards
+    /// them; nothing else reads them, so the buffer is only allocated for
+    /// a stream that reaches an application route.
+    pub(crate) hdr_buf: *mut u8,
+    pub(crate) hdr_len: u32,
+    /// 1 while this stream has a request out on `req_out`.
+    pub(crate) app_pending: u8,
+    /// `dev_millis` past which the pending request is answered 504.
+    pub(crate) app_deadline_ms: u64,
+
     pub(crate) req_path: [u8; MAX_PATH],
 }
 
@@ -168,6 +194,13 @@ impl StreamSlot {
             tmpl_pos: 0,
             recv_window: RECV_WINDOW_INITIAL,
             send_window: SEND_WINDOW_INITIAL,
+            body_buf: core::ptr::null_mut(),
+            body_len: 0,
+            body_cap: 0,
+            hdr_buf: core::ptr::null_mut(),
+            hdr_len: 0,
+            app_pending: 0,
+            app_deadline_ms: 0,
             req_path: [0; MAX_PATH],
         }
     }
@@ -300,9 +333,83 @@ unsafe fn free_slot(s: &mut HttpState, idx: i8) {
     if mr >= 0 && (slot.body_handler == HANDLER_STATIC || slot.body_handler == HANDLER_TEMPLATE) {
         super::cache::cache_release_for_route(s, mr as u8);
     }
+    // Release the per-stream request body and header copy. The slot is
+    // reused for the next stream on this connection, so anything left
+    // attached here leaks for the life of the connection and, worse, would
+    // be served as the next request's body.
+    let sys = s.syscalls;
     let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(idx as usize);
+    if !slot.body_buf.is_null() {
+        super::heap_free(&*sys, slot.body_buf);
+        slot.body_buf = core::ptr::null_mut();
+    }
+    slot.body_len = 0;
+    slot.body_cap = 0;
+    if !slot.hdr_buf.is_null() {
+        super::heap_free(&*sys, slot.hdr_buf);
+        slot.hdr_buf = core::ptr::null_mut();
+    }
+    slot.hdr_len = 0;
+    slot.app_pending = 0;
+    slot.app_deadline_ms = 0;
     slot.id = 0;
     slot.state = SlotState::Idle;
+}
+
+/// Largest per-stream header copy forwarded to an application, in bytes.
+/// Bounded for the same reason h1's is: it is copied into a fixed envelope.
+const H2_HDR_CAP: usize = super::app::MAX_FWD_HEADERS;
+
+/// Append DATA-frame payload to a stream's request body, bounded by the
+/// server's `max_body`. Returns false when the cap is reached — the caller
+/// answers 413 and resets the stream.
+unsafe fn append_stream_body(s: &mut HttpState, idx: usize, src: *const u8, n: usize) -> bool {
+    if n == 0 {
+        return true;
+    }
+    let cap = if s.server.max_body == 0 {
+        super::reqbody::DEFAULT_MAX_BODY
+    } else {
+        s.server.max_body
+    };
+    let sys = s.syscalls;
+    let (have_len, have_cap, buf) = {
+        let slot = &*cur_h2(s).streams.as_ptr().add(idx);
+        (slot.body_len, slot.body_cap, slot.body_buf)
+    };
+    let want = match have_len.checked_add(n as u32) {
+        Some(w) => w,
+        None => return false,
+    };
+    if want > cap {
+        return false;
+    }
+    if have_cap < want || buf.is_null() {
+        let mut next = if have_cap == 0 { 1024 } else { have_cap };
+        while next < want {
+            next = next.saturating_mul(2);
+        }
+        if next > cap {
+            next = cap;
+        }
+        let fresh = super::heap_alloc(&*sys, next);
+        if fresh.is_null() {
+            return false;
+        }
+        if !buf.is_null() {
+            if have_len > 0 {
+                core::ptr::copy_nonoverlapping(buf, fresh, have_len as usize);
+            }
+            super::heap_free(&*sys, buf);
+        }
+        let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(idx);
+        slot.body_buf = fresh;
+        slot.body_cap = next;
+    }
+    let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(idx);
+    core::ptr::copy_nonoverlapping(src, slot.body_buf.add(slot.body_len as usize), n);
+    slot.body_len = want;
+    true
 }
 
 /// Find any Pending slot — caller has just finished emitting a body
@@ -462,6 +569,19 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         }
         if cur_h2_mut(s).sub == Sub::Closing {
             return 1;
+        }
+    }
+
+    // A stream waiting on an application that never answers must not hold its
+    // slot forever — enough of them exhaust `MAX_STREAMS` and the connection
+    // stops accepting new requests while looking healthy. Swept here, with
+    // `send_buf` known drained by the flush above, because the 504 it emits
+    // needs it.
+    #[cfg(feature = "app")]
+    if cur_send_len(s) == 0 {
+        sweep_app_timeouts(s);
+        if cur_send_len(s) > 0 {
+            return 0;
         }
     }
 
@@ -1040,19 +1160,26 @@ unsafe fn handle_headers(
     let pl_ptr = &mut path_len as *mut u8;
     let pb_ptr = path_buf.as_mut_ptr();
 
+    // Non-pseudo header fields are re-serialised as they decode, into a heap
+    // buffer owned by the stream. This is the ONLY chance to capture them:
+    // HPACK compresses against the connection's whole header history, so the
+    // original bytes cannot be recovered from the frame afterwards, and a
+    // second decode pass would desynchronise the dynamic table.
+    //
+    // Allocated up front and written through raw pointers rather than by
+    // borrowing `s` in the closure — the same reason the scratch above is raw
+    // pointers, per the closure-borrow miscompile noted there.
+    let hdr_scratch = super::heap_alloc(&*s.syscalls, H2_HDR_CAP as u32);
+    let mut hdr_used: u32 = 0;
+    let hb_ptr = hdr_scratch;
+    let hu_ptr = &mut hdr_used as *mut u32;
+
     let dec = super::super::wire::hpack::decode_block(block_ptr, block_len, |name, value| {
         if bytes_eq(name, b":method") {
-            if bytes_eq(value, b"GET") || bytes_eq(value, b"HEAD") {
-                *mk_ptr = 1;
-            } else if bytes_eq(value, b"CONNECT") {
-                *mk_ptr = 2;
-            } else if bytes_eq(value, b"POST")
-                || bytes_eq(value, b"PUT")
-                || bytes_eq(value, b"PATCH")
-                || bytes_eq(value, b"DELETE")
-            {
-                *mk_ptr = 3;
-            }
+            // The shared vocabulary, not a local bucketing by body-bearing-ness:
+            // an application module has to tell a create from a delete, and h1
+            // resolves the same token against the same table.
+            *mk_ptr = method::method_from_token(value);
         } else if bytes_eq(name, b":path") {
             let n = value.len().min(MAX_PATH);
             let mut i = 0;
@@ -1063,14 +1190,39 @@ unsafe fn handle_headers(
             *pl_ptr = n as u8;
         } else if bytes_eq(name, b":protocol") && bytes_eq(value, b"websocket") {
             *pr_ptr = 1;
+        } else if !name.is_empty() && name[0] != b':' && !hb_ptr.is_null() {
+            // An ordinary field. Pseudo-headers are excluded: they are the
+            // request line in h2's encoding, and an application reading them
+            // as headers would see a `:method` field that h1 never sends.
+            let need = name.len() + 2 + value.len() + 2;
+            let used = *hu_ptr as usize;
+            if used + need <= H2_HDR_CAP {
+                let mut o = used;
+                core::ptr::copy_nonoverlapping(name.as_ptr(), hb_ptr.add(o), name.len());
+                o += name.len();
+                *hb_ptr.add(o) = b':';
+                *hb_ptr.add(o + 1) = b' ';
+                o += 2;
+                core::ptr::copy_nonoverlapping(value.as_ptr(), hb_ptr.add(o), value.len());
+                o += value.len();
+                *hb_ptr.add(o) = b'\r';
+                *hb_ptr.add(o + 1) = b'\n';
+                o += 2;
+                *hu_ptr = o as u32;
+            }
         }
     });
     if dec.is_err() {
+        if !hdr_scratch.is_null() {
+            super::heap_free(&*s.syscalls, hdr_scratch);
+        }
         free_slot(s, slot_idx);
         return Err(h2w::ERR_COMPRESSION_ERROR);
     }
 
     let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(slot_idx as usize);
+    slot.hdr_buf = hdr_scratch;
+    slot.hdr_len = hdr_used;
     slot.method_kind = method_kind;
     slot.req_path_len = path_len;
     slot.end_stream_in = if end_stream { 1 } else { 0 };
@@ -1098,7 +1250,7 @@ unsafe fn handle_headers(
 
     // Extended CONNECT (RFC 8441) — WS-over-h2 upgrade. Must not have
     // END_STREAM and we cap WS at one stream per connection.
-    if method_kind == 2 && protocol_ws == 1 {
+    if method_kind == method::METHOD_CONNECT && protocol_ws == 1 {
         if end_stream || cur_h2(s).ws_active != 0 {
             let n = h2w::write_rst_stream(
                 cur_send_buf_mut_ptr(s),
@@ -1122,8 +1274,10 @@ unsafe fn handle_headers(
         return Ok(());
     }
 
-    if method_kind != 1 && method_kind != 3 {
-        // CONNECT without `:protocol = websocket` not supported.
+    if !method::method_is_dispatchable(method_kind) {
+        // CONNECT without `:protocol = websocket` not supported; anything
+        // outside the recognised vocabulary is well-formed but unimplemented,
+        // which is 501 on both generations now.
         emit_response(
             s,
             hdr.stream_id,
@@ -1179,9 +1333,40 @@ unsafe fn handle_data(s: &mut HttpState, hdr: &h2w::Header, payload: *const u8) 
         return Ok(());
     }
 
-    // Request body for non-WS streams is discarded; END_STREAM moves
-    // the slot to Pending and the active loop picks it up.
+    // Request body for non-WS streams is accumulated, bounded by the server's
+    // `max_body`. Discarding it is survivable only while every route answers
+    // from configuration: a route that hands the request to an application must
+    // deliver the body too, because a PUT whose body evaporates is worse than a
+    // PUT that is refused.
+    //
+    // Padding is excluded: `data_payload_extent` resolves the pad length, and
+    // padding is transport filler that is not part of the body.
     let end_stream = (hdr.flags & h2w::FLAG_END_STREAM) != 0;
+    if hdr.length > 0 {
+        match h2w::data_payload_extent(payload, hdr.length, hdr.flags) {
+            Ok((off, len)) if len > 0 => {
+                if !append_stream_body(s, idx as usize, payload.add(off), len as usize) {
+                    // Over the cap. RST_STREAM rather than a 413 response: the
+                    // peer is mid-upload and there is no point reading the rest
+                    // of a body that has already been refused, while the
+                    // connection and its other streams stay healthy.
+                    let n = h2w::write_rst_stream(
+                        cur_send_buf_mut_ptr(s),
+                        hdr.stream_id,
+                        h2w::ERR_ENHANCE_YOUR_CALM,
+                    );
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.send_len = n as u16;
+                        cur.send_offset = 0;
+                    }
+                    free_slot(s, idx);
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return Err(h2w::ERR_PROTOCOL_ERROR),
+        }
+    }
     if end_stream {
         let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(idx as usize);
         slot.end_stream_in = 1;
@@ -1577,6 +1762,39 @@ unsafe fn dispatch_request(s: &mut HttpState, slot_idx: i8) {
             }
         }
         HANDLER_FILE => begin_file_response(s, slot_idx, matched),
+        #[cfg(feature = "app")]
+        HANDLER_APP => {
+            // The stream stays Open (not Sending) while the application
+            // thinks: h2's emitter is a single-slot round robin, and parking a
+            // stream in Sending for the length of an application round trip
+            // would stall every other stream on the connection — which is the
+            // one thing h2 exists to avoid.
+            match emit_app_request(s, slot_idx) {
+                super::app::EmitResult::Sent => {
+                    let now = super::dev_millis(&*s.syscalls);
+                    let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(slot_idx as usize);
+                    slot.app_pending = 1;
+                    slot.app_deadline_ms = now.saturating_add(super::app::APP_TIMEOUT_MS);
+                    slot.state = SlotState::Open;
+                }
+                // Ring momentarily full: leave the stream Pending so the next
+                // dispatch pass retries it.
+                super::app::EmitResult::Full => {
+                    let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(slot_idx as usize);
+                    slot.state = SlotState::Pending;
+                }
+                _ => {
+                    emit_response(
+                        s,
+                        stream_id,
+                        b"503",
+                        b"text/plain",
+                        b"No application wired to req_out\n",
+                    );
+                    free_slot(s, slot_idx);
+                }
+            }
+        }
         HANDLER_GRPC => {
             // Canned unary response, NOT an echo. `handle_data` discards
             // request bodies for non-WS streams, so mirroring the caller's
@@ -1605,6 +1823,182 @@ unsafe fn dispatch_request(s: &mut HttpState, slot_idx: i8) {
             free_slot(s, slot_idx);
         }
     }
+}
+
+/// Emit this stream's request on `req_out`.
+///
+/// Gathers the parts from the `StreamSlot` — a connection carries many requests
+/// at once, so none of them live on the `ConnSlot` — and hands them to
+/// `app::write_request_envelope`, which both generations share.
+#[cfg(feature = "app")]
+unsafe fn emit_app_request(s: &mut HttpState, slot_idx: i8) -> super::app::EmitResult {
+    if s.server.app_out_chan < 0 {
+        return super::app::EmitResult::Unwired;
+    }
+    let conn_id = super::cur_slot(s).map(|c| c.conn_id as u16).unwrap_or(0);
+    let slot = &*cur_h2(s).streams.as_ptr().add(slot_idx as usize);
+    // h2 stream ids are u32 and monotonically increasing, so a long-lived
+    // connection can pass 65535. Refuse the dispatch rather than truncate two
+    // live streams onto one correlation key.
+    if !super::app::stream_id_fits(slot.id) {
+        return super::app::EmitResult::TooLarge;
+    }
+    let empty = &[][..];
+    super::app::write_request_envelope(
+        s,
+        conn_id,
+        slot.id as u16,
+        slot.method_kind,
+        core::slice::from_raw_parts(
+            slot.req_path.as_ptr(),
+            (slot.req_path_len as usize).min(MAX_PATH),
+        ),
+        if slot.hdr_buf.is_null() {
+            empty
+        } else {
+            core::slice::from_raw_parts(slot.hdr_buf, slot.hdr_len as usize)
+        },
+        if slot.body_buf.is_null() {
+            empty
+        } else {
+            core::slice::from_raw_parts(slot.body_buf, slot.body_len as usize)
+        },
+    )
+}
+
+/// Find the h2 stream on this connection awaiting `stream_id`, if any.
+#[cfg(feature = "app")]
+pub(crate) unsafe fn find_app_stream(s: &HttpState, stream_id: u16) -> i8 {
+    let mut i = 0u8;
+    while (i as usize) < MAX_STREAMS {
+        let slot = &*cur_h2(s).streams.as_ptr().add(i as usize);
+        if slot.app_pending != 0 && (slot.id as u16) == stream_id {
+            return i as i8;
+        }
+        i += 1;
+    }
+    -1
+}
+
+/// Serve an application response on an h2 stream.
+///
+/// `more` marks a streamed body whose continuation arrives in later envelopes.
+/// h2 needs no `Content-Length` to frame one — END_STREAM on the final DATA
+/// frame is the delimiter — so unlike h1, a streamed response here costs the
+/// connection nothing.
+#[cfg(feature = "app")]
+pub(crate) unsafe fn deliver_app_response(
+    s: &mut HttpState,
+    slot_idx: i8,
+    status: u16,
+    content_type: &[u8],
+    body: &[u8],
+    more: bool,
+) {
+    let (stream_id, verb, head_sent) = {
+        let slot = &*cur_h2(s).streams.as_ptr().add(slot_idx as usize);
+        (slot.id, slot.method_kind, slot.headers_sent)
+    };
+
+    // HEAD, 204 and 304 carry no body on h2 for the same reason as on h1 —
+    // except that on h2 the consequence is a stream-state violation rather
+    // than a desynchronised connection, which a peer answers with a
+    // PROTOCOL_ERROR that kills every other stream too.
+    let allows = super::app::status_allows_body(status, verb);
+    let out: &[u8] = if allows { body } else { &[] };
+    let streaming = more && allows;
+
+    if head_sent == 0 {
+        let mut code = [b'0'; 3];
+        let s3 = status.min(999);
+        code[0] = b'0' + (s3 / 100) as u8;
+        code[1] = b'0' + ((s3 / 10) % 10) as u8;
+        code[2] = b'0' + (s3 % 10) as u8;
+        let ct: &[u8] = if content_type.is_empty() {
+            b"application/octet-stream"
+        } else {
+            content_type
+        };
+        emit_response_framed(s, stream_id, &code, ct, out, !streaming);
+    } else {
+        // Continuation: DATA only. Re-emitting HEADERS mid-body would be a
+        // trailer section by h2's rules, and one carrying `:status` is a
+        // protocol error.
+        emit_data_chunk(s, stream_id, out, !streaming);
+    }
+
+    if streaming {
+        let now = super::dev_millis(&*s.syscalls);
+        let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(slot_idx as usize);
+        slot.headers_sent = 1;
+        slot.app_pending = 1;
+        // Time since last progress, not since the request — see the h1
+        // counterpart in `app::compose_stream_chunk`.
+        slot.app_deadline_ms = now.saturating_add(super::app::APP_TIMEOUT_MS);
+    } else {
+        free_slot(s, slot_idx);
+    }
+}
+
+/// Emit a DATA frame carrying `body` on `stream_id`, optionally ending the
+/// stream.
+#[cfg(feature = "app")]
+unsafe fn emit_data_chunk(s: &mut HttpState, stream_id: u32, body: &[u8], end: bool) {
+    let buf = cur_send_buf_mut_ptr(s);
+    let cap = SEND_BUF_SIZE;
+    if h2w::FRAME_HEADER_LEN + body.len() > cap {
+        let n = h2w::write_rst_stream(buf, stream_id, h2w::ERR_INTERNAL_ERROR);
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = n as u16;
+            cur.send_offset = 0;
+        }
+        return;
+    }
+    h2w::write_data_frame_header(buf, body.len(), stream_id, end);
+    if !body.is_empty() {
+        core::ptr::copy_nonoverlapping(body.as_ptr(), buf.add(h2w::FRAME_HEADER_LEN), body.len());
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = (h2w::FRAME_HEADER_LEN + body.len()) as u16;
+        cur.send_offset = 0;
+    }
+}
+
+/// Answer every stream whose application request has outlived the timeout.
+///
+/// Per stream rather than per connection: one unanswered request must not take
+/// down the siblings sharing its connection.
+#[cfg(feature = "app")]
+pub(crate) unsafe fn sweep_app_timeouts(s: &mut HttpState) {
+    if cur_h2_ptr_is_null(s) {
+        return;
+    }
+    let now = super::dev_millis(&*s.syscalls);
+    let mut i = 0u8;
+    while (i as usize) < MAX_STREAMS {
+        let (pending, deadline) = {
+            let slot = &*cur_h2(s).streams.as_ptr().add(i as usize);
+            (slot.app_pending, slot.app_deadline_ms)
+        };
+        if pending != 0 && deadline != 0 && now >= deadline {
+            let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(i as usize);
+            slot.app_pending = 0;
+            let stream_id = slot.id;
+            emit_response(s, stream_id, b"504", b"text/plain", b"Gateway Timeout\n");
+            free_slot(s, i as i8);
+            // One per pass: `emit_response` fills `send_buf`, and a second
+            // would overwrite the first before it reached the wire.
+            return;
+        }
+        i += 1;
+    }
+}
+
+/// True when this connection has no h2 state — an h1 slot, or one that has not
+/// yet seen the preface.
+#[cfg(feature = "app")]
+unsafe fn cur_h2_ptr_is_null(s: &HttpState) -> bool {
+    super::cur_slot(s).map(|c| c.h2.is_null()).unwrap_or(true)
 }
 
 /// Populate slot's render state and mark Sending. The actual HEADERS
@@ -1745,6 +2139,22 @@ unsafe fn emit_response(
     content_type: &[u8],
     body: &[u8],
 ) {
+    emit_response_framed(s, stream_id, status, content_type, body, true)
+}
+
+/// As `emit_response`, but `end` chooses whether the DATA frame closes the
+/// stream. A streamed application response leaves it open and delimits the
+/// body with END_STREAM on its final chunk — h2 needs no `Content-Length` for
+/// that, which is why a streamed response costs the connection nothing here
+/// and costs h1 its keep-alive.
+unsafe fn emit_response_framed(
+    s: &mut HttpState,
+    stream_id: u32,
+    status: &[u8],
+    content_type: &[u8],
+    body: &[u8],
+    end: bool,
+) {
     let buf = cur_send_buf_mut_ptr(s);
     let cap = SEND_BUF_SIZE;
 
@@ -1761,14 +2171,21 @@ unsafe fn emit_response(
         content_type,
     );
 
-    let mut clen = [0u8; 11];
-    let n = super::super::fmt_u32_raw(clen.as_mut_ptr(), body.len() as u32);
-    o += super::super::wire::hpack::encode_header(
-        buf.add(o),
-        cap - o,
-        b"content-length",
-        core::slice::from_raw_parts(clen.as_ptr(), n),
-    );
+    // `content-length` only when this frame IS the whole body. Declaring the
+    // first chunk's length on a streamed response would tell the peer the
+    // transfer is complete after that chunk, and every DATA frame after it
+    // would exceed the length the peer was told to expect. h2 delimits with
+    // END_STREAM instead, so omitting it is correct rather than merely safe.
+    if end {
+        let mut clen = [0u8; 11];
+        let n = super::super::fmt_u32_raw(clen.as_mut_ptr(), body.len() as u32);
+        o += super::super::wire::hpack::encode_header(
+            buf.add(o),
+            cap - o,
+            b"content-length",
+            core::slice::from_raw_parts(clen.as_ptr(), n),
+        );
+    }
 
     let block_len = o - block_start;
     h2w::write_headers_frame_header(buf, block_len, stream_id, false, true);
@@ -1789,7 +2206,7 @@ unsafe fn emit_response(
         return;
     }
 
-    h2w::write_data_frame_header(buf.add(data_hdr_off), body.len(), stream_id, true);
+    h2w::write_data_frame_header(buf.add(data_hdr_off), body.len(), stream_id, end);
     if !body.is_empty() {
         core::ptr::copy_nonoverlapping(body.as_ptr(), buf.add(data_off), body.len());
     }

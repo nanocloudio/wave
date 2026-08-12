@@ -1,0 +1,50 @@
+version = "1.0.0"
+# No `wasm`: the browser host needs `module_init_wasm` / `module_step_wasm`
+# exports, and this fixture exists to be driven by `tools/e2e/linux_graph.sh`
+# and a rig graph. Adding the wasm shim would be code with no caller.
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+
+# CONFORMANCE FIXTURE for `foundation/http`'s application fan-out — not a
+# product module, which is why it lives in `modules/fixtures/` rather than
+# `modules/foundation/`.
+#
+# `docs/specification.md` places "HTTP application resources, tenant routing
+# policy, authorization, CDN policy, webhook meaning, or business handlers"
+# OUTSIDE Wave. A permanent application module here would contradict that. What
+# Wave does own is the port CONTRACT — the `HttpRequest` / `HttpResponse`
+# envelopes and their correlation rules — and a contract with nothing on the
+# far side of it is untested by construction.
+#
+# So this echoes: it reflects the method, path and body it was handed back as a
+# response, which is exactly enough to prove that a request crossed the port
+# pair intact and its answer came back to the connection that asked. Anything
+# more would be a business handler.
+#
+# Wire layouts (mirroring `modules/foundation/http/server/app.rs`):
+#   HttpRequest   [conn_id u16][stream_id u16][method u8][flags u8]
+#                 [path_len u16][hdr_len u16][body_len u16]
+#                 [path][headers][body]
+#   HttpResponse  [conn_id u16][stream_id u16][status u16][flags u8]
+#                 [ct_len u8][hdr_len u16][body_len u16]
+#                 [content_type][headers][body]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "HttpRequest"
+buffer_size = { default = 8192, bcm2712 = 65536 }
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "HttpResponse"
+buffer_size = { default = 8192, bcm2712 = 65536 }
+
+[observability]
+# No metrics or spans, deliberately. The convention is that a data-moving
+# module reports what it moved — but this one exists to be ASSERTED on, not
+# operated: every request it handles is already visible as the response
+# `tools/e2e/linux_graph.sh --app` reads back, and a counter would be a second
+# source of truth for the same fact. A real application behind `req_out` should
+# declare metrics; a fixture that stands in for one should not pretend to be it.
+exempt = "conformance fixture: observed through the E2E assertions it exists to serve"

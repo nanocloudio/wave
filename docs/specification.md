@@ -15,7 +15,14 @@ session product, identity provider, or service mesh.
 Wave owns:
 
 - HTTP/1.1 message parsing, serialization, routing mechanics, connection state,
-  client and server behaviour, and bounded body handling;
+  client and server behaviour, and bounded body handling — including the shared
+  method vocabulary both generations resolve against, request-body framing
+  (`Content-Length`, chunked transfer coding, `Expect: 100-continue`) and the
+  refusal of a message that carries contradictory framing headers;
+- the HTTP application fan-out contract — the `HttpRequest` / `HttpResponse`
+  envelopes, their `(conn_id, stream_id)` correlation, and the backpressure and
+  streaming rules that carry them — which is how a graph node OUTSIDE Wave holds
+  the resources and business handlers listed below as not Wave's;
 - HTTP/2 framing, stream state, flow control, and HPACK;
 - HTTP/3 request/response semantics, QPACK, and request-stream multiplexing
   above QUIC;
