@@ -48,7 +48,7 @@ verbatim so the device and the host harness compile identical bytes:
 - `b64_core.rs` — Base64 for the key nonce and proof;
 - `hex_core.rs` — hex decode for the `endpoint` parameter.
 
-Conformance vectors: `tests/ws_core_conformance.rs` (`fluxor modules test`).
+Conformance vectors: `tests/harness/tests/websocket_ws_core_conformance.rs`.
 
 ## Boundary
 

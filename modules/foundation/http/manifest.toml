@@ -37,6 +37,14 @@ capabilities = ["transport.anchor.stream"]
 name = "web"
 features = ["h1", "ws"]
 
+# h1 + the HANDLER_APP request/response fan-out, nothing else — the ingress
+# for graphs whose application IS downstream modules (chronicle's reverser
+# serves its whole pipeline chain through this on a Pi 5 whose netboot image
+# ceiling the full variant would cross).
+[[variant]]
+name = "app"
+features = ["h1", "app"]
+
 # h1 + h2 + ws — everything but HTTP/3.
 #
 # This variant was added, measured out BYTE-IDENTICAL to `full`, removed, and is
@@ -109,11 +117,20 @@ index = 3
 direction = "input"
 content_type = "WsFrame"
 # WsFrame envelopes from ws_stream: [conn_id u32][opcode][fin][len u16]
-# [payload] — payload up to 65535 B, so the full envelope is ~65 KiB.
-# Channel writes are all-or-nothing: a default ring silently rejects
-# every envelope. aarch64 pipelines two envelopes; embedded fits
-# exactly one plus header.
+# [payload]. Channel writes are all-or-nothing, so a ring too small for an
+# envelope silently rejects every one of them — hence the generous depth.
+#
+# `max_record` is the honest per-envelope ceiling, and it is NOT the ring size.
+# The reader takes one envelope per `channel_read` into a scratch of
+# `abi::CHANNEL_BUFFER_SIZE`, and there is no syscall by which a module can
+# learn a port's declared record size and size that scratch from it. A larger
+# `max_record` would therefore be a promise the reader cannot keep: the envelope
+# is consumed, found short, and dropped (counted as `ws_envelopes_dropped`).
+# Declaring the true ceiling makes the config validator reject the mistake
+# instead of the runtime discarding data. The ring stays deep so several
+# envelopes pipeline.
 buffer_size = { default = 65600, bcm2712 = 131072 }
+max_record  = 8192
 
 # Compiled-route subscription sink (rfc_dynamic_routes). The graph self-wires
 # `routes_sink` (out[4]) -> `routes_changes` (in[4]) so the store's
@@ -167,16 +184,26 @@ buffer_size = 4096
 # [path_len u16][hdr_len u16][body_len u16]` then the path, the raw header
 # block and the decoded body. `stream_id` rides beside `conn_id` because HTTP/2
 # multiplexes many requests over one connection; correlating on conn_id alone
-# misroutes as soon as a client opens parallel streams.
+# misroutes as soon as a client opens parallel streams. Under HTTP/1.1 it is a
+# request generation rather than a stream index, because connection ids are
+# recycled and a late answer would otherwise match the next holder of the id.
+# An application MUST echo `stream_id` back on the response either way.
 [[ports]]
 name = "req_out"
 index = 6
 direction = "output"
 content_type = "HttpRequest"
-# One request envelope: bounded by the configured max_body plus the head. The
-# default sizing carries a 16 KiB body; a graph ingesting artefacts raises both
-# this and `max_body_kib` together, since a body larger than the ring can never
-# be written to it.
+max_record = 8192
+# One request envelope: the head plus the decoded body. `max_record` is the
+# ceiling on ONE envelope and is set to what the reader can actually take (see
+# `ws_in` above); `buffer_size` is ring depth, so a larger ring pipelines more
+# envelopes rather than bigger ones.
+#
+# This bounds the request body that can be FORWARDED, which is not the same as
+# the body the server will accept: `max_body_kib` governs that, and a request
+# larger than the envelope is refused with a 503 naming this mismatch rather
+# than being truncated. A graph ingesting artefacts raises neither — it uses the
+# streaming path, which is what `MORE_BODY` exists for.
 buffer_size = { default = 8192, bcm2712 = 65536 }
 
 [[ports]]
@@ -184,6 +211,12 @@ name = "resp_in"
 index = 6
 direction = "input"
 content_type = "HttpResponse"
+# Same ceiling as `req_out`, for the same reason. A response larger than this
+# is not a bigger envelope — it is a STREAM: the application sets `MORE_BODY`
+# and sends it across several envelopes, which is the only way a response can
+# exceed the send buffer anyway. An application that writes one oversize
+# envelope has it dropped and counted as `app_envelopes_oversize`.
+max_record = 8192
 buffer_size = { default = 8192, bcm2712 = 65536 }
 
 [[resources]]
@@ -211,7 +244,55 @@ access = "read"
 # id 3 = proxy_retries (http.proxy.retries), id 4 = proxy_5xx
 # (http.proxy.5xx): proxy-relay failover / terminal 5xx
 # (rfc_workload_ingress §3).
-metrics = ["bytes_in", "bytes_out", "routes_dropped", "proxy_retries", "proxy_5xx"]
+#
+# ids 5-13 are the load-shedding surface. Every one of these paths refuses or
+# drops work under pressure, and before they were counted each presented to an
+# operator as the same symptom — a slow or reset client — while having a
+# different fix. They are positional and append-only, so ids 0-4 keep their
+# meanings.
+#
+# id  5 = backpressure_steps (http.backpressure.steps): counted at every send
+#         seam. Previously read only by the idle heuristic, so a module
+#         shedding work looked busy to the scheduler and fine to the operator.
+# id  6 = conns_refused_slots, id 7 = conns_refused_arena: an accept refused
+#         because the slot table was full, versus because the arena could not
+#         supply the slot's buffers. Different constants, different fix; as one
+#         number the answer is unactionable.
+# id  8 = demux_stalls (http.demux.stalls): the inbound demux stopped early
+#         because one slot's recv_buf was full, delaying every other
+#         connection. Head-of-line blocking, invisible in throughput until
+#         severe.
+# id  9 = app_timeouts, id 10 = app_envelopes_lost, id 11 =
+#         app_envelopes_oversize: the application fan-out's shed paths.
+#         `lost` is never expected in a healthy graph — it means a response was
+#         dropped rather than delayed, so the application believes it answered
+#         a client that never was.
+# id 12 = ws_envelopes_dropped, id 13 = h2_streams_refused.
+# id 14 = h3_handler_unavailable, id 15 = h3_field_limit_refused: HTTP/3's two
+#         refusal paths, both CONFIGURATION signals rather than load ones.
+#         `handler_unavailable` means a route serving fine over h1/h2 is
+#         reachable over h3 and cannot be served there; `field_limit_refused`
+#         means a peer advertised a header-size limit tighter than our smallest
+#         response, so nothing can be sent to it at all. Each otherwise presents
+#         as a client that gets no useful answer with no error naming why.
+metrics = [
+  "bytes_in",
+  "bytes_out",
+  "routes_dropped",
+  "proxy_retries",
+  "proxy_5xx",
+  "backpressure_steps",
+  "conns_refused_slots",
+  "conns_refused_arena",
+  "demux_stalls",
+  "app_timeouts",
+  "app_envelopes_lost",
+  "app_envelopes_oversize",
+  "ws_envelopes_dropped",
+  "h2_streams_refused",
+  "h3_handler_unavailable",
+  "h3_field_limit_refused",
+]
 # Span 0: one `http.server.request` span per request (head parsed -> response
 # drained), SERVER kind. Minted only when a telemetry consumer is subscribed
 # (zero-cost otherwise). Keepalive re-latches the span per request.

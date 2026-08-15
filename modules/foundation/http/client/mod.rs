@@ -7,11 +7,15 @@
 //! constants come from `super::connection`.
 
 // Per-generation front ends onto this core, one file each — the same shape as
-// `super::server`. There is no `h3.rs`: Fluxor's `quic` owns the h3 client
-// (`docs/architecture/http3-ownership.md`), and that absence is deliberate.
+// `super::server`. `h3` rides Fluxor's `mux` contract rather than net_proto, so
+// it shares this core's shape but not its `ClientState`.
 pub(crate) mod h1;
 #[cfg(feature = "h2")]
 pub(crate) mod h2;
+#[cfg(all(feature = "h3", not(feature = "host-test")))]
+pub(crate) mod h3;
+#[cfg(all(feature = "h3", feature = "host-test"))]
+pub mod h3;
 
 use super::connection::{
     NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
@@ -62,7 +66,7 @@ pub(crate) enum Phase {
 
 #[repr(C)]
 pub(crate) struct ClientState {
-    pub(crate) conn_id: u8,
+    pub(crate) conn_id: u16,
     /// 1 once `MSG_CONNECTED` established a connection, 0 otherwise. Tracks
     /// connection PRESENCE separately from `conn_id`'s value because IP can
     /// legitimately assign `conn_id == 0`; keying "connected" off `conn_id != 0`
@@ -198,14 +202,13 @@ pub(crate) unsafe fn send_close_frame(s: &mut HttpState) {
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
-    let mut payload = [0u8; 1];
-    payload[0] = s.client.conn_id;
+    let payload = s.client.conn_id.to_le_bytes();
     net_write_frame(
         sys,
         chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        1,
+        2,
         buf,
         NET_BUF_SIZE,
     );
@@ -227,6 +230,7 @@ pub(crate) unsafe fn is_foreign_frame(
     nbuf: *const u8,
 ) -> bool {
     matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
-        && payload_len >= 1
-        && *nbuf.add(NET_FRAME_HDR) != s.client.conn_id
+        && payload_len >= 2
+        && u16::from_le_bytes([*nbuf.add(NET_FRAME_HDR), *nbuf.add(NET_FRAME_HDR + 1)])
+            != s.client.conn_id
 }

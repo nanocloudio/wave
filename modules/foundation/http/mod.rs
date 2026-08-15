@@ -2,8 +2,8 @@
 //!
 //! A single PIC module that operates in one of two modes:
 //!
-//! - **Server** (mode 0, default): routing, templating, file serving,
-//!   forward-proxy stub.
+//! - **Server** (mode 0, default): routing, templating, file serving, and a
+//!   reverse-proxy relay with backend selection, failover and 5xx accounting.
 //! - **Client** (mode 1): fetches a URL, streams the response body to
 //!   the data output channel.
 //!
@@ -17,7 +17,7 @@
 //!           h1 h2 h3                            per-generation front ends
 //!           routes listeners params             config and dispatch
 //!           cache response body ws proxy        what a request is served from
-//! client/   mod  h1 h2                          same shape, fewer of each
+//! client/   mod  h1 h2 h3                       same shape, fewer of each
 //! connection.rs                                 IP-module framing constants
 //! ```
 //!
@@ -39,13 +39,19 @@
 //! and it is what `ConnSlot` implements; h2 and h3 reach their own front ends
 //! through it.
 //!
-//! **A missing file is information.** There is no `client::h3` because
-//! Fluxor's `quic` owns the h3 client (`docs/architecture/http3-ownership.md`),
-//! and no `client::ws` because the WebSocket client is its own module
-//! (`modules/foundation/websocket`) — RFC 6455's client role needs no HTTP
-//! server around it. The client has no `routes`, `cache` or `proxy` either: it
-//! issues one request rather than dispatching many. Those absences are
-//! decisions, and they are visible from `ls` rather than only from prose.
+//! **A missing file is information.** There is no `client::ws` because the
+//! WebSocket client is its own module (`modules/foundation/websocket`) — RFC
+//! 6455's client role needs no HTTP server around it. The client has no
+//! `routes`, `cache` or `proxy` either: it issues one request rather than
+//! dispatching many. Those absences are decisions, and they are visible from
+//! `ls` rather than only from prose.
+//!
+//! `client::h3` exists and `server::h3` does too, which is the boundary working
+//! as intended: all HTTP logic is this module's, QUIC is Fluxor's, and the
+//! codecs under `wire/` serve both directions rather than being written twice.
+//! The client lived inside `server/h3.rs` for a while — h3 was server-only when
+//! that file was written — which put the one capability three documents denied
+//! having under the wrong role as well.
 //!
 //! Everything under `wire/` is pure: no syscalls, no channels, no clock. That is
 //! the tier the RFC vectors pin, and the boundary is enforced by where the file
@@ -129,7 +135,13 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+// `pub` under host-test only, matching how `server` is exposed: the suites are
+// separate crates and need real `pub` to reach in, while the firmware links one
+// crate and keeps its symbol surface unchanged.
+#[cfg(not(feature = "host-test"))]
 mod client;
+#[cfg(feature = "host-test")]
+pub mod client;
 mod connection;
 #[cfg(not(feature = "host-test"))]
 mod server;
@@ -187,8 +199,8 @@ struct HttpState {
 
     /// Server mode: serve HTTP/3 over the `mux` contract on the same
     /// `net_in`/`net_out` pair, instead of HTTP/1+2 over net_proto. Set by the
-    /// `h3` parameter; the transport in front is Fluxor's `quic` with
-    /// `h3_app = 1` (see docs/architecture/http3-ownership.md).
+    /// `h3` parameter; the transport in front is Fluxor's `quic` with an `h3`
+    /// ALPN (see docs/architecture/http3-ownership.md).
     h3_mode: u8,
 
     /// Monotonic step counter feeding the tlm cadence.
@@ -211,7 +223,7 @@ struct HttpState {
 
     /// Client-mode HTTP/3 exchange state. Feature-gated with the server side.
     #[cfg(feature = "h3")]
-    h3_client: server::h3::H3Client,
+    h3_client: client::h3::H3Client,
 }
 
 /// Cadence for the `[http] tlm` line.
@@ -281,7 +293,7 @@ mod params_def {
 
         // Serve HTTP/3 over the `mux` contract on net_in/net_out instead of
     // HTTP/1+2 over net_proto. The transport in front is fluxor's `quic` with
-    // `h3_app = 1` — see docs/architecture/http3-ownership.md.
+    // an `h3` ALPN — see docs/architecture/http3-ownership.md.
     //
     // Tag 100, deliberately clear of the route block: route `n` occupies
     // `10*(n+1) + field` up to 89, 90/91 are the routes/listeners prefixes, and
@@ -599,7 +611,7 @@ pub unsafe extern "C" fn module_new(
         #[cfg(feature = "h3")]
         {
             s.h3 = server::h3::H3State::new();
-            s.h3_client = server::h3::H3Client::new();
+            s.h3_client = client::h3::H3Client::new();
         }
 
         // Pre-init both modes so the body pool is ready before TLV
@@ -664,7 +676,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // the server path does, so the transport stays protocol-free.
             #[cfg(feature = "h3")]
             if s.h3_mode != 0 {
-                let r = server::h3::step_mux_client(s);
+                let r = client::h3::step_mux_client(s);
                 tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
                 return r;
             }
@@ -746,6 +758,97 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // store key). Cumulative; 0 when no relay is configured.
                 dev_telemetry_metric(sys, -1, midx, t, counter, 3, s.server.proxy_retries as u64);
                 dev_telemetry_metric(sys, -1, midx, t, counter, 4, s.server.proxy_5xx as u64);
+                // id 5 = http.backpressure.steps. Counted at every send seam
+                // and, until now, read only by the idle heuristic — so a
+                // module quietly refusing work looked BUSY to the scheduler
+                // and looked fine to the operator. It is the single most
+                // informative load signal a bounded module has: the
+                // difference between "fast" and "shedding".
+                dev_telemetry_metric(sys, -1, midx, t, counter, 5, s.tlm.bp_steps as u64);
+                // ids 6/7 = http.conns.refused.slots / .arena. Two different
+                // ceilings with two different fixes; reported as one number
+                // they are unactionable (see `alloc_free_slot`).
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    6,
+                    s.server.conns_refused_slots as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    7,
+                    s.server.conns_refused_arena as u64,
+                );
+                // id 8 = http.demux.stalls — head-of-line blocking, which does
+                // not show in throughput until it is already severe.
+                dev_telemetry_metric(sys, -1, midx, t, counter, 8, s.server.demux_stalls as u64);
+                // ids 9..11 = the application fan-out's shed paths. `lost` is
+                // never expected in a healthy graph: it means a response was
+                // dropped rather than delayed.
+                dev_telemetry_metric(sys, -1, midx, t, counter, 9, s.server.app_timeouts as u64);
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    10,
+                    s.server.app_envelopes_lost as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    11,
+                    s.server.app_envelopes_oversize as u64,
+                );
+                // id 12 = http.ws.envelopes.dropped, id 13 =
+                // http.h2.streams.refused.
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    12,
+                    s.server.ws_envelopes_dropped as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    13,
+                    s.server.h2_streams_refused as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    14,
+                    s.server.h3_handler_unavailable as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    15,
+                    s.server.h3_field_limit_refused as u64,
+                );
             }
         }
 

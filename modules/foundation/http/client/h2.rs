@@ -208,11 +208,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 if poll > 0 && (poll as u32 & POLL_IN) != 0 {
                     let buf = s.net_buf.as_mut_ptr();
                     let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-                    if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+                    if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
                         // Claim only our own outbound connection by requester tag
                         // (see client.rs). Untagged or our tag → ours.
-                        let tag = if payload_len >= 2 {
-                            *buf.add(NET_FRAME_HDR + 1)
+                        let tag = if payload_len >= 3 {
+                            *buf.add(NET_FRAME_HDR + 2)
                         } else {
                             0
                         };
@@ -220,17 +220,20 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         if tag != 0 && tag != me {
                             return 0;
                         }
-                        s.client.conn_id = *buf.add(NET_FRAME_HDR);
+                        s.client.conn_id = u16::from_le_bytes([
+                            *buf.add(NET_FRAME_HDR),
+                            *buf.add(NET_FRAME_HDR + 1),
+                        ]);
                         s.client.conn_present = 1;
                         log(s, b"[http] connected (h2c)");
                         build_preface(s);
                         set_phase(s, H2Phase::SendPreface);
                         continue;
                     } else if msg_type == NET_MSG_ERROR {
-                        // Connect failure carries our tag at payload[2]; ignore
+                        // Connect failure carries our tag at payload[3]; ignore
                         // another consumer's error on a fanned net_in.
-                        let etag = if payload_len >= 3 {
-                            *buf.add(NET_FRAME_HDR + 2)
+                        let etag = if payload_len >= 4 {
+                            *buf.add(NET_FRAME_HDR + 3)
                         } else {
                             0
                         };
@@ -1076,20 +1079,22 @@ unsafe fn drain_request_buf(s: &mut HttpState) -> bool {
         let out_chan = s.net_out_chan;
         let conn_id = s.client.conn_id;
         let remaining = (s.client.request_len - s.client.request_sent) as usize;
-        let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+        let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 2;
         let to_send = remaining.min(max_data);
         let scratch = s.net_buf.as_mut_ptr();
-        let payload_len = 1 + to_send;
+        let payload_len = 2 + to_send;
+        let cb = conn_id.to_le_bytes();
         *scratch = NET_CMD_SEND;
         *scratch.add(1) = (payload_len & 0xFF) as u8;
         *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-        *scratch.add(3) = conn_id;
+        *scratch.add(3) = cb[0];
+        *scratch.add(4) = cb[1];
         let src = s
             .client
             .request_buf
             .as_ptr()
             .add(s.client.request_sent as usize);
-        core::ptr::copy_nonoverlapping(src, scratch.add(4), to_send);
+        core::ptr::copy_nonoverlapping(src, scratch.add(5), to_send);
         let total = NET_FRAME_HDR + payload_len;
         let written = (sys.channel_write)(out_chan, scratch, total);
         if written < total as i32 {
@@ -1131,8 +1136,9 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
     // Established-stream isolation: ignore DATA/CLOSED/ERROR frames for other
     // connections sharing a fanned net_in (e.g. an OTLP exporter).
     if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
-        && payload_len >= 1
-        && *buf.add(NET_FRAME_HDR) != s.client.conn_id
+        && payload_len >= 2
+        && u16::from_le_bytes([*buf.add(NET_FRAME_HDR), *buf.add(NET_FRAME_HDR + 1)])
+            != s.client.conn_id
     {
         return false;
     }
@@ -1141,11 +1147,11 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
         log(s, b"[http] premature close");
         return true;
     }
-    if msg_type != NET_MSG_DATA || payload_len < 1 {
+    if msg_type != NET_MSG_DATA || payload_len < 2 {
         return false;
     }
-    let data_ptr = buf.add(NET_FRAME_HDR + 1);
-    let data_len = payload_len - 1;
+    let data_ptr = buf.add(NET_FRAME_HDR + 2);
+    let data_len = payload_len - 2;
     let cur = s.client.recv_len as usize;
     let space = RECV_BUF_SIZE - cur;
     let to_copy = data_len.min(space);
@@ -1189,14 +1195,13 @@ unsafe fn send_close_frame(s: &mut HttpState) {
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
-    let mut payload = [0u8; 1];
-    payload[0] = s.client.conn_id;
+    let payload = s.client.conn_id.to_le_bytes();
     net_write_frame(
         sys,
         chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        1,
+        2,
         buf,
         NET_BUF_SIZE,
     );

@@ -34,6 +34,7 @@ modules that consume those contracts and add no second ABI.
 | `rtp` | RFC 3550 transmitter and receiver, PCMU/G.711 | rp2350, bcm2712 |
 | `sip` | RFC 3261 subset UAC/UAS for two-party PCMU voice, with receive-side jitter and playout | rp2350, bcm2712 |
 | `smtp` | RFC 5321 mail submission **client** — lockstep ESMTP, unauthenticated | bcm2712 |
+| `s3` | SigV4-signed S3 object **client** — GET/PUT/HEAD/DELETE, driven or probe | bcm2712 |
 
 Roles are deliberately asymmetric: `http` is both server and client, `websocket`
 and `smtp` are clients only, `ws_stream` is an adapter, and `rtp`/`sip` are peer
@@ -41,16 +42,21 @@ user agents. Nothing here promises a server for every protocol with a client.
 Targets are asymmetric too — the smallest silicon serves WebSocket without being
 able to dial one.
 
-`http` ships as three variants selected in its manifest: `web` (HTTP/1.1 + WS),
-`h2` (adds HTTP/2) and `full` (adds HTTP/3). The split is about flash — `http-web`
-is roughly 45% smaller than `http`, which is what makes the h1-only path viable on
-rp2350. `tools/ci/fmod_size_budget.sh` gates every variant against a byte ceiling and
-asserts each subset stays smaller than its superset.
+`http` ships as four variants selected in its manifest: `web` (HTTP/1.1 + WS),
+`app` (HTTP/1.1 + the application fan-out, nothing else), `h2` (adds HTTP/2) and
+`full` (adds HTTP/3). The split is about flash, and the numbers live in
+`tools/ci/fmod_size_budget.sh` rather than here so they cannot drift out of step
+with what is measured — it gates every artefact against a byte ceiling and
+asserts each subset stays smaller than its superset. The variants form a
+lattice, not a chain: `web` and `app` are not subsets of each other, so no
+relation between them is asserted.
 
 Each module carries a `README.md` beside its `manifest.toml` documenting ports,
 parameters, timer class, and — as importantly — what it does not claim.
 `modules/common/` holds the pure `no_std`, I/O-free cores the modules `include!`
-verbatim, so the device build and the host tests compile identical bytes.
+verbatim, so the device build and the host tests compile identical bytes. Their
+vectors live in the host harness with everything else — a module directory holds
+no tests, which is what `forbid_inline_tests` enforces.
 
 ## Composition, not more modules
 
@@ -85,8 +91,7 @@ the SDK at `target/fluxor/fluxor-abi`.
 
 ```bash
 fluxor modules build --all --strict     # rp2350, bcm2712, wasm
-fluxor modules test                     # each module's own core vectors
-tools/ci/fmod_size_budget.sh --print       # per-variant flash sizes
+tools/ci/fmod_size_budget.sh --print    # per-artefact flash sizes
 ```
 
 Those work from a fresh clone. `make build`, `make test`, `make lint` and
@@ -106,9 +111,8 @@ wave/
 
 Two tiers exist in a working checkout and are **not in this repository**:
 `examples/` (runnable graphs) and `tests/` (the host harness and hardware
-scenarios). Each module's own core vectors do ship, under
-`modules/foundation/<name>/tests/`, so `fluxor modules test` works from a clone.
-See [Tests](#tests).
+scenarios). A clone therefore builds and lints but cannot test; see
+[Tests](#tests).
 
 A module is a directory, never a crate — there are no `Cargo.toml` files under
 `modules/**`, and `tests/harness/tests/project_contract.rs` fails if one appears.
@@ -119,26 +123,23 @@ own `[workspace]`.
 
 ## Tests
 
-Two test lanes plus the project's runtime gate, all three run by `make test` and
-all three `fluxor ci` phases, so none can quietly stop running. Counts come from
-the command, not from this page. One lane ships with this repository and one does
-not.
+One test lane plus the project's runtime gates, all run by `make test` and by
+`fluxor ci`, so none can quietly stop running. Counts come from the command, not
+from this page. The lane does not ship with this repository.
 
-(The harness lane is the reason `fluxor test` learned to look for
-`tests/harness/`: this project has no root `Cargo.toml`, so nothing else in the
-verb's shape reaches it, and a `make test` that skipped it would have reported
-green over every integration suite here.)
+(It is the reason `fluxor test` learned to look for `tests/harness/`: this
+project has no root `Cargo.toml`, so nothing else in the verb's shape reaches
+it, and a `make test` that skipped it would have reported green over every
+suite here.)
 
-**Module lane — in this repository.** A module's own core vectors live beside it in
-`modules/foundation/<name>/tests/`, declared by `[test] harness` in its
-`manifest.toml` and built hermetically by `fluxor modules test` with zero
-dependencies. A suite belongs here when it exercises one module's cores and needs
-nothing mocked.
-
-**Cargo lane — not in this repository.** `tests/harness/tests/`, for everything
-needing the mock syscall table and channels: module I/O pumps, HTTP over a
-virtual TCP stack, interop against real third-party servers, the codec suites,
-and the repo-structure contracts.
+**Everything lives in `tests/harness/tests/`** — the codec vectors, the module
+I/O pumps, HTTP over a virtual TCP stack, interop against real third-party
+servers, the concurrency and isolation suites, and the repo-structure contracts.
+There was briefly a second lane holding each module's own vectors beside its
+source, run by `fluxor modules test`; it was folded into this one, because a
+core that is `include!`d into a module and also compiled by the harness is the
+same bytes either way, and two lanes meant two places for a vector to be
+forgotten.
 
 Per the team's test-tracking standard (`../standards/test-tracking.md`, alongside
 this checkout), `tests/` and `examples/` are versioned in a second, local-only Git

@@ -18,9 +18,9 @@ fluxor = { abi = 1 }
 [ci]
 # Silicon targets `fluxor modules build --all` produces artefacts for. Which
 # modules build for which silicon is decided per module by `manifest.toml`'s
-# `hardware_targets` (`websocket` and `smtp` are bcm2712-only, `ws_stream` is
-# portable, `http`/`rtp`/`sip` are rp2350 + bcm2712 — rtp gained bcm2712 on
-# 2026-08-03, see T3.6.5). The two bcm2712-only modules are both OUTBOUND
+# `hardware_targets` (`websocket`, `smtp` and `s3` are bcm2712-only, `ws_stream`
+# is portable, `http`/`rtp`/`sip` are rp2350 + bcm2712 — rtp gained bcm2712 on
+# 2026-08-03, see T3.6.5). The three bcm2712-only modules are all OUTBOUND
 # connectors, which is why rp2350 can serve WebSocket but not dial one; that is
 # an unexamined default rather than a requirement. `linux` is a *runtime* host,
 # not a silicon, so it is not listed here; the Linux path is exercised by
@@ -56,7 +56,7 @@ targets = ["rp2350", "bcm2712", "wasm"]
 #   1. ci-shadow-guard.sh — shadow-checkout hard-fail (test-tracking.md §7):
 #      tests/ is shadow-tracked in .git-shadow/, so a primary-only checkout has
 #      zero files there and the test phases would pass vacuously.
-#   2. host_crates_e2e.sh — phases 1.1/1.2 fmt-check and clippy the PIC module
+#   2. host_crates.sh — phases 1.1/1.2 fmt-check and clippy the PIC module
 #      sources directly when there is no root manifest, which is new coverage —
 #      but it leaves the two host crates linted by nothing, and
 #      `tools/load/wave-bench` built by nothing. This gate is that.

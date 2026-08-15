@@ -90,7 +90,7 @@ pub(crate) struct BoundListener {
     pub(crate) state: u8,
     pub(crate) used: u8,
     /// linux_net listener conn_id from MSG_BOUND (teardown CMD_CLOSE).
-    pub(crate) conn_id: i16,
+    pub(crate) conn_id: i32,
 }
 
 impl BoundListener {
@@ -226,7 +226,7 @@ impl DynListeners {
     /// inbound demux, so `LISTENER_*` and the `bound` array stay private to the
     /// reconciler that owns them. Unknown ports are ignored: post-`bound`, a
     /// `MSG_BOUND` for a port this table never asked for is not ours.
-    pub(crate) fn mark_bound(&mut self, port: u16, conn_id: i16) {
+    pub(crate) fn mark_bound(&mut self, port: u16, conn_id: i32) {
         if let Some(bi) = self.bound_slot_for(port) {
             let b = &mut self.bound[bi];
             b.state = LISTENER_BOUND;
@@ -256,7 +256,7 @@ impl DynListeners {
         self.remove(key, false);
     }
     /// `(state, conn_id)` of the runtime bind record for `port`, if any.
-    pub fn test_bound_state(&self, port: u16) -> Option<(u8, i16)> {
+    pub fn test_bound_state(&self, port: u16) -> Option<(u8, i32)> {
         self.bound
             .iter()
             .find(|b| b.used == 1 && b.port == port)
@@ -310,7 +310,7 @@ pub unsafe fn test_remove_listener(state: *mut u8, key: &[u8]) {
 ///
 /// # Safety
 /// See [`test_inject_dyn_route`].
-pub unsafe fn test_listener_state(state: *mut u8, port: u16) -> Option<(u8, i16)> {
+pub unsafe fn test_listener_state(state: *mut u8, port: u16) -> Option<(u8, i32)> {
     let s = &*(state as *mut HttpState);
     s.server.listeners.test_bound_state(port)
 }
@@ -437,7 +437,7 @@ unsafe fn reconcile_listeners(s: &mut HttpState) {
             continue;
         }
         if state == LISTENER_BOUND && conn_id >= 0 {
-            close_net_conn(s, conn_id as u8);
+            close_net_conn(s, conn_id as u16);
         }
         s.server.listeners.bound[bi] = BoundListener::new();
     }

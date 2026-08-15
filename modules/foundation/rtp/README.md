@@ -10,8 +10,7 @@ the graph's, not its own.
 Header decode is shared with `sip` in `modules/common/rtp_core.rs`, so the module
 that sends packets and the module that plays them agree on which bytes are
 payload — the fixed header, the CSRC list, a §5.3.1 extension and §5.1 padding
-all move that boundary. Vectors: `tests/rtp_core_vectors.rs` (run by
-`fluxor modules test`).
+all move that boundary. Vectors: `tests/harness/tests/rtp_core_vectors.rs`.
 
 ## Ports
 

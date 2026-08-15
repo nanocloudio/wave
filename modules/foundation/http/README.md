@@ -145,8 +145,9 @@ does not run.
   refusal rather than overwriting when the table is full. Tested serving two
   requests concurrently over one connection.
 
-**How it is wired:** Fluxor's `quic` with `h3_app = 1` surfaces h3 request
-streams over the `mux` contract; `http` with `h3 = 1` consumes them on its
+**How it is wired:** Fluxor's `quic` surfaces h3 request streams over the `mux`
+contract — an `h3` ALPN is all it takes, since the transport has no responder of
+its own to displace; `http` with `h3 = 1` consumes them on its
 ordinary `net_in`/`net_out` (mux opcodes are disjoint from net_proto's, so one
 channel pair carries both). `tools/e2e/h3_server.sh` proves it against **aioquic**.
 
@@ -175,9 +176,12 @@ tunnel must outlive the 200 that opened it. Client frames must be masked
 
 **Not served over h3:** file and proxy routes. Those thread more than a cursor
 through `server::cur_slot_mut` — file handles, relay connection state — so
-dispatch returns `HandlerNotShared(id)`: not a 404, not a 500, and not a path
-that happens to work for exactly one concurrent request.
+dispatch answers **501** and names the handler: not a 404 (the route exists),
+not a 500 (nothing failed), not a stream reset (nothing is wrong with the
+connection), and not a path that happens to work for exactly one concurrent
+request. `http.h3.handler_unavailable` counts it, so the mismatch is visible to
+whoever configured the route and not only to the client that hit it.
 
-The remaining design question is recorded in `docs/specification.md`: Fluxor's
-`quic` module carries its own `qpack.rs` and `h3.rs`, and any shared core has to
-be designed around whichever implementation ends up owning the transport.
+There is no longer a second implementation to reconcile with: Fluxor's `quic`
+has shed its own `qpack.rs` and `h3.rs` responder, so QPACK exists once in the
+stack, here. See `docs/architecture/http3-ownership.md`.

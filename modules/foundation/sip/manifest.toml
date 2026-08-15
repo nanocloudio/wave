@@ -64,5 +64,3 @@ access = "read"
 [observability]
 exempt = "signalling module — media throughput is observed at the rtp transport"
 
-[test]
-harness = "tests/harness.rs"

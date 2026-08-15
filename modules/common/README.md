@@ -18,7 +18,9 @@ also that no core sits here unmounted.
 | `jitter_core` | Bounded RTP reorder window + loss-concealing playout | `sip` |
 | `rtp_core` | RFC 3550 header decode — fixed header, CSRC list, §5.3.1 extension, §5.1 padding — and therefore which bytes of a packet are payload | `rtp`, `sip` |
 | `smtp_core` | RFC 5321 reply-line parsing, dot-stuffed command builders, lockstep submission phase machine | `smtp` |
-| `hex_core` | ASCII hex, for byte-valued module parameters | `websocket`, `smtp` |
+| `hex_core` | ASCII hex, for byte-valued module parameters | `websocket`, `smtp`, `s3` |
+| `s3_core` | AWS SigV4 request signing for S3-compatible endpoints — canonical-form construction and key derivation over SDK-owned SHA-256/HMAC | `s3` |
+| `s3_wire` | The connector's request/response records (`S3Request`/`S3Response`) — the client-side mirror of `http`'s application fan-out | `s3` |
 
 SHA-1 (`Sec-WebSocket-Accept`) and Base64 (the key nonce and accept proof) are
 **Fluxor SDK-owned**, mounted from `target/fluxor/fluxor-abi/sdk/crypto/`. Wave

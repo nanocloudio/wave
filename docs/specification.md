@@ -3,7 +3,7 @@
 ## Definition
 
 Wave is the Fluxor-native home for portable application-protocol capabilities —
-HTTP, WebSocket, gRPC, RTP, SIP and SMTP — in both client and server roles. It
+HTTP, WebSocket, gRPC, RTP, SIP, SMTP and S3 — in both client and server roles. It
 exists so applications consume bounded protocol modules without Fluxor becoming
 the owner of application or session protocol semantics.
 
@@ -35,6 +35,8 @@ Wave owns:
   packetization, depacketization, and bounded session state;
 - RFC 3261 subset dialog transaction mechanics and receive-side jitter recovery;
 - RFC 5321 submission-client mechanics;
+- S3 object-request mechanics — SigV4 canonical-form construction, the signing
+  key chain, and the request/response records that carry one operation;
 - protocol feature/variant declarations and target constraints;
 - the shared I/O-free codec cores in `modules/common`, `include!`d verbatim so
   host and device compile identical bytes;
@@ -74,10 +76,10 @@ API. WebSocket protocol logic consumes an HTTP upgrade and exposes `WsFrame`;
 
 ## Modules
 
-Roles are not uniform. `http` is server and client; `websocket` and `smtp` are
-clients only; `ws_stream` is an adapter; `rtp` and `sip` are peer user agents.
-Nothing in this document promises a server for every protocol that has a client,
-or the reverse.
+Roles are not uniform. `http` is server and client; `websocket`, `smtp` and `s3`
+are clients only; `ws_stream` is an adapter; `rtp` and `sip` are peer user
+agents. Nothing in this document promises a server for every protocol that has a
+client, or the reverse.
 
 ### `http`
 
@@ -147,6 +149,22 @@ recipient per instance — which suits a trusted relay or sink behind a security
 boundary and does not suit a public MX. As everywhere in Wave, TLS is a Fluxor
 module wired in front.
 
+### `s3`
+
+A SigV4-signed client for S3-compatible object endpoints: GET, PUT, HEAD and
+DELETE on `/bucket/key`, each signed with the payload hashed in. It earns a
+compiled module for a reason none of the others share — not round-trip count,
+which is one, but crypto: the `Authorization` header is an HMAC chain over a
+canonical form of the request, and a bytecode codec cannot compute it. SHA-256
+is SDK-owned, as `websocket`'s SHA-1 is.
+
+Two modes, chosen by whether `request_in` is wired: driven, one operation per
+`S3Request` record answered with an `S3Response`; and probe, which signs a
+ListBuckets on boot and reports the status, as the cheapest proof that
+credentials work against a real endpoint. Which bucket backs which namespace,
+and what a key denotes, are the consumer's — Wave owns the wire mechanics and
+the signature.
+
 ## HTTP/3 status
 
 Every module must declare where a listed surface is not yet a working path, since
@@ -162,9 +180,10 @@ repeatedly, and two requests multiplexed on one connection are both answered.
 The boundary is the one drawn above — Wave owns HTTP/3 request/response semantics
 and QPACK, Fluxor owns QUIC transport, streams and packet protection — and the
 seam is Fluxor's `mux` contract, which names QUIC as its canonical provider.
-`quic` gained one parameter (`h3_app`) to let an h3 connection use it; `http`
-gained one (`h3`) to consume it. No new content type, no new ports, no ABI
-change. See [`architecture/http3-ownership.md`](architecture/http3-ownership.md).
+An h3 ALPN is the whole configuration: `quic` surfaces the request streams and
+`http` consumes them with `h3 = 1`. No new content type, no new ports, no ABI
+change. `quic` no longer carries an HTTP/3 implementation of its own, so QPACK
+exists once in the stack rather than twice. See [`architecture/http3-ownership.md`](architecture/http3-ownership.md).
 
 Implemented and tested: the RFC 9114 frame layer; QPACK including Huffman-coded
 names and values; the request header decoder with the §4.3 message rules; RFC
@@ -184,13 +203,17 @@ through `server::cur_slot_mut` — file handles, relay connection state. Dispatc
 reports `HandlerNotShared(id)` for those rather than serving one concurrent
 request correctly and the rest wrongly.
 
-**Deliberately duplicated**: Fluxor's `quic` keeps its own `h3.rs`, `qpack.rs` and
-`ws.rs`. That is not a copy awaiting deletion — it carries an h3 *client*, which
-Wave does not have, and it is how Fluxor self-tests its transport without
-depending on Wave. Wave's h3 is the server applications use; `quic`'s is a
-transport self-test and a client. The RFC 7541 Huffman table is the part worth
-sharing, and it has to travel through the Fluxor SDK to point the right way down
-the dependency graph.
+**Client and server both.** Wave's h3 client rides the same `mux` contract the
+server does, so the transport stays protocol-free in both directions.
+
+The duplicate HTTP/3 in Fluxor's `quic` is therefore now scheduled for removal
+rather than kept: the boundary is *all HTTP logic here, QUIC below*, and the two
+arguments that previously held the copy in place have both lapsed — the client
+one because Wave has a client, and the self-test one because proving a transport
+is a job for a `mux`-level fixture rather than for a second HTTP server. The
+sequencing constraint is that the replacement self-test lands FIRST: Fluxor must
+stay able to prove its own transport using only Fluxor, and the dependency
+direction forbids reaching through Wave to do it.
 
 ## Transport and security boundary
 

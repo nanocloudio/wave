@@ -1,0 +1,59 @@
+version          = "0.1.0"
+hardware_targets = ["bcm2712"]
+timer_class      = "wall_clock"
+
+[[ports]]
+name         = "net_in"
+direction    = "input"
+content_type = "NetProto"
+buffer_size  = 2048
+
+[[ports]]
+name         = "net_out"
+direction    = "output"
+content_type = "NetProto"
+buffer_size  = 2048
+max_record   = 1600
+
+[[ports]]
+name         = "status_out"
+index        = 1
+direction    = "output"
+content_type = "TextPlain"
+buffer_size  = 2048
+
+# Driven mode: one S3 operation per record, answered on `response_out`. The
+# client-side mirror of wave's HTTP application fan-out — there a graph node
+# ANSWERS requests a gateway hands it, here a graph node ISSUES requests a
+# connector performs. Both ports unwired = the boot ListBuckets probe, which is
+# what `examples/s3_client/` runs.
+#
+# `OctetStream` rather than a registered content type on purpose: a new entry in
+# Fluxor's CONTENT_TYPES moves the ABI surface digest and forces a coordinated
+# rebuild of every .fmod in every workspace member. Two modules that already
+# agree on a layout do not earn that cost — the same call `body_store` and
+# `object_index` made.
+#
+# Layouts in modules/common/s3_wire.rs:
+#   S3Request  [op][cid:u32][bucket_len:u16][key_len:u16][body_len:u32][…]
+#   S3Response [op][cid:u32][status:u16][body_len:u32][body]
+[[ports]]
+name         = "request_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 32768
+
+[[ports]]
+name         = "response_out"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 32768
+
+[[resources]]
+requires_contract = "channel"
+access            = "read"
+
+[observability]
+exempt = "S3/SigV4 connector; throughput is observed at the network provider"

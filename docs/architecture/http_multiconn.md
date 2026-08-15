@@ -180,8 +180,11 @@ and bounded body handling, and something else owns what the request MEANS.
 
 `drain_responses` routes an envelope by `(conn_id, stream_id)` — never
 `conn_id` alone, because h2 multiplexes many requests over one connection and
-an application is entitled to answer them out of order. Under h1 `stream_id` is
-always 0. If the target slot's `send_buf` is busy, the envelope is written back
+an application is entitled to answer them out of order. Under h1 `stream_id`
+carries a request generation instead: a connection released with a request
+still outstanding is followed by a new peer holding the same recycled id, and
+pinning the field to 0 made the late answer match the new peer's request
+exactly. Applications echo the field back in both cases. If the target slot's `send_buf` is busy, the envelope is written back
 to `resp_in` and retried next tick, the same backpressure the WS fan-out uses;
 unlike WS fan-out there is NO retention, since replaying a previous response to
 a new request would answer request N with response N-1.
@@ -214,10 +217,12 @@ byte-streaming FIFO, which fragments structured records. See
   fallback (`legacy_mode == 2`) serialises all requests through
   the slot phase machine. Multi-conn parallelism applies; the file
   channel is the bottleneck.
-- **`MAX_CONCURRENT_CONNS` capped at 256** — the net-protocol wire
-  format carries `conn_id` as a single byte. Lifting the cap
-  requires widening `conn_id` end-to-end across IP + HTTP +
-  ws_stream.
+- **`MAX_CONCURRENT_CONNS` set to 256** — no longer a wire limit. `conn_id` is
+  a `u16` on the net-protocol surface, so the id space allows 65,535; the 256 is
+  now a memory decision (slot table plus `ARENA_WORKING_SET_CONNS` of buffers)
+  and raising it is a sizing question rather than a flag-day. The two are worth
+  keeping distinct: the shed counters report slot exhaustion and arena
+  exhaustion separately precisely because they are different ceilings.
 - **Per-instance `H2State`** is large (`MAX_STREAMS` ×
   `StreamSlot`). On embedded targets only one slot exists, so the
   cost is bounded; on host targets it scales with `ARENA_WORKING_SET_CONNS`.

@@ -43,28 +43,30 @@ the protocol, so the same protocol code serves both schemes. The h3 analogue is
 that shape with a different contract on the seam:
 
 ```text
-linux_net  <--UDP-->  quic (h3_app=1)  <--mux stream records-->  http (h3=1)
+linux_net  <--UDP-->  quic (alpn=h3)  <--mux stream records-->  http (h3=1)
 ```
 
 ## What each side does
 
-**Fluxor `quic`** takes one parameter, `h3_app`. With it set, an ALPN-negotiated
-h3 connection surfaces its REQUEST streams over `mux` instead of answering them
-from its own table. The connection preamble — the h3 control and QPACK
-unidirectional streams, and SETTINGS — stays in `quic`: stream-type plumbing is
-transport-adjacent, and the client mode needs it regardless. Only request streams
-cross the seam.
+**Fluxor `quic`** surfaces every REQUEST stream on an ALPN-negotiated h3
+connection over `mux`. This is not a mode — it is what the transport does, and
+there is no alternative path, because there is no longer a responder to take.
+The connection preamble — the h3 control and QPACK unidirectional streams, and
+SETTINGS — stays in `quic`: stream-type plumbing is connection-scoped and no
+request can flow before it. Only request streams cross the seam.
 
 **Wave `http`** takes `h3 = 1`, which routes `module_step` to the mux pump instead
-of the net_proto server loop. Decode, dispatch and response framing are I/O-free
+of the net_proto server loop. The same pump carries the h3 CLIENT: a client
+request opens a mux stream and rides the identical contract, so the transport
+stays protocol-free in both directions. Decode, dispatch and response framing are I/O-free
 — no syscalls, no channels, no clock — so the protocol is testable without a
 socket, which is why the concurrency tests can exist at all.
 
-## Why the protocol does not belong in the transport
+## Why the protocol did not belong in the transport
 
-Not because the transport is incapable. `quic`'s own HTTP/3 responder handles
-concurrent bidi streams and accumulates POST bodies. The reason is what it
-serves:
+Not because the transport was incapable. `quic`'s HTTP/3 responder handled
+concurrent bidi streams and accumulated POST bodies. The reason was what it
+served:
 
 > `/// Server-side: hardcoded route table.` `GET /` returns "hello h3"; anything
 > else returns 404.
@@ -74,9 +76,9 @@ to have when bringing up QUIC, and not an HTTP server. Serving real content need
 routes, static/template/file/proxy handlers, dynamic route updates, content
 types, request spans, range requests, and documented deviations against all of
 it. That exists in Wave's `http`, which already owns HTTP/1.1 and HTTP/2. So the
-question is not who *could* implement HTTP/3, but whether the protocol should be
-implemented twice — about 2,500 lines across `h3.rs`, `qpack.rs` and `ws.rs` are
-carried in both places today, and a fix to either QPACK does not reach the other.
+question was never who *could* implement HTTP/3, but whether the protocol should
+be implemented twice — about 2,500 lines across `h3.rs`, `qpack.rs` and `ws.rs`
+were carried in both places, and a fix to either QPACK did not reach the other.
 
 ## Status: served end to end
 
@@ -125,37 +127,72 @@ finds nothing, and reports the board answering ~14 s later rather than replying
 from the previous kernel. The kernel side is clean — no PANIC, no `rc=-110`, no
 dropped frames, `bna=0 ovr=0`.
 
-The scenario is also proven able to **fail**, which matters more than the pass.
-Flipping the graph to `h3_app: 0` + `enable_h3: 1` leaves the board serving
-HTTP/3 perfectly well — from `quic`'s hardcoded fixture — and the run fails with
-`body=b'hello h3\n' lacks 'wave h3 on pi5'`. A scenario asserting only "200 OK"
-would have passed that, while measuring the wrong implementation.
+The scenario was also proven able to **fail**, which matters more than the pass.
+While `quic` still had its responder, flipping the graph to `h3_app: 0` +
+`enable_h3: 1` left the board serving HTTP/3 perfectly well — from the hardcoded
+fixture — and the run failed with `body=b'hello h3\n' lacks 'wave h3 on pi5'`. A
+scenario asserting only "200 OK" would have passed that, while measuring the
+wrong implementation. That particular substitution is no longer constructible,
+which is the point of removing the fixture, but the assertion stays as written:
+it is what distinguishes serving content from answering a request.
 
-## The duplication stays, and the boundary is narrower than it looks
+## The duplication is gone
 
-`quic`'s HTTP/3 is not a copy awaiting deletion. Two reasons:
+**Decision, now carried out: all HTTP logic is Wave's, QUIC is Fluxor's.** `quic`
+has shed `qpack.rs` and `ws.rs` entirely, its hardcoded three-entry route table,
+its client request path, and the `h3.request` span — roughly 2,500 lines. `h3.rs`
+survives at a fifth of its former size, holding the connection preamble alone:
+frame header build/parse and the control-stream SETTINGS / GOAWAY /
+PRIORITY_UPDATE codecs. What `quic` keeps is packets, keys, recovery, congestion
+control and stream lifecycle. The seam did not move; it was already the right
+one.
 
-1. **It has a client side.** `h3_encode_request_headers`, the client request path
-   and `quic_h3_client.yaml` have no counterpart in Wave, whose h3 is server-only.
-   Removing them would delete a capability nothing replaces.
-2. **It is Fluxor's QUIC self-test, and the dependency direction forbids the
-   alternative.** Six paired example graphs (server/client, ws, concurrent) let
-   Fluxor prove its transport carries an HTTP/3 exchange using only Fluxor. Wave
-   depends on Fluxor, never the reverse, so Fluxor cannot test `quic` through
-   Wave's `http`. Deleting the responder would leave the transport testable only
-   from another repository.
+This reversed what this document previously concluded, and it is worth being
+explicit about why, because the earlier reasoning was sound on the facts it had:
 
-So the split is:
+1. **"It has a client side."** It did, and Wave did not. Wave now does —
+   `step_mux_client` rides the same mux contract the server does — so keeping a
+   second HTTP/3 to preserve a capability no longer preserves anything.
+2. **"It is Fluxor's QUIC self-test, and the dependency direction forbids the
+   alternative."** The dependency direction is unchanged and still forbids
+   testing `quic` through Wave. What changed is the recognition that this is a
+   *testing* requirement, not an ownership one, and it is satisfied by a
+   fixture at the `mux` layer — the surface `quic` actually exposes — rather
+   than by a second HTTP server maintained for the purpose.
 
-- **Wave's h3 is the server** applications use — routes, handlers, spans,
-  everything an HTTP server is. `h3_app = 1` selects it.
-- **`quic`'s h3 is a transport self-test and an h3 client.** Its hardcoded
-  three-entry table is the right size for that job.
+**The replacement self-test landed before the deletion, not after.** That was
+the one hard ordering constraint: Fluxor must remain able to prove its own
+transport carries a multiplexed exchange using only Fluxor, and a window where
+that is untrue is a window where a QUIC regression has nothing to catch it. The
+replacement is `mux_echo` driven by `quic_mux_loopback.yaml` and gated by
+`../fluxor/tests/harness/tests/quic_mux_selftest.rs` — a real loopback handshake, a real
+multiplexed exchange, asserted on the property a transport actually owes its
+application: bytes come back on the stream they were sent on, byte for byte, and
+the exchange repeats rather than working once and wedging.
 
-What is worth deduplicating is the RFC 7541 Huffman table, which exists in Wave's
-`modules/common/huffman_core.rs` and again in `quic`'s `qpack.rs`. Sharing it has
-to go through Fluxor's SDK, because that is the one source both sides already
-`include!` and it points the right way down the dependency graph.
+The peer's own limits cross the seam too, in the other direction. They arrive
+on the h3 control stream, which only the transport reads, but every one of them
+constrains how a REQUEST is encoded — so `quic` forwards them as
+`MSG_MUX_PEER_SETTINGS` and Wave enforces them. Two details decide whether that
+is safe: an ABSENT `SETTINGS_MAX_FIELD_SECTION_SIZE` means unlimited while an
+advertised `0` forbids header sections outright, so the unset state is a
+`u32::MAX` sentinel rather than a zero that would silently refuse every
+response; and the wire type is a varint up to 2^62 against a `u32` field, where
+truncating `2^32` yields `0` and wedges the connection, so it saturates. Both
+are gated, and both gates were verified by mutation.
+
+Two further gates hold the line now that the code is out.
+`../fluxor/tests/harness/tests/quic_telemetry.rs` asserts `quic.connection` is the ONLY
+span the transport emits, so a protocol span cannot reappear below Wave's and
+start double-counting requests. And the retired parameter tags — 8
+(`enable_ws`), 10 (`enable_concurrent_bidi`), 13 (`h3_app`) — are recorded as
+retired rather than reused, so a graph still carrying one gets a clean
+"unknown param" from the composer instead of silently binding to whatever
+took the tag.
+
+With `quic` carrying no QPACK, the RFC 7541 Huffman table has one home and the
+"share it through the SDK to point the right way down the dependency graph"
+workaround is unnecessary.
 
 ## Open
 
@@ -163,4 +200,11 @@ to go through Fluxor's SDK, because that is the one source both sides already
   cursor through `server::cur_slot_mut` — file handles, relay connection state —
   so dispatch reports `HandlerNotShared(id)` rather than serving one concurrent
   request correctly and the rest wrongly.
-- **Client-side h3 is untouched.** `quic`'s client path owns it.
+- **File and proxy routes answer 501 over h3, and that is the end state for
+  now.** They are single-in-flight by construction — `render_file_into` pulls
+  from ONE module-scoped `file_chan`, and the proxy threads a relay connection —
+  so "sharing" them with h3 would serialise every stream on a connection behind
+  one file, which is worse than not offering them. Per-stream file channels are
+  a storage-contract change, not an h3 one. Until then the answer is a 501 with
+  a body naming the situation, plus `http.h3.handler_unavailable`, so it reads
+  as the configuration fact it is.

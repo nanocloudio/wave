@@ -31,5 +31,3 @@ content_type = "OctetStream"
 [observability]
 exempt = "outbound mail-submission connector — throughput is the transport's (net) concern; this module runs one lockstep delivery conversation"
 
-[test]
-harness = "tests/harness.rs"

@@ -7,7 +7,7 @@
 # Driven by tools/peers/sip_ua.py, which is a PEER, NOT AN ORACLE: no independent
 # SIP implementation is installable on this host (no sipp/pjsua/baresip; aiosip
 # is dead on Python 3.13). Byte-level SIP correctness is pinned by
-# modules/foundation/sip/tests/sip_vectors.rs and modules/foundation/sip/tests/sip_dialog_vectors.rs against the origin
+# tests/harness/tests/sip_vectors.rs and tests/harness/tests/sip_dialog_vectors.rs against the origin
 # implementation. What this asserts is the system property those cannot reach:
 # a call is answered, the answer's SDP names a port audio actually arrives on,
 # audio comes back out, and BYE ends it.
@@ -15,7 +15,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FLUXOR_ROOT="${FLUXOR_ROOT:-$ROOT/../fluxor}"
-RUNTIME="${WAVE_LINUX_RUNTIME:-$FLUXOR_ROOT/target/aarch64-unknown-linux-gnu/debug/fluxor-linux}"
+# Prefer the runtime `fluxor sync` materialises into THIS checkout: it is pinned
+# by fluxor.lock, so it is the one the modules were built against. A sibling
+# checkout is the fallback, for a working-on-both-repos setup where a local
+# debug build is the point.
+SYNCED_RUNTIME="$ROOT/target/aarch64-unknown-linux-gnu/release/fluxor-linux"
+if [ -n "${WAVE_LINUX_RUNTIME:-}" ]; then
+  RUNTIME="$WAVE_LINUX_RUNTIME"
+elif [ -x "$SYNCED_RUNTIME" ]; then
+  RUNTIME="$SYNCED_RUNTIME"
+else
+  RUNTIME="$FLUXOR_ROOT/target/aarch64-unknown-linux-gnu/debug/fluxor-linux"
+fi
 DUT_SIP_PORT=5062
 UA_SIP_PORT=5061
 UA_RTP_PORT=5010

@@ -11,6 +11,9 @@ without assigning replacement identifiers.
 | `FmpMessage` | Structured control records | `http` (`variables`), `sip` (`call`) |
 | `Telemetry` | Observability records | `ws_stream` |
 | `AudioEncoded` | Codec-domain audio access units | not consumed — see below |
+| `HttpRequest` / `HttpResponse` | The application fan-out envelopes | `http` (`req_out`/`resp_in`) |
+| `S3Request` / `S3Response` | One object operation and its answer | `s3` (`request_in`/`response_out`) |
+| `TextPlain` | Human-readable status lines | `s3`, `smtp` (`status_out`) |
 
 Two surfaces are carried *over* ports rather than declared as port types. The
 `mux` contract (`0xB0..0xCF`, disjoint from `NetProto`) delivers QUIC request

@@ -86,9 +86,9 @@ requires an explicit future capability and is never implied by an RTP binding
 
 ## Coverage
 
-- **L0** — the cores are vector-tested in this module's own lane (run
-  by `fluxor modules test`): `modules/foundation/sip/tests/sip_vectors.rs` (9), `modules/foundation/sip/tests/sip_dialog_vectors.rs`
-  (11), `tests/jitter_vectors.rs` (11), plus the hostile-input sweep in
+- **L0** — the cores are vector-tested in the host harness:
+  `tests/harness/tests/sip_vectors.rs`, `tests/harness/tests/sip_dialog_vectors.rs`,
+  `tests/harness/tests/sip_jitter_vectors.rs`, plus the hostile-input sweep in
   `tests/harness/tests/codec_bounds_sweep_cores.rs`.
 - **L1** — `tests/harness/tests/sip.rs` drives the wrapper through
   `sip_harness`, which plays both the peer UA and the far-end media source:

@@ -129,7 +129,7 @@ pub(crate) struct StreamSlot {
     /// generation.
     pub(crate) method_kind: u8,
     pub(crate) end_stream_in: u8,
-    pub(crate) req_path_len: u8,
+    pub(crate) req_path_len: u16,
     /// 1 = a per-stream WINDOW_UPDATE owes peer, queued by the active
     /// loop the next time `send_buf` is free.
     pub(crate) window_update_pending: u8,
@@ -582,6 +582,24 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         sweep_app_timeouts(s);
         if cur_send_len(s) > 0 {
             return 0;
+        }
+    }
+
+    // Retry any stream left Pending because the resource it needed was busy.
+    //
+    // Dispatch is otherwise driven by events — a frame arriving, an emission
+    // completing — and a stream deferred by a full `req_out` ring has neither
+    // coming. On an idle connection it was stranded: never dispatched, never
+    // answered, and never even timed out, because the deadline is latched when
+    // the request is SENT and this one never was. The client waited out its own
+    // timeout against a server that had accepted the request and simply stopped.
+    //
+    // Cheap: `try_dispatch_pending` returns immediately when nothing is Pending,
+    // which is the steady state.
+    if cur_send_len(s) == 0 && cur_h2(s).sub == Sub::Active {
+        try_dispatch_pending(s);
+        if cur_send_len(s) > 0 {
+            return 2;
         }
     }
 
@@ -1127,6 +1145,10 @@ unsafe fn handle_headers(
     let slot_idx = alloc_slot(s, hdr.stream_id);
     if slot_idx < 0 {
         // Stream table full — refuse this stream, leave existing ones alone.
+        // Counted: a client outrunning `MAX_STREAMS` is a normal floor rather
+        // than a fault, but it is indistinguishable from a stuck stream table
+        // unless the refusals are visible.
+        s.server.h2_streams_refused = s.server.h2_streams_refused.wrapping_add(1);
         let n = h2w::write_rst_stream(
             cur_send_buf_mut_ptr(s),
             hdr.stream_id,
@@ -1154,10 +1176,10 @@ unsafe fn handle_headers(
     let mut method_kind: u8 = 0;
     let mut protocol_ws: u8 = 0;
     let mut path_buf = [0u8; MAX_PATH];
-    let mut path_len: u8 = 0;
+    let mut path_len: u16 = 0;
     let mk_ptr = &mut method_kind as *mut u8;
     let pr_ptr = &mut protocol_ws as *mut u8;
-    let pl_ptr = &mut path_len as *mut u8;
+    let pl_ptr = &mut path_len as *mut u16;
     let pb_ptr = path_buf.as_mut_ptr();
 
     // Non-pseudo header fields are re-serialised as they decode, into a heap
@@ -1187,7 +1209,7 @@ unsafe fn handle_headers(
                 *pb_ptr.add(i) = value[i];
                 i += 1;
             }
-            *pl_ptr = n as u8;
+            *pl_ptr = n as u16;
         } else if bytes_eq(name, b":protocol") && bytes_eq(value, b"websocket") {
             *pr_ptr = 1;
         } else if !name.is_empty() && name[0] != b':' && !hb_ptr.is_null() {
@@ -1473,7 +1495,7 @@ unsafe fn accept_ws_upgrade(s: &mut HttpState, slot_idx: i8) {
     let stream_ptr = cur_h2(s).streams.as_ptr().add(slot_idx as usize);
     let plen = (*stream_ptr).req_path_len as usize;
     if let Some(cur) = super::cur_slot_mut(s) {
-        cur.req_path_len = plen as u8;
+        cur.req_path_len = plen as u16;
         let mut i = 0usize;
         while i < plen {
             cur.req_path[i] = (*stream_ptr).req_path[i];
@@ -1658,7 +1680,11 @@ unsafe fn queue_ws_close(s: &mut HttpState, code: u16) {
 /// the body cache. Called after HEADERS / DATA arrival and after each
 /// body completes.
 unsafe fn try_dispatch_pending(s: &mut HttpState) {
-    loop {
+    // Bounded by the stream table: each pass either advances a slot out of
+    // Pending or returns. The explicit cap is defence in depth — this loop runs
+    // inside `module_step`, and a module_step that does not return is not a hung
+    // task on a device with no allocator and no unwinding, it is the device.
+    for _ in 0..MAX_STREAMS {
         let mut chosen: i8 = -1;
         let mut i = 0u8;
         while (i as usize) < MAX_STREAMS {
@@ -1683,6 +1709,26 @@ unsafe fn try_dispatch_pending(s: &mut HttpState) {
         // frames), in which case we should bail and let the flush
         // happen.
         if cur_send_len(s) > 0 {
+            return;
+        }
+        // A dispatch that left the slot Pending made NO progress: the resource
+        // it needs is unavailable this tick. Re-picking it is not a retry, it
+        // is the same call with the same inputs and the same outcome — this
+        // loop selects the lowest-indexed Pending slot, so it would choose that
+        // slot again forever without ever returning from `module_step`.
+        //
+        // The reachable case is HANDLER_APP: `req_out` is a mailbox holding one
+        // envelope, so the second of two concurrent streams dispatching to an
+        // application gets `Full`, stays Pending by design, and used to spin the
+        // connection — and the whole graph — until power was cycled. Two
+        // concurrent streams to an application route is not an edge case; it is
+        // what HTTP/2 is for.
+        //
+        // Leaving it Pending is right; retrying it NEXT TICK is right. Retrying
+        // it in this one is what hangs.
+        let still_pending =
+            (*cur_h2(s).streams.as_ptr().add(chosen as usize)).state == SlotState::Pending;
+        if still_pending {
             return;
         }
         // Else loop and try to dispatch more inline streams.
@@ -1724,7 +1770,7 @@ unsafe fn dispatch_request(s: &mut HttpState, slot_idx: i8) {
     // there.
     let stream_ptr = cur_h2(s).streams.as_ptr().add(slot_idx as usize);
     if let Some(cur) = super::cur_slot_mut(s) {
-        cur.req_path_len = plen as u8;
+        cur.req_path_len = plen as u16;
         let mut i = 0;
         while i < plen {
             cur.req_path[i] = (*stream_ptr).req_path[i];
@@ -1984,6 +2030,7 @@ pub(crate) unsafe fn sweep_app_timeouts(s: &mut HttpState) {
             let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(i as usize);
             slot.app_pending = 0;
             let stream_id = slot.id;
+            s.server.app_timeouts = s.server.app_timeouts.wrapping_add(1);
             emit_response(s, stream_id, b"504", b"text/plain", b"Gateway Timeout\n");
             free_slot(s, i as i8);
             // One per pass: `emit_response` fills `send_buf`, and a second
@@ -2322,7 +2369,7 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
     if s.net_out_chan < 0 {
         return 0;
     }
-    let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+    let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 2;
     let to_send = len.min(max_data);
     if to_send == 0 {
         return 0;
@@ -2332,12 +2379,14 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
     let chan = s.net_out_chan;
     let conn_id = cur_conn_id(s);
     let scratch = s.net_buf.as_mut_ptr();
-    let payload_len = 1 + to_send;
+    let payload_len = 2 + to_send;
+    let cb = conn_id.to_le_bytes();
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(3) = conn_id;
-    core::ptr::copy_nonoverlapping(data, scratch.add(4), to_send);
+    *scratch.add(3) = cb[0];
+    *scratch.add(4) = cb[1];
+    core::ptr::copy_nonoverlapping(data, scratch.add(5), to_send);
     let total = NET_FRAME_HDR + payload_len;
     let written = (sys.channel_write)(chan, scratch, total);
     if written >= total as i32 {

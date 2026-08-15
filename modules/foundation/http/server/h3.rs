@@ -30,10 +30,19 @@
 //! which models ONE TCP connection with ONE request in flight. HTTP/3 has
 //! many concurrent streams per connection, so sharing those renderers means
 //! giving them a stream-scoped cursor instead of a connection-scoped one.
-//! [`dispatch_request`] returns `HandlerNotShared(id)` for those rather than
-//! serving one concurrent request correctly and the rest wrongly.
+//! [`dispatch_request`] answers those with a **501** — the route exists and is
+//! understood, this generation cannot fulfil it (RFC 9110 §15.6.2) — rather
+//! than serving one concurrent request correctly and the rest wrongly. The
+//! handler id rides along so `http.h3.handler_unavailable` and the log can name
+//! which one, since a 501 only the client sees is a misconfiguration nobody
+//! operating the server can find.
 //!
-//! # Phase E — WebSocket over HTTP/3 (RFC 9220)
+//! For the file handler in particular, "sharing" would not even be an
+//! improvement: `render_file_into` pulls from ONE module-scoped `file_chan`, so
+//! every stream on the connection would serialise behind one file. Per-stream
+//! file channels are a storage-contract change, not an h3 one.
+//!
+//! # WebSocket over HTTP/3 (RFC 9220)
 //!
 //! RFC 9220 reuses RFC 8441's extended-CONNECT machinery wholesale:
 //! the request carries `:method = CONNECT`, `:protocol = websocket`,
@@ -192,12 +201,22 @@ impl H3StreamSlot {
 pub struct H3State {
     pub slots: [H3StreamSlot; MAX_H3_STREAMS],
     pub emit_cursor: u8,
-    pub control_stream_seen: bool,
-    pub qpack_encoder_stream_seen: bool,
-    pub qpack_decoder_stream_seen: bool,
-    pub settings_received: bool,
-    pub goaway_sent: bool,
-    pub max_field_section_size: u64,
+    /// The peer's limits, delivered by the transport over
+    /// `MSG_MUX_PEER_SETTINGS`. They arrive on the h3 CONTROL stream, which is
+    /// the transport's to read — but they bind us, because we are what encodes
+    /// the header sections.
+    ///
+    /// Until one arrives these hold the spec defaults, and that is the correct
+    /// standing state rather than a "not ready" flag: a transport that carries
+    /// no connection-scoped settings never emits the event, and RFC 9114's
+    /// default for an absent `SETTINGS_MAX_FIELD_SECTION_SIZE` is unlimited.
+    pub peer_settings_seen: bool,
+    /// `u32::MAX` = no limit advertised. Distinct from an advertised `0`, which
+    /// forbids header sections outright — hence the sentinel rather than
+    /// treating 0 as "unset", which would silently ignore that instruction.
+    pub peer_max_field_section: u32,
+    /// The peer advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` (RFC 9220 §3).
+    pub peer_enable_connect: bool,
 }
 
 impl H3State {
@@ -210,12 +229,9 @@ impl H3State {
                 H3StreamSlot::empty(),
             ],
             emit_cursor: 0,
-            control_stream_seen: false,
-            qpack_encoder_stream_seen: false,
-            qpack_decoder_stream_seen: false,
-            settings_received: false,
-            goaway_sent: false,
-            max_field_section_size: 0,
+            peer_settings_seen: false,
+            peer_max_field_section: u32::MAX,
+            peer_enable_connect: false,
         }
     }
 }
@@ -513,6 +529,32 @@ pub fn encode_response_headers(status: &[u8], fields: &[(&[u8], &[u8])], out: &m
     off
 }
 
+/// The size RFC 9114 §4.2.2 counts a field section as, for the purpose of
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE`: the sum over fields of
+/// `name.len() + value.len() + 32`, on the UNCOMPRESSED values.
+///
+/// The +32 per field is not padding — it is the spec's allowance for a
+/// decoder's per-entry overhead, and omitting it under-counts every section by
+/// 32 bytes per header, which is exactly enough to sail past a tight limit and
+/// have the peer reject a response we measured as fitting.
+pub fn field_section_size(status: &[u8], fields: &[(&[u8], &[u8])]) -> usize {
+    // `:status` is a field like any other for this calculation.
+    let mut total = b":status".len() + status.len() + 32;
+    for (name, value) in fields {
+        total += name.len() + value.len() + 32;
+    }
+    total
+}
+
+/// Whether a response's field section is within what the peer will accept.
+///
+/// `u32::MAX` means the peer advertised no limit. A `0` limit is real and
+/// forbids every section, including a bare `:status` — which is why this is a
+/// comparison against a sentinel rather than a `limit == 0` short-circuit.
+fn fits_peer_field_limit(limit: u32, status: &[u8], fields: &[(&[u8], &[u8])]) -> bool {
+    limit == u32::MAX || field_section_size(status, fields) as u64 <= u64::from(limit)
+}
+
 /// Frame a complete response — HEADERS then DATA — into `out`.
 ///
 /// Returns bytes written, or 0 if it does not fit whole. Partial output is
@@ -592,14 +634,63 @@ pub enum H3Dispatch {
     NotFound(usize),
     /// The route matched, but its handler needs the per-connection slot
     /// machinery that only the h1/h2 path has today (`cur_slot_mut`, the
-    /// chunked renderers, the file/proxy state). Carries the handler id so the
-    /// caller can say which, rather than reporting a generic failure.
-    HandlerNotShared(u8),
+    /// chunked renderers, the file/proxy state).
+    ///
+    /// A **501 response IS written** — `n` bytes — and the handler id rides
+    /// along so the caller can name which one in a log and a counter. It used
+    /// to reset the stream instead, which is the wrong answer twice over: a
+    /// reset is indistinguishable from a transport fault, so an operator who
+    /// configured a file route and reached it over HTTP/3 saw a connection
+    /// problem rather than a configuration one; and RFC 9110 §15.6.2 has a
+    /// status that means exactly this — the server does not support the
+    /// functionality required to fulfil the request.
+    HandlerNotShared(usize, u8),
     /// The response does not fit `out`. Nothing is written.
     TooLarge,
+    /// The peer advertised a `SETTINGS_MAX_FIELD_SECTION_SIZE` smaller than the
+    /// response's field section (RFC 9114 §4.2.2). Nothing is written.
+    ///
+    /// Refusing is the better failure. Sending it anyway is not "best effort":
+    /// the peer is entitled to treat an over-limit section as malformed and
+    /// reset the stream, so the request fails either way — but it fails with a
+    /// QPACK/frame error at the client, which points at the encoder rather than
+    /// at the limit the client itself set.
+    PeerFieldLimit,
     /// RFC 9220 extended CONNECT accepted: `n` bytes of a 200 response with no
     /// body are written, and the stream becomes a WebSocket tunnel.
     WebSocketAccepted(usize),
+}
+
+/// Render the 501 an unshared handler gets.
+///
+/// The body names the situation rather than saying "error": whoever sees this
+/// configured a route that works over HTTP/1.1 and HTTP/2 and reached it over
+/// HTTP/3, and the useful thing to tell them is which of those two facts to act
+/// on. `Not Implemented\n` alone would send them looking for a missing feature
+/// in their own client.
+///
+/// Field literals go through stack buffers for the same PIC reason the 404 path
+/// documents below — a const array of fat pointers needs relocation the loader
+/// does not apply, and dereferencing it on device segfaults.
+unsafe fn not_implemented(peer_limit: u32, handler: u8, out: &mut [u8]) -> H3Dispatch {
+    let mut status = [0u8; 3];
+    status.copy_from_slice(b"501");
+    let mut name = [0u8; 12];
+    name.copy_from_slice(b"content-type");
+    let mut ctype = [0u8; 10];
+    ctype.copy_from_slice(b"text/plain");
+    let mut body = [0u8; 42];
+    body.copy_from_slice(b"Handler not available over HTTP/3 for this");
+    let fields = [(&name[..], &ctype[..])];
+    if !fits_peer_field_limit(peer_limit, &status, &fields) {
+        return H3Dispatch::PeerFieldLimit;
+    }
+    let n = build_response(&status, &fields, &body, out);
+    if n == 0 {
+        H3Dispatch::TooLarge
+    } else {
+        H3Dispatch::HandlerNotShared(n, handler)
+    }
 }
 
 /// Match a decoded request to a route and render its response.
@@ -631,8 +722,9 @@ pub(crate) unsafe fn dispatch_request(
     s: &super::super::HttpState,
     req: &H3Request,
     out: &mut [u8],
+    peer_limit: u32,
 ) -> H3Dispatch {
-    dispatch_request_bounded(s, req, out, H3_TEMPLATE_BUF)
+    dispatch_request_bounded(s, req, out, H3_TEMPLATE_BUF, peer_limit)
 }
 
 /// [`dispatch_request`] with the template scratch capacity injected.
@@ -648,6 +740,7 @@ pub(crate) unsafe fn dispatch_request_bounded(
     req: &H3Request,
     out: &mut [u8],
     tmpl_cap: usize,
+    peer_limit: u32,
 ) -> H3Dispatch {
     let path = req.path_bytes();
     let matched = super::match_route_path(s, path.as_ptr(), path.len());
@@ -670,6 +763,9 @@ pub(crate) unsafe fn dispatch_request_bounded(
         let mut body = [0u8; 10];
         body.copy_from_slice(b"Not Found\n");
         let fields = [(&name[..], &ctype[..])];
+        if !fits_peer_field_limit(peer_limit, &status, &fields) {
+            return H3Dispatch::PeerFieldLimit;
+        }
         let n = build_response(&status, &fields, &body, out);
         return if n == 0 {
             H3Dispatch::TooLarge
@@ -687,10 +783,13 @@ pub(crate) unsafe fn dispatch_request_bounded(
     // upgrade.
     if req.method_kind == H3_METHOD_CONNECT && req.protocol_ws {
         if handler != super::HANDLER_WEBSOCKET {
-            return H3Dispatch::HandlerNotShared(handler);
+            return not_implemented(peer_limit, handler, out);
         }
         let mut status = [0u8; 3];
         status.copy_from_slice(b"200");
+        if !fits_peer_field_limit(peer_limit, &status, &[]) {
+            return H3Dispatch::PeerFieldLimit;
+        }
         let n = build_response(&status, &[], &[], out);
         return if n == 0 {
             H3Dispatch::TooLarge
@@ -732,7 +831,7 @@ pub(crate) unsafe fn dispatch_request_bounded(
         }
         &tmpl[..n]
     } else {
-        return H3Dispatch::HandlerNotShared(handler);
+        return not_implemented(peer_limit, handler, out);
     };
 
     let ctype_len = route.content_type_len as usize;
@@ -751,6 +850,9 @@ pub(crate) unsafe fn dispatch_request_bounded(
     let mut name = [0u8; 12];
     name.copy_from_slice(b"content-type");
     let fields = [(&name[..], ctype)];
+    if !fits_peer_field_limit(peer_limit, &status, &fields) {
+        return H3Dispatch::PeerFieldLimit;
+    }
     let n = build_response(&status, &fields, body, out);
     if n == 0 {
         H3Dispatch::TooLarge
@@ -862,10 +964,29 @@ pub unsafe fn test_decode_and_dispatch(
     block: &[u8],
     out: &mut [u8],
 ) -> Result<H3Dispatch, H3Error> {
+    // `u32::MAX` = no peer limit, which is the standing default until a
+    // transport delivers `MSG_MUX_PEER_SETTINGS`. The limit's own behaviour is
+    // driven through the pump, where it actually arrives.
+    test_decode_and_dispatch_limited(state, block, out, u32::MAX)
+}
+
+/// [`test_decode_and_dispatch`] with the peer's advertised field-section limit
+/// injected, for the refusal path.
+///
+/// # Safety
+///
+/// `state` must point at a `module_state` buffer initialised by `module_new`.
+#[cfg(feature = "host-test")]
+pub unsafe fn test_decode_and_dispatch_limited(
+    state: *mut u8,
+    block: &[u8],
+    out: &mut [u8],
+    peer_limit: u32,
+) -> Result<H3Dispatch, H3Error> {
     let s = &*(state as *const super::super::HttpState);
     let mut req = H3Request::empty();
     decode_request_headers(block, &mut req)?;
-    Ok(dispatch_request(s, &req, out))
+    Ok(dispatch_request(s, &req, out, peer_limit))
 }
 
 // ----------------------------------------------------------------------
@@ -898,11 +1019,7 @@ pub unsafe fn test_decode_and_dispatch(
 /// net_proto and the datagram surface, and the mux opcode range (0xB0..0xCF) is
 /// disjoint from theirs — which is why h3 needs no new ports: one channel pair
 /// carries both contracts unambiguously.
-#[path = "../../../../target/fluxor/fluxor-abi/sdk/contracts/net/mux.rs"]
-pub mod mux;
-
-/// Header shared by every contract on a net channel.
-pub const FRAME_HDR: usize = 3;
+pub use super::super::connection::{mux, FRAME_HDR};
 
 /// What feeding a stream produced.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -913,9 +1030,18 @@ pub enum H3StreamOutcome {
     /// drainable with [`pump_next_out`].
     Responded(usize),
     /// The route matched a handler HTTP/3 cannot serve yet
-    /// ([`H3Dispatch::HandlerNotShared`]). The stream is reset rather than
-    /// answered with a lie about what happened.
+    /// ([`H3Dispatch::HandlerNotShared`]). A 501 is queued on the stream — the
+    /// request is answered, not dropped — and the handler id rides along so the
+    /// caller can name which one.
     HandlerNotShared(u8),
+    /// The response's field section exceeds the peer's advertised
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`. Reset, because there is no response
+    /// we are permitted to send: even a bare `:status` is over a limit this
+    /// tight, so a smaller answer is not available either.
+    PeerFieldLimit,
+    /// The transport delivered the peer's connection-scoped settings.
+    /// Connection-scoped, so it names no stream.
+    PeerSettings,
     /// The rendered response exceeds [`H3_SEND_BUF`]. Reset, never truncated:
     /// half a response is a protocol error the peer attributes to us.
     ResponseTooLarge,
@@ -1058,21 +1184,30 @@ pub(crate) unsafe fn pump_stream_in(
     // Render into the slot's own send buffer — per stream, so two concurrent
     // requests cannot overwrite each other's response.
     let mut rendered = [0u8; H3_SEND_BUF];
-    let outcome = dispatch_request(s, &req, &mut rendered);
+    let outcome = dispatch_request(s, &req, &mut rendered, st.peer_max_field_section);
     let mut upgraded = false;
+    let mut not_shared_handler: Option<u8> = None;
     let n = match outcome {
         H3Dispatch::WebSocketAccepted(n) => {
             upgraded = true;
             n
         }
         H3Dispatch::Response(n) | H3Dispatch::NotFound(n) => n,
-        H3Dispatch::HandlerNotShared(h) => {
-            st.slots[idx].state = H3StreamState::Reset;
-            return H3StreamOutcome::HandlerNotShared(h);
+        // Answered, not reset — so the queue-and-drain below runs for this
+        // stream exactly as it does for a 404. The outcome is still reported so
+        // the caller logs and counts it; a 501 that only the client ever sees
+        // is a misconfiguration nobody operating the server can find.
+        H3Dispatch::HandlerNotShared(n, h) => {
+            not_shared_handler = Some(h);
+            n
         }
         H3Dispatch::TooLarge => {
             st.slots[idx].state = H3StreamState::Reset;
             return H3StreamOutcome::ResponseTooLarge;
+        }
+        H3Dispatch::PeerFieldLimit => {
+            st.slots[idx].state = H3StreamState::Reset;
+            return H3StreamOutcome::PeerFieldLimit;
         }
     };
 
@@ -1086,6 +1221,9 @@ pub(crate) unsafe fn pump_stream_in(
         slot.ws_active = true;
         slot.ws_buf_len = 0;
         return H3StreamOutcome::WebSocketUpgraded(n);
+    }
+    if let Some(h) = not_shared_handler {
+        return H3StreamOutcome::HandlerNotShared(h);
     }
     H3StreamOutcome::Responded(n)
 }
@@ -1262,6 +1400,24 @@ pub(crate) unsafe fn pump_mux_frame(
     msg_type: u8,
     payload: &[u8],
 ) -> H3StreamOutcome {
+    // Session-scoped, so it is handled BEFORE the stream-prefix parse below:
+    // its payload is `[session_id][limits]`, and bytes 4..8 are a limit, not a
+    // stream id. Reading it as one would address a stream that does not exist.
+    if msg_type == mux::MSG_MUX_PEER_SETTINGS {
+        if payload.len() < mux::SESSION_ID_BYTES + mux::PEER_SETTINGS_BODY {
+            return H3StreamOutcome::Ignored;
+        }
+        let b = &payload[mux::SESSION_ID_BYTES..];
+        st.peer_max_field_section = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        st.peer_enable_connect = (b[12] & mux::PEER_SETTINGS_FLAG_ENABLE_CONNECT) != 0;
+        st.peer_settings_seen = true;
+        // The QPACK limits are deliberately not stored: this encoder never
+        // references a dynamic table (it advertises capacity 0 and emits only
+        // static and literal fields), so the peer's table capacity and
+        // blocked-stream allowance cannot constrain anything it produces.
+        // Storing them to look thorough would be state nothing reads.
+        return H3StreamOutcome::PeerSettings;
+    }
     if payload.len() < mux::STREAM_DATA_PREFIX {
         return H3StreamOutcome::Ignored;
     }
@@ -1428,7 +1584,7 @@ pub unsafe fn test_decode_and_dispatch_bounded(
     let s = &*(state as *const super::super::HttpState);
     let mut req = H3Request::empty();
     decode_request_headers(block, &mut req)?;
-    Ok(dispatch_request_bounded(s, &req, out, tmpl_cap))
+    Ok(dispatch_request_bounded(s, &req, out, tmpl_cap, u32::MAX))
 }
 
 #[cfg(feature = "host-test")]
@@ -1530,7 +1686,15 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
             H3StreamOutcome::SlotsExhausted => log_h3(s, b"[http] h3 slots exhausted"),
             H3StreamOutcome::ResponseTooLarge => log_h3(s, b"[http] h3 response too large"),
             H3StreamOutcome::HandlerNotShared(_) => {
-                log_h3(s, b"[http] h3 handler not available over h3")
+                s.server.h3_handler_unavailable = s.server.h3_handler_unavailable.wrapping_add(1);
+                log_h3(s, b"[http] h3 501 - handler not served over h3")
+            }
+            H3StreamOutcome::PeerFieldLimit => {
+                s.server.h3_field_limit_refused = s.server.h3_field_limit_refused.wrapping_add(1);
+                log_h3(
+                    s,
+                    b"[http] h3 peer max_field_section_size too small to answer",
+                )
             }
             _ => {}
         }
@@ -1560,416 +1724,4 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
         s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add((n - FRAME_HDR) as u32);
     }
     0
-}
-
-// ----------------------------------------------------------------------
-// Client mode
-// ----------------------------------------------------------------------
-//
-// The other half of owning HTTP/3. `quic` carries an h3 client of its own, but
-// it issues a hardcoded `GET /` to `localhost` — a transport self-test, the
-// mirror of its hardcoded server table. An application client needs to choose
-// its own method, authority and path, and to hand the response body onward,
-// which is protocol work and therefore Wave's.
-//
-// The transport still owns everything below: `CMD_MUX_STREAM_OPEN` asks it for
-// a stream, and the id it returns is the only thing this module knows about
-// QUIC's stream space.
-
-/// Client state machine for one request.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum H3ClientState {
-    /// Nothing asked for yet.
-    Idle,
-    /// `CMD_MUX_STREAM_OPEN` sent; waiting for the transport's stream id.
-    Opening,
-    /// Request sent; accumulating the response.
-    AwaitingResponse,
-    /// `:status` and body complete.
-    Complete,
-    /// The exchange failed; `status` carries 0.
-    Failed,
-}
-
-/// One client-side HTTP/3 exchange.
-pub struct H3Client {
-    pub state: H3ClientState,
-    pub session_id: u32,
-    pub stream_id: u32,
-    /// Decoded `:status`, once the response headers arrive.
-    pub status: u16,
-    pub recv_buf: [u8; H3_RECV_BUF],
-    pub recv_len: usize,
-    pub body: [u8; H3_TEMPLATE_BUF],
-    pub body_len: usize,
-    /// The response body has been handed to the app port.
-    pub body_emitted: bool,
-}
-
-impl H3Client {
-    pub const fn new() -> Self {
-        Self {
-            state: H3ClientState::Idle,
-            session_id: 0,
-            stream_id: 0,
-            status: 0,
-            recv_buf: [0; H3_RECV_BUF],
-            recv_len: 0,
-            body: [0; H3_TEMPLATE_BUF],
-            body_len: 0,
-            body_emitted: false,
-        }
-    }
-
-    pub fn body_bytes(&self) -> &[u8] {
-        &self.body[..self.body_len]
-    }
-}
-
-/// Encode a client request field section: block prefix then the pseudo-headers
-/// RFC 9114 §4.3.1 requires of a request.
-///
-/// Returns bytes written, or 0 if it does not fit whole — a partial field
-/// section decodes as a different request, so there is no partial success.
-pub fn encode_request_headers(
-    method: &[u8],
-    scheme: &[u8],
-    authority: &[u8],
-    path: &[u8],
-    out: &mut [u8],
-) -> usize {
-    let mut off = qpack::qpack_emit_block_prefix(out);
-    if off == 0 {
-        return 0;
-    }
-    // Names copied into stack buffers, never a const array of fat pointers:
-    // that lands in .rodata with pointers the PIC loader does not relocate.
-    let mut n_method = [0u8; 7];
-    n_method.copy_from_slice(b":method");
-    let mut n_scheme = [0u8; 7];
-    n_scheme.copy_from_slice(b":scheme");
-    let mut n_auth = [0u8; 10];
-    n_auth.copy_from_slice(b":authority");
-    let mut n_path = [0u8; 5];
-    n_path.copy_from_slice(b":path");
-
-    for (name, value) in [
-        (&n_method[..], method),
-        (&n_scheme[..], scheme),
-        (&n_auth[..], authority),
-        (&n_path[..], path),
-    ] {
-        let n = qpack::qpack_encode_field(name, value, &mut out[off..]);
-        if n == 0 {
-            return 0;
-        }
-        off += n;
-    }
-    off
-}
-
-/// Build a complete request: a HEADERS frame carrying the field section.
-pub fn build_request(
-    method: &[u8],
-    scheme: &[u8],
-    authority: &[u8],
-    path: &[u8],
-    out: &mut [u8],
-) -> usize {
-    let mut block = [0u8; 512];
-    let block_len = encode_request_headers(method, scheme, authority, path, &mut block);
-    if block_len == 0 {
-        return 0;
-    }
-    let mut scratch = [0u8; 16];
-    let hdr = build_h3_frame_header(H3_FRAME_HEADERS, block_len, &mut scratch);
-    if hdr == 0 || out.len() < hdr + block_len {
-        return 0;
-    }
-    out[..hdr].copy_from_slice(&scratch[..hdr]);
-    out[hdr..hdr + block_len].copy_from_slice(&block[..block_len]);
-    hdr + block_len
-}
-
-/// Decode a response field section far enough to learn `:status`.
-///
-/// Returns the status, or None if the section did not decode or carried no
-/// `:status` — which RFC 9114 §4.3.2 requires of every response.
-pub fn decode_response_status(block: &[u8]) -> Option<u16> {
-    let mut off = qpack::qpack_decode_block_prefix(block)?;
-    let mut scratch = [0u8; H3_FIELD_SCRATCH];
-    while off < block.len() {
-        let r = qpack::qpack_decode_field_into(&block[off..], &mut scratch)?;
-        if r.consumed == 0 {
-            return None;
-        }
-        let name = &scratch[r.name.0..r.name.1];
-        if name == b":status" {
-            let value = &scratch[r.value.0..r.value.1];
-            let mut code: u16 = 0;
-            for b in value {
-                if !b.is_ascii_digit() {
-                    return None;
-                }
-                code = code.checked_mul(10)?.checked_add((b - b'0') as u16)?;
-            }
-            return Some(code);
-        }
-        off += r.consumed;
-    }
-    None
-}
-
-/// Feed one `mux` frame to the client.
-pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3ClientState {
-    if payload.len() < mux::SESSION_ID_BYTES {
-        return c.state;
-    }
-    match msg_type {
-        mux::MSG_MUX_STREAM_OPENED => {
-            if payload.len() < mux::STREAM_DATA_PREFIX + 1 {
-                return c.state;
-            }
-            let status = payload[mux::STREAM_DATA_PREFIX];
-            if status != mux::STATUS_OK {
-                c.state = H3ClientState::Failed;
-                return c.state;
-            }
-            c.session_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            c.stream_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            c.state = H3ClientState::AwaitingResponse;
-        }
-        mux::MSG_MUX_STREAM_RX => {
-            if payload.len() < mux::STREAM_DATA_PREFIX {
-                return c.state;
-            }
-            let body = &payload[mux::STREAM_DATA_PREFIX..];
-            let room = H3_RECV_BUF - c.recv_len;
-            if body.len() > room {
-                c.state = H3ClientState::Failed;
-                return c.state;
-            }
-            c.recv_buf[c.recv_len..c.recv_len + body.len()].copy_from_slice(body);
-            c.recv_len += body.len();
-            client_drain(c);
-        }
-        mux::MSG_MUX_STREAM_CLOSED => {
-            if c.state == H3ClientState::AwaitingResponse {
-                // The peer finished. A response without a `:status` never
-                // arrived, and reporting Complete would invent one.
-                c.state = if c.status > 0 {
-                    H3ClientState::Complete
-                } else {
-                    H3ClientState::Failed
-                };
-            }
-        }
-        _ => {}
-    }
-    c.state
-}
-
-/// Walk complete h3 frames out of the client's accumulator.
-fn client_drain(c: &mut H3Client) {
-    let mut consumed = 0usize;
-    loop {
-        let (kind, range, total) = {
-            let buf = &c.recv_buf[consumed..c.recv_len];
-            match parse_h3_frame(buf) {
-                Some((f, n)) => {
-                    let start = consumed + (n - f.payload.len());
-                    (f.frame_type, (start, start + f.payload.len()), n)
-                }
-                None => break,
-            }
-        };
-        if kind == H3_FRAME_HEADERS {
-            match decode_response_status(&c.recv_buf[range.0..range.1]) {
-                Some(code) => c.status = code,
-                None => {
-                    c.state = H3ClientState::Failed;
-                    return;
-                }
-            }
-        } else if kind == H3_FRAME_DATA {
-            let n = (range.1 - range.0).min(H3_TEMPLATE_BUF - c.body_len);
-            let (a, b) = (range.0, range.0 + n);
-            c.body.copy_within(0..0, 0); // no-op, keeps the borrow shape obvious
-            let mut tmp = [0u8; H3_TEMPLATE_BUF];
-            tmp[..n].copy_from_slice(&c.recv_buf[a..b]);
-            c.body[c.body_len..c.body_len + n].copy_from_slice(&tmp[..n]);
-            c.body_len += n;
-        }
-        consumed += total;
-        if consumed >= c.recv_len {
-            break;
-        }
-    }
-    if consumed > 0 {
-        c.recv_buf.copy_within(consumed..c.recv_len, 0);
-        c.recv_len -= consumed;
-    }
-}
-
-/// One step of the HTTP/3 client: ask for a stream, send the request, collect
-/// the response, hand the body to the app.
-///
-/// # Safety
-///
-/// `s` must be a live `HttpState` with its channels resolved.
-pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
-    let sys = &*s.syscalls;
-    let (in_chan, out_chan) = (s.net_in_chan, s.net_out_chan);
-    if in_chan < 0 || out_chan < 0 {
-        return 0;
-    }
-
-    // Ask the transport for a stream, once. It answers MSG_MUX_STREAM_OPENED
-    // with the id — the only thing this module ever learns about QUIC's stream
-    // space.
-    if s.h3_client.state == H3ClientState::Idle {
-        let plen = mux::SESSION_ID_BYTES + 1;
-        let mut frame = [0u8; FRAME_HDR + mux::SESSION_ID_BYTES + 1];
-        frame[0] = mux::CMD_MUX_STREAM_OPEN;
-        frame[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-        frame[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&0u32.to_le_bytes());
-        frame[FRAME_HDR + 4] = mux::STREAM_FLAG_BIDI;
-        let poll = (sys.channel_poll)(out_chan, super::super::POLL_OUT);
-        if poll > 0
-            && (poll as u32) & super::super::POLL_OUT != 0
-            && (sys.channel_write)(out_chan, frame.as_ptr(), frame.len()) > 0
-        {
-            s.h3_client.state = H3ClientState::Opening;
-        }
-        return 0;
-    }
-
-    // Drain inbound mux frames.
-    loop {
-        let poll = (sys.channel_poll)(in_chan, super::super::POLL_IN);
-        if poll <= 0 || (poll as u32) & super::super::POLL_IN == 0 {
-            break;
-        }
-        let buf = s.net_buf.as_mut_ptr();
-        let (msg_type, plen) =
-            super::super::net_read_frame(sys, in_chan, buf, super::super::NET_BUF_SIZE);
-        if msg_type == 0 {
-            break;
-        }
-        let mut frame = [0u8; H3_RECV_BUF];
-        let n = plen.min(frame.len());
-        core::ptr::copy_nonoverlapping(
-            s.net_buf.as_ptr().add(super::super::NET_FRAME_HDR),
-            frame.as_mut_ptr(),
-            n,
-        );
-        let was = s.h3_client.state;
-        let now = client_mux_frame(&mut s.h3_client, msg_type, &frame[..n]);
-
-        // The stream has just been granted: send the request on it.
-        if was == H3ClientState::Opening && now == H3ClientState::AwaitingResponse {
-            client_send_request(s);
-        }
-    }
-
-    // Hand the body onward, once, the way the h1 client does (out[1]).
-    if s.h3_client.state == H3ClientState::Complete && !s.h3_client.body_emitted {
-        {
-            // One line per exchange, so a graph without out[1] wired still
-            // shows whether the request completed and with what.
-            let mut lb = [0u8; 64];
-            let pre = b"[http] h3 client status=";
-            let mut p = 0usize;
-            for &c in pre {
-                lb[p] = c;
-                p += 1;
-            }
-            let st = s.h3_client.status;
-            lb[p] = b'0' + ((st / 100) % 10) as u8;
-            lb[p + 1] = b'0' + ((st / 10) % 10) as u8;
-            lb[p + 2] = b'0' + (st % 10) as u8;
-            p += 3;
-            let tail = b" body=";
-            for &c in tail {
-                lb[p] = c;
-                p += 1;
-            }
-            let n = s.h3_client.body_len.min(999);
-            lb[p] = b'0' + ((n / 100) % 10) as u8;
-            lb[p + 1] = b'0' + ((n / 10) % 10) as u8;
-            lb[p + 2] = b'0' + (n % 10) as u8;
-            p += 3;
-            super::super::dev_log(sys, 3, lb.as_ptr(), p);
-        }
-        let chan = s.client.out_chan;
-        if chan >= 0 && s.h3_client.body_len > 0 {
-            let poll = (sys.channel_poll)(chan, super::super::POLL_OUT);
-            if poll > 0 && (poll as u32) & super::super::POLL_OUT != 0 {
-                let mut body = [0u8; H3_TEMPLATE_BUF];
-                let n = s.h3_client.body_len;
-                body[..n].copy_from_slice(&s.h3_client.body[..n]);
-                if (sys.channel_write)(chan, body.as_ptr(), n) > 0 {
-                    s.h3_client.body_emitted = true;
-                }
-            }
-        } else {
-            s.h3_client.body_emitted = true;
-        }
-    }
-    0
-}
-
-/// Build and send the configured request, then FIN the stream — a GET carries
-/// no body, so the request is complete the moment its headers are sent.
-unsafe fn client_send_request(s: &mut super::super::HttpState) {
-    let sys = &*s.syscalls;
-    let out_chan = s.net_out_chan;
-
-    let plen = s.client.path_len as usize;
-    let mut path = [0u8; 128];
-    let plen = plen.min(path.len());
-    path[..plen].copy_from_slice(&s.client.path[..plen]);
-    let path: &[u8] = if plen == 0 { b"/" } else { &path[..plen] };
-
-    // `:authority` is not configurable yet. Virtual hosting needs it to be, and
-    // that is a parameter away — but inventing one here would be a surface
-    // nobody asked for.
-    let mut authority = [0u8; 9];
-    authority.copy_from_slice(b"localhost");
-    let mut method = [0u8; 3];
-    method.copy_from_slice(b"GET");
-    let mut scheme = [0u8; 5];
-    scheme.copy_from_slice(b"https");
-
-    let mut req = [0u8; 512];
-    let n = build_request(&method, &scheme, &authority, path, &mut req);
-    if n == 0 {
-        s.h3_client.state = H3ClientState::Failed;
-        return;
-    }
-
-    let (session, stream) = (s.h3_client.session_id, s.h3_client.stream_id);
-    let body_len = mux::STREAM_DATA_PREFIX + n;
-    let mut frame = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 512];
-    frame[0] = mux::CMD_MUX_STREAM_SEND;
-    frame[1..3].copy_from_slice(&(body_len as u16).to_le_bytes());
-    frame[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-    frame[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
-    frame[FRAME_HDR + mux::STREAM_DATA_PREFIX..FRAME_HDR + mux::STREAM_DATA_PREFIX + n]
-        .copy_from_slice(&req[..n]);
-    let total = FRAME_HDR + body_len;
-    if (sys.channel_write)(out_chan, frame.as_ptr(), total) <= 0 {
-        s.h3_client.state = H3ClientState::Failed;
-        return;
-    }
-
-    // FIN the request half: a server waits for it before responding.
-    let cplen = mux::STREAM_DATA_PREFIX + 1;
-    let mut close = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 1];
-    close[0] = mux::CMD_MUX_STREAM_CLOSE;
-    close[1..3].copy_from_slice(&(cplen as u16).to_le_bytes());
-    close[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-    close[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
-    close[FRAME_HDR + 8] = mux::STATUS_OK;
-    let _ = (sys.channel_write)(out_chan, close.as_ptr(), close.len());
 }

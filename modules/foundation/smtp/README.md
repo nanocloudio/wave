@@ -64,7 +64,7 @@ negotiation.
 
 ## Coverage
 
-- **L0** — `tests/smtp_core.rs` (6 tests, run by `fluxor modules test`) vectors the reply parser, the
+- **L0** — `tests/harness/tests/smtp_core.rs` vectors the reply parser, the
   dot-stuffing command builders, and the phase machine.
 - **L1** — `tests/harness/tests/smtp.rs` drives the module itself
   through `smtp_harness`, which plays the server. It covers what a codec vector

@@ -26,7 +26,7 @@ use super::routes::{HANDLER_WEBSOCKET_FANOUT, HANDLER_WEBSOCKET_SESSION};
 use super::{
     cur_conn_id, cur_matched_route, cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_recv_len,
     cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_slot, cur_slot_mut, cur_ws_fan_out,
-    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_log, find_first_ws_fanout_slot,
+    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_log, find_sentinel_ws_fanout_slot,
     find_slot_by_conn_id, heap_alloc, heap_free, log, msg_read, net_send, net_write_frame,
     set_cur_phase, HttpState, Phase, IOCTL_FLUSH, IOCTL_NOTIFY, MAX_CONCURRENT_CONNS, MSG_HDR_SIZE,
     NET_FRAME_HDR, POLL_IN, RECV_BUF_SIZE, SEND_BUF_SIZE,
@@ -195,6 +195,7 @@ pub(crate) unsafe fn ws_emit_fanout_frame(
         return;
     }
     if WS_FRAME_HDR + payload_len > super::super::abi::CHANNEL_BUFFER_SIZE {
+        s.server.ws_envelopes_dropped = s.server.ws_envelopes_dropped.wrapping_add(1);
         return;
     }
     let mut frame_buf = [0u8; super::super::abi::CHANNEL_BUFFER_SIZE];
@@ -267,6 +268,10 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
     let payload_len = u16::from_le_bytes([frame_buf[6], frame_buf[7]]) as usize;
     let total = WS_FRAME_HDR + payload_len;
     if (n as usize) < total {
+        // The envelope claims more than one channel read carries. It has
+        // already been consumed, so it is lost — count it rather than let a
+        // silently missing frame look like a producer that never sent one.
+        s.server.ws_envelopes_dropped = s.server.ws_envelopes_dropped.wrapping_add(1);
         return false;
     }
     let opcode = frame_buf[4];
@@ -296,17 +301,27 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
     // as the validity check.
     let conn_u32 = u32::from_le_bytes([frame_buf[0], frame_buf[1], frame_buf[2], frame_buf[3]]);
     let target_idx = if conn_u32 == u32::MAX {
-        match find_first_ws_fanout_slot(s) {
+        match find_sentinel_ws_fanout_slot(s) {
             Some(i) => i,
-            None => return false, // no fan-out slot active; drop
+            None => {
+                // Either no fan-out slot is active, or several are and the
+                // sentinel cannot say which one this envelope is for. Both are
+                // a drop, and both are counted — the second case used to be a
+                // silent delivery to the wrong client.
+                s.server.ws_envelopes_dropped = s.server.ws_envelopes_dropped.wrapping_add(1);
+                return false;
+            }
         }
     } else {
-        match find_slot_by_conn_id(s, frame_buf[0]) {
+        match find_slot_by_conn_id(s, conn_u32 as u16) {
             Some(i) => i,
             None => {
                 // Unknown conn — the conn closed between the
                 // producer's write and our read. Drop the envelope;
-                // unavoidable loss for a closed recipient.
+                // unavoidable loss for a closed recipient, but a rising
+                // count distinguishes "the peer went away" from "the
+                // producer is addressing connections that never existed".
+                s.server.ws_envelopes_dropped = s.server.ws_envelopes_dropped.wrapping_add(1);
                 return false;
             }
         }

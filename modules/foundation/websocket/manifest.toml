@@ -36,5 +36,3 @@ access            = "read"
 [observability]
 exempt = "WebSocket connector; throughput is observed at the network provider"
 
-[test]
-harness = "tests/harness.rs"

@@ -227,9 +227,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 // server from flipping to WaitAccept / `bound` on someone
                 // else's listen completing first.
                 NET_MSG_BOUND
-                    if payload_len < 3 || {
-                        let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
-                        let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                    if payload_len < 4 || {
+                        let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                        let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
                         ((lo as u16) | ((hi as u16) << 8)) == s.server.port
                     } =>
                 {
@@ -254,15 +254,18 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                     return -1;
                 }
-                NET_MSG_ACCEPTED if payload_len >= 1 => {
+                NET_MSG_ACCEPTED if payload_len >= 2 => {
                     // A connection accepted by linux_net while we were
                     // still binding. Allocate a slot directly — the
                     // slot table is the queue. Multi-anchor demux: claim
                     // only accepts on our bound port (see the demux path).
-                    let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                    let ours = payload_len < 3 || {
-                        let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
-                        let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                    let conn = u16::from_le_bytes([
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                    ]);
+                    let ours = payload_len < 4 || {
+                        let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                        let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
                         ((lo as u16) | ((hi as u16) << 8)) == s.server.port
                     };
                     if ours {
@@ -275,11 +278,14 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                     return 2;
                 }
-                NET_MSG_DATA if payload_len > 1 => {
+                NET_MSG_DATA if payload_len > 2 => {
                     // Append directly to the owning slot's `recv_buf`.
-                    let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                    let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
-                    let data_len = payload_len - 1;
+                    let conn = u16::from_le_bytes([
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                    ]);
+                    let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                    let data_len = payload_len - 2;
                     if let Some(idx) = find_slot_by_conn_id(s, conn) {
                         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                         if slot.recv_buf.is_null() {
@@ -297,8 +303,11 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // Else: orphan — drop.
                     return 2;
                 }
-                NET_MSG_CLOSED if payload_len >= 1 => {
-                    let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                NET_MSG_CLOSED if payload_len >= 2 => {
+                    let conn = u16::from_le_bytes([
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                        *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                    ]);
                     if let Some(idx) = find_slot_by_conn_id(s, conn) {
                         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                         slot.peer_closed = 1;
@@ -315,20 +324,20 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // own `traceparent` parents `http.server.request` under it.
                     if dev_telemetry_enabled(&*s.syscalls) {
                         let p = s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                        let conn = *p;
+                        let conn = u16::from_le_bytes([*p, *p.add(1)]);
                         if let Some(idx) = find_slot_by_conn_id(s, conn) {
                             let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                             core::ptr::copy_nonoverlapping(
-                                p.add(1),
+                                p.add(2),
                                 slot.conn_trace_id.as_mut_ptr(),
                                 16,
                             );
                             core::ptr::copy_nonoverlapping(
-                                p.add(17),
+                                p.add(18),
                                 slot.conn_parent_id.as_mut_ptr(),
                                 8,
                             );
-                            slot.conn_flags = *p.add(25);
+                            slot.conn_flags = *p.add(26);
                         }
                     }
                     return 2;
@@ -450,7 +459,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         Some((verb, n)) => {
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.req_method = verb;
-                                cur.req_path_len = n as u8;
+                                cur.req_path_len = n as u16;
                                 cur.recv_parsed = 1;
                             }
                         }
@@ -705,6 +714,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // back in time.
             if let Some(idx) = current_slot_index(s) {
                 if app::app_deadline_passed(s, idx) {
+                    s.server.app_timeouts = s.server.app_timeouts.wrapping_add(1);
                     // Mid-stream, the response head and part of its body are
                     // already on the wire. A 504 here would append a second
                     // status line INSIDE the first response's body, which the
@@ -1131,7 +1141,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         app::EmitResult::Sent => {
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.app_pending = 1;
-                                cur.app_stream_id = 0;
+                                // `app_stream_id` is the request generation and
+                                // was stamped by `emit_request`; setting it here
+                                // would erase the discriminator.
+
                                 cur.phase = Phase::AwaitApp;
                             }
                         }
@@ -2135,7 +2148,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
             let sent = net_send_conn(
                 s,
-                backend as u8,
+                backend as u16,
                 cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
                 remaining,
             );
@@ -2202,7 +2215,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // MSG_CLOSED for this conn, the slot's TCP socket is
             // gone — sending any more bytes is wasted work, and
             // leaving `ws_fan_out=1` on the slot makes
-            // `find_first_ws_fanout_slot` hand new producers a dead
+            // `find_sentinel_ws_fanout_slot` hand new producers a dead
             // delivery target. Transition straight to CloseConn so
             // `slot_release_buffers` clears the fanout flag and
             // frees the slot for a new live client. Without this
@@ -2342,7 +2355,20 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // per video frame would otherwise take ~50 ticks to emit).
             // Exits as soon as no work can be done on either side.
             let mut did_any = false;
-            loop {
+            // Bounded batch per tick. The loop's termination argument is
+            // "exit when neither side made progress", which is sound but is
+            // bounded by WORK AVAILABLE rather than by anything this module
+            // controls: a producer that keeps `ws_in` saturated while net_out
+            // keeps accepting can hold the tick for as long as it cares to.
+            // That is a step-time problem rather than a hang — every other
+            // module in the domain waits — so the batch is capped and the
+            // remainder rolls into the next tick, the same shape the inbound
+            // demux uses. 32 keeps the pipeline saturated (the fan-out case
+            // this loop exists for chunks ~50 frames per video frame, so a
+            // tick still carries most of one) without letting one connection
+            // own the domain.
+            const WS_BATCH_PER_TICK: usize = 32;
+            for _ in 0..WS_BATCH_PER_TICK {
                 let mut progress = false;
 
                 // Flush as much of send_buf as net_out will accept.

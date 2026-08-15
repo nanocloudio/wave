@@ -13,7 +13,7 @@
 //
 // The single implementation of the `SipPhase` dialog transitions.
 // under Conclave plan S4.3 (T4.3.4). Transitions are behaviour-exact with those
-// handlers; the coverage lives in `modules/foundation/sip/tests/sip_dialog_vectors.rs`.
+// handlers; the coverage lives in `tests/harness/tests/sip_dialog_vectors.rs`.
 
 /// Maximum retransmissions before a transaction gives up and returns to idle
 /// (origin `MAX_RETRANSMIT`). The exponential backoff schedule that paces them

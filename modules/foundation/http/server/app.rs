@@ -25,11 +25,23 @@
 //! the bug `HANDLER_WEBSOCKET_SESSION` exists to avoid. There is no retention
 //! here.
 //!
-//! **Correlation is `(conn_id, stream_id)`, never `conn_id` alone.** Under h1 a
-//! connection carries one request at a time and `stream_id` is 0. Under h2 it
-//! carries many at once, and an application that answers them out of order —
-//! which it is entitled to do — would have its responses delivered to the wrong
-//! requests. The pair is what makes the port pair usable from h2 at all.
+//! **Correlation is `(conn_id, stream_id)`, never `conn_id` alone.** Under h2 a
+//! connection carries many requests at once, and an application that answers
+//! them out of order — which it is entitled to do — would have its responses
+//! delivered to the wrong requests.
+//!
+//! Under h1 a connection carries one request at a time, so `stream_id` is not
+//! separating concurrent requests; it is a REQUEST GENERATION, and it is
+//! load-bearing for a different reason. Connection ids are recycled by the
+//! transport, so a connection released with a request still outstanding is
+//! followed by a new peer holding the same id and also awaiting an answer.
+//! Pinning `stream_id` to 0 made those two indistinguishable, and the late
+//! answer was served to the new peer: a valid, well-framed, entirely wrong
+//! reply. See `ServerState::app_gen_next`.
+//!
+//! Either way the rule for an application is the same and was always the same:
+//! **echo `stream_id` back**. An application that hardcodes 0 was already
+//! broken under h2.
 
 use super::super::wire::method;
 use super::{cur_slot, cur_slot_mut, dev_millis, find_slot_by_conn_id, HttpState, MAX_PATH};
@@ -143,15 +155,21 @@ pub(crate) unsafe fn emit_request(s: &mut HttpState, head: &[u8]) -> EmitResult 
     let hdr = header_block(head);
     let hdrs = &hdr[..hdr.len().min(MAX_FWD_HEADERS)];
 
-    // `stream_id` is 0 under h1: a connection carries one request at a time, so
-    // `conn_id` alone identifies it.
-    let res = write_request_envelope(s, conn_id, 0, verb, path, hdrs, body);
+    // Under h1 a connection carries one request at a time, so `stream_id` does
+    // not have to distinguish concurrent requests — but it does have to
+    // distinguish this request from one asked by a PREVIOUS holder of the same
+    // connection id, whose answer may still be in flight. See
+    // `ServerState::app_gen_next`.
+    let gen = s.server.app_gen_next;
+    s.server.app_gen_next = gen.wrapping_add(1);
+    let res = write_request_envelope(s, conn_id, gen, verb, path, hdrs, body);
     if res == EmitResult::Sent {
         // Latch the deadline as the request goes out, not when it was received:
         // the timeout measures how long the APPLICATION has had it.
         let now = dev_millis(&*s.syscalls);
         if let Some(cur) = cur_slot_mut(s) {
             cur.app_deadline_ms = now.saturating_add(APP_TIMEOUT_MS);
+            cur.app_stream_id = gen;
         }
     }
     res
@@ -250,7 +268,7 @@ pub(crate) unsafe fn find_awaiting_slot(
     conn_id: u16,
     stream_id: u16,
 ) -> Option<usize> {
-    let idx = find_slot_by_conn_id(s, conn_id as u8)?;
+    let idx = find_slot_by_conn_id(s, conn_id)?;
     let slot = &*s.server.slots.as_ptr().add(idx);
     if slot.app_stream_id == stream_id && slot.app_pending != 0 {
         Some(idx)
@@ -304,18 +322,26 @@ pub(crate) unsafe fn drain_responses(s: &mut HttpState) -> bool {
             v.stream_id,
             RESP_HDR + v.content_type.len() + v.headers.len() + v.body.len(),
         ),
-        // Malformed: the envelope claims more than it carries. Dropping it is
-        // the only safe option — the slot it named will time out into a 504,
-        // which is the honest outcome for an application speaking a broken
-        // protocol.
-        None => return false,
+        // The envelope claims more than this read carries. Two causes, and
+        // they are counted the same because the consequence is identical: an
+        // application speaking a broken protocol, or — far more likely — an
+        // envelope larger than one channel read, on a port whose declared
+        // record size exceeds the reader's. Dropping is the only safe option
+        // once the read has consumed it, but dropping SILENTLY is not: the
+        // request would wait out the full application timeout and surface as
+        // a 504, pointing the investigation at the application rather than at
+        // the port sizing that actually caused it.
+        None => {
+            s.server.app_envelopes_oversize = s.server.app_envelopes_oversize.wrapping_add(1);
+            return false;
+        }
     };
 
     // An h2 stream on the named connection takes precedence: under h2 the
     // ConnSlot is the connection, not the request, and many requests share it.
     #[cfg(feature = "h2")]
     {
-        if let Some(conn_idx) = find_slot_by_conn_id(s, conn_id as u8) {
+        if let Some(conn_idx) = find_slot_by_conn_id(s, conn_id) {
             let has_h2 = !(*s.server.slots.as_ptr().add(conn_idx)).h2.is_null();
             if has_h2 {
                 let saved = s.server.cur_slot;
@@ -330,7 +356,15 @@ pub(crate) unsafe fn drain_responses(s: &mut HttpState) -> bool {
                     };
                     if busy {
                         s.server.cur_slot = saved;
-                        let _ = (sys.channel_write)(chan, buf.as_ptr(), total);
+                        if (sys.channel_write)(chan, buf.as_ptr(), total) <= 0 {
+                            // The envelope left the mailbox on read and the
+                            // writeback was refused, so it is gone. The
+                            // application believes it answered and the client
+                            // will not be answered — a lost response, not a
+                            // delayed one, and the only place that fact exists.
+                            s.server.app_envelopes_lost =
+                                s.server.app_envelopes_lost.wrapping_add(1);
+                        }
                         return false;
                     }
                     let view = match parse_response(&buf[..total]) {
@@ -373,7 +407,10 @@ pub(crate) unsafe fn drain_responses(s: &mut HttpState) -> bool {
         slot.send_len > slot.send_offset
     };
     if busy {
-        let _ = (sys.channel_write)(chan, buf.as_ptr(), total);
+        if (sys.channel_write)(chan, buf.as_ptr(), total) <= 0 {
+            // See the h2 path above: a refused writeback loses the response.
+            s.server.app_envelopes_lost = s.server.app_envelopes_lost.wrapping_add(1);
+        }
         return false;
     }
 
@@ -478,11 +515,26 @@ unsafe fn compose_stream_chunk(s: &mut HttpState, view: &RespView<'_>) {
     if n > 0 {
         core::ptr::copy_nonoverlapping(view.body.as_ptr(), super::cur_send_buf_mut_ptr(s), n);
     }
-    let last = (view.flags & FLAG_MORE_BODY) == 0;
+    // A chunk larger than `send_buf` cannot be delivered whole, and the bytes
+    // past `n` are gone. Silently keeping the connection alive after that is
+    // the worst available outcome: the declared `Content-Length` can never be
+    // satisfied, so the client either hangs waiting for a body that has
+    // stopped coming or — on keep-alive — reads the NEXT response as the
+    // remainder of this one. Closing makes the loss a short read, which is
+    // detectable, and matches what the single-envelope path above already does
+    // when a body overruns the buffer.
+    let truncated = view.body.len() > n;
+    if truncated {
+        s.server.app_envelopes_oversize = s.server.app_envelopes_oversize.wrapping_add(1);
+    }
+    let last = (view.flags & FLAG_MORE_BODY) == 0 || truncated;
     let now = dev_millis(&*s.syscalls);
     if let Some(cur) = cur_slot_mut(s) {
         cur.send_len = n as u16;
         cur.send_offset = 0;
+        if truncated {
+            cur.keepalive = 0;
+        }
         if last {
             cur.app_streaming = 0;
             cur.app_pending = 0;

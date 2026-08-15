@@ -367,6 +367,70 @@ pub enum BodyFraming {
     Invalid,
 }
 
+/// Whether `head` carries more than one field line named `name` with values
+/// that are not byte-identical.
+///
+/// `find_header` answers with the FIRST match, which is the right shape for
+/// every header whose meaning does not change when it is repeated. Framing
+/// headers are not those: RFC 9112 §6.3 makes multiple `Content-Length` lines
+/// with differing values an unrecoverable error precisely because a server and
+/// an intermediary in front of it may pick different ones, and the bytes
+/// between the two lengths become a second request the front end never saw.
+///
+/// Identical repeats are permitted by the RFC (they can be collapsed to one
+/// value), so this reports only genuine disagreement.
+pub fn header_values_disagree(head: &[u8], name: &[u8]) -> bool {
+    let mut cursor = 0usize;
+    while cursor + 1 < head.len() {
+        if head[cursor] == b'\r' && head[cursor + 1] == b'\n' {
+            break;
+        }
+        cursor += 1;
+    }
+    if cursor + 1 >= head.len() {
+        return false;
+    }
+    cursor += 2;
+    let mut first: Option<&[u8]> = None;
+    while cursor < head.len() {
+        let line_start = cursor;
+        let mut nl = line_start;
+        while nl + 1 < head.len() {
+            if head[nl] == b'\r' && head[nl + 1] == b'\n' {
+                break;
+            }
+            nl += 1;
+        }
+        if nl == line_start || nl + 1 >= head.len() {
+            break;
+        }
+        let line = &head[line_start..nl];
+        if let Some(colon) = line.iter().position(|c| *c == b':') {
+            if line[..colon].eq_ignore_ascii_case(name) {
+                let mut vs = colon + 1;
+                while vs < line.len() && (line[vs] == b' ' || line[vs] == b'\t') {
+                    vs += 1;
+                }
+                let mut ve = line.len();
+                while ve > vs && (line[ve - 1] == b' ' || line[ve - 1] == b'\t') {
+                    ve -= 1;
+                }
+                let val = &line[vs..ve];
+                match first {
+                    None => first = Some(val),
+                    Some(prev) => {
+                        if prev != val {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        cursor = nl + 2;
+    }
+    false
+}
+
 /// Decide how a request's body is framed, from its parsed head.
 pub fn body_framing(head: &[u8]) -> BodyFraming {
     let te = find_header(head, b"transfer-encoding");
@@ -404,6 +468,25 @@ pub fn body_framing(head: &[u8]) -> BodyFraming {
         None => BodyFraming::None,
         Some(v) => {
             if v.is_empty() {
+                return BodyFraming::Invalid;
+            }
+            // Several `Content-Length` lines that disagree, or one line
+            // carrying a list, are the same ambiguity the CL+TE case above
+            // refuses and for the same reason: whichever value this server
+            // picks, an intermediary may pick the other, and the bytes between
+            // them become a request nobody authorised. `find_header` returns
+            // the first match, so without this the second length was simply
+            // ignored and the message served.
+            // clippy prefers `v.contains(&b',')` here and it is wrong to take
+            // the advice: `<[u8]>::contains` lowers to `core::slice::memchr`,
+            // which the bare-metal PIC link has no symbol for. The explicit
+            // scan is the same check and is the only one that links.
+            #[allow(
+                clippy::manual_contains,
+                reason = "slice::contains pulls in core::slice::memchr, which the PIC link cannot resolve"
+            )]
+            let listed = v.iter().any(|c| *c == b',');
+            if header_values_disagree(head, b"content-length") || listed {
                 return BodyFraming::Invalid;
             }
             let mut n: u64 = 0;

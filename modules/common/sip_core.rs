@@ -19,7 +19,7 @@
 // (`20+16+17+34`) by 2, so it advertised a `Content-Length` two larger than the
 // SDP that followed. This core diverges from the origin there by design; every
 // other formatted byte is identical. Golden transcripts live in
-// `modules/foundation/sip/tests/sip_vectors.rs`.
+// `tests/harness/tests/sip_vectors.rs`.
 //
 // Dialog tags and the Via branch are formatted as exactly four lowercase hex
 // digits ([`put_hex16`]) — the origin's fixed width, correct for the `u16`

@@ -251,12 +251,12 @@ pub(crate) enum Phase {
 #[repr(C)]
 pub(crate) struct ConnSlot {
     /// Conn id from `MSG_ACCEPTED`. `-1` when the slot is free.
-    pub(crate) conn_id: i16,
+    pub(crate) conn_id: i32,
     /// Per-slot phase machine state.
     pub(crate) phase: Phase,
     pub(crate) matched_route: i8,
     pub(crate) recv_parsed: u8,
-    pub(crate) req_path_len: u8,
+    pub(crate) req_path_len: u16,
     /// Method of the request currently being served, as a
     /// `wire::method::METHOD_*` value. Set in `Phase::RecvRequest`,
     /// consumed by dispatch (HEAD suppresses the response body) and by
@@ -451,7 +451,7 @@ pub(crate) struct ConnSlot {
     // `send_buf` (backend→client) windows — no extra arenas.
     /// Upstream backend conn id latched from `MSG_CONNECTED`; `-1`
     /// when no backend conn is dialed / open.
-    pub(crate) backend_conn_id: i16,
+    pub(crate) backend_conn_id: i32,
     /// Dyn-route index driving this relay (`-1` = static proxy route
     /// or none). Used to advance `rr_cursor` + reselect on failover.
     pub(crate) proxy_dyn_idx: i16,
@@ -784,6 +784,86 @@ pub(crate) struct ServerState {
     /// Cumulative relay 5xx responses (`http.proxy.5xx`, §3).
     pub(crate) proxy_5xx: u32,
 
+    /// Next request generation stamped into an HTTP/1.1 application request's
+    /// `stream_id`.
+    ///
+    /// Under h1 a connection carries one request at a time, so `stream_id` was
+    /// pinned to 0 and `(conn_id, stream_id)` reduced to the connection. That is
+    /// sound only while a connection id means one thing forever, and it does
+    /// not: the transport recycles ids, so a slot released with an application
+    /// request still outstanding is followed by a NEW peer holding the same id
+    /// and also awaiting an answer with `stream_id` 0. The late answer then
+    /// matched the new peer's request exactly, and one connection was served
+    /// another's response — a valid, well-framed, entirely wrong reply.
+    ///
+    /// A generation makes the pair mean what it claims. It lives on the server
+    /// rather than the slot because `slot_release_buffers` zeroes the slot, so
+    /// anything held there is reset precisely when a connection id is about to
+    /// be reused — which is the moment the discriminator has to survive.
+    ///
+    /// Applications echo `stream_id` back, which the fan-out contract already
+    /// requires of them, so this is transparent to any application that was
+    /// correct under h2. It wraps at 65_536 outstanding-request generations;
+    /// a stale answer surviving that long is not distinguishable by any scheme
+    /// this envelope can carry, and the request it would collide with has long
+    /// since timed out.
+    pub(crate) app_gen_next: u16,
+
+    // ── Load-shedding counters ─────────────────────────────────────
+    //
+    // Every path below sheds work under pressure, and each one used to
+    // present to an operator as the same symptom — a slow or reset
+    // client. They are separate counters because they have separate
+    // fixes: the first two decide whether to raise the slot table or
+    // the arena, and confusing them sends a capacity investigation to
+    // the wrong constant. A resource denial that cannot say who asked
+    // for what is the failure mode the resource model exists to end.
+    /// Connections refused because no `ConnSlot` was free
+    /// (`http.conns.refused.slots`). Raise `MAX_CONCURRENT_CONNS`.
+    pub(crate) conns_refused_slots: u32,
+    /// Connections refused because the module arena could not supply the
+    /// slot's buffers (`http.conns.refused.arena`). Raise
+    /// `ARENA_WORKING_SET_CONNS` — the slot table was NOT the limit.
+    pub(crate) conns_refused_arena: u32,
+    /// Ticks the inbound demux stopped early because the target slot's
+    /// `recv_buf` was full (`http.demux.stalls`). Rising here means one
+    /// slow peer is holding up delivery for every other connection,
+    /// which is head-of-line blocking rather than a throughput limit.
+    pub(crate) demux_stalls: u32,
+    /// Application requests answered 504 by the module because the
+    /// application never replied (`http.app.timeouts`).
+    pub(crate) app_timeouts: u32,
+    /// Application responses lost because the backpressure writeback to
+    /// `resp_in` was itself refused (`http.app.envelopes.lost`). The
+    /// application believes it answered; the client will not be answered.
+    /// Non-zero means the response path dropped data, not merely delayed
+    /// it, and is never expected in a healthy graph.
+    pub(crate) app_envelopes_lost: u32,
+    /// Envelopes discarded because they exceeded what one channel read
+    /// can carry (`http.app.envelopes.oversize`). A configuration error:
+    /// the port's declared record size is larger than the reader's.
+    pub(crate) app_envelopes_oversize: u32,
+    /// WebSocket fan-out envelopes dropped — unknown conn, no fan-out
+    /// slot active, or oversize (`http.ws.envelopes.dropped`).
+    pub(crate) ws_envelopes_dropped: u32,
+    /// HTTP/2 streams refused because the connection's stream table was
+    /// full (`http.h2.streams.refused`). Expected under a client that
+    /// outruns `MAX_STREAMS`; a floor, not a fault.
+    pub(crate) h2_streams_refused: u32,
+    /// HTTP/3 requests answered 501 because the matched route's handler is not
+    /// served over h3 (`http.h3.handler_unavailable`). A CONFIGURATION signal,
+    /// not a load one: it means a route that works over HTTP/1.1 and HTTP/2 is
+    /// reachable over HTTP/3 and cannot be served there. Without the counter
+    /// this is visible only to the client that asked.
+    pub(crate) h3_handler_unavailable: u32,
+    /// HTTP/3 responses refused because their field section exceeds the peer's
+    /// advertised `SETTINGS_MAX_FIELD_SECTION_SIZE`
+    /// (`http.h3.field_limit_refused`). Non-zero means a peer's limit is
+    /// tighter than our smallest response, so nothing can be served to it —
+    /// which otherwise presents as a client that connects and then gets
+    /// nothing, with no error on either side naming the cause.
+    pub(crate) h3_field_limit_refused: u32,
+
     // ── Dynamic listeners (rfc_workload_ingress §4.2) ──────────────
     //
     // Default-off: `listeners_prefix_len == 0` leaves the whole
@@ -811,7 +891,8 @@ pub(crate) const DYN_SCRATCH: usize = 8192;
 pub(crate) const DYN_ROUTES_PORT_INDEX: u8 = 4;
 
 /// Number of `u64` words needed to cover `MAX_CONCURRENT_CONNS`
-/// bits (rounded up). At MAX=1024 this is 16 words = 128 bytes.
+/// bits (rounded up). At the host profile's 256 that is 4 words = 32 bytes;
+/// on `profile_embedded`'s single slot, one word.
 pub(crate) const READY_BITS_WORDS: usize = MAX_CONCURRENT_CONNS.div_ceil(64);
 
 #[inline(always)]
@@ -844,8 +925,8 @@ pub(crate) unsafe fn ready_clear(s: &mut HttpState, idx: usize) {
 /// Find the slot whose `conn_id` matches `conn_id`. Returns `None`
 /// when no slot owns that conn id (e.g. an MSG_DATA arrived for a
 /// peer that already closed and got pruned).
-pub(crate) unsafe fn find_slot_by_conn_id(s: &HttpState, conn_id: u8) -> Option<usize> {
-    let needle = conn_id as i16;
+pub(crate) unsafe fn find_slot_by_conn_id(s: &HttpState, conn_id: u16) -> Option<usize> {
+    let needle = conn_id as i32;
     for i in 0..MAX_CONCURRENT_CONNS {
         let slot = &*s.server.slots.as_ptr().add(i);
         if slot.conn_id == needle {
@@ -855,24 +936,52 @@ pub(crate) unsafe fn find_slot_by_conn_id(s: &HttpState, conn_id: u8) -> Option<
     None
 }
 
-/// Return the lowest-indexed slot that has `ws_fan_out = 1` and a
-/// live conn. Used by `ws_drain_fanout_input` when the envelope's
-/// `conn_id` is the `u32::MAX` "unclaimed" sentinel from
-/// `ws_stream` — i.e. the producer hasn't latched a real id yet
-/// because no inbound WS frame has arrived.
+/// Resolve the "unclaimed" (`u32::MAX`) sentinel `ws_stream` stamps on an
+/// envelope before it has observed an inbound frame and learned a real conn id.
 ///
-/// Single-active-WS workloads (the common case) get correct
-/// delivery without ws_stream needing a real id; multi-WS
-/// workloads naturally provide the real id once any inbound
-/// arrives. Returns `None` if no fan-out slot is currently active.
-pub(crate) unsafe fn find_first_ws_fanout_slot(s: &HttpState) -> Option<usize> {
-    for i in 0..MAX_CONCURRENT_CONNS {
+/// Returns the fan-out slot the envelope belongs to, or `None` when that cannot
+/// be known.
+///
+/// `ws_stream` is a framing adapter with a single-connection model by design —
+/// it latches one conn id and a second connection replaces it — so a sentinel
+/// envelope means "the one connection". The server enforces the same policy
+/// from its side with last-connection-wins: a newer fan-out upgrade displaces
+/// the older slot, which is sent a graceful close.
+///
+/// The subtlety is the displacement WINDOW. Between the new upgrade and the old
+/// slot's close draining, two fan-out slots are live, and the previous
+/// behaviour — take the lowest-indexed one — resolved the sentinel to whichever
+/// happened to sit earlier in the table. That is frequently the slot being
+/// closed, so a producer pushing on connect had its bytes delivered to the
+/// departing client instead of the arriving one.
+///
+/// So the newest fan-out slot wins, because that is the connection the producer
+/// means. Only when no slot is identifiable does this refuse, and the caller
+/// counts the drop — an unaddressable envelope becomes a visible loss rather
+/// than an invisible delivery to the wrong peer.
+pub(crate) unsafe fn find_sentinel_ws_fanout_slot(s: &HttpState) -> Option<usize> {
+    let is_live_fanout = |i: usize| -> bool {
         let slot = &*s.server.slots.as_ptr().add(i);
-        if slot.conn_id >= 0 && slot.ws_fan_out != 0 {
-            return Some(i);
+        slot.conn_id >= 0 && slot.ws_fan_out != 0
+    };
+    // The most recent fan-out upgrade, when it is still live: the connection a
+    // producer-first bundle is for.
+    let latest = s.server.latest_fanout_slot;
+    if latest >= 0 && (latest as usize) < MAX_CONCURRENT_CONNS && is_live_fanout(latest as usize) {
+        return Some(latest as usize);
+    }
+    // No current winner (none has upgraded yet this run, or it has closed):
+    // fall back to the sole live fan-out slot if there is exactly one.
+    let mut found: Option<usize> = None;
+    for i in 0..MAX_CONCURRENT_CONNS {
+        if is_live_fanout(i) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
         }
     }
-    None
+    found
 }
 
 /// Allocate the first free slot and acquire its heap buffers.
@@ -886,7 +995,7 @@ pub(crate) unsafe fn find_first_ws_fanout_slot(s: &HttpState) -> Option<usize> {
 /// pointers) by `slot_release_buffers` on the close path — this
 /// function therefore only needs to acquire fresh buffers and set
 /// the conn id.
-pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u8) -> Option<usize> {
+pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u16) -> Option<usize> {
     let mut chosen: Option<usize> = None;
     for i in 0..MAX_CONCURRENT_CONNS {
         let slot = &*s.server.slots.as_ptr().add(i);
@@ -895,13 +1004,26 @@ pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u8) -> Option<u
             break;
         }
     }
-    let idx = chosen?;
+    // The two ways this returns None are different capacity limits with
+    // different fixes, so they are counted apart. Reported as one number they
+    // are unactionable: "connections are being refused" does not say whether
+    // to raise the slot table or the arena, and raising the wrong one changes
+    // nothing while looking like a fix.
+    let idx = match chosen {
+        Some(i) => i,
+        None => {
+            s.server.conns_refused_slots = s.server.conns_refused_slots.wrapping_add(1);
+            return None;
+        }
+    };
     if !slot_acquire_buffers(s, idx) {
-        // Heap exhausted — leave the slot free and tell the caller.
+        // Arena exhausted — leave the slot free and tell the caller. The slot
+        // table still had room, so `MAX_CONCURRENT_CONNS` is NOT the limit here.
+        s.server.conns_refused_arena = s.server.conns_refused_arena.wrapping_add(1);
         return None;
     }
     let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
-    slot.conn_id = conn_id as i16;
+    slot.conn_id = conn_id as i32;
     // Clear any trace context inherited from a prior connection on this slot;
     // the new connection's `MSG_TRACE_CTX` (if any) repopulates it.
     slot.conn_trace_id = [0u8; 16];
@@ -1098,13 +1220,13 @@ pub(crate) unsafe fn cur_send_buf_mut_ptr(s: &mut HttpState) -> *mut u8 {
         .unwrap_or(core::ptr::null_mut())
 }
 
-/// Active slot's `conn_id` as u8. The slot stores conn_id as i16
+/// Active slot's `conn_id` on the wire type. The slot stores conn_id as i32
 /// with `-1` meaning free; callers reaching this are only in-flight
 /// phases where the slot is live (conn_id ≥ 0). The cast to u8
 /// matches the wire format in MSG_ACCEPTED / CMD_SEND etc.
 #[inline(always)]
-pub(crate) unsafe fn cur_conn_id(s: &HttpState) -> u8 {
-    cur_slot(s).map(|c| c.conn_id as u8).unwrap_or(0)
+pub(crate) unsafe fn cur_conn_id(s: &HttpState) -> u16 {
+    cur_slot(s).map(|c| c.conn_id as u16).unwrap_or(0)
 }
 
 /// Number of slots currently in use (any phase other than `Init`
@@ -1404,7 +1526,7 @@ pub(crate) unsafe fn reset_connection(s: &mut HttpState) {
         None => (-1, 0),
     };
     if backend >= 0 && backend_closed == 0 && s.net_out_chan >= 0 {
-        close_net_conn(s, backend as u8);
+        close_net_conn(s, backend as u16);
     }
     if let Some(idx) = current_slot_index(s) {
         if s.server.proxy_connect_owner == idx as i16 {
@@ -1436,21 +1558,20 @@ pub(crate) unsafe fn current_slot_index(s: &HttpState) -> Option<usize> {
     }
 }
 
-pub(crate) unsafe fn close_net_conn(s: &mut HttpState, conn_id: u8) {
+pub(crate) unsafe fn close_net_conn(s: &mut HttpState, conn_id: u16) {
     if s.net_out_chan < 0 {
         return;
     }
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
-    let mut payload = [0u8; 1];
-    payload[0] = conn_id;
+    let payload = conn_id.to_le_bytes();
     net_write_frame(
         sys,
         chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        1,
+        2,
         buf,
         NET_BUF_SIZE,
     );
@@ -1473,7 +1594,7 @@ pub(crate) unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) ->
 /// `net_send`; the only difference is which conn the bytes address.
 pub(crate) unsafe fn net_send_conn(
     s: &mut HttpState,
-    conn_id: u8,
+    conn_id: u16,
     data: *const u8,
     len: usize,
 ) -> i32 {
@@ -1495,7 +1616,7 @@ pub(crate) unsafe fn net_send_conn(
     //
     // Both paths build for aarch64-unknown-none in PIC, so the cap is
     // a module-local runtime field set from the `host_tcp` param.
-    let frame_cap = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+    let frame_cap = NET_BUF_SIZE - NET_FRAME_HDR - 2;
     let per_call_cap = if s.host_tcp != 0 {
         frame_cap
     } else {
@@ -1509,12 +1630,14 @@ pub(crate) unsafe fn net_send_conn(
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let scratch = s.net_buf.as_mut_ptr();
-    let payload_len = 1 + to_send;
+    let payload_len = 2 + to_send;
+    let cb = conn_id.to_le_bytes();
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(3) = conn_id;
-    core::ptr::copy_nonoverlapping(data, scratch.add(4), to_send);
+    *scratch.add(3) = cb[0];
+    *scratch.add(4) = cb[1];
+    core::ptr::copy_nonoverlapping(data, scratch.add(5), to_send);
     let total = NET_FRAME_HDR + payload_len;
     let written = (sys.channel_write)(chan, scratch, total);
     if written == total as i32 {
@@ -1572,20 +1695,20 @@ unsafe fn demux_inbound(s: &mut HttpState) {
         // and the peer retransmits once we drain. Consuming
         // unconditionally would let IP advance ACK and the peer
         // would never retransmit the bytes we couldn't hold.
-        let mut hdr = [0u8; NET_FRAME_HDR + 1];
+        let mut hdr = [0u8; NET_FRAME_HDR + 2];
         let peeked = (sys.channel_peek)(chan, hdr.as_mut_ptr(), hdr.len());
         if peeked < NET_FRAME_HDR as i32 {
             return;
         }
         let peeked_msg = hdr[0];
         let peeked_payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        if peeked_msg == NET_MSG_DATA && peeked_payload_len > 1 {
-            // Need at least the conn_id byte to find the target.
-            if peeked < NET_FRAME_HDR as i32 + 1 {
+        if peeked_msg == NET_MSG_DATA && peeked_payload_len > 2 {
+            // Need at least the conn_id bytes to find the target.
+            if peeked < NET_FRAME_HDR as i32 + 2 {
                 return;
             }
-            let conn = hdr[NET_FRAME_HDR];
-            let data_len = peeked_payload_len - 1;
+            let conn = u16::from_le_bytes([hdr[NET_FRAME_HDR], hdr[NET_FRAME_HDR + 1]]);
+            let data_len = peeked_payload_len - 2;
             if let Some(idx) = find_slot_by_conn_id(s, conn) {
                 let slot = &*s.server.slots.as_ptr().add(idx);
                 if !slot.recv_buf.is_null() {
@@ -1599,6 +1722,15 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                         // stalls siblings until it drains. IP's
                         // TCP backpressure handles the producer
                         // side correctly.
+                        //
+                        // Counted because "briefly" is an assumption, not a
+                        // guarantee: a peer that stops reading holds its
+                        // recv_buf full for as long as it stays silent, and
+                        // for that whole window this server is effectively
+                        // single-connection. A rising stall count is the
+                        // signature of head-of-line blocking and is not
+                        // visible in throughput until it is severe.
+                        s.server.demux_stalls = s.server.demux_stalls.wrapping_add(1);
                         return;
                     }
                 }
@@ -1614,11 +1746,13 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 // channel so TCP backpressure applies to the backend.
                 let slot = &*s.server.slots.as_ptr().add(idx);
                 if !is_proxy_relay_phase(slot.phase) {
+                    s.server.demux_stalls = s.server.demux_stalls.wrapping_add(1);
                     return;
                 }
                 if !slot.send_buf.is_null() {
                     let space = slot.send_cap as usize - slot.send_len as usize;
                     if data_len > space {
+                        s.server.demux_stalls = s.server.demux_stalls.wrapping_add(1);
                         return;
                     }
                 }
@@ -1632,17 +1766,20 @@ unsafe fn demux_inbound(s: &mut HttpState) {
         let buf = s.net_buf.as_mut_ptr();
         let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
         match msg_type {
-            NET_MSG_ACCEPTED if payload_len >= 1 => {
-                let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+            NET_MSG_ACCEPTED if payload_len >= 2 => {
+                let conn = u16::from_le_bytes([
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                ]);
                 // Multi-anchor demux: when the accept carries a listener
-                // port (payload_len >= 3), claim it only if it matches our
+                // port (payload_len >= 4), claim it only if it matches our
                 // bound port — a fanned net_out delivers every consumer's
-                // accepts to all of them. A port-less frame (legacy
-                // single-anchor producer) is always ours. A non-matching
-                // accept is ignored (the owning anchor closes/claims it).
-                let ours = payload_len < 3 || {
-                    let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
-                    let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                // accepts to all of them. A port-less frame (single-anchor
+                // producer) is always ours. A non-matching accept is
+                // ignored (the owning anchor closes/claims it).
+                let ours = payload_len < 4 || {
+                    let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                    let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
                     is_listen_port(s, (lo as u16) | ((hi as u16) << 8))
                 };
                 if ours {
@@ -1662,10 +1799,13 @@ unsafe fn demux_inbound(s: &mut HttpState) {
             // `bound`, a MSG_BOUND is only ever a pooled-listener bind (the
             // static bind is consumed pre-`bound` by slot 0's WaitBound).
             // Payload `[conn_id:1][port:2 LE]`.
-            NET_MSG_BOUND if payload_len >= 3 => {
-                let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR) as i16;
-                let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
-                let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+            NET_MSG_BOUND if payload_len >= 4 => {
+                let conn = u16::from_le_bytes([
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                ]) as i32;
+                let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
                 let port = (lo as u16) | ((hi as u16) << 8);
                 s.server.listeners.mark_bound(port, conn);
             }
@@ -1680,10 +1820,13 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 let port = (lo as u16) | ((hi as u16) << 8);
                 s.server.listeners.mark_refused(port);
             }
-            NET_MSG_DATA if payload_len > 1 => {
-                let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
-                let data_len = payload_len - 1;
+            NET_MSG_DATA if payload_len > 2 => {
+                let conn = u16::from_le_bytes([
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                ]);
+                let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                let data_len = payload_len - 2;
                 if let Some(idx) = find_slot_by_conn_id(s, conn) {
                     let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                     if slot.recv_buf.is_null() {
@@ -1719,34 +1862,109 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 }
                 // Else: orphan — slot already closed; drop the data.
             }
-            NET_MSG_CONNECTED if payload_len >= 1 => {
-                // Reply to a serialised proxy dial. `MSG_CONNECTED`
-                // carries `[conn_id][tag]` and the tag is our module
-                // index (identical across slots), so the pending
-                // `proxy_connect_owner` is the correlator. The owner's
-                // `ProxyWaitConnect` handler releases the ownership
-                // once it forwards the request.
-                let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                let owner = s.server.proxy_connect_owner;
-                if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
-                    let slot = &mut *s.server.slots.as_mut_ptr().add(owner as usize);
-                    slot.backend_conn_id = conn as i16;
-                    slot.proxy_connected = 1;
+            NET_MSG_CONNECTED if payload_len >= 2 => {
+                // Reply to a serialised proxy dial. `MSG_CONNECTED` carries
+                // `[conn_id u16][requester_tag u8]`. The tag is our module
+                // index + 1 and is identical across slots, so it cannot say
+                // WHICH slot dialled — the pending `proxy_connect_owner` is
+                // that correlator — but it does say whether the connection is
+                // OURS at all. On a fanned `net_in` (TLS, an OTLP exporter, a
+                // co-wired client) another consumer's connect would otherwise
+                // be latched as this server's backend, binding one request's
+                // client to another module's socket.
+                let conn = u16::from_le_bytes([
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                ]);
+                let me = dev_requester_tag(sys);
+                let tag = if payload_len >= 3 {
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2)
+                } else {
+                    0
+                };
+                if tag == 0 || tag == me {
+                    let owner = s.server.proxy_connect_owner;
+                    if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
+                        let slot = &mut *s.server.slots.as_mut_ptr().add(owner as usize);
+                        slot.backend_conn_id = conn as i32;
+                        slot.proxy_connected = 1;
+                    }
                 }
             }
-            NET_MSG_ERROR if payload_len >= 1 => {
-                // Post-bind, an ERROR is a backend connect failure for
-                // the serialised proxy dial (pre-bind errors are
-                // consumed by slot 0's `WaitBound` handler, before the
-                // demux runs).
-                let owner = s.server.proxy_connect_owner;
-                if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
-                    let slot = &mut *s.server.slots.as_mut_ptr().add(owner as usize);
-                    slot.proxy_connect_failed = 1;
+            NET_MSG_ERROR if payload_len >= 2 => {
+                // An ERROR is one of two different events and they are told
+                // apart by which field identifies the owner.
+                //
+                // A CONNECT-PHASE failure is identified by `requester_tag`
+                // ALONE. The contract is explicit that a connect failure's
+                // `conn_id` is meaningless — it is 0 when the dial failed
+                // before a slot was allocated, which is indistinguishable
+                // from a valid id 0 — so the tag is the only usable
+                // discriminator, and it is what says the failure is ours
+                // rather than a co-wired consumer's on a fanned `net_in`.
+                //
+                // An ESTABLISHED-CONNECTION error carries the owning
+                // connection's conn_id, so it is routed by slot lookup like
+                // MSG_CLOSED. Previously this arm read NEITHER field and
+                // failed whichever slot happened to hold `proxy_connect_owner`
+                // — so any peer reset anywhere aborted an unrelated backend
+                // dial and charged a spurious failover against a healthy
+                // upstream.
+                let conn = u16::from_le_bytes([
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                ]);
+                let tag = if payload_len >= 4 {
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3)
+                } else {
+                    0
+                };
+                if tag != 0 {
+                    // TAGGED: a connect-phase failure, attributed to the
+                    // requester that dialled. Ours only if the tag is ours —
+                    // on a fanned `net_in` this is what stops a co-wired
+                    // consumer's failed dial from aborting our backend
+                    // connect. The conn_id is deliberately NOT consulted.
+                    if tag == dev_requester_tag(sys) {
+                        let owner = s.server.proxy_connect_owner;
+                        if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
+                            let slot = &mut *s.server.slots.as_mut_ptr().add(owner as usize);
+                            slot.proxy_connect_failed = 1;
+                        }
+                    }
+                } else if let Some(idx) = find_slot_by_conn_id(s, conn) {
+                    // UNTAGGED: the transport passes tag 0 for errors that are
+                    // not tied to an outbound connect, so this is an error on
+                    // an established connection and routes by conn_id exactly
+                    // as MSG_CLOSED does. Error on a client conn = peer gone.
+                    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+                    slot.peer_closed = 1;
+                } else if let Some(idx) = find_slot_by_backend_conn(s, conn) {
+                    // Error on an established upstream: the relay flushes what
+                    // is staged, then tears down.
+                    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+                    slot.backend_closed = 1;
+                } else if dev_requester_tag(sys) == 0 {
+                    // Untagged, and owned by no slot of ours. This is only OUR
+                    // connect failure if we dialled untagged too — `proxy_dial`
+                    // stamps `dev_requester_tag`, so an untagged dial means the
+                    // module has no index to tag with. A tagged module reaching
+                    // here is looking at another consumer's error for a
+                    // connection it does not own, and must ignore it: claiming
+                    // it would abort a healthy dial on every peer reset
+                    // anywhere in the graph.
+                    let owner = s.server.proxy_connect_owner;
+                    if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
+                        let slot = &mut *s.server.slots.as_mut_ptr().add(owner as usize);
+                        slot.proxy_connect_failed = 1;
+                    }
                 }
             }
-            NET_MSG_CLOSED if payload_len >= 1 => {
-                let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+            NET_MSG_CLOSED if payload_len >= 2 => {
+                let conn = u16::from_le_bytes([
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
+                ]);
                 if let Some(idx) = find_slot_by_conn_id(s, conn) {
                     let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                     slot.peer_closed = 1;
@@ -1875,4 +2093,53 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     let next_cursor = (cursor_start + 1) % MAX_CONCURRENT_CONNS;
     s.server.step_cursor = next_cursor as u32;
     aggregated
+}
+
+/// Snapshot of the load-shedding counters, in `[observability].metrics` id
+/// order (ids 5..13): backpressure steps, connections refused for want of a
+/// slot, connections refused for want of arena, demux stalls, application
+/// timeouts, application envelopes lost, application envelopes oversize,
+/// WebSocket envelopes dropped, HTTP/2 streams refused.
+///
+/// Exposed so a test can assert the counter its scenario should have moved.
+/// A counter with no test that moves it is a counter that will silently stop
+/// working, and these exist precisely to be trusted during an incident.
+///
+/// # Safety
+/// See [`routes::test_inject_dyn_route`].
+#[cfg(feature = "host-test")]
+pub unsafe fn test_shed_metrics(state: *mut u8) -> ShedMetrics {
+    let s = &*(state as *mut HttpState);
+    ShedMetrics {
+        bp_steps: s.tlm.bp_steps,
+        idle_steps: s.tlm.idle_steps,
+        conns_refused_slots: s.server.conns_refused_slots,
+        conns_refused_arena: s.server.conns_refused_arena,
+        demux_stalls: s.server.demux_stalls,
+        app_timeouts: s.server.app_timeouts,
+        app_envelopes_lost: s.server.app_envelopes_lost,
+        app_envelopes_oversize: s.server.app_envelopes_oversize,
+        ws_envelopes_dropped: s.server.ws_envelopes_dropped,
+        h2_streams_refused: s.server.h2_streams_refused,
+    }
+}
+
+/// See [`test_shed_metrics`].
+#[cfg(feature = "host-test")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ShedMetrics {
+    pub bp_steps: u32,
+    /// Steps in which nothing moved — no bytes either way and no backpressure.
+    /// The signal the scheduler's adaptive tick reads to slow a quiet module
+    /// down, so it is what "minimising hardware use under light load" means in
+    /// practice.
+    pub idle_steps: u32,
+    pub conns_refused_slots: u32,
+    pub conns_refused_arena: u32,
+    pub demux_stalls: u32,
+    pub app_timeouts: u32,
+    pub app_envelopes_lost: u32,
+    pub app_envelopes_oversize: u32,
+    pub ws_envelopes_dropped: u32,
+    pub h2_streams_refused: u32,
 }

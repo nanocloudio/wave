@@ -7,8 +7,10 @@
 // RFC 9204 §4.1.2 specifies that QPACK uses this exact table: "The Huffman code
 // used is defined in Appendix B of [RFC7541]". So h2 and h3 are not two similar
 // tables that must be kept in step — they are one table, and this file is it.
-// Fluxor's `quic` module carries its own transcription; this is the core it
-// could consume instead (Conclave plan T2.2.4).
+// It is the one copy in the stack, not merely in this repo: Fluxor's `quic`
+// carried a second transcription for its own HTTP/3 responder, and that
+// responder — with its QPACK — is gone. QPACK now has exactly one home, and the
+// question of keeping two tables in step no longer exists.
 //
 // A transcription slip in a 257-entry table is exactly the kind of error that
 // decodes MOST strings correctly, so `huffman_table_valid` checks Kraft

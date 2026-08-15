@@ -18,7 +18,20 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FLUXOR_ROOT="${FLUXOR_ROOT:-$ROOT/../fluxor}"
-RUNTIME="${WAVE_LINUX_RUNTIME:-$FLUXOR_ROOT/target/aarch64-unknown-linux-gnu/debug/fluxor-linux}"
+# Prefer the runtime `fluxor sync` materialises into THIS checkout: it is pinned
+# by fluxor.lock, so it is the one the modules were built against. A sibling
+# checkout is the fallback, for a working-on-both-repos setup where a local
+# debug build is the point. Looking only at the sibling meant a fresh clone that
+# had run `fluxor sync` — which is the documented setup — still failed here with
+# "no fluxor-linux runtime", pointing at a build command it did not need.
+SYNCED_RUNTIME="$ROOT/target/aarch64-unknown-linux-gnu/release/fluxor-linux"
+if [ -n "${WAVE_LINUX_RUNTIME:-}" ]; then
+  RUNTIME="$WAVE_LINUX_RUNTIME"
+elif [ -x "$SYNCED_RUNTIME" ]; then
+  RUNTIME="$SYNCED_RUNTIME"
+else
+  RUNTIME="$FLUXOR_ROOT/target/aarch64-unknown-linux-gnu/debug/fluxor-linux"
+fi
 
 PLAIN_PORT=18081
 APP_PORT=18082

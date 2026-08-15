@@ -32,21 +32,36 @@ MODE="${1:-}"
 # (modules/foundation/http/server/app.rs) is behind the `app` feature, which
 # `web` does not carry, so the flash-constrained variant does not pay for a
 # handler that forwards to a module the device does not run.
+#
+# EVERY artefact the build produces must have a row here. `http-app` and `s3`
+# were both absent while this file's own header claimed to gate the variant
+# split — so the newest variant, added specifically because a netboot image
+# ceiling was being crossed, was the one variant with no ceiling. A budget that
+# silently omits an artefact is worse than no budget, because the omission
+# reads as coverage.
 BUDGETS="
 rp2350|http.fmod|137000|126744 (2026-08-12, +9.1K for request bodies + app fan-out)
 rp2350|http-h2.fmod|119000|110760 (2026-08-12, +5.1K)
-rp2350|http-web.fmod|78000|71816 (2026-08-12, +5.5K for request bodies; no app)
+rp2350|http-web.fmod|78000|72936 (2026-08-16, +1.1K for the shedding counters)
+rp2350|http-app.fmod|80000|73368 (2026-08-16, first row; h1 + app fan-out only)
 rp2350|rtp.fmod|4600|4192 (2026-08-12)
 rp2350|sip.fmod|13500|12831 (2026-08-12)
 rp2350|ws_stream.fmod|3000|2717 (2026-08-07)
 bcm2712|http.fmod|291000|269704 (2026-08-12, +12.2K for request bodies + app fan-out)
 bcm2712|http-h2.fmod|270000|250032 (2026-08-12, +6.2K)
-bcm2712|http-web.fmod|196000|181208 (2026-08-12, +5.8K for request bodies; no app)
+bcm2712|http-web.fmod|196000|182504 (2026-08-16, +1.3K for the shedding counters)
+bcm2712|http-app.fmod|203000|187064 (2026-08-16, first row; h1 + app fan-out only)
+bcm2712|s3.fmod|22000|19647 (2026-08-16, first row; SigV4 signing connector)
 bcm2712|smtp.fmod|6300|5713 (2026-08-07)
 bcm2712|websocket.fmod|12700|10912 (2026-08-12)
 "
 
 # subset|superset|target — the subset must be strictly smaller.
+#
+# The variants are a LATTICE, not a chain, and the relations have to say so.
+# `web` is h1+ws and `app` is h1+app: neither contains the other, so no relation
+# between them is assertable and claiming one would be a false gate. Both sit
+# under `h2` (h1+h2+ws+app), which sits under `full`.
 RELATIONS="
 http-web.fmod|http.fmod|rp2350
 http-web.fmod|http.fmod|bcm2712
@@ -54,6 +69,10 @@ http-h2.fmod|http.fmod|rp2350
 http-h2.fmod|http.fmod|bcm2712
 http-web.fmod|http-h2.fmod|rp2350
 http-web.fmod|http-h2.fmod|bcm2712
+http-app.fmod|http-h2.fmod|rp2350
+http-app.fmod|http-h2.fmod|bcm2712
+http-app.fmod|http.fmod|rp2350
+http-app.fmod|http.fmod|bcm2712
 "
 
 fail=0

@@ -95,7 +95,14 @@ struct WsState {
     message_len: u16,
 
     phase: WsPhase,
-    conn_id: u8,
+    conn_id: u16,
+    /// 1 once `MSG_CONNECTED` established a connection, 0 otherwise. Tracks
+    /// connection PRESENCE separately from `conn_id`'s value because the net
+    /// stack can legitimately assign `conn_id == 0`; keying "connected" off
+    /// `conn_id != 0` would skip the close on every connection that happened
+    /// to land in slot 0, leaking a transport slot per failure. Same split the
+    /// HTTP client carries for the same reason.
+    conn_present: u8,
     tag: u8,
     started_ms: u64,
     draining: u8,
@@ -199,6 +206,7 @@ pub extern "C" fn module_new(
         s.message_len = 0;
         s.phase = WsPhase::Disconnected;
         s.conn_id = 0;
+        s.conn_present = 0;
         s.tag = dev_requester_tag(sys);
         s.started_ms = 0;
         s.draining = 0;
@@ -312,19 +320,20 @@ unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
             }
         }
         WsAct::Fail => {
-            if s.conn_id != 0 {
-                let close = [s.conn_id];
+            if s.conn_present != 0 {
+                let close = s.conn_id.to_le_bytes();
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    1,
+                    2,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
             }
             s.conn_id = 0;
+            s.conn_present = 0;
             s.acc_len = 0;
             s.req_len = 0;
             s.req_sent = 0;
@@ -374,18 +383,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == WsPhase::Connecting => {
-                        if plen >= 2 && *payload.add(1) == s.tag {
-                            s.conn_id = *payload;
+                        if plen >= 3 && *payload.add(2) == s.tag {
+                            s.conn_id = u16::from_le_bytes([*payload, *payload.add(1)]);
+                            s.conn_present = 1;
                             feed(s, sys, WsEv::Connected, now);
                         }
                     }
                     NET_MSG_DATA if s.phase != WsPhase::Disconnected => {
-                        if plen > 1 && *payload == s.conn_id {
-                            let data_len = plen - 1;
+                        if plen > 2 && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id
+                        {
+                            let data_len = plen - 2;
                             let space = ACC_BUF - s.acc_len as usize;
                             let take = if data_len < space { data_len } else { space };
                             core::ptr::copy_nonoverlapping(
-                                payload.add(1),
+                                payload.add(2),
                                 s.acc.as_mut_ptr().add(s.acc_len as usize),
                                 take,
                             );
@@ -462,17 +473,27 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     NET_MSG_CLOSED if s.phase != WsPhase::Disconnected => {
-                        if plen >= 1 && *payload == s.conn_id {
+                        if plen >= 2 && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id
+                        {
                             feed(s, sys, WsEv::PeerClosed, now);
                         }
                     }
                     NET_MSG_ERROR => {
+                        // A connect-phase failure is matched on the TAG ALONE:
+                        // the contract states its `conn_id` is meaningless (0
+                        // when the dial failed before a slot was allocated,
+                        // indistinguishable from a valid id 0). The
+                        // established-connection clause is gated on
+                        // `conn_present`, not on the phase — during
+                        // `Connecting` this module's `conn_id` is still
+                        // zero-initialised, so a peer's failed dial carrying
+                        // conn_id 0 would otherwise be claimed here.
                         let ours = (s.phase == WsPhase::Connecting
-                            && plen >= 3
-                            && *payload.add(2) == s.tag)
-                            || (s.phase != WsPhase::Disconnected
-                                && plen >= 1
-                                && *payload == s.conn_id);
+                            && plen >= 4
+                            && *payload.add(3) == s.tag)
+                            || (s.conn_present != 0
+                                && plen >= 2
+                                && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id);
                         if ours {
                             feed(s, sys, WsEv::NetError, now);
                         }
@@ -482,7 +503,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        if s.conn_id != 0 && s.req_sent < s.req_len {
+        if s.conn_present != 0 && s.req_sent < s.req_len {
             let max_chunk = NET_BUF - NET_FRAME_HDR - 1;
             while s.req_sent < s.req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
@@ -495,14 +516,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 } else {
                     max_chunk
                 };
-                let total_payload = chunk + 1;
+                let total_payload = chunk + 2;
+                let cb = s.conn_id.to_le_bytes();
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
                 s.nbuf[2] = (total_payload >> 8) as u8;
-                s.nbuf[3] = s.conn_id;
+                s.nbuf[3] = cb[0];
+                s.nbuf[4] = cb[1];
                 core::ptr::copy_nonoverlapping(
                     s.req.as_ptr().add(s.req_sent as usize),
-                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 1),
+                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 2),
                     chunk,
                 );
                 (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), NET_FRAME_HDR + total_payload);
@@ -522,18 +545,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if s.draining == 1 && matches!(s.phase, WsPhase::Disconnected | WsPhase::Ready) {
-            if s.conn_id != 0 {
-                let close = [s.conn_id];
+            if s.conn_present != 0 {
+                let close = s.conn_id.to_le_bytes();
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    1,
+                    2,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
                 s.conn_id = 0;
+                s.conn_present = 0;
             }
             return 1;
         }

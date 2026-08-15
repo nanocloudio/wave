@@ -15,7 +15,7 @@
 // (`Complete Wave voice protocol ownership`, T4.3.7). Presentation-clock
 // adaptation is intentionally excluded — pacing lives in the composing module,
 // not hidden in the buffer. Behaviour is parity-exact with the origin ring;
-// the vectors live in `modules/foundation/sip/tests/jitter_vectors.rs`.
+// the vectors live in `tests/harness/tests/sip_jitter_vectors.rs`.
 
 /// Payload bytes held per slot — 20 ms of 8 kHz G.711 (`8000 * 0.02`).
 pub const JITTER_SLOT_SIZE: usize = 160;

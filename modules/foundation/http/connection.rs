@@ -56,3 +56,21 @@ pub(crate) const NET_BUF_SIZE: usize = 1600;
 /// THIS — not `NET_BUF_SIZE` (the much larger outbound scratch) — so an h2
 /// client with a small `recv_buf` still admits inbound frames.
 pub(crate) const MAX_DATA_FRAGMENT: usize = 1460;
+
+// ── Multiplexed-session contract (HTTP/3) ──
+//
+// Mounted here rather than inside either role because it is neither role's: it
+// is the transport surface QUIC exposes, and both `server::h3` and `client::h3`
+// speak it. It lived in `server::h3` while h3 was server-only, which made the
+// client — once it existed — import from the server to reach the transport
+// contract, exactly the wrong direction.
+//
+// Frames share the `[msg_type u8][len u16 LE][payload]` TLV header with
+// net_proto and the datagram surface, and the mux opcode range (0xB0..0xCF) is
+// disjoint from theirs — which is why h3 needs no new ports: one channel pair
+// carries both contracts unambiguously.
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/net/mux.rs"]
+pub mod mux;
+
+/// Header shared by every contract on a net channel.
+pub const FRAME_HDR: usize = 3;

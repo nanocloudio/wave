@@ -82,14 +82,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 if poll > 0 && (poll as u32 & POLL_IN) != 0 {
                     let buf = s.net_buf.as_mut_ptr();
                     let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-                    if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+                    if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
                         // Claim only our own outbound connection: MSG_CONNECTED
                         // is `[conn_id][requester_tag]`; the tag echoes our
                         // CMD_CONNECT index. Untagged (legacy/sole-consumer) or
                         // our tag → ours; any other tag belongs to a co-wired
                         // consumer sharing this fanned queue, so ignore it.
-                        let tag = if payload_len >= 2 {
-                            *buf.add(NET_FRAME_HDR + 1)
+                        let tag = if payload_len >= 3 {
+                            *buf.add(NET_FRAME_HDR + 2)
                         } else {
                             0
                         };
@@ -97,17 +97,20 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         if tag != 0 && tag != me {
                             return 0; // another consumer's connection — keep waiting.
                         }
-                        s.client.conn_id = *buf.add(NET_FRAME_HDR);
+                        s.client.conn_id = u16::from_le_bytes([
+                            *buf.add(NET_FRAME_HDR),
+                            *buf.add(NET_FRAME_HDR + 1),
+                        ]);
                         s.client.conn_present = 1;
                         log(s, b"[http] connected");
                         build_request(s);
                         s.client.phase = Phase::SendRequest;
                         continue;
                     } else if msg_type == NET_MSG_ERROR {
-                        // Connect failure carries our tag at payload[2]
+                        // Connect failure carries our tag at payload[3]
                         // ([conn_id][errno][tag]); ignore another consumer's.
-                        let etag = if payload_len >= 3 {
-                            *buf.add(NET_FRAME_HDR + 2)
+                        let etag = if payload_len >= 4 {
+                            *buf.add(NET_FRAME_HDR + 3)
                         } else {
                             0
                         };
@@ -140,15 +143,17 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     .as_ptr()
                     .add(s.client.request_sent as usize);
 
-                let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+                let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 2;
                 let to_send = remaining.min(max_data);
                 let scratch = s.net_buf.as_mut_ptr();
-                let payload_len = 1 + to_send;
+                let payload_len = 2 + to_send;
+                let cb = conn_id.to_le_bytes();
                 *scratch = NET_CMD_SEND;
                 *scratch.add(1) = (payload_len & 0xFF) as u8;
                 *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-                *scratch.add(3) = conn_id;
-                core::ptr::copy_nonoverlapping(data_ptr, scratch.add(4), to_send);
+                *scratch.add(3) = cb[0];
+                *scratch.add(4) = cb[1];
+                core::ptr::copy_nonoverlapping(data_ptr, scratch.add(5), to_send);
                 let total = NET_FRAME_HDR + payload_len;
                 let written = (sys.channel_write)(out_chan, scratch, total);
 
@@ -195,8 +200,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 }
 
                 if msg_type == NET_MSG_DATA && payload_len > 1 {
-                    let data_ptr = nbuf.add(NET_FRAME_HDR + 1) as *const u8;
-                    let data_len = payload_len - 1;
+                    let data_ptr = nbuf.add(NET_FRAME_HDR + 2) as *const u8;
+                    let data_len = payload_len - 2;
 
                     let cur = s.client.recv_len as usize;
                     let space = RECV_BUF_SIZE - cur;
@@ -269,8 +274,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 }
 
                 if msg_type == NET_MSG_DATA && payload_len > 1 {
-                    let data_ptr = nbuf.add(NET_FRAME_HDR + 1) as *const u8;
-                    let data_len = payload_len - 1;
+                    let data_ptr = nbuf.add(NET_FRAME_HDR + 2) as *const u8;
+                    let data_len = payload_len - 2;
 
                     let to_copy = data_len.min(RECV_BUF_SIZE);
                     core::ptr::copy_nonoverlapping(

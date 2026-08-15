@@ -30,8 +30,8 @@ use super::{
 pub(crate) const PROXY_CONNECT_TIMEOUT_MS: u32 = 10_000;
 
 /// Find the slot whose upstream `backend_conn_id` matches `conn`.
-pub(crate) unsafe fn find_slot_by_backend_conn(s: &HttpState, conn: u8) -> Option<usize> {
-    let needle = conn as i16;
+pub(crate) unsafe fn find_slot_by_backend_conn(s: &HttpState, conn: u16) -> Option<usize> {
+    let needle = conn as i32;
     for i in 0..MAX_CONCURRENT_CONNS {
         let slot = &*s.server.slots.as_ptr().add(i);
         if slot.backend_conn_id == needle {
@@ -205,7 +205,7 @@ pub(crate) unsafe fn proxy_relay_step(s: &mut HttpState) {
         let remaining = (recv_len - creq_off) as usize;
         let sent = net_send_conn(
             s,
-            backend as u8,
+            backend as u16,
             cur_recv_buf_ptr(s).add(creq_off as usize),
             remaining,
         );
@@ -224,7 +224,7 @@ pub(crate) unsafe fn proxy_relay_step(s: &mut HttpState) {
         let remaining = (send_len - send_off) as usize;
         let sent = net_send_conn(
             s,
-            client as u8,
+            client as u16,
             cur_send_buf_ptr(s).add(send_off as usize),
             remaining,
         );
@@ -307,7 +307,7 @@ pub(crate) unsafe fn try_begin_dyn_proxy(s: &mut HttpState) -> bool {
 ///
 /// # Safety
 /// See [`super::routes::test_inject_dyn_route`].
-pub unsafe fn test_set_client_ip(state: *mut u8, conn_id: u8, ip: u32) {
+pub unsafe fn test_set_client_ip(state: *mut u8, conn_id: u16, ip: u32) {
     let s = &mut *(state as *mut HttpState);
     if let Some(idx) = find_slot_by_conn_id(s, conn_id) {
         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);

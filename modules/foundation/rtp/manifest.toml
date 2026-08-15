@@ -49,5 +49,3 @@ access = "read"
 [observability]
 exempt = "application-layer demo — byte throughput is observed at the foundation transport (ip/quic/http) it rides"
 
-[test]
-harness = "tests/harness.rs"
