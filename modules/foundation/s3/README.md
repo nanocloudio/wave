@@ -33,20 +33,41 @@ signature. SHA-256 itself is SDK-owned
 One record in, one record out. Every `S3Request` the connector understands is
 answered with exactly one `S3Response` carrying the same correlation id — the
 endpoint's status when it replied, `501` for an operation this connector does
-not perform, `413` for an object larger than one record can carry, `500` when
+not perform, `413` for an object larger than one record can carry, `400` for a
+header declaring a record larger than the connector can ever hold, `500` when
 the request could not be built at all, `502` when the transport failed before
-the endpoint could answer, and `504` when it stayed silent past the reply
-budget. The three 5xx name the failing party: `500` is this connector, `502` the
-path to the endpoint, `504` the endpoint itself. A record whose own header is
-truncated is dropped rather than answered, because the correlation id is inside
-the part that could not be trusted; the drop is logged, since it is the only
-signal a caller gets for a record nothing is owed for.
+the endpoint could answer, `503` when a drain arrived before the operation was
+attempted, and `504` when it stayed silent past the reply budget. The three 5xx
+name the failing party: `500` is this connector, `502` the
+path to the endpoint, `504` the endpoint itself.
 
 The connector performs one operation at a time, and the answer is what releases
 it: a full `response_out` holds the finished record until the caller reads it,
-and no further request is taken until then. Draining follows the same rule — the
+and no further request is taken until then. `net_out` is held to the same rule
+in the other direction: a dial, a request chunk or a close the transport refuses
+is offered again unchanged on a later step, so a signed request never goes out
+with a hole in it and a connection is never left open because its close could
+not be written.
+
+One read of `request_in` can take several records at once, and all of them are
+the connector's from that moment. Draining follows: no further record is taken
+off the channel, every record already taken is answered — the one in flight by
+whatever the endpoint or the transport does, the rest with `503` — and the
 connector reports itself finished only once nothing it accepted is still
-unanswered.
+unanswered and the transport has taken every command it owes.
+
+`request_in` is a byte stream, so that same read can also end part-way through a
+record. A record split across any number of reads is assembled and performed
+once: the fragment is kept and the reads behind it continue it, because its
+bytes are already off the channel and nothing else can serve them. A header
+whose declared length has simply not all arrived is not a header in error — only
+one declaring more than a single record can ever hold is, and that is refused
+with a status rather than dropped, since the bytes were taken and the header
+names a correlation id. What bounds retention is the drain, not a clock: a
+deadline would report a caller for a state that is entirely local. At the drain
+a fragment is refused with `503` like any other record the connector will not
+perform, unless too little of it arrived to carry a correlation id — the one
+case with nothing to answer on, which is logged and counted instead.
 
 ## Ports
 

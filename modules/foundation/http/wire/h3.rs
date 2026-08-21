@@ -46,6 +46,18 @@ pub const H3_UNI_STREAM_QPACK_DECODER: u64 = 0x03;
 pub const H3_SETTING_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
 pub const H3_SETTING_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 pub const H3_SETTING_QPACK_BLOCKED_STREAMS: u64 = 0x07;
+/// RFC 9220 §3 / RFC 8441 — the peer permits extended CONNECT, which is
+/// how a WebSocket tunnel is opened over HTTP/3.
+pub const H3_SETTING_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
+
+// ----------------------------------------------------------------------
+// PRIORITY_UPDATE frames (RFC 9218 §7.2)
+// ----------------------------------------------------------------------
+//
+// Both types are 0xF07xx, so both encode as a 4-byte QUIC varint.
+
+pub const H3_FRAME_PRIORITY_UPDATE_REQUEST: u64 = 0xF0700;
+pub const H3_FRAME_PRIORITY_UPDATE_PUSH: u64 = 0xF0701;
 
 // ----------------------------------------------------------------------
 // Parsing
@@ -77,6 +89,33 @@ pub fn parse_h3_frame(buf: &[u8]) -> Option<(H3Frame<'_>, usize)> {
         },
         payload_off + length,
     ))
+}
+
+/// Build a SETTINGS frame body: a sequence of (varint id, varint value)
+/// pairs (RFC 9114 §7.2.4). Returns bytes written, or 0 on overflow.
+///
+/// Takes a slice of pairs rather than a callback. A per-entry
+/// `&mut dyn FnMut` is a trait object, and a trait object is a vtable:
+/// these modules are position-independent with no relocation processing
+/// for one, so the call jumps to an unrelocated address and faults the
+/// runtime rather than failing the build.
+pub fn build_h3_settings_payload(settings: &[(u64, u64)], out: &mut [u8]) -> usize {
+    let mut pos = 0usize;
+    for (id, val) in settings {
+        for v in [*id, *val] {
+            if pos >= out.len() {
+                return 0;
+            }
+            // SAFETY: pointer derived from a Rust slice; `out.len() - pos`
+            // is the exact remaining capacity passed for bounds.
+            let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, v) };
+            if n == 0 {
+                return 0;
+            }
+            pos += n;
+        }
+    }
+    pos
 }
 
 /// Build a frame header (type + length) into `out`, returning bytes

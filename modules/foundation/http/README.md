@@ -77,9 +77,16 @@ they end.
 Connections themselves are not outstanding work, and the distinction is what
 makes the drain terminate at all: a keep-alive connection between requests is
 closed, an HTTP/2 connection with no open stream is sent GOAWAY naming the last
-stream it served, and a WebSocket tunnel is sent a `1001 going away` close. Each
-of those is an ending the peer can act on, where waiting for the peer to close
-first would simply never finish.
+stream it served, an HTTP/3 session with no open stream is sent GOAWAY naming
+the first request it will not process and then closed, and a WebSocket tunnel —
+over either generation — is sent a `1001 going away` close. Each of those is an
+ending the peer can act on, where waiting for the peer to close first would
+simply never finish.
+
+Admission stops the moment the drain begins. A connection accepted afterwards is
+closed rather than served, and a new HTTP/3 stream is refused; the GOAWAY
+identifier tells the peer which requests it may re-issue elsewhere. Bytes for
+work already accepted keep flowing, because that work still has to finish.
 
 ## Methods and request bodies
 

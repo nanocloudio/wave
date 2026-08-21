@@ -21,6 +21,13 @@
 //! implementation serve both directions.
 
 use super::super::connection::{mux, FRAME_HDR};
+// The connection-scoped HTTP/3 machinery, shared with the server role.
+// RFC 9114 §6.2.1 asks it of an ENDPOINT, not of a server, so both roles
+// use one implementation rather than two that can disagree.
+use super::super::server::h3::{
+    commit_session, local_uni_opened, peer_uni_alloc, peer_uni_slot, preamble_done,
+    preamble_open_outstanding, session_preamble_out, uni_ingest, H3Session, H3_ALPN_TOKEN,
+};
 use super::super::wire::h3::{
     build_h3_frame_header, parse_h3_frame, H3Frame, H3_FRAME_DATA, H3_FRAME_HEADERS,
 };
@@ -42,8 +49,18 @@ pub const H3_CLIENT_BODY_BUF: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum H3ClientState {
-    /// Nothing asked for yet.
+    /// No session yet. The transport has not announced one, so there is
+    /// nothing to open a stream ON.
+    ///
+    /// The client WAITS for that announcement rather than assuming session
+    /// 0: which session id a connection gets is the transport's to
+    /// allocate, and a client that guessed would address a session that
+    /// does not exist the moment more than one is in play.
     Idle,
+    /// A session exists and its connection preamble — control and QPACK
+    /// streams, SETTINGS — is being opened. RFC 9114 §6.2.1 puts SETTINGS
+    /// first, so no request may go out until this completes.
+    Preamble,
     /// `CMD_MUX_STREAM_OPEN` sent; waiting for the transport's stream id.
     Opening,
     /// Request sent; accumulating the response.
@@ -57,7 +74,13 @@ pub enum H3ClientState {
 /// One client-side HTTP/3 exchange.
 pub struct H3Client {
     pub state: H3ClientState,
+    /// The connection-scoped HTTP/3 state, shared in shape with the
+    /// server's. Both roles owe the same preamble and read the peer's
+    /// SETTINGS the same way, so the state and the code are the same; a
+    /// second copy here is how the two drift.
+    pub session: H3Session,
     pub session_id: u32,
+    /// The transport's opaque handle for the request stream.
     pub stream_id: u32,
     /// Decoded `:status`, once the response headers arrive.
     pub status: u16,
@@ -67,12 +90,22 @@ pub struct H3Client {
     pub body_len: usize,
     /// The response body has been handed to the app port.
     pub body_emitted: bool,
+    /// The request head has been taken by the transport in full. Until it
+    /// has, the identical frame is offered again: a request the channel
+    /// refused is one the server never sees, and the exchange would sit
+    /// awaiting a response to something never sent.
+    pub request_sent: bool,
+    /// The FIN closing the request half has been taken. A server waits for
+    /// it before responding, so a refused close is retried rather than
+    /// dropped.
+    pub fin_sent: bool,
 }
 
 impl H3Client {
     pub const fn new() -> Self {
         Self {
             state: H3ClientState::Idle,
+            session: H3Session::empty(),
             session_id: 0,
             stream_id: 0,
             status: 0,
@@ -81,6 +114,8 @@ impl H3Client {
             body: [0; H3_CLIENT_BODY_BUF],
             body_len: 0,
             body_emitted: false,
+            request_sent: false,
+            fin_sent: false,
         }
     }
 
@@ -188,22 +223,96 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
     if payload.len() < mux::SESSION_ID_BYTES {
         return c.state;
     }
+    let session = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+
+    // Session-scoped events first: their bytes 4..8 are not a stream
+    // handle, and reading them as one would address a stream that does not
+    // exist.
+    if msg_type == mux::MSG_MUX_SESSION_OPENED {
+        if payload.len() < mux::SESSION_ID_BYTES + mux::SESSION_OPENED_BODY_MIN {
+            return c.state;
+        }
+        let b = &payload[mux::SESSION_ID_BYTES..];
+        if b[0] != mux::STATUS_OK {
+            c.state = H3ClientState::Failed;
+            return c.state;
+        }
+        let alpn_len = b[2] as usize;
+        if b.len() < 3 + alpn_len {
+            return c.state;
+        }
+        // The transport reports the negotiated token; deciding it selects
+        // HTTP/3 is this module's call.
+        if &b[3..3 + alpn_len] != H3_ALPN_TOKEN {
+            return c.state;
+        }
+        c.session = H3Session::empty();
+        c.session.allocated = true;
+        c.session.session_id = session;
+        c.session.is_h3 = true;
+        c.session_id = session;
+        if c.state == H3ClientState::Idle {
+            c.state = H3ClientState::Preamble;
+        }
+        return c.state;
+    }
+    if msg_type == mux::MSG_MUX_SESSION_CLOSED {
+        if c.state == H3ClientState::AwaitingResponse {
+            c.state = H3ClientState::Failed;
+        }
+        return c.state;
+    }
+    if payload.len() < mux::STREAM_DATA_PREFIX {
+        return c.state;
+    }
+    let handle = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+
     match msg_type {
+        mux::MSG_MUX_STREAM_ACCEPTED => {
+            if payload.len() < mux::STREAM_DATA_PREFIX + mux::STREAM_ACCEPTED_BODY {
+                return c.state;
+            }
+            let flags = payload[mux::STREAM_DATA_PREFIX];
+            if flags & mux::STREAM_FLAG_UNI != 0 {
+                // The server's control and QPACK streams. Registered now,
+                // classified from their first bytes.
+                let _ = peer_uni_alloc(&mut c.session, handle);
+            }
+        }
         mux::MSG_MUX_STREAM_OPENED => {
-            if payload.len() < mux::STREAM_DATA_PREFIX + 1 {
+            if payload.len() < mux::STREAM_DATA_PREFIX + mux::STREAM_OPENED_BODY {
                 return c.state;
             }
             let status = payload[mux::STREAM_DATA_PREFIX];
+            // Which open this answers is decided by whether a preamble
+            // open is outstanding, not by the client's own state: the
+            // transport does not say which request it is answering, and
+            // one open is in flight at a time precisely so this is
+            // unambiguous.
+            if preamble_open_outstanding(&c.session) {
+                local_uni_opened(&mut c.session, handle, status);
+                return c.state;
+            }
             if status != mux::STATUS_OK {
                 c.state = H3ClientState::Failed;
                 return c.state;
             }
-            c.session_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            c.stream_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            c.session_id = session;
+            c.stream_id = handle;
             c.state = H3ClientState::AwaitingResponse;
         }
         mux::MSG_MUX_STREAM_RX => {
             if payload.len() < mux::STREAM_DATA_PREFIX {
+                return c.state;
+            }
+            // A server unidirectional stream carries the connection's
+            // control or QPACK traffic, not our response.
+            if let Some(ui) = peer_uni_slot(&c.session, handle) {
+                let body = &payload[mux::STREAM_DATA_PREFIX..];
+                if let Some(code) = uni_ingest(&mut c.session, ui, body) {
+                    c.session.fail(code);
+                    c.state = H3ClientState::Failed;
+                }
                 return c.state;
             }
             let body = &payload[mux::STREAM_DATA_PREFIX..];
@@ -216,7 +325,21 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
             c.recv_len += body.len();
             client_drain(c);
         }
+        mux::MSG_MUX_STREAM_RESET => {
+            // The server abandoned the exchange. Whatever arrived is a
+            // fragment of a response it withdrew, so reporting Complete
+            // would present a truncated body as a whole one.
+            if c.state == H3ClientState::AwaitingResponse {
+                c.state = H3ClientState::Failed;
+            }
+        }
         mux::MSG_MUX_STREAM_CLOSED => {
+            if peer_uni_slot(&c.session, handle).is_some() {
+                // RFC 9114 §6.2.1: a critical stream the connection
+                // depends on for its whole life has ended.
+                c.state = H3ClientState::Failed;
+                return c.state;
+            }
             if c.state == H3ClientState::AwaitingResponse {
                 // The peer finished. A response without a `:status` never
                 // arrived, and reporting Complete would invent one.
@@ -287,24 +410,47 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
         return 0;
     }
 
-    // Ask the transport for a stream, once. It answers MSG_MUX_STREAM_OPENED
-    // with the id — the only thing this module ever learns about QUIC's stream
-    // space.
-    if s.h3_client.state == H3ClientState::Idle {
-        let plen = mux::SESSION_ID_BYTES + 1;
-        let mut frame = [0u8; FRAME_HDR + mux::SESSION_ID_BYTES + 1];
-        frame[0] = mux::CMD_MUX_STREAM_OPEN;
-        frame[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-        frame[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&0u32.to_le_bytes());
-        frame[FRAME_HDR + 4] = mux::STREAM_FLAG_BIDI;
-        let poll = (sys.channel_poll)(out_chan, super::super::POLL_OUT);
-        if poll > 0
-            && (poll as u32) & super::super::POLL_OUT != 0
-            && (sys.channel_write)(out_chan, frame.as_ptr(), frame.len()) > 0
-        {
-            s.h3_client.state = H3ClientState::Opening;
+    // Idle means the transport has not announced a session yet. There is
+    // nothing to open a stream on, and guessing session 0 would address a
+    // session that need not exist — so the loop falls through to the
+    // ingress drain and waits for MSG_MUX_SESSION_OPENED.
+    //
+    // Preamble means a session exists and its control and QPACK streams
+    // are being opened. RFC 9114 §6.2.1 makes SETTINGS the first frame an
+    // endpoint sends, so the request stream waits for that to finish.
+    if s.h3_client.state == H3ClientState::Preamble {
+        let mut frame = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 64];
+        if let Some((n, what)) = session_preamble_out(&s.h3_client.session, &mut frame) {
+            let poll = (sys.channel_poll)(out_chan, super::super::POLL_OUT);
+            // All-or-nothing: a partial mux frame would desync the
+            // transport's reader. The preamble advances only once the whole
+            // frame is taken, so a refusal restages the identical bytes
+            // rather than skipping a critical stream.
+            if poll > 0
+                && (poll as u32) & super::super::POLL_OUT != 0
+                && (sys.channel_write)(out_chan, frame.as_ptr(), n) > 0
+            {
+                commit_session(&mut s.h3_client.session, what);
+            }
+        } else if preamble_done(&s.h3_client.session) {
+            // Preamble handed over: ask for the request stream, on the
+            // session the transport named.
+            let plen = mux::SESSION_ID_BYTES + 1;
+            let mut open = [0u8; FRAME_HDR + mux::SESSION_ID_BYTES + 1];
+            open[0] = mux::CMD_MUX_STREAM_OPEN;
+            open[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
+            open[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&s.h3_client.session_id.to_le_bytes());
+            open[FRAME_HDR + 4] = mux::STREAM_FLAG_BIDI;
+            let poll = (sys.channel_poll)(out_chan, super::super::POLL_OUT);
+            if poll > 0
+                && (poll as u32) & super::super::POLL_OUT != 0
+                && (sys.channel_write)(out_chan, open.as_ptr(), open.len()) > 0
+            {
+                s.h3_client.state = H3ClientState::Opening;
+            }
         }
-        return 0;
+        // Either way, fall through: the answer to whatever was just sent
+        // arrives on the ingress drain below.
     }
 
     // Drain inbound mux frames.
@@ -326,13 +472,13 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             frame.as_mut_ptr(),
             n,
         );
-        let was = s.h3_client.state;
-        let now = client_mux_frame(&mut s.h3_client, msg_type, &frame[..n]);
+        client_mux_frame(&mut s.h3_client, msg_type, &frame[..n]);
+    }
 
-        // The stream has just been granted: send the request on it.
-        if was == H3ClientState::Opening && now == H3ClientState::AwaitingResponse {
-            client_send_request(s);
-        }
+    // The stream is granted: send the request on it, then FIN the request
+    // half. Each is retried until the transport takes it whole.
+    if s.h3_client.state == H3ClientState::AwaitingResponse {
+        client_send_request(s);
     }
 
     // Hand the body onward, once, the way the h1 client does (out[1]).
@@ -384,7 +530,15 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
 
 /// Build and send the configured request, then FIN the stream — a GET carries
 /// no body, so the request is complete the moment its headers are sent.
+///
+/// Both writes are all-or-nothing and are only recorded once accepted, so a
+/// step that finds the channel full re-offers the identical bytes on the
+/// next one. Called every step while the exchange awaits its response; it
+/// returns immediately once both have gone out.
 unsafe fn client_send_request(s: &mut super::super::HttpState) {
+    if s.h3_client.fin_sent {
+        return;
+    }
     let sys = &*s.syscalls;
     let out_chan = s.net_out_chan;
 
@@ -412,18 +566,20 @@ unsafe fn client_send_request(s: &mut super::super::HttpState) {
     }
 
     let (session, stream) = (s.h3_client.session_id, s.h3_client.stream_id);
-    let body_len = mux::STREAM_DATA_PREFIX + n;
-    let mut frame = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 512];
-    frame[0] = mux::CMD_MUX_STREAM_SEND;
-    frame[1..3].copy_from_slice(&(body_len as u16).to_le_bytes());
-    frame[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-    frame[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
-    frame[FRAME_HDR + mux::STREAM_DATA_PREFIX..FRAME_HDR + mux::STREAM_DATA_PREFIX + n]
-        .copy_from_slice(&req[..n]);
-    let total = FRAME_HDR + body_len;
-    if (sys.channel_write)(out_chan, frame.as_ptr(), total) <= 0 {
-        s.h3_client.state = H3ClientState::Failed;
-        return;
+    if !s.h3_client.request_sent {
+        let body_len = mux::STREAM_DATA_PREFIX + n;
+        let mut frame = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 512];
+        frame[0] = mux::CMD_MUX_STREAM_SEND;
+        frame[1..3].copy_from_slice(&(body_len as u16).to_le_bytes());
+        frame[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
+        frame[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
+        frame[FRAME_HDR + mux::STREAM_DATA_PREFIX..FRAME_HDR + mux::STREAM_DATA_PREFIX + n]
+            .copy_from_slice(&req[..n]);
+        let total = FRAME_HDR + body_len;
+        if (sys.channel_write)(out_chan, frame.as_ptr(), total) <= 0 {
+            return;
+        }
+        s.h3_client.request_sent = true;
     }
 
     // FIN the request half: a server waits for it before responding.
@@ -434,5 +590,7 @@ unsafe fn client_send_request(s: &mut super::super::HttpState) {
     close[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
     close[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
     close[FRAME_HDR + 8] = mux::STATUS_OK;
-    let _ = (sys.channel_write)(out_chan, close.as_ptr(), close.len());
+    if (sys.channel_write)(out_chan, close.as_ptr(), close.len()) > 0 {
+        s.h3_client.fin_sent = true;
+    }
 }

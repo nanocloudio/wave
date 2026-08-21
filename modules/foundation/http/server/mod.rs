@@ -1783,7 +1783,16 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                     is_listen_port(s, (lo as u16) | ((hi as u16) << 8))
                 };
                 if ours {
-                    if let Some(idx) = alloc_free_slot(s, conn) {
+                    if s.server.draining != 0 {
+                        // Admission stops at the drain, and it stops HERE
+                        // rather than at the top of `step`: inbound bytes for
+                        // connections admitted BEFORE the drain must keep
+                        // flowing or the work the drain exists to finish
+                        // never completes. Closing the new conn rather than
+                        // dropping it is what stops a continuous arrival
+                        // stream from holding quiescence open indefinitely.
+                        close_net_conn(s, conn);
+                    } else if let Some(idx) = alloc_free_slot(s, conn) {
                         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                         slot.phase = Phase::RecvRequest;
                     } else {

@@ -40,7 +40,7 @@ MODE="${1:-}"
 # silently omits an artefact is worse than no budget, because the omission
 # reads as coverage.
 BUDGETS="
-rp2350|http.fmod|137000|126744 (2026-08-12, +9.1K for request bodies + app fan-out)
+rp2350|http.fmod|142000|141136 (2026-08-21, +4.1K: h3 stage/commit split so a refused write cannot drop a frame, plus h3 drain)
 rp2350|http-h2.fmod|119000|110760 (2026-08-12, +5.1K)
 rp2350|http-web.fmod|78000|72936 (2026-08-16, +1.1K for the shedding counters)
 rp2350|http-app.fmod|80000|73368 (2026-08-16, first row; h1 + app fan-out only)
