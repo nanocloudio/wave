@@ -1,5 +1,4 @@
 # Wave project configuration consumed by the `fluxor` CLI.
-# See ~/Development/nanocloudio/standards/{ci,tests,fluxor-modules,dependencies}.md.
 
 [project]
 name    = "wave"
@@ -23,8 +22,7 @@ fluxor = { abi = 1 }
 # 2026-08-03, see T3.6.5). The three bcm2712-only modules are all OUTBOUND
 # connectors, which is why rp2350 can serve WebSocket but not dial one; that is
 # an unexamined default rather than a requirement. `linux` is a *runtime* host,
-# not a silicon, so it is not listed here; the Linux path is exercised by
-# `tools/e2e/linux_graph.sh`.
+# not a silicon, so it is not listed here.
 targets = ["rp2350", "bcm2712", "wasm"]
 
 # No `[ci.cargo]`. Wave has NO root cargo workspace: it was retired on
@@ -53,7 +51,7 @@ targets = ["rp2350", "bcm2712", "wasm"]
 [ci.test]
 # Three project gates, run in order at CI phase 3.5 (after the strict module
 # build):
-#   1. ci-shadow-guard.sh — shadow-checkout hard-fail (test-tracking.md §7):
+#   1. ci-shadow-guard.sh — shadow-checkout hard-fail:
 #      tests/ is shadow-tracked in .git-shadow/, so a primary-only checkout has
 #      zero files there and the test phases would pass vacuously.
 #   2. host_crates.sh — phases 1.1/1.2 fmt-check and clippy the PIC module

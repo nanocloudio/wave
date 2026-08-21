@@ -357,6 +357,18 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // `demux_inbound` at the top of `step()`. If nothing's
             // buffered, the slot is genuinely idle — yield this tick.
             if cur_recv_len(s) == 0 {
+                // Unless the server is draining. A keep-alive connection with
+                // no request buffered holds no admitted work, so it is closed
+                // rather than waited on: occupancy is not work, and a drain
+                // that waits for occupancy to end never completes on a server
+                // with live clients. A request already in flight is unaffected —
+                // it is in a later phase.
+                if s.server.draining != 0 {
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::CloseConn;
+                    }
+                    return 2;
+                }
                 return 0;
             }
 
@@ -2272,6 +2284,19 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                 }
                 return 0;
+            }
+
+            // Draining: a tunnel is long-lived by construction, so waiting for
+            // the peer to close it is waiting forever. A CLOSE 1001 tells the
+            // peer the endpoint is going away — which is the difference between
+            // a client that reconnects and one that reports a broken socket.
+            if s.server.draining != 0 {
+                let send_empty = cur_send_len(s) == 0;
+                let no_frag = cur_slot(s).map(|c| c.ws_frag_buf.is_null()).unwrap_or(true);
+                if send_empty && no_frag {
+                    ws_begin_close(s, wire::ws::CLOSE_GOING_AWAY);
+                    return 2;
+                }
             }
 
             // Retention replay: a freshly upgraded fan-out slot drains

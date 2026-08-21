@@ -10,7 +10,7 @@ the graph's, not its own.
 Header decode is shared with `sip` in `modules/common/rtp_core.rs`, so the module
 that sends packets and the module that plays them agree on which bytes are
 payload — the fixed header, the CSRC list, a §5.3.1 extension and §5.1 padding
-all move that boundary. Vectors: `tests/harness/tests/rtp_core_vectors.rs`.
+all move that boundary.
 
 ## Ports
 
@@ -35,9 +35,8 @@ Transmit and receive ceilings are deliberately different numbers.
   RTP muxer defaults to 1024-byte PCMU payloads, or 128 ms.
 
 A packet too large to accept is refused and counted, never delivered as the
-fraction that happened to fit. Both directions are verified against ffmpeg rather
-than against Wave's own reading of the RFC
-(`tests/harness/tests/rtp_interop.rs`).
+fraction that happened to fit. Both directions interoperate with ffmpeg's RTP
+muxer, not only with Wave's own reading of the RFC.
 
 ## Not implemented
 
@@ -48,6 +47,5 @@ capability and is never implied by an RTP binding.
 
 ## Observability
 
-Module-scope metrics are exempt (`../standards/observability.md` §6): byte
-throughput is observed at the foundation transport this module rides, not
-recounted here.
+This module carries no metrics of its own: byte throughput is observed at the
+foundation transport it rides, not recounted here.

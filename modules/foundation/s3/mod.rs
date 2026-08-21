@@ -28,7 +28,7 @@
 //! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `host` (the Host header, e.g.
 //!         "127.0.0.1:19000"), `access_key`, `secret`, `region`.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     unused_imports,
     dead_code,
@@ -135,10 +135,26 @@ struct S3State {
     cur_op: u8,
     cur_cid: u32,
     /// 1 while a driven request is in flight, so the boot probe cannot fire and
-    /// a second record is not consumed until this one is answered.
+    /// a second record is not consumed until this one is answered. Cleared only
+    /// once the answering `S3Response` has been accepted by `response_out`, so
+    /// an admitted request is never displaced by the next one before its own
+    /// terminal outcome has left the module.
     busy: u8,
-    /// Staging for one inbound `S3Request` record.
+    /// Staging for inbound `S3Request` records. One `channel_read` on the byte
+    /// FIFO can return several whole records, so this holds all of them and the
+    /// one being performed stays at the front.
     rec: [u8; REQ_BUF],
+    /// Valid bytes in `rec`.
+    rec_len: u32,
+    /// Length of the record at the front of `rec` that is in flight. Its bytes
+    /// are retired only after it has been answered.
+    rec_taken: u32,
+    /// The encoded `S3Response` awaiting `response_out`. `resp_len == 0` means
+    /// nothing is owed. A full output channel parks the record here rather than
+    /// discarding it: the request was admitted, so the answer is owed until it
+    /// is delivered.
+    resp: [u8; REQ_BUF],
+    resp_len: u32,
 
     req: [u8; REQ_BUF],
     req_len: u16,
@@ -149,6 +165,43 @@ struct S3State {
     nbuf: [u8; NET_BUF],
     ok: u32,
     errors: u32,
+    /// Conservation counters for driven mode. `admitted` counts `S3Request`
+    /// records taken off `request_in` and understood; `terminated` counts the
+    /// `S3Response` records delivered for them. `admitted == terminated` holds
+    /// whenever nothing is in flight. `dropped_unparsable` counts records whose
+    /// own header could not be trusted — there is no correlation id to answer
+    /// on, so they are never admitted and never owed a response.
+    admitted: u32,
+    terminated: u32,
+    dropped_unparsable: u32,
+}
+
+/// Driven-mode conservation snapshot: the admission and terminal-outcome
+/// counts, plus whether work is still owed.
+#[cfg(feature = "host-test")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct S3Conservation {
+    pub admitted: u32,
+    pub terminated: u32,
+    pub dropped_unparsable: u32,
+    /// 1 while an admitted request has not yet had its response delivered.
+    pub in_flight: u8,
+    /// 1 while an encoded response is parked waiting for `response_out`.
+    pub response_owed: u8,
+}
+
+/// # Safety
+/// `state` must point to an `S3State` initialised by `module_new`.
+#[cfg(feature = "host-test")]
+pub unsafe fn test_conservation(state: *mut u8) -> S3Conservation {
+    let s = &*(state as *const S3State);
+    S3Conservation {
+        admitted: s.admitted,
+        terminated: s.terminated,
+        dropped_unparsable: s.dropped_unparsable,
+        in_flight: s.busy,
+        response_owed: u8::from(s.resp_len != 0),
+    }
 }
 
 define_params! {
@@ -186,17 +239,17 @@ define_params! {
     };
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<S3State>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_drain"]
 pub extern "C" fn module_drain(state: *mut u8) -> i32 {
     unsafe {
@@ -205,7 +258,7 @@ pub extern "C" fn module_drain(state: *mut u8) -> i32 {
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -252,6 +305,13 @@ pub extern "C" fn module_new(
         s.acc_len = 0;
         s.ok = 0;
         s.errors = 0;
+        s.busy = 0;
+        s.rec_len = 0;
+        s.rec_taken = 0;
+        s.resp_len = 0;
+        s.admitted = 0;
+        s.terminated = 0;
+        s.dropped_unparsable = 0;
         parse_tlv(s, params, params_len);
         let mut ep = [0u8; 8];
         if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
@@ -280,6 +340,30 @@ unsafe fn emit_status(s: &mut S3State, text: &[u8]) {
     }
 }
 
+/// Abandon the transport. A driven request that was in flight is answered with
+/// `status` before the connector goes idle: the record was admitted, so it is
+/// owed exactly one outcome whether or not the endpoint ever replied.
+unsafe fn fail_driven(s: &mut S3State, status: u16) {
+    if s.busy != 0 {
+        let sys = &*s.syscalls;
+        if s.conn_present != 0 {
+            let close = s.conn_id.to_le_bytes();
+            net_write_frame(
+                sys,
+                s.net_out,
+                NET_CMD_CLOSE,
+                close.as_ptr(),
+                2,
+                s.nbuf.as_mut_ptr(),
+                NET_BUF,
+            );
+        }
+        emit_response(s, status, 0, 0);
+        return;
+    }
+    fail(s);
+}
+
 unsafe fn fail(s: &mut S3State) {
     let sys = &*s.syscalls;
     if s.conn_present != 0 {
@@ -306,28 +390,65 @@ unsafe fn fail(s: &mut S3State) {
 /// idle. One at a time: the transport is a single connection and SigV4 signs a
 /// specific request, so overlapping two would interleave their bytes on the
 /// wire.
+///
+/// `request_in` is a byte FIFO, so one `channel_read` can return several whole
+/// records back to back. The buffer therefore holds everything that read
+/// returned, the record being performed stays at the front of it (SigV4 signs
+/// out of `rec` long after the read), and its bytes are retired only once it
+/// has been answered. Reading again before the buffer is empty would discard
+/// records a caller has already handed over.
 unsafe fn pump_request(s: &mut S3State, now: u64) {
     if s.busy != 0 || s.phase != DISCONNECTED || s.draining != 0 {
         return;
     }
     let sys = &*s.syscalls;
-    let poll = (sys.channel_poll)(s.request_in, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
-        return;
+    // Retire the record just answered, exposing whatever arrived behind it.
+    if s.rec_taken > 0 {
+        let taken = (s.rec_taken as usize).min(s.rec_len as usize);
+        let remaining = s.rec_len as usize - taken;
+        if remaining > 0 {
+            core::ptr::copy(s.rec.as_ptr().add(taken), s.rec.as_mut_ptr(), remaining);
+        }
+        s.rec_len = remaining as u32;
+        s.rec_taken = 0;
     }
-    let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr(), REQ_BUF);
-    if n <= 0 {
-        return;
+    if s.rec_len == 0 {
+        let poll = (sys.channel_poll)(s.request_in, 0x01);
+        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            return;
+        }
+        let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr(), REQ_BUF);
+        if n <= 0 {
+            return;
+        }
+        s.rec_len = n as u32;
     }
-    let n = n as usize;
+    let n = s.rec_len as usize;
 
     let view = match parse_s3_request(&s.rec[..n]) {
         Some(v) => v,
         // A record shorter than the lengths it declares. There is no cid to
         // answer on — the header itself is what could not be trusted — so it is
-        // dropped, exactly as the HTTP fan-out drops a truncated envelope.
-        None => return,
+        // dropped, exactly as the HTTP fan-out drops a truncated envelope. It
+        // is counted rather than admitted: no response is owed for it. The rest
+        // of the buffer goes with it: without a trustworthy header there is no
+        // record boundary to resume from.
+        None => {
+            // The counter is host-test surface; the log is what a running
+            // deployment gets, and silence is otherwise the only other signal.
+            let m = b"[s3] unparsable S3Request - dropped, no cid to answer on";
+            dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
+            s.dropped_unparsable = s.dropped_unparsable.wrapping_add(1);
+            s.rec_len = 0;
+            return;
+        }
     };
+    // The body is the last field, so its end is the record's end.
+    s.rec_taken = (view.body_at + view.body_len) as u32;
+    s.admitted = s.admitted.wrapping_add(1);
+    // In flight from the moment the record is understood, so a refusal below
+    // that back-pressures on `response_out` still blocks the next admission.
+    s.busy = 1;
     s.cur_op = view.op;
     s.cur_cid = view.cid;
 
@@ -349,7 +470,6 @@ unsafe fn pump_request(s: &mut S3State, now: u64) {
     // signature covers the current wall-clock time, so it is built here rather
     // than at connect time only because the payload is already in hand — the
     // timestamp is re-taken on connect below.
-    s.busy = 1;
     s.acc_len = 0;
     s.req_len = 0;
     s.req_sent = 0;
@@ -452,26 +572,38 @@ unsafe fn sign_pending(s: &mut S3State) -> bool {
 /// `body_at`/`body_len` name a span inside `acc` (the accumulated HTTP
 /// response); `0,0` means no body, which is every op but GET and every failure.
 unsafe fn emit_response(s: &mut S3State, status: u16, body_at: usize, body_len: usize) {
-    let sys = &*s.syscalls;
     if s.response_out >= 0 {
-        let mut out = [0u8; REQ_BUF];
         let len = body_len
             .min(MAX_OBJECT_BYTES)
             .min(REQ_BUF - S3_RESP_BODY_AT);
+        // Encode into the state-owned parking buffer rather than a local: the
+        // record must survive a back-pressured `response_out` across steps, and
+        // at REQ_BUF it has no business on the stack either way. Not cleared
+        // first — `write_s3_response` fills the header and the body span is
+        // copied below, so every byte under `resp_len` is written here.
         if len > 0 {
-            out[S3_RESP_BODY_AT..S3_RESP_BODY_AT + len]
+            s.resp[S3_RESP_BODY_AT..S3_RESP_BODY_AT + len]
                 .copy_from_slice(&s.acc[body_at..body_at + len]);
         }
-        if let Some(total) = write_s3_response(s.cur_op, s.cur_cid, status, len, &mut out) {
-            (sys.channel_write)(s.response_out, out.as_ptr(), total);
-        }
+        s.resp_len = match write_s3_response(s.cur_op, s.cur_cid, status, len, &mut s.resp) {
+            Some(total) => total as u32,
+            None => 0,
+        };
     }
     if (200..400).contains(&status) {
         s.ok = s.ok.wrapping_add(1);
     } else {
         s.errors = s.errors.wrapping_add(1);
     }
-    s.busy = 0;
+    // `busy` stays set while a response is parked, so `pump_request` cannot
+    // admit the next record over the top of an undelivered answer. Nothing is
+    // parked when `response_out` is unwired — no consumer asked for an answer,
+    // so the request finishes here — nor when the record could not be encoded,
+    // which the body caps above make unreachable.
+    if s.resp_len == 0 {
+        s.busy = 0;
+        s.terminated = s.terminated.wrapping_add(1);
+    }
     s.cur_op = 0;
     s.cur_cid = 0;
     s.acc_len = 0;
@@ -482,6 +614,27 @@ unsafe fn emit_response(s: &mut S3State, status: u16, body_at: usize, body_len: 
     s.phase = DISCONNECTED;
     s.conn_id = 0;
     s.conn_present = 0;
+}
+
+/// Hand the parked `S3Response` to `response_out`, retrying on a later step
+/// while the channel refuses it. The channel takes a record whole or not at
+/// all, so a rejected write leaves the record intact and nothing is owed twice.
+unsafe fn flush_response(s: &mut S3State) {
+    if s.resp_len == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.response_out, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return;
+    }
+    let written = (sys.channel_write)(s.response_out, s.resp.as_ptr(), s.resp_len as usize);
+    if written <= 0 {
+        return;
+    }
+    s.resp_len = 0;
+    s.busy = 0;
+    s.terminated = s.terminated.wrapping_add(1);
 }
 
 /// Complete a driven request from the accumulated HTTP response.
@@ -519,7 +672,7 @@ unsafe fn finish_response(s: &mut S3State) {
     s.conn_present = 0;
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
@@ -686,9 +839,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id);
                         if ours {
                             if s.phase == AWAIT_RESPONSE && s.acc_len > 0 {
-                                finish_response(s);
+                                if s.busy != 0 {
+                                    finish_driven(s);
+                                } else {
+                                    finish_response(s);
+                                }
                             } else {
-                                fail(s);
+                                // 502: the transport failed, so the endpoint
+                                // never got to answer for itself.
+                                fail_driven(s, 502);
                             }
                         }
                     }
@@ -736,14 +895,29 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             };
             if now.wrapping_sub(s.started_ms) > budget {
                 if s.phase == AWAIT_RESPONSE && s.acc_len > 0 {
-                    finish_response(s);
+                    if s.busy != 0 {
+                        finish_driven(s);
+                    } else {
+                        finish_response(s);
+                    }
                 } else {
-                    fail(s);
+                    // 504: the endpoint was reachable but silent past the
+                    // budget, which is a different fact from a dead transport.
+                    fail_driven(s, 504);
                 }
             }
         }
 
-        if s.draining == 1 && matches!(s.phase, DISCONNECTED | DONE) {
+        // Retry a parked answer last, so a response produced this step reaches
+        // `response_out` without waiting for the next one.
+        if s.resp_len != 0 {
+            flush_response(s);
+        }
+
+        // Drain is complete only at genuine quiescence: no admitted request in
+        // flight and no answer still owed. A request taken off `request_in` is
+        // never abandoned unreported.
+        if s.draining == 1 && s.busy == 0 && matches!(s.phase, DISCONNECTED | DONE) {
             return 1;
         }
         0

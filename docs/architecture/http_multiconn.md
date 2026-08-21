@@ -1,16 +1,20 @@
 # HTTP multi-connection architecture
 
-A single `http` module instance serves many concurrent HTTP/1, HTTP/2,
-and WebSocket connections within one process tick. Each in-flight
-connection gets its own slot, its own phase, and a tick of work per
-`step()` — comparable to Linux's per-process behaviour, with no
-FIFO-induced head-of-line blocking and no idle peer starving the
-queue.
+A single `http` module instance serves many concurrent HTTP/1,
+HTTP/2, and WebSocket connections within one process tick. Each
+in-flight connection gets its own slot, its own phase, and a tick of
+work per `step()` — comparable to Linux's per-process behaviour,
+with no FIFO-induced head-of-line blocking and no idle peer starving
+the queue.
+
+Source: `modules/foundation/http/server/mod.rs`; the fan-out paths
+are `modules/foundation/http/server/ws.rs` and
+`modules/foundation/http/server/app.rs`.
 
 ## State layout
 
-`ServerState` holds the **server-wide** configuration: channel
-handles, routes, the body cache and arena, telemetry variables, the
+`ServerState` holds the server-wide configuration: channel handles,
+routes, the body cache and arena, telemetry variables, the
 per-connection slot table, and the step iterator's bookkeeping.
 Per-connection state lives in `ConnSlot`, one entry per slot.
 
@@ -26,17 +30,20 @@ handlers and their helpers (`cur_slot`, `cur_slot_mut`,
 
 ## Per-target sizing
 
-| Target | `MAX_CONCURRENT_CONNS` | Memory cost (rough) |
-|--------|------------------------|---------------------|
-| `aarch64` (Pi 5, Linux host) | 256 | ~4 MB peak (working-set h2) |
-| `wasm32` | 256 | ~4 MB peak |
-| `rp2350`, `rp2040` | 1 | ~16 KB peak |
+The capacity tunables live in the `abi::config::http` profile of the
+SDK the modules build against, one profile per target class:
 
-`MAX_CONCURRENT_CONNS` matches the IP module's `MAX_TCP_CONNS` on
-host platforms. The slot table is the parallelism bound; idle slots
-cost ~250 B because their heap allocations are released on close.
-Per-slot `recv_buf` (8 KB), `send_buf` (~4 KB), and `H2State` (~3 KB,
-h2 only) all live on the module heap arena.
+| Profile | `MAX_CONCURRENT_CONNS` | `ARENA_WORKING_SET_CONNS` | `RECV_BUF_SIZE` | `SEND_BUF_SIZE` |
+|---|---|---|---|---|
+| aarch64 (bcm2712, Linux host) | 256 | 256 | 8192 | 4100 |
+| wasm32 | 256 | 64 | 4096 | 4100 |
+| embedded (rp2350) | 1 | 1 | 2048 | 4100 |
+
+`MAX_CONCURRENT_CONNS` matches fluxor's IP-module TCP connection
+ceiling on host platforms. The slot table is the parallelism bound;
+an idle slot costs only its table entry, because its heap
+allocations are released on close. Per-slot `recv_buf`, `send_buf`,
+and `H2State` (h2 only) all live on the module heap arena.
 
 `alloc_free_slot` allocates `recv_buf` + `send_buf` on
 `MSG_ACCEPTED`; `slot_release_buffers` returns them on close.
@@ -44,14 +51,14 @@ h2 only) all live on the module heap arena.
 `h2::enter()`. `body_pool` grows via `heap_realloc` doubling each
 time `parse_route_body` would overflow; `body_offset`, `body_len`,
 `body_pool_cap`, and `body_pool_used` are all u32 so the pool can
-exceed 64 KB if app templates demand it.
+exceed 64 KiB if app templates demand it.
 
 `module_arena_size()` reports
 `2 × DEFAULT_BODY_POOL_SIZE +
 ARENA_WORKING_SET_CONNS × (RECV_BUF_SIZE + SEND_BUF_SIZE +
 size_of::<H2State>()) + per-alloc-overhead + slack`, so the kernel
 allocates the right peak envelope at module-init time. Memory
-scales with **active** connections, not with the slot table size.
+scales with active connections, not with the slot table size.
 
 ## Step iterator
 
@@ -70,7 +77,7 @@ connection after bind completes.
 ## Inbound demux
 
 `demux_inbound` runs once per `step()` at the top, before any
-per-slot work. It reads net_proto frames from `net_in_chan`, looks
+per-slot work. It reads `NetProto` frames from `net_in_chan`, looks
 up the target slot by `conn_id`, and routes:
 
 - `MSG_ACCEPTED` → `alloc_free_slot(s, conn_id)` → mark phase
@@ -119,7 +126,7 @@ a `file_chan_owner: i16` slot-index lock:
   `slot_release_buffers` (any close path).
 
 `HANDLER_FS_FILE` (handler 7) bypasses this entirely via a per-slot
-`fs_fd` through the FS_CONTRACT, and is the recommended path for
+`fs_fd` through the FS contract, and is the recommended path for
 new deployments.
 
 ## Body cache retention
@@ -128,10 +135,11 @@ Cache entries carry a `retain: u8` reader refcount. A cache hit
 bumps it on the way in (in `cache_try_or_fetch` and the inline h1
 hit path); end-of-emission (`Phase::DrainSend` for h1, h2's
 `free_slot`) decrements via `cache_release_for_route`.
-`cache_alloc` refuses to evict any entry with `retain > 0`, so another
-cache miss can't trample the body_pool region a stream is
+`cache_alloc` refuses to evict any entry with `retain > 0`, so
+another cache miss can't trample the body_pool region a stream is
 still rendering from. `cache_lookup` also requires `CACHE_COMPLETE`
-so an in-progress fill doesn't masquerade as a hit.
+so an in-progress fill doesn't masquerade as a hit. Source:
+`modules/foundation/http/server/cache.rs`.
 
 ## WebSocket fan-out
 
@@ -146,11 +154,13 @@ of typed channels:
   emitted as `WsFrame` records for downstream consumers.
 
 `ws_drain_fanout_input` routes envelopes by their `conn_id` field
-to the target slot. A `u32::MAX` "unclaimed" sentinel from
-`ws_stream` (a wave module; used until it observes a real inbound frame) routes
-to the first available fan-out slot. If the target's `send_buf`
-is non-empty (or it's mid-fragmentation), the envelope is written
-back to `ws_in_chan` so the next tick retries delivery.
+to the target slot. The `WsFrame` envelope carries its conn id as a
+u32, and `ws_stream` stamps a `u32::MAX` "unclaimed" sentinel on
+outbound envelopes until it observes a real inbound frame; the
+sentinel routes to the first available fan-out slot. If the
+target's `send_buf` is non-empty (or it's mid-fragmentation), the
+envelope is written back to `ws_in_chan` so the next tick retries
+delivery.
 
 Fragmentation: when a `WsFrame` envelope's payload exceeds
 `SEND_BUF_SIZE - WS_FRAG_HDR_RESERVE`, the message is split into a
@@ -161,55 +171,78 @@ freed when the final fragment is queued (or on slot close).
 
 ## HTTP application fan-out
 
-When a route's handler is `HANDLER_APP` (11), the request is handed to a
-downstream module and its answer is served back. The symmetric counterpart to
-WebSocket fan-out above: there the module owns the WS envelope and something
-else owns the protocol inside it; here it owns HTTP framing, connection state
-and bounded body handling, and something else owns what the request MEANS.
+When a route's handler is `HANDLER_APP` (11), the request is handed
+to a downstream module and its answer is served back. The symmetric
+counterpart to WebSocket fan-out above: there the module owns the WS
+envelope and something else owns the protocol inside it; here it
+owns HTTP framing, connection state and bounded body handling, and
+something else owns what the request means.
 
 - `req_out` (out[6], `HttpRequest`): the matched request, as
   `[conn_id u16][stream_id u16][method u8][flags u8][path_len u16]
-  [hdr_len u16][body_len u16]` followed by the path, the raw header block and
-  the decoded body. Header fields are forwarded verbatim rather than filtered —
-  an application's API is defined in terms of headers a gateway cannot know in
-  advance. Pseudo-headers are excluded on h2: `:method` is that generation's
-  encoding of the request line, not a field.
-- `resp_in` (in[6], `HttpResponse`): `[conn_id u16][stream_id u16][status u16]
-  [flags u8][ct_len u8][hdr_len u16][body_len u16]` then the content type, the
+  [hdr_len u16][body_len u16]` followed by the path, the raw header
+  block and the decoded body. Header fields are forwarded verbatim
+  rather than filtered — an application's API is defined in terms of
+  headers a gateway cannot know in advance. Pseudo-headers are
+  excluded on h2: `:method` is that generation's encoding of the
+  request line, not a field.
+- `resp_in` (in[6], `HttpResponse`):
+  `[conn_id u16][stream_id u16][status u16][flags u8][ct_len u8]
+  [hdr_len u16][body_len u16]` then the content type, the
   application's own headers and the body.
 
-`drain_responses` routes an envelope by `(conn_id, stream_id)` — never
-`conn_id` alone, because h2 multiplexes many requests over one connection and
-an application is entitled to answer them out of order. Under h1 `stream_id`
-carries a request generation instead: a connection released with a request
-still outstanding is followed by a new peer holding the same recycled id, and
-pinning the field to 0 made the late answer match the new peer's request
-exactly. Applications echo the field back in both cases. If the target slot's `send_buf` is busy, the envelope is written back
-to `resp_in` and retried next tick, the same backpressure the WS fan-out uses;
-unlike WS fan-out there is NO retention, since replaying a previous response to
-a new request would answer request N with response N-1.
+`drain_responses` routes an envelope by `(conn_id, stream_id)` —
+never `conn_id` alone, because h2 multiplexes many requests over one
+connection and an application is entitled to answer them out of
+order. Under h1 `stream_id` carries a request generation instead: a
+connection released with a request still outstanding can be followed
+by a new peer holding the same recycled id, and the generation keeps
+the late answer from matching the new peer's request. Applications
+echo the field back in both cases. If the target slot's `send_buf`
+is busy, the envelope is written back to `resp_in` and retried next
+tick, the same backpressure the WS fan-out uses; unlike WS fan-out
+there is no retention, since replaying a previous response to a new
+request would answer request N with response N-1.
 
-`Content-Length`, `Connection` and `Transfer-Encoding` are dropped from the
-application's header block and emitted by the module: they describe this
-connection's framing, which only the module knows. Two `Content-Length` values
-on the wire is the ambiguity RFC 9112 §6.3 refuses on the request side.
+`Content-Length`, `Connection` and `Transfer-Encoding` are dropped
+from the application's header block and emitted by the module: they
+describe this connection's framing, which only the module knows. Two
+`Content-Length` values on the wire is the ambiguity RFC 9112 §6.3
+refuses on the request side.
 
-**Streaming.** `flags` bit 0 (`MORE_BODY`) marks a body arriving across several
-envelopes — the only way a response can exceed `SEND_BUF_SIZE`, which is what
-serving artefacts requires. On h1 the first envelope's `Content-Length` header
-(if the application declared one) frames the whole transfer and keep-alive
-survives; without one the response is close-delimited. On h2 no length is
+**Streaming.** `flags` bit 0 (`MORE_BODY`) marks a body arriving
+across several envelopes — the only way a response can exceed
+`SEND_BUF_SIZE`, which is what serving artefacts requires. On h1 the
+first envelope's `Content-Length` header (if the application
+declared one) frames the whole transfer and keep-alive survives;
+without one the response is close-delimited. On h2 no length is
 needed at all: END_STREAM on the final DATA frame delimits it.
 
-**Timeout.** A request unanswered for `APP_TIMEOUT_MS` (30 s) is answered 504 by
-the module, per stream under h2, so one hung request does not exhaust the slot
-table. Mid-stream the connection is closed instead — a 504 appended to a body
-already on the wire would be read as content.
+**Timeout.** A request unanswered for `APP_TIMEOUT_MS` (30 s) is
+answered 504 by the module, per stream under h2, so one hung request
+does not exhaust the slot table. Mid-stream the connection is closed
+instead — a 504 appended to a body already on the wire would be read
+as content.
 
-**Graph wiring.** Both edges need a non-zero `buffer_group:`, which puts the
-channel in mailbox mode so one write is one whole envelope. The default is a
-byte-streaming FIFO, which fragments structured records. See
-[`wave_http_app.yaml`](../../examples/linux/wave_http_app.yaml).
+**Graph wiring.** Both edges need a non-zero `buffer_group:`, which
+puts the channel in mailbox mode so one write is one whole envelope.
+The default is a byte-streaming FIFO, which fragments structured
+records — so omitting the group does not fail loudly, it delivers
+half an envelope.
+
+```yaml
+- from: http.req_out
+  to: app.request_in
+  buffer_group: 1
+- from: app.response_out
+  to: http.resp_in
+  buffer_group: 2
+```
+
+The groups differ because the two directions are independent channels
+carrying different types; sharing a group would alias their buffers.
+The auto-assign pass cannot infer either group, because "this edge
+needs transport atomicity" is not visible from the graph shape.
 
 ## Limitations
 
@@ -217,12 +250,14 @@ byte-streaming FIFO, which fragments structured records. See
   fallback (`legacy_mode == 2`) serialises all requests through
   the slot phase machine. Multi-conn parallelism applies; the file
   channel is the bottleneck.
-- **`MAX_CONCURRENT_CONNS` set to 256** — no longer a wire limit. `conn_id` is
-  a `u16` on the net-protocol surface, so the id space allows 65,535; the 256 is
-  now a memory decision (slot table plus `ARENA_WORKING_SET_CONNS` of buffers)
-  and raising it is a sizing question rather than a flag-day. The two are worth
-  keeping distinct: the shed counters report slot exhaustion and arena
-  exhaustion separately precisely because they are different ceilings.
+- **`MAX_CONCURRENT_CONNS` set to 256** — not a wire limit.
+  `conn_id` is a u16 on the net-protocol surface, so the id space
+  allows 65,535; the 256 is a memory decision (slot table plus
+  `ARENA_WORKING_SET_CONNS` of buffers) and raising it is a sizing
+  question. The two are worth keeping distinct: the shed counters
+  report slot exhaustion and arena exhaustion separately precisely
+  because they are different ceilings.
 - **Per-instance `H2State`** is large (`MAX_STREAMS` ×
   `StreamSlot`). On embedded targets only one slot exists, so the
-  cost is bounded; on host targets it scales with `ARENA_WORKING_SET_CONNS`.
+  cost is bounded; on host targets it scales with
+  `ARENA_WORKING_SET_CONNS`.

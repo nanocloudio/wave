@@ -603,6 +603,22 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         }
     }
 
+    // Draining with no stream in flight. The connection holds no admitted work,
+    // so it is told to go away rather than waited on: a multiplexed connection
+    // sits open between requests by design, and a drain that waits for it to
+    // close waits for the client, not for the work. GOAWAY names the last
+    // stream this connection served, which is what lets the peer re-issue
+    // anything it had not yet sent. Streams still open keep the connection —
+    // they are admitted work and are owed their answers.
+    if s.server.draining != 0
+        && cur_send_len(s) == 0
+        && cur_h2(s).sub == Sub::Active
+        && !any_stream_open(s)
+    {
+        queue_goaway(s, h2w::ERR_NO_ERROR);
+        return 2;
+    }
+
     match cur_h2(s).sub {
         Sub::SendSettings => {
             let n = h2w::write_settings(
@@ -2351,6 +2367,19 @@ unsafe fn emit_grpc_response(s: &mut HttpState, stream_id: u32, body: &[u8], grp
 }
 
 // ── Connection-level error path ───────────────────────────────────────────
+
+/// True while any stream slot on this connection is still occupied.
+unsafe fn any_stream_open(s: &HttpState) -> bool {
+    let h2 = cur_h2(s);
+    let mut i = 0;
+    while i < MAX_STREAMS {
+        if h2.streams[i].state != SlotState::Idle {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
 
 unsafe fn queue_goaway(s: &mut HttpState, code: u32) {
     let n = h2w::write_goaway(cur_send_buf_mut_ptr(s), cur_h2(s).last_stream_id, code);

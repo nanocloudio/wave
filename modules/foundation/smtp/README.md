@@ -18,7 +18,7 @@ Every command waits on the 3-digit code of the previous — possibly multi-line 
 reply, and the first thing that happens is the *server* speaking. A reply-driven,
 multi-round-trip session over a server-chosen greeting is not a stateless
 transform, so it is a module rather than a shared-core codec called by someone
-else (`rfc_connector_strategy.md` §9).
+else: it must own the connection lifecycle and drive the transport itself.
 
 ## Ports
 
@@ -62,33 +62,12 @@ implicit-TLS submission port, exactly as `websocket` does for `wss://`.
 No MX resolution, no queue, no retry, no DSN parsing, no 8BITMIME/SMTPUTF8
 negotiation.
 
-## Coverage
+## Status
 
-- **L0** — `tests/harness/tests/smtp_core.rs` vectors the reply parser, the
-  dot-stuffing command builders, and the phase machine.
-- **L1** — `tests/harness/tests/smtp.rs` drives the module itself
-  through `smtp_harness`, which plays the server. It covers what a codec vector
-  cannot reach: silence until the 220 greeting; the command sequence in order;
-  multi-line replies advancing the conversation exactly once; a reply split
-  byte-by-byte across transport reads; rejection and deferral never reporting
-  `delivered`; a connection dropped between the queue and the QUIT reply; both
-  deadlines; another connection's bytes being ignored; a body chunked across
-  several `CMD_SEND` frames arriving intact; and drain.
-
-- **L3** — `tests/harness/tests/smtp_interop.rs` drives the module against
-  **Exim** (`exim4 -bs`), so a real MTA parses our commands and its transcript
-  is the oracle. It proves what a scripted server cannot: EHLO and MAIL FROM are
-  byte-legal to an outside implementation, Exim's genuinely ten-line EHLO reply
-  advances the conversation exactly once, and a real 501 surfaces as
-  `smtp: rejected`. Skips cleanly where `exim4` is absent (`WAVE_REQUIRE_INTEROP=1`
-  turns the skip into a failure).
-
-  The interop session stops at RCPT **by design**: driving DATA to a 250 would
-  put a real message in the host's mail spool for the system queue runner to
-  deliver. A test suite may not do that. The accepted-delivery path stays
-  covered against the scripted server, and CRLF line endings stay pinned by the
-  L0 vectors — Exim accepts a bare LF, so a lenient oracle cannot prove that
-  requirement.
+The module's behavioural contract: silence until the 220 greeting, the
+conversation advanced exactly once per reply however the bytes are split across
+transport reads, `delivered` never reported on rejection, deferral, or a dropped
+connection, and commands that a real MTA (Exim) parses as byte-legal.
 
 Known gaps, stated rather than implied:
 

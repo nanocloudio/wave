@@ -3,10 +3,9 @@
 Pure, `no_std`, I/O-free codecs mounted by Wave's `.fmod` modules. They are
 domain-neutral by construction: framing only, no session, no I/O, no allocation.
 
-Each file carries **no inner attributes and no test module**, so the PIC module
-build can `include!` it verbatim — the host build and the device build compile
-the same bytes. `tests/harness/tests/project_contract.rs` enforces that, and
-also that no core sits here unmounted.
+Each file carries no inner attributes and no test module, so the PIC module
+build can `include!` it verbatim — every consumer compiles the same bytes. No
+core sits here unmounted.
 
 | Core | Owns | Mounted by |
 | --- | --- | --- |

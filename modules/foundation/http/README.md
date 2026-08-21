@@ -11,7 +11,7 @@ upgrade path, and the gRPC-over-HTTP/2 composition.
 | Server | HTTP/2 (h2c + ALPN) | Implemented, on silicon, load-tested |
 | Server | WebSocket (RFC 6455 upgrade + fan-out) | Implemented, on silicon |
 | Server | gRPC (HEADERS/DATA/trailers) | Implemented, verified against `grpcio` |
-| Server | Application fan-out (`HANDLER_APP`) | Implemented on h1 + h2, driven by `tools/e2e/linux_graph.sh --app` |
+| Server | Application fan-out (`HANDLER_APP`) | Implemented on h1 + h2 |
 | Client | HTTP/1 | Implemented — speaks **HTTP/1.0** (see deviations) |
 | Client | HTTP/2, incl. gRPC and WS-over-h2 (RFC 8441) | Implemented |
 | Server | HTTP/3 | Implemented — served end to end over `quic`, verified against aioquic |
@@ -28,12 +28,11 @@ generations it serves:
 | `web` | `http-web.fmod` | h1, ws |
 
 The point is flash. `web` is roughly 45% smaller than `full`, which is what makes
-the h1-only path viable on rp2350. `tools/ci/fmod_size_budget.sh` gates every
-artefact against a byte ceiling **and** enforces the subset relation — `http-web`
-strictly smaller than `http-h2`, which is strictly smaller than `http` — so a
-variant cannot quietly stop paying for itself. Run it with `--print` for current
-sizes; they are not repeated here, because a number in prose is a number that
-rots.
+the h1-only path viable on rp2350. Each artefact is held to a byte ceiling and to
+the subset relation — `http-web` strictly smaller than `http-h2`, which is
+strictly smaller than `http` — so a variant cannot quietly stop paying for
+itself. Current sizes are not repeated here, because a number in prose is a
+number that rots.
 
 `h1` and `ws` are declared markers, always compiled. A `min` (h1-only) variant
 would need the WebSocket seams gated first. Most of that code is now one file
@@ -68,14 +67,27 @@ Tags are wire positions: append, never renumber.
 `timer_class = "wall_clock"` — the client connect timeout and the proxy dial and
 retry deadlines all read `dev_millis`. Nothing counts scheduler passes as time.
 
+## Draining
+
+Asked to shut down, the server stops answering and reports itself finished only
+once nothing it accepted is still outstanding — a request mid-parse, one waiting
+on an application, and a response still flushing all hold the drain open until
+they end.
+
+Connections themselves are not outstanding work, and the distinction is what
+makes the drain terminate at all: a keep-alive connection between requests is
+closed, an HTTP/2 connection with no open stream is sent GOAWAY naming the last
+stream it served, and a WebSocket tunnel is sent a `1001 going away` close. Each
+of those is an ending the peer can act on, where waiting for the peer to close
+first would simply never finish.
+
 ## Methods and request bodies
 
 The server recognises `GET HEAD POST PUT PATCH DELETE OPTIONS CONNECT` on both
 h1 and h2, from one table (`wire/method.rs`). A well-formed request naming
 anything else is **501**, not 400 — the bytes were fine, the method is not
 implemented. One table for both generations is what makes a request mean the
-same thing whichever carried it, which `http_interop.rs` asserts from both
-sides.
+same thing whichever carried it.
 
 Request bodies are read and bounded: `Content-Length`, `Transfer-Encoding:
 chunked`, and `Expect: 100-continue` (which `docker push` and `curl -T` send and
@@ -96,9 +108,8 @@ the application keeps what the request means — the split
 
 Envelope layouts, correlation, backpressure, streaming and the required
 `buffer_group:` on both edges are documented in
-[`docs/architecture/http_multiconn.md`](../../../docs/architecture/http_multiconn.md).
-A worked graph is `examples/linux/wave_http_app.yaml`, driven end to end by
-`tools/e2e/linux_graph.sh --app`.
+[`docs/architecture/http_multiconn.md`](../../../docs/architecture/http_multiconn.md),
+which shows the two edges alongside them.
 
 Behind the `app` feature, so the `web` variant does not carry it — an rp2350
 serving h1 from config should not pay for a handler that forwards to a module it
@@ -107,18 +118,17 @@ does not run.
 ## Declared deviations
 
 - **The HTTP/1 client speaks HTTP/1.0**, with a `Host` header. Legal, and
-  deliberate, but it means no keep-alive: one connection per request. Found by
-  `http_client_interop.rs` driving it against Python's `http.server`.
+  deliberate, but it means no keep-alive: one connection per request.
 - **`bytes=500-499` returns 416** where RFC 7233 §3.1 says an unsatisfiable-looking
   range whose first-byte-pos exceeds last-byte-pos should be ignored (→ 200).
-  Preserved from the origin rather than corrected, and pinned by test.
+  Preserved from the origin rather than corrected.
 - **An unterminated header block after a valid request line does not 400.** The
   `>= RECV_BUF_SIZE → 400` guard only fires when no request line has arrived; the
   slot is held and reaped by the transport's per-connection timeout instead.
 
 ## HTTP/3 — what exists and what does not
 
-**What exists, and is tested** (`tests/harness/tests/http3.rs`):
+**What exists:**
 
 - the frame layer — varint type/length framing, truncation, grease types, and
   request-stream frame legality (RFC 9114 §7.1);
@@ -142,14 +152,14 @@ does not run.
   `[stream_id u64][flags][len u16][payload]` records, the same envelope
   `ws_stream` uses to multiplex WebSocket frames. Four concurrent request slots,
   each with its own accumulator and response buffer, round-robin emission, and
-  refusal rather than overwriting when the table is full. Tested serving two
-  requests concurrently over one connection.
+  refusal rather than overwriting when the table is full. Two requests can be
+  served concurrently over one connection.
 
 **How it is wired:** Fluxor's `quic` surfaces h3 request streams over the `mux`
 contract — an `h3` ALPN is all it takes, since the transport has no responder of
 its own to displace; `http` with `h3 = 1` consumes them on its
 ordinary `net_in`/`net_out` (mux opcodes are disjoint from net_proto's, so one
-channel pair carries both). `tools/e2e/h3_server.sh` proves it against **aioquic**.
+channel pair carries both). The full path interoperates with **aioquic**.
 
 **Handlers served over h3:** `HANDLER_STATIC` and `HANDLER_TEMPLATE`. Templates
 go through the *same* renderer h1 and h2 use — `render_template_route_into`,

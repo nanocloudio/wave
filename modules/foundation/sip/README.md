@@ -84,29 +84,18 @@ multi-party mixing, RTCP, SRTP, and any codec other than PCMU. Secure RTP
 requires an explicit future capability and is never implied by an RTP binding
 (`docs/specification.md`).
 
-## Coverage
+## Status
 
-- **L0** — the cores are vector-tested in the host harness:
-  `tests/harness/tests/sip_vectors.rs`, `tests/harness/tests/sip_dialog_vectors.rs`,
-  `tests/harness/tests/sip_jitter_vectors.rs`, plus the hostile-input sweep in
-  `tests/harness/tests/codec_bounds_sweep_cores.rs`.
-- **L1** — `tests/harness/tests/sip.rs` drives the wrapper through
-  `sip_harness`, which plays both the peer UA and the far-end media source:
-  both endpoints bound at the configured ports; silence until a bind is
-  answered; an inbound INVITE answered with a 200 OK advertising our own media
-  port; the ACK starting media at the endpoint the peer's SDP named, with
-  SET_ENDPOINT strictly before START; an outbound call ACKing its answer; the
-  T1 retransmit being byte-identical to the original request; BYE answered and
-  media stopped; local hangup; playout at the `ptime` cadence; reordered packets
-  played in sequence order; malformed RTP concealed as silence rather than
-  played; no audio before a call is up; and an unconfigured module staying
-  inert.
+The wrapper's behavioural contract: silence until its endpoints are bound and a
+call is up, media started at the endpoint the peer's SDP named with
+`SET_ENDPOINT` strictly before `START`, T1 retransmits byte-identical to the
+original request, and an unconfigured module staying inert.
 
 **No rig scenario.** The media path has never run on real silicon. That needs a
 graph and an independent RTP peer on the host, and it is the remaining gap for
 this module.
 
-Two behaviours worth knowing before reading the tests. Playout is
+Two behaviours worth knowing. Playout is
 loss-**concealing**: once a call is up the channel emits one `ptime` frame per
 cadence tick whether or not a packet arrived, writing µ-law silence when it did
 not — a voice path that stopped emitting would starve the codec downstream. And
