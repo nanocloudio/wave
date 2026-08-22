@@ -103,6 +103,11 @@ pub enum H3StreamState {
 /// Per-slot ingress accumulator. One HTTP/3 request head must fit whole: the
 /// QPACK field section is decoded in one pass, so a head split across QUIC
 /// stream chunks is buffered until complete.
+///
+/// This is a PROTOCOL budget — how much request head this server will hold —
+/// and it is unrelated to how much the transport may hand over in one frame.
+/// Sizing a wire scratch from it is what silently truncated `MSG_MUX_STREAM_RX`;
+/// the assertion below the ingress copy keeps the two apart.
 pub const H3_RECV_BUF: usize = 1024;
 
 /// Per-slot egress buffer. Holds one rendered response (HEADERS + DATA frames)
@@ -3075,8 +3080,30 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
         }
         // Copy the payload out of `net_buf` before touching state: the pump
         // borrows `HttpState` immutably and `net_buf` lives inside it.
-        let mut frame = [0u8; H3_RECV_BUF];
-        let n = payload_len.min(frame.len());
+        //
+        // Sized from the TRANSPORT's published bound, not from a protocol
+        // budget. `H3_RECV_BUF` is a per-slot request-head accumulator and has
+        // no bearing on how much the transport may hand over at once; sizing
+        // this from it truncated any `MSG_MUX_STREAM_RX` above 1 KiB, and
+        // because the channel frame had already been consumed the loss was
+        // silent — a short request head, or a body missing its tail, with no
+        // error anywhere.
+        // Gated, not merely intended: a scratch smaller than the transport's
+        // published frame bound cannot hold what the provider is entitled to
+        // send, and the resulting truncation is silent at every layer.
+        const _: () = assert!(
+            mux::MUX_QUIC_STREAM_RX_FRAME_MAX
+                >= mux::STREAM_DATA_PREFIX + mux::MUX_QUIC_STREAM_RX_MAX
+        );
+        let mut frame = [0u8; mux::MUX_QUIC_STREAM_RX_FRAME_MAX];
+        if payload_len > frame.len() {
+            // Cannot happen against a conforming provider; if it does, the
+            // stream is failed rather than half-copied. A prefix of a frame is
+            // indistinguishable from a complete one downstream.
+            log_h3(s, b"[http] h3 mux frame over transport bound - dropped");
+            continue;
+        }
+        let n = payload_len;
         core::ptr::copy_nonoverlapping(
             s.net_buf.as_ptr().add(super::super::NET_FRAME_HDR),
             frame.as_mut_ptr(),

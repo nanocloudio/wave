@@ -78,6 +78,10 @@ const NET_MSG_ERROR: u8 = 0x06;
 
 const NET_BUF: usize = 2048;
 const REQ_BUF: usize = 4096;
+/// Longest delivery-result line (`smtp: connection closed\n` is the longest
+/// today); parked in state, so it is sized for the class rather than the
+/// current maximum.
+const STATUS_BUF: usize = 64;
 const ACC_BUF: usize = 2048;
 const NAME_BUF: usize = 128;
 const BODY_BUF: usize = 2048;
@@ -126,6 +130,16 @@ struct SmtpState {
     nbuf: [u8; NET_BUF],
     delivered: u32,
     errors: u32,
+    /// The one delivery result this session owes, held until `status_out`
+    /// accepts it. `status_len == 0` means nothing is owed.
+    ///
+    /// The module's contract is exactly one result per submission, and a
+    /// channel that is briefly full is not a reason to break it: the previous
+    /// behaviour polled, skipped the write when there was no room, and let the
+    /// FSM go terminal anyway — so a caller waiting for the outcome of a
+    /// message that had in fact been delivered waited forever.
+    status: [u8; STATUS_BUF],
+    status_len: u32,
 }
 
 define_params! {
@@ -224,6 +238,7 @@ pub extern "C" fn module_new(
         s.req_sent = 0;
         s.acc_len = 0;
         s.delivered = 0;
+        s.status_len = 0;
         s.errors = 0;
         parse_tlv(s, params, params_len);
         let mut ep = [0u8; 8];
@@ -244,14 +259,39 @@ pub extern "C" fn module_new(
     }
 }
 
+/// Record the session's delivery result, to be handed to `status_out` as soon
+/// as it will take it.
+///
+/// First writer wins. Exactly one result is owed per submission, and where a
+/// later event would overwrite an earlier one the earlier is the outcome —
+/// "delivered" followed by the connection closing describes a delivery, not a
+/// connection failure.
 unsafe fn emit_status(s: &mut SmtpState, text: &[u8]) {
-    let sys = &*s.syscalls;
-    if s.status_out >= 0 {
-        let poll = (sys.channel_poll)(s.status_out, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
-            (sys.channel_write)(s.status_out, text.as_ptr(), text.len());
-        }
+    if s.status_out < 0 || s.status_len != 0 {
+        return;
     }
+    let n = text.len().min(STATUS_BUF);
+    s.status[..n].copy_from_slice(&text[..n]);
+    s.status_len = n as u32;
+}
+
+/// Hand the parked delivery result to `status_out`, retrying on a later step
+/// while the channel refuses it. The channel takes a record whole or not at
+/// all, so a rejected write leaves it intact and nothing is reported twice.
+unsafe fn flush_status(s: &mut SmtpState) {
+    if s.status_len == 0 || s.status_out < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.status_out, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return;
+    }
+    let len = s.status_len as usize;
+    if (sys.channel_write)(s.status_out, s.status.as_ptr(), len) != len as i32 {
+        return;
+    }
+    s.status_len = 0;
 }
 
 /// Stage `bytes` as the outbound command to send (chunked in module_step).
@@ -381,7 +421,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             payload[5] = port[0];
             payload[6] = port[1];
             payload[7] = s.tag;
-            net_write_frame(
+            // Enter `Connecting` only once the dial has actually been taken.
+            // `net_write_frame` returns 0 on backpressure so a caller can
+            // retry; advancing anyway started the connect deadline against a
+            // CONNECT the channel had refused, and the exchange failed on a
+            // timeout for a dial that was never made.
+            if net_write_frame(
                 sys,
                 s.net_out,
                 NET_CMD_CONNECT,
@@ -389,9 +434,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 8,
                 s.nbuf.as_mut_ptr(),
                 NET_BUF,
-            );
-            s.phase = SmtpPhase::Connecting;
-            s.started_ms = now;
+            ) != 0
+            {
+                s.phase = SmtpPhase::Connecting;
+                s.started_ms = now;
+            }
         }
 
         if s.net_in >= 0 {
@@ -496,7 +543,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 2),
                     chunk,
                 );
-                (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), NET_FRAME_HDR + total_payload);
+                // All-or-nothing: the offset advances only over committed
+                // bytes. Advancing past a refused write would send the server
+                // a truncated command, which ESMTP answers with a syntax
+                // error for a command this client believes it sent correctly.
+                let total = NET_FRAME_HDR + total_payload;
+                if (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), total) != total as i32 {
+                    break;
+                }
                 s.req_sent += chunk as u16;
             }
         }
@@ -517,7 +571,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // Hand over the delivery result before anything else can end the step,
+        // so a result produced this step does not wait for the next one.
+        flush_status(s);
+
+        // Quiescence means the result has been delivered and the CLOSE has been
+        // taken — not merely that the FSM reached a terminal phase. Reporting
+        // earlier tears the instance down with the one outcome it promised
+        // still in its own buffer, and with a CLOSE the peer never receives.
         if s.draining == 1
+            && s.status_len == 0
             && matches!(
                 s.phase,
                 SmtpPhase::Disconnected | SmtpPhase::Done | SmtpPhase::Failed
@@ -525,7 +588,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         {
             if s.conn_present != 0 {
                 let close = s.conn_id.to_le_bytes();
-                net_write_frame(
+                if net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
@@ -533,7 +596,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     2,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
-                );
+                ) == 0
+                {
+                    return 0;
+                }
                 s.conn_id = 0;
                 s.conn_present = 0;
             }

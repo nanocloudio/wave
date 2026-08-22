@@ -88,6 +88,8 @@ const PLAYOUT_BUF: usize = jitter_core::JITTER_SLOT_SIZE;
 const CTRL_SET_ENDPOINT: u8 = 0x01;
 const CTRL_START: u8 = 0x02;
 const CTRL_STOP: u8 = 0x03;
+/// Depth of the ordered media-control queue.
+const CTRL_QUEUE: usize = 4;
 const CTRL_MSG_SIZE: usize = 8;
 
 const T1_MS: u64 = 500;
@@ -148,6 +150,11 @@ struct SipModState {
     last_playout_ms: u64,
     target_fill: u16,
     playing: u8,
+    /// Ordered media-control commands awaiting the transmitter's channel.
+    /// Depth covers the longest run this module emits (`SET_ENDPOINT` then
+    /// `START`) with room for a `STOP` behind them.
+    ctrl_queue: [u8; CTRL_QUEUE],
+    ctrl_len: u8,
     _pad3: u8,
     jitter: JitterBuffer,
 
@@ -155,6 +162,13 @@ struct SipModState {
     call_id: [u8; CALL_ID_SIZE],
     sip_tx_buf: [u8; SIP_TX_BUF_SIZE],
     sip_tx_len: u16,
+    /// 1 while the staged datagram in `sip_tx_buf` still owes a send.
+    ///
+    /// Separate from `sip_tx_len` because that buffer is RETAINED after a
+    /// successful send: `SipSend::Retransmit` re-flushes it unchanged for T1.
+    /// Clearing the length on send would have destroyed the retransmission
+    /// buffer; this flag is what a refused write leaves set instead.
+    sip_tx_pending: u8,
     _pad4: u16,
     sip_rx_buf: [u8; SIP_RX_BUF_SIZE],
     playout_buf: [u8; PLAYOUT_BUF],
@@ -198,6 +212,9 @@ impl SipModState {
         self.playing = 0;
         self.jitter = JitterBuffer::new();
         self.sip_tx_len = 0;
+        self.sip_tx_pending = 0;
+        self.ctrl_queue = [0; CTRL_QUEUE];
+        self.ctrl_len = 0;
     }
 }
 
@@ -251,7 +268,7 @@ unsafe fn build(s: &mut SipModState, msg: SipSend) {
 
 /// Send the staged SIP message to the signalling peer.
 unsafe fn sip_flush(s: &mut SipModState) {
-    if s.sip_tx_len == 0 || s.sip_net_out < 0 || s.sip_ep_id == 0xFF {
+    if s.sip_tx_pending == 0 || s.sip_tx_len == 0 || s.sip_net_out < 0 || s.sip_ep_id == 0xFF {
         return;
     }
     let sys = &*s.syscalls;
@@ -279,7 +296,18 @@ unsafe fn sip_flush(s: &mut SipModState) {
         b.add(NET_FRAME_HDR + DG_V4_PREFIX),
         data_len,
     );
-    let _ = (sys.channel_write)(s.sip_net_out, b, NET_FRAME_HDR + frame_payload);
+    let total = NET_FRAME_HDR + frame_payload;
+    if (sys.channel_write)(s.sip_net_out, b, total) == total as i32 {
+        s.sip_tx_pending = 0;
+    }
+    // On refusal `sip_tx_pending` stays set and the step loop retries.
+    // Signalling is not media: a dropped SIP datagram is a lost transaction,
+    // and only requests are covered by T1 retransmission — a refused 200 OK
+    // would never be sent again.
+    //
+    // `sip_tx_len` is deliberately NOT cleared. It is the retransmission
+    // buffer: `SipSend::Retransmit` re-flushes it unchanged, which is why the
+    // pending flag is separate from the buffer's length.
 }
 
 /// Classify a received datagram into a dialog event and extract its facts.
@@ -325,6 +353,7 @@ unsafe fn classify_and_extract(s: &mut SipModState, len: usize) -> Option<SipEve
 unsafe fn apply(s: &mut SipModState, step: sip_dialog::SipStep) {
     if let Some(msg) = step.send {
         build(s, msg);
+        s.sip_tx_pending = 1;
         sip_flush(s);
     }
     match step.media {
@@ -475,9 +504,47 @@ unsafe fn step_sip(s: &mut SipModState) {
 // Media control — drive the rtp transmitter + the jitter receive path.
 // ---------------------------------------------------------------------------
 
-unsafe fn send_rtp_ctrl(s: &mut SipModState, cmd: u8) {
+/// Queue an ordered media-control command for the RTP transmitter.
+///
+/// Queued rather than written directly because these commands are RELIABLE and
+/// ORDERED in a way media is not: `SET_ENDPOINT` names where to send, `START`
+/// begins sending, and a refused write used to be discarded. That left the
+/// transmitter stopped, or sending to the endpoint of a previous call, while
+/// this module believed a call was up — silence one way with nothing reporting
+/// a fault. Losing an RTP packet is acceptable; losing the instruction that
+/// says where the packets go is not.
+unsafe fn queue_rtp_ctrl(s: &mut SipModState, cmd: u8) {
     if s.rtp_ctrl_out < 0 {
         return;
+    }
+    if (s.ctrl_len as usize) < CTRL_QUEUE {
+        s.ctrl_queue[s.ctrl_len as usize] = cmd;
+        s.ctrl_len += 1;
+    }
+    flush_rtp_ctrl(s);
+}
+
+/// Hand queued control commands to the transmitter, in order, stopping at the
+/// first refusal so ordering is preserved across steps.
+unsafe fn flush_rtp_ctrl(s: &mut SipModState) {
+    while s.ctrl_len > 0 {
+        if !send_rtp_ctrl(s, s.ctrl_queue[0]) {
+            return;
+        }
+        let n = s.ctrl_len as usize;
+        let mut i = 1;
+        while i < n {
+            s.ctrl_queue[i - 1] = s.ctrl_queue[i];
+            i += 1;
+        }
+        s.ctrl_len -= 1;
+    }
+}
+
+/// Write one control command. Returns whether the channel took it whole.
+unsafe fn send_rtp_ctrl(s: &mut SipModState, cmd: u8) -> bool {
+    if s.rtp_ctrl_out < 0 {
+        return true;
     }
     let sys = &*s.syscalls;
     let mut m = [0u8; CTRL_MSG_SIZE];
@@ -492,20 +559,20 @@ unsafe fn send_rtp_ctrl(s: &mut SipModState, cmd: u8) {
         m[6] = ip[2];
         m[7] = ip[3];
     }
-    let _ = (sys.channel_write)(s.rtp_ctrl_out, m.as_ptr(), CTRL_MSG_SIZE);
+    (sys.channel_write)(s.rtp_ctrl_out, m.as_ptr(), CTRL_MSG_SIZE) == CTRL_MSG_SIZE as i32
 }
 
 unsafe fn media_start(s: &mut SipModState) {
     s.jitter.reset();
     s.playing = 1;
     s.last_playout_ms = dev_millis(&*s.syscalls);
-    send_rtp_ctrl(s, CTRL_SET_ENDPOINT);
-    send_rtp_ctrl(s, CTRL_START);
+    queue_rtp_ctrl(s, CTRL_SET_ENDPOINT);
+    queue_rtp_ctrl(s, CTRL_START);
 }
 
 unsafe fn media_stop(s: &mut SipModState) {
     s.playing = 0;
-    send_rtp_ctrl(s, CTRL_STOP);
+    queue_rtp_ctrl(s, CTRL_STOP);
 }
 
 /// Bind the RTP-receive endpoint and pump packets into the jitter buffer.
@@ -698,6 +765,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         if s.sip_active != 0 {
             step_sip(s);
+            // Retry anything a full channel refused: a staged SIP datagram and
+            // any queued media-control command.
+            sip_flush(s);
+            flush_rtp_ctrl(s);
         }
         step_jitter(s);
         0

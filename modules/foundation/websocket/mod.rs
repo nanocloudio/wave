@@ -249,20 +249,91 @@ unsafe fn next_mask(s: &mut WsState, now: u64) -> [u8; 4] {
     (x as u32).to_le_bytes()
 }
 
-unsafe fn emit_message(s: &mut WsState, start: usize, end: usize) {
+/// Hand one received application message to `message_out`.
+///
+/// Returns whether the caller may consume the frame that carried it. `false`
+/// means `message_out` refused the write, and the frame must stay in `acc` so
+/// the identical bytes are offered again next step — a message the peer sent
+/// successfully is not ours to drop because a downstream reader is briefly
+/// behind.
+///
+/// An unwired `message_out` returns `true`: nobody asked for the data, so
+/// there is nothing to deliver and nothing to retry.
+#[must_use]
+unsafe fn emit_message(s: &mut WsState, start: usize, end: usize) -> bool {
+    if s.message_out < 0 {
+        s.frames = s.frames.wrapping_add(1);
+        return true;
+    }
+    if end > s.acc_len as usize || end < start {
+        return true;
+    }
     let sys = &*s.syscalls;
-    if s.message_out >= 0 && end <= s.acc_len as usize && end >= start {
-        let poll = (sys.channel_poll)(s.message_out, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
-            (sys.channel_write)(s.message_out, s.acc.as_ptr().add(start), end - start);
-        }
+    let poll = (sys.channel_poll)(s.message_out, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return false;
+    }
+    let len = end - start;
+    if (sys.channel_write)(s.message_out, s.acc.as_ptr().add(start), len) != len as i32 {
+        return false;
     }
     s.frames = s.frames.wrapping_add(1);
+    true
 }
 
 unsafe fn stage(s: &mut WsState, n: usize) {
     s.req_len = n as u16;
     s.req_sent = 0;
+}
+
+/// Drive one FSM transition.
+///
+/// The phase advances only when the action it carries actually reached the
+/// transport. `net_write_frame` returns 0 on backpressure precisely so a caller
+/// can retry rather than treat a dropped frame as committed; advancing anyway
+/// left this client waiting in `Connecting` for a reply to a CONNECT the
+/// channel had refused, until the connect deadline failed the exchange.
+/// Parse and deliver whatever complete frames the accumulator holds.
+///
+/// Called once per step rather than only when new bytes arrive: a frame the
+/// consumer refused stays in `acc`, and if this ran only on fresh input it
+/// would sit there until the peer happened to send something else — which,
+/// for a peer waiting on a reply, is never.
+unsafe fn drain_messages(s: &mut WsState, now: u64) {
+    if s.phase != WsPhase::Ready {
+        return;
+    }
+    while let Some(f) = ws_parse_frame(&s.acc[..s.acc_len as usize]) {
+        if f.opcode == ws_op::TEXT || f.opcode == ws_op::BINARY {
+            // Refused downstream: leave the frame in `acc` and stop draining.
+            // It is re-parsed and re-offered next step.
+            if !emit_message(s, f.payload_start, f.payload_end) {
+                return;
+            }
+        } else if f.opcode == ws_op::PING {
+            // answer with a masked PONG
+            let mask = next_mask(s, now);
+            let mut out = [0u8; 128];
+            let pl2 = (f.payload_end - f.payload_start).min(120);
+            let mut body = [0u8; 120];
+            body[..pl2].copy_from_slice(&s.acc[f.payload_start..f.payload_start + pl2]);
+            if let Some(n) = ws_frame(ws_op::PONG, &body[..pl2], mask, &mut out) {
+                s.req[..n].copy_from_slice(&out[..n]);
+                stage(s, n);
+            }
+        }
+        let total = f.total;
+        let rem = s.acc_len as usize - total;
+        let mut k = 0;
+        while k < rem {
+            s.acc[k] = s.acc[total + k];
+            k += 1;
+        }
+        s.acc_len = rem as u32;
+        if s.acc_len == 0 {
+            return;
+        }
+    }
 }
 
 unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
@@ -279,7 +350,7 @@ unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
             payload[5] = port[0];
             payload[6] = port[1];
             payload[7] = s.tag;
-            net_write_frame(
+            if net_write_frame(
                 sys,
                 s.net_out,
                 NET_CMD_CONNECT,
@@ -287,7 +358,13 @@ unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
                 8,
                 s.nbuf.as_mut_ptr(),
                 NET_BUF,
-            );
+            ) == 0
+            {
+                // Refused: stay where we are so the same CONNECT is offered
+                // again next step. The deadline has not started, because
+                // nothing has been asked of the peer yet.
+                return;
+            }
             s.started_ms = now;
         }
         WsAct::SendUpgrade => {
@@ -437,39 +514,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     );
                                 }
                             }
-                            if s.phase == WsPhase::Ready {
-                                while let Some(f) = ws_parse_frame(&s.acc[..s.acc_len as usize]) {
-                                    if f.opcode == ws_op::TEXT || f.opcode == ws_op::BINARY {
-                                        emit_message(s, f.payload_start, f.payload_end);
-                                    } else if f.opcode == ws_op::PING {
-                                        // answer with a masked PONG
-                                        let mask = next_mask(s, now);
-                                        let mut out = [0u8; 128];
-                                        let pl2 = (f.payload_end - f.payload_start).min(120);
-                                        let mut body = [0u8; 120];
-                                        body[..pl2].copy_from_slice(
-                                            &s.acc[f.payload_start..f.payload_start + pl2],
-                                        );
-                                        if let Some(n) =
-                                            ws_frame(ws_op::PONG, &body[..pl2], mask, &mut out)
-                                        {
-                                            s.req[..n].copy_from_slice(&out[..n]);
-                                            stage(s, n);
-                                        }
-                                    }
-                                    let total = f.total;
-                                    let rem = s.acc_len as usize - total;
-                                    let mut k = 0;
-                                    while k < rem {
-                                        s.acc[k] = s.acc[total + k];
-                                        k += 1;
-                                    }
-                                    s.acc_len = rem as u32;
-                                    if s.acc_len == 0 {
-                                        break;
-                                    }
-                                }
-                            }
+                            drain_messages(s, now);
                         }
                     }
                     NET_MSG_CLOSED if s.phase != WsPhase::Disconnected => {
@@ -503,6 +548,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // Re-offer anything a full `message_out` refused earlier, without
+        // waiting for the peer to send more.
+        drain_messages(s, now);
+
         if s.conn_present != 0 && s.req_sent < s.req_len {
             let max_chunk = NET_BUF - NET_FRAME_HDR - 1;
             while s.req_sent < s.req_len {
@@ -528,7 +577,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 2),
                     chunk,
                 );
-                (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), NET_FRAME_HDR + total_payload);
+                // All-or-nothing: the offset advances only over bytes the
+                // channel actually took. A short or refused write that still
+                // advanced it would skip those bytes forever, and the peer
+                // would see a truncated HTTP upgrade or WS frame.
+                let total = NET_FRAME_HDR + total_payload;
+                if (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), total) != total as i32 {
+                    break;
+                }
                 s.req_sent += chunk as u16;
             }
         }
@@ -544,10 +600,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // Drain reports finished only once the CLOSE has actually been taken
+        // by the transport. Reporting on an unconfirmed write drops the
+        // connection locally while the peer's socket stays open: the instance
+        // is torn down, the CLOSE never goes out, and the far end waits on a
+        // half of a connection nobody owns any more. A refused CLOSE simply
+        // retries next step.
         if s.draining == 1 && matches!(s.phase, WsPhase::Disconnected | WsPhase::Ready) {
             if s.conn_present != 0 {
                 let close = s.conn_id.to_le_bytes();
-                net_write_frame(
+                if net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
@@ -555,7 +617,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     2,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
-                );
+                ) == 0
+                {
+                    return 0;
+                }
                 s.conn_id = 0;
                 s.conn_present = 0;
             }

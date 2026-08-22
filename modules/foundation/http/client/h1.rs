@@ -327,12 +327,12 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             Phase::Done => {
-                send_close_frame(s);
+                let _ = send_close_frame(s);
                 return 1;
             }
 
             Phase::Error => {
-                send_close_frame(s);
+                let _ = send_close_frame(s);
                 return -1;
             }
 

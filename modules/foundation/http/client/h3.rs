@@ -465,8 +465,18 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
         if msg_type == 0 {
             break;
         }
-        let mut frame = [0u8; H3_CLIENT_RECV_BUF];
-        let n = plen.min(frame.len());
+        // Sized from the transport's published bound, not from
+        // `H3_CLIENT_RECV_BUF` — that is the response-head accumulator, a
+        // protocol budget, and sizing the wire scratch from it truncated any
+        // frame above it after the channel had already consumed it.
+        let mut frame = [0u8; mux::MUX_QUIC_STREAM_RX_FRAME_MAX];
+        if plen > frame.len() {
+            // A conforming provider cannot exceed its own bound. Fail the
+            // exchange rather than decode a prefix as if it were whole.
+            s.h3_client.state = H3ClientState::Failed;
+            continue;
+        }
+        let n = plen;
         core::ptr::copy_nonoverlapping(
             s.net_buf.as_ptr().add(super::super::NET_FRAME_HDR),
             frame.as_mut_ptr(),

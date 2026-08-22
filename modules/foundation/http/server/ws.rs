@@ -180,23 +180,31 @@ pub(crate) const WS_FRAME_HDR: usize = 8;
 /// fragments via the continuation path.
 pub(crate) const WS_FRAG_HDR_RESERVE: usize = 4;
 
-/// Emit a single inbound WS data frame on the `ws_out` port. Drops the
-/// frame silently if the port isn't wired or the payload exceeds the
-/// channel buffer — both are misconfiguration cases the downstream
-/// consumer can't recover the lost data from anyway.
+/// Emit a single inbound WS data frame on the `ws_out` port.
+///
+/// Returns whether the caller may now consume the source frame. `false` means
+/// only one thing — `ws_out` refused the write — and the caller must leave the
+/// frame buffered so the identical bytes are offered again next step.
+///
+/// The two `true`-with-no-delivery cases are deliberate and different from
+/// backpressure: an unwired port means nobody asked for the data, and an
+/// envelope larger than the channel buffer can never be delivered however long
+/// it is retried. Both are counted or structural; a full channel is neither,
+/// and treating it like them loses a frame the peer successfully sent.
+#[must_use]
 pub(crate) unsafe fn ws_emit_fanout_frame(
     s: &mut HttpState,
     opcode: u8,
     fin: u8,
     payload: *const u8,
     payload_len: usize,
-) {
+) -> bool {
     if s.server.ws_out_chan < 0 {
-        return;
+        return true;
     }
     if WS_FRAME_HDR + payload_len > super::super::abi::CHANNEL_BUFFER_SIZE {
         s.server.ws_envelopes_dropped = s.server.ws_envelopes_dropped.wrapping_add(1);
-        return;
+        return true;
     }
     let mut frame_buf = [0u8; super::super::abi::CHANNEL_BUFFER_SIZE];
     let conn_id = cur_conn_id(s) as u32;
@@ -214,7 +222,16 @@ pub(crate) unsafe fn ws_emit_fanout_frame(
     }
     let total = WS_FRAME_HDR + payload_len;
     let sys = &*s.syscalls;
-    let _ = (sys.channel_write)(s.server.ws_out_chan, frame_buf.as_ptr(), total);
+    let poll = (sys.channel_poll)(s.server.ws_out_chan, super::super::POLL_OUT);
+    if poll <= 0 || (poll as u32 & super::super::POLL_OUT) == 0 {
+        s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+        return false;
+    }
+    if (sys.channel_write)(s.server.ws_out_chan, frame_buf.as_ptr(), total) <= 0 {
+        s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+        return false;
+    }
+    true
 }
 
 /// Try to read one outbound WsFrame from `ws_in` and queue it as a WS
@@ -597,13 +614,21 @@ pub(crate) unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
             if cur_ws_fan_out(s) != 0 {
                 // Fan out: emit a WsFrame record on `ws_out` and let the
                 // downstream module decide what to do with the payload.
-                ws_emit_fanout_frame(
+                //
+                // A refusal leaves the frame in `recv_buf`, unconsumed, and
+                // returns "need more data" so the same bytes are re-parsed and
+                // re-offered next step. Consuming it here would drop a frame
+                // the peer sent successfully, with nothing downstream aware one
+                // was ever coming.
+                if !ws_emit_fanout_frame(
                     s,
                     frame.opcode,
                     if frame.fin { 1 } else { 0 },
                     payload_ptr,
                     frame.payload_len as usize,
-                );
+                ) {
+                    return false;
+                }
             } else {
                 // Echo: send back as the same data opcode. Continuation
                 // frames keep the original opcode the peer chose; the

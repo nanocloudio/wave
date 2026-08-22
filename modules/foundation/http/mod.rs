@@ -671,6 +671,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             s.server.retained_idle_ticks = s.server.retained_idle_ticks.saturating_add(1);
         }
 
+        // A CLOSE the transport refused leaves `conn_present` set; retry it
+        // here so every terminal path in the protocol steps gets the retry for
+        // free rather than each having to carry one.
+        if s.mode == MODE_CLIENT
+            && s.client.conn_present != 0
+            && matches!(s.client.phase, client::Phase::Done | client::Phase::Error)
+        {
+            let _ = client::send_close_frame(s);
+        }
+
         let rc = if s.mode == MODE_CLIENT {
             // HTTP/3 client: the request rides the `mux` contract, exactly as
             // the server path does, so the transport stays protocol-free.
@@ -695,7 +705,34 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 client::h1::step(s)
             };
-            r
+            // Drain completion. The step above ran first, so an exchange that
+            // was one frame from finishing has already finished.
+            //
+            // Anything still in flight is then FAILED rather than waited on. A
+            // one-shot client mid-exchange is waiting on a peer, and drain is
+            // the graph being reconfigured underneath both of them — so waiting
+            // means waiting on a clock, and a client whose deadline has not yet
+            // fired would hold the reconfiguration open until the scheduler's
+            // forced-drain timeout. Failing explicitly gives the caller the one
+            // terminal outcome it is owed and makes the drain bounded without
+            // depending on a clock at all.
+            if s.client.draining != 0 {
+                if !matches!(
+                    s.client.phase,
+                    client::Phase::Init | client::Phase::Done | client::Phase::Error
+                ) {
+                    s.client.phase = client::Phase::Error;
+                }
+                // Quiescence is also the CLOSE having been taken: a refused one
+                // retries next step rather than abandoning the connection.
+                if client::send_close_frame(s) {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                r
+            }
         } else {
             // Server mode. With `h3 = 1` the module speaks HTTP/3 over the
             // `mux` contract instead of HTTP/1+2 over net_proto — same ports,
@@ -953,6 +990,13 @@ pub unsafe extern "C" fn module_drain(state: *mut u8) -> i32 {
             // every tick and returns 1 once no in-flight conns
             // remain, so no specific slot needs to be poked.
             s.server.draining = 1;
+        } else {
+            // Client mode participates too. It is one-shot, so draining means
+            // "finish the exchange already admitted, then go" — abandoning it
+            // would leave a caller waiting on a response that was still coming,
+            // and ignoring drain entirely left the instance to be torn down by
+            // the scheduler's forced-drain timeout even when it was idle.
+            s.client.draining = 1;
         }
     }
     0

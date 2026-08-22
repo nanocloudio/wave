@@ -51,8 +51,8 @@ use super::super::{
     SOCK_TYPE_STREAM,
 };
 use super::{
-    Phase as H1Phase, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED, RECV_BUF_SIZE,
-    REQUEST_BUF_SIZE,
+    send_close_frame, Phase as H1Phase, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED,
+    E_WRITE_FAILED, RECV_BUF_SIZE, REQUEST_BUF_SIZE,
 };
 
 const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -354,7 +354,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     }
                     FrameAction::Done => {
                         log_done(s);
-                        send_close_frame(s);
+                        let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
                         return 1;
                     }
@@ -390,7 +390,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // Peer's CLOSE echo arrived — exit cleanly.
                 if s.client.ws_done == 2 {
                     log_done(s);
-                    send_close_frame(s);
+                    let _ = send_close_frame(s);
                     set_phase(s, H2Phase::Done);
                     return 1;
                 }
@@ -416,7 +416,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     FrameAction::DataPending => continue,
                     FrameAction::Done => {
                         log_done(s);
-                        send_close_frame(s);
+                        let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
                         return 1;
                     }
@@ -436,7 +436,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     consume_data_frame(s);
                     if end {
                         log_done(s);
-                        send_close_frame(s);
+                        let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
                         return 1;
                     }
@@ -459,7 +459,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     consume_data_frame(s);
                     if end_stream {
                         log_done(s);
-                        send_close_frame(s);
+                        let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
                         return 1;
                     }
@@ -487,12 +487,12 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             H2Phase::Done => {
-                send_close_frame(s);
+                let _ = send_close_frame(s);
                 return 1;
             }
 
             H2Phase::Error => {
-                send_close_frame(s);
+                let _ = send_close_frame(s);
                 return -1;
             }
         }
@@ -1184,27 +1184,4 @@ unsafe fn consume_until_settings(s: &mut HttpState) -> Option<bool> {
         // SETTINGS is first, but be liberal with PING / WINDOW_UPDATE).
         shift_consume(s, total);
     }
-}
-
-unsafe fn send_close_frame(s: &mut HttpState) {
-    // Presence — not `conn_id != 0` — since IP may assign conn_id 0 (see
-    // ClientState::conn_present).
-    if s.client.conn_present == 0 || s.net_out_chan < 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    let chan = s.net_out_chan;
-    let buf = s.net_buf.as_mut_ptr();
-    let payload = s.client.conn_id.to_le_bytes();
-    net_write_frame(
-        sys,
-        chan,
-        NET_CMD_CLOSE,
-        payload.as_ptr(),
-        2,
-        buf,
-        NET_BUF_SIZE,
-    );
-    s.client.conn_id = 0;
-    s.client.conn_present = 0;
 }

@@ -72,6 +72,11 @@ pub(crate) struct ClientState {
     /// legitimately assign `conn_id == 0`; keying "connected" off `conn_id != 0`
     /// would leak the first connection (its `CMD_CLOSE` suppressed).
     pub(crate) conn_present: u8,
+    /// Set by `module_drain`. The client finishes the exchange it already
+    /// admitted, then closes and reports quiescence — it does not abandon a
+    /// request whose response a caller is waiting for, and it does not sit
+    /// open once there is nothing left to finish.
+    pub(crate) draining: u8,
     _conn_pad: [u8; 2],
     pub(crate) out_chan: i32,
     /// `in[1]` — when wired (≥ 0), the WS client reads outgoing
@@ -195,15 +200,22 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) {
     s.client.request_sent = 0;
 }
 
-pub(crate) unsafe fn send_close_frame(s: &mut HttpState) {
+/// Close the client's connection. Returns whether the transport took the
+/// CLOSE — `true` also when there was nothing to close.
+///
+/// Ownership is released only on a confirmed write. Clearing it after a refused
+/// one abandons a connection the peer still holds open, and nothing afterwards
+/// knows the CLOSE is owed.
+#[must_use]
+pub(crate) unsafe fn send_close_frame(s: &mut HttpState) -> bool {
     if s.client.conn_present == 0 || s.net_out_chan < 0 {
-        return;
+        return true;
     }
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
     let payload = s.client.conn_id.to_le_bytes();
-    net_write_frame(
+    if net_write_frame(
         sys,
         chan,
         NET_CMD_CLOSE,
@@ -211,9 +223,13 @@ pub(crate) unsafe fn send_close_frame(s: &mut HttpState) {
         2,
         buf,
         NET_BUF_SIZE,
-    );
+    ) == 0
+    {
+        return false;
+    }
     s.client.conn_id = 0;
     s.client.conn_present = 0;
+    true
 }
 
 /// True when a just-read established-stream frame (`MSG_DATA` / `MSG_CLOSED` /
