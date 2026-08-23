@@ -120,6 +120,40 @@ pub fn smtp_body(body: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(p)
 }
 
+/// Dot-stuff one span of a message that is being streamed.
+///
+/// `at_line_start` carries the line state across a span boundary: transparency
+/// applies to a `.` that begins a LINE, and a span that ends mid-line must not
+/// re-arm it for the next span's first byte. Returns the bytes written and the
+/// line state to carry forward.
+///
+/// Unlike [`smtp_body`] this writes no terminator: the message is not known to
+/// be complete until the caller says so, and a terminator emitted early would
+/// end the message at a span boundary.
+pub fn smtp_body_chunk(chunk: &[u8], at_line_start: bool, out: &mut [u8]) -> Option<(usize, bool)> {
+    let mut p = 0usize;
+    let mut line_start = at_line_start;
+    for &b in chunk {
+        if line_start && b == b'.' {
+            smtp_put(out, &mut p, b".")?; // transparency dot
+        }
+        smtp_put(out, &mut p, &[b])?;
+        line_start = b == b'\n';
+    }
+    Some((p, line_start))
+}
+
+/// The end-of-data marker, preceded by CRLF when the message did not end with
+/// one. RFC 5321 requires the terminator to sit on a line of its own.
+pub fn smtp_body_end(ends_with_crlf: bool, out: &mut [u8]) -> Option<usize> {
+    let mut p = 0usize;
+    if !ends_with_crlf {
+        smtp_put(out, &mut p, b"\r\n")?;
+    }
+    smtp_put(out, &mut p, b".\r\n")?;
+    Some(p)
+}
+
 // ---- delivery phase machine -------------------------------------------------
 
 /// Where the delivery conversation currently stands. `Disconnected`/`Connecting`
@@ -153,6 +187,55 @@ pub enum SmtpCmd {
     Complete,
     /// An unexpected reply code for this phase — abort.
     Fail,
+}
+
+/// Whether this reply is the server taking responsibility for the message.
+///
+/// Exactly one reply means that: the 250 answering end-of-data. From that
+/// moment the message is the server's, and the QUIT that follows is graceful
+/// cleanup — a failed QUIT does not un-accept a message, and resubmitting on
+/// the strength of one would deliver it twice.
+pub fn smtp_reply_accepts(phase: SmtpPhase, code: u16) -> bool {
+    matches!(phase, SmtpPhase::Body) && code == 250
+}
+
+/// The stable byte a phase is reported as on the result port.
+///
+/// Wire positions: append new phases, never renumber an existing one.
+pub fn smtp_phase_code(phase: SmtpPhase) -> u8 {
+    match phase {
+        SmtpPhase::Disconnected => 0,
+        SmtpPhase::Connecting => 1,
+        SmtpPhase::Greet => 2,
+        SmtpPhase::Ehlo => 3,
+        SmtpPhase::MailFrom => 4,
+        SmtpPhase::RcptTo => 5,
+        SmtpPhase::Data => 6,
+        SmtpPhase::Body => 7,
+        SmtpPhase::Quit => 8,
+        SmtpPhase::Done => 9,
+        SmtpPhase::Failed => 10,
+    }
+}
+
+/// The reply text of one reply line, without its code, separator or CRLF.
+///
+/// Returns the span within `buf`, so a caller can copy the bounded text it
+/// wants to keep. `None` for a line too short to carry any.
+pub fn smtp_reply_text(buf: &[u8], line_len: usize) -> Option<(usize, usize)> {
+    // The span must lie inside the buffer it is measured against: a caller
+    // passing a length from a different line would otherwise name bytes that
+    // are not part of this reply.
+    if line_len > buf.len() {
+        return None;
+    }
+    // `line_len` includes the trailing CRLF; the text starts after the
+    // 3-digit code and its separator, when there is one.
+    let end = line_len.checked_sub(2)?;
+    if end <= 4 {
+        return None;
+    }
+    Some((4, end - 4))
 }
 
 /// Decide the next command from the current phase and a FINAL reply code. Every

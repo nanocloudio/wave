@@ -202,3 +202,25 @@ whoever configured the route and not only to the client that hit it.
 There is no longer a second implementation to reconcile with: Fluxor's `quic`
 has shed its own `qpack.rs` and `h3.rs` responder, so QPACK exists once in the
 stack, here. See `docs/architecture/http3-ownership.md`.
+
+## WebSocket admission
+
+A route using the admission handler does not grant its own upgrade. The
+request is reported on `ws_admit_out` — connection id, path, headers and
+requested subprotocols — and the 101 is composed only when a decision naming
+that connection arrives on `ws_admit_in`. An accept may name the subprotocol to
+echo; a refusal carries an HTTP status and a bounded reason.
+
+The distinction that matters is when. A gate downstream of a completed upgrade
+can refuse to act on frames, but the socket is already open and the peer already
+believes it is talking to the application. Here nothing downstream ever sees a
+frame from a connection it did not admit.
+
+`ws_event_out` carries what happened rather than what was asked for: `opened`
+once the upgrade is on the wire, and `closed` once the connection has actually
+ended, with its origin and close code. A connection that never opened owes no
+closure.
+
+A decision that never arrives is refused on the module's own deadline with a
+503, so a browser is never left holding an upgrade forever. Any decision byte
+that is not an explicit accept refuses.

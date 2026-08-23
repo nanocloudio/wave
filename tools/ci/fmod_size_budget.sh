@@ -40,19 +40,22 @@ MODE="${1:-}"
 # silently omits an artefact is worse than no budget, because the omission
 # reads as coverage.
 BUDGETS="
-rp2350|http.fmod|142000|141136 (2026-08-21, +4.1K: h3 stage/commit split so a refused write cannot drop a frame, plus h3 drain)
+rp2350|http.fmod|146000|144860 (2026-08-23, +3.7K: WebSocket admission — the upgrade is reported and awaits an application decision before any 101 is composed)
 rp2350|http-h2.fmod|119000|110760 (2026-08-12, +5.1K)
-rp2350|http-web.fmod|78000|72936 (2026-08-16, +1.1K for the shedding counters)
+rp2350|http-web.fmod|78600|78332 (2026-08-23, +332 B: WebSocket lifecycle events retried rather than dropped when the event channel is full)
 rp2350|http-app.fmod|80000|73368 (2026-08-16, first row; h1 + app fan-out only)
 rp2350|rtp.fmod|4600|4192 (2026-08-12)
-rp2350|sip.fmod|13900|13567 (2026-08-22, +736 B: ordered media-control queue so a refused SET_ENDPOINT/START is retried in order rather than dropped)
+rp2350|sip.fmod|17000|16295 (2026-08-23, +2.7K: the application command/event contract — a call is offered and decided rather than auto-answered, and every terminal outcome is reported)
+rp2350|stun.fmod|6000|4881 (2026-08-23, first row; STUN Binding responder with HMAC-SHA-1 and CRC-32)
+bcm2712|stun.fmod|6000|4793 (2026-08-23, first row)
+bcm2712|mail.fmod|24000|21081 (2026-08-23, first row; RFC 5322 + MIME assembly over the smtp connector)
 rp2350|ws_stream.fmod|3000|2717 (2026-08-07)
-bcm2712|http.fmod|291000|269704 (2026-08-12, +12.2K for request bodies + app fan-out)
+bcm2712|http.fmod|300000|295348 (2026-08-23, +25.6K: WebSocket admission — the upgrade is reported and awaits an application decision before any 101 is composed)
 bcm2712|http-h2.fmod|270000|250032 (2026-08-12, +6.2K)
 bcm2712|http-web.fmod|196000|182504 (2026-08-16, +1.3K for the shedding counters)
 bcm2712|http-app.fmod|203000|187064 (2026-08-16, first row; h1 + app fan-out only)
 bcm2712|s3.fmod|22000|19647 (2026-08-16, first row; SigV4 signing connector)
-bcm2712|smtp.fmod|6300|5713 (2026-08-07)
+bcm2712|smtp.fmod|10200|9305 (2026-08-23, +3.6K: driven SmtpRequest/SmtpResult surface, streamed message bodies, and the enhanced-status parsing a result carries)
 bcm2712|websocket.fmod|12700|10912 (2026-08-12)
 "
 

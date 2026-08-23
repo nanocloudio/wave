@@ -212,6 +212,10 @@ pub(crate) enum Phase {
     ProxyRelayHeaders = 16,
     ProxyRelayBody = 17,
 
+    /// The upgrade has been reported on `ws_admit_out` and this slot is
+    /// waiting for the matching decision on `ws_admit_in`. Leaves for
+    /// `WsHandshake` on an accept, and for a refusal response otherwise.
+    WsAwaitAdmit = 25,
     /// 101 Switching Protocols composed; flush it then enter `WsActive`.
     WsHandshake = 18,
     /// WebSocket frame loop. Reads masked client frames from net_in,
@@ -272,6 +276,27 @@ pub(crate) struct ConnSlot {
     /// Set to 1 when the matched route uses
     /// `HANDLER_WEBSOCKET_FANOUT` and the upgrade succeeded.
     pub(crate) ws_fan_out: u8,
+    /// 1 while this slot's upgrade is waiting on an admission decision.
+    pub(crate) ws_admit_pending: u8,
+    /// 1 once the admission request has been handed to `ws_admit_out`.
+    ///
+    /// The request is offered until the channel takes it: a request dropped
+    /// because the channel was briefly full would leave the peer waiting on a
+    /// decision nobody was ever asked for.
+    pub(crate) ws_admit_sent: u8,
+    /// 1 once an `opened` event has been reported for this connection, so a
+    /// `closed` is reported for exactly the connections that opened.
+    pub(crate) ws_opened_sent: u8,
+    /// The RFC 6455 accept value computed at admission time.
+    ///
+    /// Kept because the request buffer is reused while the decision is
+    /// outstanding, and the key it was derived from would be gone.
+    pub(crate) ws_accept: [u8; 28],
+    /// Ticks spent awaiting a decision, against `WS_ADMIT_TIMEOUT_TICKS`.
+    pub(crate) ws_admit_ticks: u16,
+    /// The RFC 6455 close code observed for this connection, or 0 when it
+    /// ended without one.
+    pub(crate) ws_close_code: u16,
     /// Set to 1 if a WsFrame envelope read from `ws_in` had fin=1
     /// and was split into multiple wire fragments. The final wire
     /// fragment will carry `fin=1`; intermediate ones carry `fin=0`.
@@ -510,6 +535,28 @@ unsafe fn slot_init_zero(slot: &mut ConnSlot) {
 /// Called from `free_slot` (close path) and as the cleanup half
 /// of `alloc_free_slot` when a buffer's allocation fails.
 unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
+    // A connection that opened owes a committed closure. Reported here, where
+    // every path that ends a connection converges, so it is reported once and
+    // for exactly the connections that opened — not where a close was
+    // REQUESTED, which is a different fact.
+    {
+        let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+        if slot.ws_opened_sent != 0 {
+            let conn = if slot.conn_id >= 0 {
+                slot.conn_id as u32
+            } else {
+                0
+            };
+            let origin = if slot.peer_closed != 0 {
+                ws::WS_ORIGIN_PEER
+            } else {
+                ws::WS_ORIGIN_LOCAL
+            };
+            let code = slot.ws_close_code;
+            slot.ws_opened_sent = 0;
+            ws::ws_report_event(s, conn, ws::WS_EV_CLOSED, origin, code, b"");
+        }
+    }
     // If this slot owned `file_chan`, release the lock so a sibling
     // slot blocked in DispatchRoute can proceed. Done before the
     // slot's `cur_slot` index is touched so `release_file_chan`
@@ -634,6 +681,12 @@ pub(crate) struct ServerState {
     /// `WsFrame` records when a route uses `HANDLER_WEBSOCKET_FANOUT`.
     /// `-1` if the port is unwired.
     pub(crate) ws_out_chan: i32,
+    /// Where admission requests are offered.
+    pub(crate) ws_admit_out_chan: i32,
+    /// Where admission decisions arrive.
+    pub(crate) ws_admit_in_chan: i32,
+    /// Where committed lifecycle facts are reported.
+    pub(crate) ws_event_out_chan: i32,
     /// Input channel for `ws_in` (manifest port in[3]). Carries
     /// `WsFrame` records to be queued back as outbound WS frames.
     /// `-1` if the port is unwired.
@@ -846,6 +899,14 @@ pub(crate) struct ServerState {
     /// WebSocket fan-out envelopes dropped — unknown conn, no fan-out
     /// slot active, or oversize (`http.ws.envelopes.dropped`).
     pub(crate) ws_envelopes_dropped: u32,
+    /// WebSocket lifecycle events dropped because the retry ring was already
+    /// full (`http.ws.events.dropped`). Non-zero means an application is far
+    /// enough behind on `ws_event_out` that its view of which connections
+    /// exist has diverged from this module's.
+    pub(crate) ws_events_dropped: u32,
+    /// Lifecycle events awaiting a `ws_event_out` that refused them.
+    pub(crate) ws_event_ring: [ws::PendingWsEvent; ws::WS_EVENT_RING],
+    pub(crate) ws_event_len: u8,
     /// HTTP/2 streams refused because the connection's stream table was
     /// full (`http.h2.streams.refused`). Expected under a client that
     /// outruns `MAX_STREAMS`; a floor, not a fault.
@@ -1256,6 +1317,9 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.file_chan_owner = -1;
     s.server.out_chan = -1;
     s.server.ws_out_chan = -1;
+    s.server.ws_admit_out_chan = -1;
+    s.server.ws_admit_in_chan = -1;
+    s.server.ws_event_out_chan = -1;
     s.server.ws_in_chan = -1;
     s.server.app_out_chan = -1;
     s.server.app_in_chan = -1;
@@ -1338,6 +1402,12 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     s.server.ws_in_chan = dev_channel_port(sys, 0, 3);
     s.server.out_chan = dev_channel_port(sys, 1, 1);
     s.server.ws_out_chan = dev_channel_port(sys, 1, 2);
+    //   in[7]  = ws_admit_in       (OctetStream, admission decisions)
+    //   out[7] = ws_admit_out      (OctetStream, admission requests)
+    //   out[8] = ws_event_out      (OctetStream, committed lifecycle facts)
+    s.server.ws_admit_in_chan = dev_channel_port(sys, 0, 7);
+    s.server.ws_admit_out_chan = dev_channel_port(sys, 1, 7);
+    s.server.ws_event_out_chan = dev_channel_port(sys, 1, 8);
     //   in[6]  = resp_in           (HttpResponse, HANDLER_APP only)
     //   out[6] = req_out           (HttpRequest, HANDLER_APP only)
     #[cfg(feature = "app")]
@@ -2032,6 +2102,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     demux_inbound(s);
     pump_dyn_routes(s);
     pump_listeners(s);
+    // Re-offer lifecycle events a full `ws_event_out` refused earlier. Before
+    // the drain check below, so a closure reported on the last connection is
+    // handed over rather than stranded by the instance reporting itself done.
+    ws::ws_flush_events(s);
 
     // Graceful-drain check, run before any per-slot work. Drain is
     // complete once `module_drain` has set the flag, the listener
@@ -2039,7 +2113,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // slot-agnostic on purpose — slot 0 is reused for connections
     // after bind, so it's not always the listener slot when drain
     // is requested.
-    if s.server.draining != 0 && s.server.bound != 0 && active_slot_count(s) == 0 {
+    //
+    // Also once every lifecycle event has been delivered: an application whose
+    // last `closed` never arrived would track the connection indefinitely.
+    if s.server.draining != 0
+        && s.server.bound != 0
+        && active_slot_count(s) == 0
+        && s.server.ws_event_len == 0
+    {
         return 1;
     }
 

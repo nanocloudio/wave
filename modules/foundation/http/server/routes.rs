@@ -96,6 +96,18 @@ pub(crate) const HANDLER_APP: u8 = 11;
 /// session's replies delivered into the next.
 pub(crate) const HANDLER_WEBSOCKET_SESSION: u8 = 9;
 
+/// Like `HANDLER_WEBSOCKET_SESSION`, but the upgrade is not this module's
+/// to grant: the request is reported on `ws_admit_out` and the 101 is
+/// composed only when `ws_admit_in` answers accept.
+///
+/// The distinction that matters is WHEN. A gate downstream of a completed
+/// upgrade can refuse to act on frames, but the socket is already open and
+/// the peer already believes it is talking to the application. Here nothing
+/// above ever sees a frame from a connection it did not admit, and a refusal
+/// is an HTTP status the browser's `WebSocket` constructor reports as a
+/// failure rather than a connection that opens and then goes quiet.
+pub(crate) const HANDLER_WEBSOCKET_ADMIT: u8 = 12;
+
 // ── The static route arena ────────────────────────────────────────────────
 
 #[repr(C)]

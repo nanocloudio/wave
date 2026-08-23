@@ -23,6 +23,15 @@ use super::super::connection::NET_CMD_SEND;
 use super::super::wire::ws;
 use super::response::build_error;
 use super::routes::{HANDLER_WEBSOCKET_FANOUT, HANDLER_WEBSOCKET_SESSION};
+// The admission record layouts, mounted beside the frame core in `wire::ws`.
+// Reached relative to this module rather than through `crate::`: the module
+// root is the crate root only in the PIC build, and a `crate::` path here
+// stops resolving the moment a host harness mounts this file as a submodule.
+pub(crate) use super::wire::ws::{
+    parse_ws_admit_decision, write_ws_admit_request, write_ws_event, WS_ADMIT_ACCEPT,
+    WS_ADMIT_DEC_HDR, WS_ADMIT_REQ_HDR, WS_EVENT_HDR, WS_EV_CLOSED, WS_EV_OPENED, WS_ORIGIN_LOCAL,
+    WS_ORIGIN_PEER,
+};
 use super::{
     cur_conn_id, cur_matched_route, cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_recv_len,
     cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_slot, cur_slot_mut, cur_ws_fan_out,
@@ -61,6 +70,19 @@ pub(crate) const RETAIN_RESET_TICKS: u16 = 500;
 /// already populated `send_buf` with the appropriate error response and
 /// transitioned to `DrainSend`).
 pub(crate) unsafe fn begin_ws_upgrade(s: &mut HttpState) -> bool {
+    let Some(accept) = ws_validate_upgrade(s) else {
+        return false;
+    };
+    ws_compose_accept(s, &accept, &[]);
+    true
+}
+
+/// Validate the upgrade request and compute its accept value.
+///
+/// `None` when the request is not a well-formed upgrade; the caller's error
+/// response and phase have already been set, exactly as `begin_ws_upgrade`
+/// used to do inline.
+pub(crate) unsafe fn ws_validate_upgrade(s: &mut HttpState) -> Option<[u8; 28]> {
     let buf = cur_recv_buf_ptr(s);
     let len = cur_recv_len(s) as usize;
 
@@ -89,15 +111,21 @@ pub(crate) unsafe fn begin_ws_upgrade(s: &mut HttpState) -> bool {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::DrainSend;
             }
-            return false;
+            return None;
         }
     };
 
     let mut accept = [0u8; 28];
     ws::compute_accept(buf.add(key_off), key_len, accept.as_mut_ptr());
+    Some(accept)
+}
 
+/// Compose the 101 response for an accept value, optionally naming the
+/// subprotocol the application chose.
+pub(crate) unsafe fn ws_compose_accept(s: &mut HttpState, accept: &[u8; 28], protocol: &[u8]) {
     let written =
         ws::write_handshake_response(cur_send_buf_mut_ptr(s), SEND_BUF_SIZE, accept.as_ptr());
+    let written = ws_append_protocol(s, written, protocol);
     if let Some(cur) = cur_slot_mut(s) {
         cur.send_offset = 0;
     }
@@ -110,7 +138,36 @@ pub(crate) unsafe fn begin_ws_upgrade(s: &mut HttpState) -> bool {
     if let Some(cur) = cur_slot_mut(s) {
         cur.recv_parsed = 0;
     }
-    true
+}
+
+/// Splice a `Sec-WebSocket-Protocol` line into a composed 101 response.
+///
+/// The handshake response ends with a blank line, so the header goes in ahead
+/// of it. A protocol that does not fit is dropped rather than truncated: half
+/// a subprotocol name names a different subprotocol.
+unsafe fn ws_append_protocol(s: &mut HttpState, written: usize, protocol: &[u8]) -> usize {
+    if protocol.is_empty() || written < 2 {
+        return written;
+    }
+    const NAME: &[u8] = b"Sec-WebSocket-Protocol: ";
+    let extra = NAME.len() + protocol.len() + 2;
+    if written + extra > SEND_BUF_SIZE {
+        return written;
+    }
+    let buf = cur_send_buf_mut_ptr(s);
+    // Everything up to the final CRLF stays; the header is inserted before it.
+    let insert_at = written - 2;
+    let mut p = insert_at;
+    core::ptr::copy_nonoverlapping(NAME.as_ptr(), buf.add(p), NAME.len());
+    p += NAME.len();
+    core::ptr::copy_nonoverlapping(protocol.as_ptr(), buf.add(p), protocol.len());
+    p += protocol.len();
+    *buf.add(p) = b'\r';
+    *buf.add(p + 1) = b'\n';
+    p += 2;
+    *buf.add(p) = b'\r';
+    *buf.add(p + 1) = b'\n';
+    p + 2
 }
 
 /// Build an unmasked server-to-client WebSocket frame in `send_buf`.
@@ -155,6 +212,10 @@ pub(crate) unsafe fn ws_begin_close(s: &mut HttpState, code: u16) {
     let payload = [(code >> 8) as u8, (code & 0xFF) as u8];
     ws_queue_frame(s, ws::OP_CLOSE, payload.as_ptr(), 2);
     if let Some(cur) = cur_slot_mut(s) {
+        // Kept for the closure event. This records the code this end SENT;
+        // whether the peer or this end initiated is tracked separately, since
+        // a close echoed back to a peer carries the peer's code.
+        cur.ws_close_code = code;
         cur.phase = Phase::WsClose;
     }
 }
@@ -662,4 +723,302 @@ pub(crate) unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
         cur.recv_len = leftover as u16;
     }
     true
+}
+
+// ── Admission ─────────────────────────────────────────────────────────────
+//
+// An admission-gated route asks before it opens anything. The three steps are
+// deliberately separate records on separate ports: what was asked, what was
+// decided, and what actually happened. Collapsing the last two loses the
+// distinction between a decision and its outcome, which is the same mistake as
+// treating "close requested" as "closed".
+
+/// How long a slot waits for an admission decision before refusing on its own.
+///
+/// A decision that never arrives must not leave a browser holding an upgrade
+/// forever; the refusal is the module's, and it says so.
+pub(crate) const WS_ADMIT_TIMEOUT_TICKS: u16 = 1500;
+
+/// Longest subprotocol name a decision may name.
+const WS_PROTOCOL_MAX: usize = 64;
+/// Longest refusal reason carried into the response body.
+const WS_REASON_MAX: usize = 128;
+
+/// Lifecycle events held for retry when `ws_event_out` is full.
+///
+/// Small because it is a stall buffer, not a queue: it covers a consumer that
+/// is a few steps behind, and overflowing it means one so far behind that the
+/// drop counter is the more useful signal.
+pub(crate) const WS_EVENT_RING: usize = 8;
+
+/// One deferred lifecycle event. No reason text — the reasons this module
+/// generates are empty, and holding a 128-byte buffer per deferred event to
+/// carry nothing would cost more than the events do.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingWsEvent {
+    pub(crate) conn: u32,
+    pub(crate) event: u8,
+    pub(crate) origin: u8,
+    pub(crate) code: u16,
+}
+
+impl PendingWsEvent {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            conn: 0,
+            event: 0,
+            origin: 0,
+            code: 0,
+        }
+    }
+}
+/// Bounded header block reported with an admission request.
+const WS_ADMIT_HDR_MAX: usize = 1024;
+
+/// Offer this slot's admission request on `ws_admit_out`.
+///
+/// Returns true once the channel has taken it. Until then the request is
+/// offered again on later steps: dropping it because the channel was briefly
+/// full would leave the peer waiting on a decision nobody was ever asked for.
+pub(crate) unsafe fn ws_offer_admission(s: &mut HttpState) -> bool {
+    let chan = s.server.ws_admit_out_chan;
+    if chan < 0 {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(chan, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return false;
+    }
+
+    let conn = u32::from(cur_conn_id(s));
+    let buf = cur_recv_buf_ptr(s);
+    let len = cur_recv_len(s) as usize;
+
+    // The request line's path, and the header block after it.
+    let mut path_at = 0usize;
+    while path_at < len && *buf.add(path_at) != b' ' {
+        path_at += 1;
+    }
+    path_at += 1;
+    let mut path_end = path_at;
+    while path_end < len && *buf.add(path_end) != b' ' {
+        path_end += 1;
+    }
+    let mut path = [0u8; 256];
+    let path_len = (path_end.saturating_sub(path_at)).min(path.len());
+    for (k, slot) in path.iter_mut().enumerate().take(path_len) {
+        *slot = *buf.add(path_at + k);
+    }
+
+    let mut headers = [0u8; WS_ADMIT_HDR_MAX];
+    let hdr_start = {
+        let mut i = path_end;
+        while i + 1 < len && !(*buf.add(i) == b'\r' && *buf.add(i + 1) == b'\n') {
+            i += 1;
+        }
+        (i + 2).min(len)
+    };
+    let hdr_len = (len - hdr_start).min(WS_ADMIT_HDR_MAX);
+    for (k, slot) in headers.iter_mut().enumerate().take(hdr_len) {
+        *slot = *buf.add(hdr_start + k);
+    }
+
+    let mut protocols = [0u8; WS_PROTOCOL_MAX * 4];
+    let proto_len = match ws::find_header_value(buf, len, b"Sec-WebSocket-Protocol") {
+        Some((off, n)) => {
+            let take = n.min(protocols.len());
+            for (k, slot) in protocols.iter_mut().enumerate().take(take) {
+                *slot = *buf.add(off + k);
+            }
+            take
+        }
+        None => 0,
+    };
+
+    let mut out = [0u8; WS_ADMIT_REQ_HDR + 256 + WS_ADMIT_HDR_MAX + WS_PROTOCOL_MAX * 4];
+    let Some(total) = write_ws_admit_request(
+        conn,
+        &path[..path_len],
+        &headers[..hdr_len],
+        &protocols[..proto_len],
+        &mut out,
+    ) else {
+        return false;
+    };
+    (sys.channel_write)(chan, out.as_ptr(), total) == total as i32
+}
+
+/// Report a committed lifecycle fact on `ws_event_out`.
+///
+/// Retried, not best-effort. These events are how an application knows which
+/// connections exist: a lost `opened` gives it frames from a connection it was
+/// never told about, and a lost `closed` leaves it tracking one that has
+/// already ended, forever. `ws_event_out` is a mailbox holding one envelope, so
+/// two connections closing in the same step is enough to refuse the second —
+/// which is ordinary, not exceptional.
+///
+/// A refused event goes to [`ServerState::ws_event_ring`] and is re-offered
+/// each step. The ring is bounded, and overflowing it is counted rather than
+/// silent, because at that point the application is far enough behind that the
+/// fact is worth surfacing.
+pub(crate) unsafe fn ws_report_event(
+    s: &mut HttpState,
+    conn: u32,
+    event: u8,
+    origin: u8,
+    code: u16,
+    reason: &[u8],
+) {
+    if s.server.ws_event_out_chan < 0 {
+        return;
+    }
+    if try_write_ws_event(s, conn, event, origin, code, reason) {
+        return;
+    }
+    let len = s.server.ws_event_len as usize;
+    if len >= WS_EVENT_RING {
+        s.server.ws_events_dropped = s.server.ws_events_dropped.wrapping_add(1);
+        return;
+    }
+    s.server.ws_event_ring[len] = PendingWsEvent {
+        conn,
+        event,
+        origin,
+        code,
+    };
+    s.server.ws_event_len += 1;
+}
+
+/// Offer one event to `ws_event_out`. Returns whether the channel took it.
+unsafe fn try_write_ws_event(
+    s: &mut HttpState,
+    conn: u32,
+    event: u8,
+    origin: u8,
+    code: u16,
+    reason: &[u8],
+) -> bool {
+    let chan = s.server.ws_event_out_chan;
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(chan, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return false;
+    }
+    let mut out = [0u8; WS_EVENT_HDR + WS_REASON_MAX];
+    let take = reason.len().min(WS_REASON_MAX);
+    match write_ws_event(conn, event, origin, code, &reason[..take], &mut out) {
+        Some(total) => (sys.channel_write)(chan, out.as_ptr(), total) == total as i32,
+        // Unencodable at this length — retrying cannot help.
+        None => true,
+    }
+}
+
+/// Re-offer events a full `ws_event_out` refused earlier, oldest first so an
+/// application sees a connection open before it sees it close.
+pub(crate) unsafe fn ws_flush_events(s: &mut HttpState) {
+    while s.server.ws_event_len > 0 {
+        let e = s.server.ws_event_ring[0];
+        if !try_write_ws_event(s, e.conn, e.event, e.origin, e.code, b"") {
+            return;
+        }
+        let n = s.server.ws_event_len as usize;
+        let mut i = 1;
+        while i < n {
+            s.server.ws_event_ring[i - 1] = s.server.ws_event_ring[i];
+            i += 1;
+        }
+        s.server.ws_event_len -= 1;
+    }
+}
+
+/// Render a status line (`"403 Forbidden"`) for a refusal.
+///
+/// Only the statuses a refusal actually uses carry a reason phrase; anything
+/// else gets its number and a neutral phrase, which is a valid status line and
+/// does not pretend to a meaning the application did not give.
+pub(crate) fn http_status_line(status: u16, out: &mut [u8]) -> usize {
+    let phrase: &[u8] = match status {
+        400 => b" Bad Request",
+        401 => b" Unauthorized",
+        403 => b" Forbidden",
+        404 => b" Not Found",
+        409 => b" Conflict",
+        429 => b" Too Many Requests",
+        500 => b" Internal Server Error",
+        503 => b" Service Unavailable",
+        _ => b" Rejected",
+    };
+    let mut p = 0usize;
+    let digits = [
+        b'0' + ((status / 100) % 10) as u8,
+        b'0' + ((status / 10) % 10) as u8,
+        b'0' + (status % 10) as u8,
+    ];
+    for d in digits {
+        if p < out.len() {
+            out[p] = d;
+            p += 1;
+        }
+    }
+    for &b in phrase {
+        if p < out.len() {
+            out[p] = b;
+            p += 1;
+        }
+    }
+    p
+}
+
+/// The outcome of looking for this slot's admission decision.
+pub(crate) enum AdmitPoll {
+    /// No decision for this connection yet.
+    Waiting,
+    /// Admitted, naming the subprotocol to echo (empty for none).
+    Accept([u8; WS_PROTOCOL_MAX], usize),
+    /// Refused, with the status and reason to answer.
+    Reject(u16, [u8; WS_REASON_MAX], usize),
+}
+
+/// Read one admission decision addressed to `conn`.
+///
+/// A decision for another connection is left on the channel: slots are served
+/// in whatever order their peers arrive, and consuming another slot's answer
+/// would strand it.
+pub(crate) unsafe fn ws_poll_admission(s: &mut HttpState, conn: u32) -> AdmitPoll {
+    let chan = s.server.ws_admit_in_chan;
+    if chan < 0 {
+        return AdmitPoll::Waiting;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(chan, 0x01);
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return AdmitPoll::Waiting;
+    }
+    let mut buf = [0u8; WS_ADMIT_DEC_HDR + WS_PROTOCOL_MAX + WS_REASON_MAX];
+    let n = (sys.channel_read)(chan, buf.as_mut_ptr(), buf.len());
+    if n <= 0 {
+        return AdmitPoll::Waiting;
+    }
+    let Some(view) = parse_ws_admit_decision(&buf[..n as usize]) else {
+        return AdmitPoll::Waiting;
+    };
+    if view.conn != conn {
+        // Not ours. It has been taken off the channel, so it cannot be
+        // returned; the slot it belongs to falls back on its own deadline
+        // rather than waiting forever for a record that no longer exists.
+        return AdmitPoll::Waiting;
+    }
+    if view.accepted() {
+        let mut protocol = [0u8; WS_PROTOCOL_MAX];
+        let take = view.protocol_len.min(WS_PROTOCOL_MAX);
+        protocol[..take].copy_from_slice(&buf[view.protocol_at..view.protocol_at + take]);
+        AdmitPoll::Accept(protocol, take)
+    } else {
+        let mut reason = [0u8; WS_REASON_MAX];
+        let take = view.reason_len.min(WS_REASON_MAX);
+        reason[..take].copy_from_slice(&buf[view.reason_at..view.reason_at + take]);
+        let status = if view.status == 0 { 403 } else { view.status };
+        AdmitPoll::Reject(status, reason, take)
+    }
 }

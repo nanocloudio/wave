@@ -391,6 +391,51 @@ pub fn build_bye_ok(d: &SipDialog<'_>, out: &mut [u8]) -> Option<usize> {
     Some(w.pos)
 }
 
+/// UAS final response refusing an `INVITE`, with the status the caller chose.
+///
+/// The reason phrase is derived from the code rather than taken from the
+/// caller: a phrase and a code that disagree describe two different refusals,
+/// and the code is the one the peer acts on.
+pub fn build_invite_status(d: &SipDialog<'_>, code: u16, out: &mut [u8]) -> Option<usize> {
+    let phrase: &[u8] = match code {
+        400 => b"Bad Request",
+        403 => b"Forbidden",
+        404 => b"Not Found",
+        486 => b"Busy Here",
+        487 => b"Request Terminated",
+        488 => b"Not Acceptable Here",
+        603 => b"Decline",
+        _ => b"Declined",
+    };
+    let mut w = SipWriter { out, pos: 0 };
+    w.put(b"SIP/2.0 ")?;
+    w.put_u16_decimal(code)?;
+    w.put_byte(b' ')?;
+    w.put(phrase)?;
+    w.put(b"\r\n")?;
+    w.put(b"Via: SIP/2.0/UDP ")?;
+    w.put_ip(d.peer_ip)?;
+    w.put_byte(b':')?;
+    w.put_u16_decimal(d.peer_port)?;
+    w.put(b"\r\n")?;
+    w.put(b"From: <sip:")?;
+    w.put_ip(d.peer_ip)?;
+    w.put(b">\r\n")?;
+    w.put(b"To: <sip:")?;
+    w.put_ip(d.local_ip)?;
+    w.put(b">;tag=")?;
+    w.put_hex16(d.to_tag)?;
+    w.put(b"\r\n")?;
+    w.put(b"Call-ID: ")?;
+    w.put(d.call_id)?;
+    w.put(b"\r\n")?;
+    w.put(b"CSeq: ")?;
+    w.put_u32_decimal(d.cseq)?;
+    w.put(b" INVITE\r\n")?;
+    w.put(b"Content-Length: 0\r\n\r\n")?;
+    Some(w.pos)
+}
+
 // ---------------------------------------------------------------------------
 // Parsers — read protocol facts out of a received message.
 // ---------------------------------------------------------------------------

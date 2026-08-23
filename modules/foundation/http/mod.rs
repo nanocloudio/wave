@@ -886,6 +886,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     15,
                     s.server.h3_field_limit_refused as u64,
                 );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    16,
+                    s.server.ws_events_dropped as u64,
+                );
             }
         }
 

@@ -73,10 +73,22 @@ mod sip_dialog;
 #[cfg(feature = "host-test")]
 #[path = "../../common/sip_dialog.rs"]
 pub mod sip_dialog;
+#[cfg(not(feature = "host-test"))]
+#[path = "../../common/sip_wire.rs"]
+mod sip_wire;
+#[cfg(feature = "host-test")]
+#[path = "../../common/sip_wire.rs"]
+pub mod sip_wire;
 
 use jitter_core::{JitterBuffer, Playout};
 use sip_core::SipDialog;
 use sip_dialog::{MediaCmd, SipDialogFsm, SipEvent, SipSend, SipState};
+use sip_wire::{
+    parse_sip_command, sip_cmd_is_known, write_sip_event, SIP_CMD_ACCEPT, SIP_CMD_CANCEL,
+    SIP_CMD_DIAL, SIP_CMD_HANGUP, SIP_CMD_LEN, SIP_CMD_REJECT, SIP_EVENT_HDR, SIP_EV_DECLINED,
+    SIP_EV_ESTABLISHED, SIP_EV_FAILED, SIP_EV_LOCAL_CLOSED, SIP_EV_OFFERED, SIP_EV_PROVISIONAL,
+    SIP_EV_REJECTED, SIP_EV_REMOTE_HANGUP, SIP_EV_TIMEOUT,
+};
 
 const NET_BUF_SIZE: usize = 600;
 const SIP_TX_BUF_SIZE: usize = 512;
@@ -106,6 +118,8 @@ struct SipModState {
     ulaw_out: i32,       // out[2]: playout µ-law to the g711 decoder
     rtp_ctrl_out: i32,   // out[3]: control to the rtp transmitter
     call_ctrl_in: i32,   // ctrl: local call/hangup trigger
+    command_in: i32,     // in[2]: SipCommand records
+    event_out: i32,      // out[4]: SipEvent records
 
     // Datagram endpoint ids (0xFF = unallocated).
     sip_ep_id: u8,
@@ -128,6 +142,21 @@ struct SipModState {
     peer_rtp_ip: u32,
     peer_rtp_port: u16,
     _pad1: u16,
+
+    /// The call this module is currently working on. Zero when idle.
+    cid: u32,
+    /// Source of call ids for calls that arrive rather than being placed.
+    cid_counter: u32,
+    /// 1 while an offered call is held awaiting an accept or reject.
+    ///
+    /// The INVITE is NOT given to the dialog machine while this is set: a
+    /// machine that had already answered would leave nothing to decide.
+    offer_pending: u8,
+    /// 1 while a decided event still owes `event_out`.
+    event_owed: u8,
+    /// The staged event record.
+    event_buf: [u8; SIP_EVENT_HDR + 64],
+    event_len: u16,
 
     // TEMPORARY diagnosis counters (rig): datagrams seen on sip_net_in, SIP
     // messages among them, and the last heartbeat time.
@@ -185,6 +214,13 @@ impl SipModState {
         self.ulaw_out = -1;
         self.rtp_ctrl_out = -1;
         self.call_ctrl_in = -1;
+        self.command_in = -1;
+        self.event_out = -1;
+        self.cid = 0;
+        self.cid_counter = 0;
+        self.offer_pending = 0;
+        self.event_owed = 0;
+        self.event_len = 0;
         self.sip_ep_id = 0xFF;
         self.jitter_ep_id = 0xFF;
         self.sip_bound = 0;
@@ -266,6 +302,28 @@ unsafe fn build(s: &mut SipModState, msg: SipSend) {
     }
 }
 
+/// Stage a final response refusing the offered `INVITE`.
+unsafe fn build_refusal(s: &mut SipModState, code: u16) {
+    let clen = s.call_id_len as usize;
+    let mut cid = [0u8; CALL_ID_SIZE];
+    cid[..clen].copy_from_slice(&s.call_id[..clen]);
+    let d = SipDialog {
+        local_ip: s.local_ip,
+        peer_ip: s.peer_ip,
+        local_port: s.local_sip_port,
+        peer_port: s.peer_sip_port,
+        rtp_port: s.rtp_port,
+        cseq: s.cseq,
+        from_tag: s.from_tag,
+        to_tag: s.to_tag,
+        branch: s.branch,
+        call_id: &cid[..clen],
+    };
+    if let Some(n) = sip_core::build_invite_status(&d, code, &mut s.sip_tx_buf) {
+        s.sip_tx_len = n as u16;
+    }
+}
+
 /// Send the staged SIP message to the signalling peer.
 unsafe fn sip_flush(s: &mut SipModState) {
     if s.sip_tx_pending == 0 || s.sip_tx_len == 0 || s.sip_net_out < 0 || s.sip_ep_id == 0xFF {
@@ -310,6 +368,133 @@ unsafe fn sip_flush(s: &mut SipModState) {
     // pending flag is separate from the buffer's length.
 }
 
+/// Act on one application command.
+unsafe fn handle_command(s: &mut SipModState, cmd: &sip_wire::SipCommandView) {
+    match cmd.op {
+        SIP_CMD_DIAL if s.fsm.state() == SipState::Ready && s.offer_pending == 0 => {
+            // The peer and media endpoints travel with the command: a
+            // connector that can only ever call one address is not one.
+            if cmd.peer_port != 0 {
+                s.peer_ip = u32::from_be_bytes(cmd.peer_ip);
+                s.peer_sip_port = cmd.peer_port;
+            }
+            if cmd.media_port != 0 {
+                s.rtp_port = cmd.media_port;
+            }
+            s.cid = cmd.cid;
+            s.call_id_counter = s.call_id_counter.wrapping_add(1);
+            write_hex16(&mut s.call_id, s.call_id_counter ^ s.from_tag);
+            s.call_id_len = 4;
+            s.cseq = 1;
+            s.to_tag = 0;
+            s.branch = s.branch.wrapping_add(1);
+            let step = s.fsm.on_event(SipEvent::LocalInvite);
+            apply(s, step);
+        }
+        SIP_CMD_ACCEPT if s.offer_pending != 0 => {
+            if cmd.media_port != 0 {
+                s.rtp_port = cmd.media_port;
+            }
+            s.offer_pending = 0;
+            // Only now does the dialog machine see the INVITE, with an answer
+            // it was given rather than one it assumed.
+            let step = s.fsm.on_event(SipEvent::RxInvite { answer: true });
+            apply(s, step);
+        }
+        SIP_CMD_REJECT if s.offer_pending != 0 => {
+            s.offer_pending = 0;
+            let code = if cmd.code == 0 { 603 } else { cmd.code };
+            build_refusal(s, code);
+            s.sip_tx_pending = 1;
+            sip_flush(s);
+            emit_event(s, SIP_EV_DECLINED, code);
+            s.cid = 0;
+        }
+        SIP_CMD_HANGUP if s.fsm.state() == SipState::Active => {
+            s.cseq += 1;
+            s.branch = s.branch.wrapping_add(1);
+            emit_event(s, SIP_EV_LOCAL_CLOSED, 0);
+            let step = s.fsm.on_event(SipEvent::LocalBye);
+            apply(s, step);
+        }
+        SIP_CMD_CANCEL if s.fsm.state() == SipState::Inviting => {
+            // Abandoning a call that was never answered. The transaction is
+            // dropped locally and reported; a CANCEL request on the wire is a
+            // later profile, and claiming one was sent would be a lie.
+            emit_event(s, SIP_EV_LOCAL_CLOSED, 0);
+            s.fsm = SipDialogFsm::new();
+            media_stop(s);
+            s.cid = 0;
+        }
+        _ => {
+            // A command that does not apply in this state is reported rather
+            // than dropped: a caller waiting on an outcome for a call it
+            // thinks it started would otherwise wait forever.
+            let cid_before = s.cid;
+            s.cid = cmd.cid;
+            emit_event(s, SIP_EV_FAILED, 0);
+            if cid_before != 0 {
+                s.cid = cid_before;
+            }
+        }
+    }
+}
+
+/// Stage the one event this transition owes.
+///
+/// First writer wins per transition, and the record is retried until the
+/// channel takes it: an event dropped because the channel was briefly full
+/// would leave a caller holding a call that had in fact ended.
+unsafe fn emit_event(s: &mut SipModState, event: u8, code: u16) {
+    if s.event_owed != 0 || s.event_out < 0 {
+        return;
+    }
+    let media_ip = s.peer_rtp_ip.to_be_bytes();
+    // 0 (PCMU) is the only payload this module carries; 0xFF says none is
+    // settled, which is the honest answer before an answer SDP has arrived.
+    let payload = if s.peer_rtp_port != 0 { 0u8 } else { 0xFF };
+    let mut out = [0u8; SIP_EVENT_HDR + 64];
+    if let Some(total) = write_sip_event(
+        s.cid,
+        event,
+        code,
+        media_ip,
+        s.peer_rtp_port,
+        payload,
+        &[],
+        &mut out,
+    ) {
+        s.event_buf[..total].copy_from_slice(&out[..total]);
+        s.event_len = total as u16;
+        s.event_owed = 1;
+    }
+}
+
+/// Hand the staged event to `event_out`, retrying while the channel refuses.
+unsafe fn flush_event(s: &mut SipModState) {
+    if s.event_owed == 0 || s.event_out < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.event_out, POLL_OUT);
+    if poll <= 0 || (poll as u32) & POLL_OUT == 0 {
+        return;
+    }
+    let len = s.event_len as usize;
+    if (sys.channel_write)(s.event_out, s.event_buf.as_ptr(), len) == len as i32 {
+        s.event_owed = 0;
+    }
+}
+
+/// Whether an application is driving this module.
+///
+/// When one is, `auto_answer` does not apply: a graph that wired a decision
+/// port and also let the module answer on its own would answer twice, and the
+/// first answer would be the one nobody authorised.
+unsafe fn application_driven(s: &SipModState) -> bool {
+    s.command_in >= 0
+}
+
 /// Classify a received datagram into a dialog event and extract its facts.
 unsafe fn classify_and_extract(s: &mut SipModState, len: usize) -> Option<SipEvent> {
     let msg = &s.sip_rx_buf[..len];
@@ -324,14 +509,31 @@ unsafe fn classify_and_extract(s: &mut SipModState, len: usize) -> Option<SipEve
         }
         s.to_tag = sip_core::parse_from_tag(msg).wrapping_add(1);
         s.branch = s.branch.wrapping_add(1);
+        if application_driven(s) {
+            // The call is held: nothing is answered until a decision names
+            // it. Ringing a caller and then having nobody able to accept is
+            // a worse outcome than a refusal.
+            if s.offer_pending == 0 && s.fsm.state() == SipState::Ready {
+                s.cid_counter = s.cid_counter.wrapping_add(1);
+                s.cid = s.cid_counter;
+                s.offer_pending = 1;
+                emit_event(s, SIP_EV_OFFERED, 0);
+            }
+            return None;
+        }
         return Some(SipEvent::RxInvite {
             answer: s.auto_answer != 0,
         });
     }
     if msg.starts_with(b"ACK ") {
+        // The ACK completes an answer this end sent: the call is up.
+        if s.fsm.state() == SipState::WaitAck {
+            emit_event(s, SIP_EV_ESTABLISHED, 200);
+        }
         return Some(SipEvent::RxAck);
     }
     if msg.starts_with(b"BYE ") {
+        emit_event(s, SIP_EV_REMOTE_HANGUP, 0);
         return Some(SipEvent::RxBye);
     }
     let code = sip_core::parse_status_code(msg);
@@ -343,6 +545,18 @@ unsafe fn classify_and_extract(s: &mut SipModState, len: usize) -> Option<SipEve
                 s.peer_rtp_port = ep.port;
             }
             s.to_tag = sip_core::parse_to_tag(msg);
+        }
+        // Report what the response means for the call. A provisional response
+        // is progress and not an outcome; a final one that is not a 2xx ended
+        // it, and says with which code.
+        if s.fsm.state() == SipState::Inviting {
+            if (100..200).contains(&code) {
+                emit_event(s, SIP_EV_PROVISIONAL, code);
+            } else if (200..300).contains(&code) {
+                emit_event(s, SIP_EV_ESTABLISHED, code);
+            } else {
+                emit_event(s, SIP_EV_REJECTED, code);
+            }
         }
         return Some(SipEvent::RxResponse { code });
     }
@@ -426,6 +640,24 @@ unsafe fn step_sip(s: &mut SipModState) {
         return;
     }
 
+    // Application commands take precedence over the one-byte trigger below, so
+    // a graph that wires both is driven by the surface that can express which
+    // call it means and why.
+    if s.command_in >= 0 && s.event_owed == 0 {
+        let poll = (sys.channel_poll)(s.command_in, POLL_IN);
+        if poll > 0 && (poll as u32) & POLL_IN != 0 {
+            let mut b = [0u8; SIP_CMD_LEN];
+            if (sys.channel_read)(s.command_in, b.as_mut_ptr(), SIP_CMD_LEN) > 0 {
+                if let Some(cmd) = parse_sip_command(&b) {
+                    if sip_cmd_is_known(cmd.op) {
+                        handle_command(s, &cmd);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // Local call / hangup trigger.
     if s.call_ctrl_in >= 0 {
         let poll = (sys.channel_poll)(s.call_ctrl_in, POLL_IN);
@@ -465,7 +697,13 @@ unsafe fn step_sip(s: &mut SipModState) {
         SipState::Inviting | SipState::WaitAck | SipState::ByeSent
     ) && now.wrapping_sub(s.last_retransmit_ms) >= T1_MS
     {
+        let before = s.fsm.state();
         let step = s.fsm.on_event(SipEvent::Timeout);
+        // A transaction that gave up rather than retransmitting again has
+        // ended the call, and the layer above is told which way.
+        if step.send.is_none() && s.fsm.state() != before {
+            emit_event(s, SIP_EV_TIMEOUT, 0);
+        }
         apply(s, step);
     }
 
@@ -507,12 +745,12 @@ unsafe fn step_sip(s: &mut SipModState) {
 /// Queue an ordered media-control command for the RTP transmitter.
 ///
 /// Queued rather than written directly because these commands are RELIABLE and
-/// ORDERED in a way media is not: `SET_ENDPOINT` names where to send, `START`
-/// begins sending, and a refused write used to be discarded. That left the
-/// transmitter stopped, or sending to the endpoint of a previous call, while
-/// this module believed a call was up — silence one way with nothing reporting
-/// a fault. Losing an RTP packet is acceptable; losing the instruction that
-/// says where the packets go is not.
+/// ORDERED in a way media is not. `SET_ENDPOINT` names where to send and
+/// `START` begins sending, so a dropped one leaves the transmitter stopped, or
+/// aimed at a previous call's endpoint, while this module believes a call is
+/// up — silence in one direction with nothing reporting a fault. Losing an RTP
+/// packet is acceptable; losing the instruction that says where the packets go
+/// is not.
 unsafe fn queue_rtp_ctrl(s: &mut SipModState, cmd: u8) {
     if s.rtp_ctrl_out < 0 {
         return;
@@ -717,6 +955,8 @@ pub extern "C" fn module_new(
         s.sip_net_in = in_chan;
         s.sip_net_out = out_chan;
         s.call_ctrl_in = ctrl_chan;
+        s.command_in = dev_channel_port(sys, 0, 2);
+        s.event_out = dev_channel_port(sys, 1, 4);
         let ch = dev_channel_port(sys, 0, 1);
         if ch >= 0 {
             s.jitter_net_in = ch;
@@ -769,6 +1009,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // any queued media-control command.
             sip_flush(s);
             flush_rtp_ctrl(s);
+            // And the one event the last transition owes.
+            flush_event(s);
         }
         step_jitter(s);
         0

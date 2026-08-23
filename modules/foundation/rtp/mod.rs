@@ -57,6 +57,31 @@ mod rtp_core;
 pub mod rtp_core;
 use rtp_core::{rtp_parse, RTP_HEADER_SIZE};
 
+// SFrame framing, mounted here because it is the media path: a sealed frame
+// travels inside RTP payloads, and the split between the readable header a
+// relay routes on and the payload it must not read is the same concern this
+// module already owns for RTP itself. Nothing in this module encrypts; the
+// framing says where sealed bytes go and what a cipher must authenticate.
+#[cfg(not(feature = "host-test"))]
+#[path = "../../common/sframe_core.rs"]
+mod sframe_core;
+#[cfg(feature = "host-test")]
+#[path = "../../common/sframe_core.rs"]
+pub mod sframe_core;
+
+// The WebRTC session-description attributes, mounted alongside for the same
+// reason: they describe the media path this module carries. `sip_core.rs`
+// writes an SDP body for a call to a telephone, which is the wrong shape for a
+// browser — it carries no ICE credentials, no candidates and no DTLS
+// fingerprint — and adding them there would put browser concerns inside a
+// telephony codec.
+#[cfg(not(feature = "host-test"))]
+#[path = "../../common/webrtc_sdp.rs"]
+mod webrtc_sdp;
+#[cfg(feature = "host-test")]
+#[path = "../../common/webrtc_sdp.rs"]
+pub mod webrtc_sdp;
+
 // Host-build equivalents of the ARM EABI memory intrinsics.
 //
 // The SDK defines `__aeabi_memcpy` / `__aeabi_memmove` inside

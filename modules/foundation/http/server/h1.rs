@@ -53,12 +53,18 @@ use super::routes::HANDLER_APP;
 use super::routes::{
     content_type_from_path, match_route, Route, HANDLER_FILE, HANDLER_FS_FILE, HANDLER_FS_LIST,
     HANDLER_GRPC, HANDLER_PROXY, HANDLER_STATIC, HANDLER_STREAM, HANDLER_TEMPLATE,
-    HANDLER_WEBSOCKET, HANDLER_WEBSOCKET_FANOUT, HANDLER_WEBSOCKET_SESSION,
+    HANDLER_WEBSOCKET, HANDLER_WEBSOCKET_ADMIT, HANDLER_WEBSOCKET_FANOUT,
+    HANDLER_WEBSOCKET_SESSION,
 };
 use super::ws::{
-    begin_ws_upgrade, retain_capture_envelope, ws_begin_close, ws_drain_fanout_input,
-    ws_emit_next_fragment, ws_process_inbound, ws_queue_envelope_on_active, ws_queue_frame,
-    ws_queue_frame_fin, RETAINED_ENVELOPE_HDR, RETAIN_RESET_TICKS,
+    begin_ws_upgrade, retain_capture_envelope, ws_begin_close, ws_compose_accept,
+    ws_drain_fanout_input, ws_offer_admission, ws_poll_admission, ws_report_event,
+    ws_validate_upgrade, AdmitPoll, WS_ADMIT_TIMEOUT_TICKS,
+};
+use super::ws::{
+    http_status_line, ws_emit_next_fragment, ws_process_inbound, ws_queue_envelope_on_active,
+    ws_queue_frame, ws_queue_frame_fin, RETAINED_ENVELOPE_HDR, RETAIN_RESET_TICKS, WS_EV_CLOSED,
+    WS_EV_OPENED, WS_ORIGIN_LOCAL, WS_ORIGIN_PEER,
 };
 // The h2 helpers are gated with the state they touch: `http-web` links no
 // `H2State`, so importing them unconditionally breaks that variant while the
@@ -1537,6 +1543,26 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         begin_proxy(s, ip, port, -1);
                     }
                 }
+                HANDLER_WEBSOCKET_ADMIT => {
+                    // The upgrade is not this module's to grant. Validate the
+                    // request, keep the accept value the key yields, and ask.
+                    if let Some(accept) = ws_validate_upgrade(s) {
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.ws_accept = accept;
+                            cur.ws_admit_pending = 1;
+                            cur.ws_admit_sent = 0;
+                            cur.ws_admit_ticks = 0;
+                            cur.ws_fan_out = 1;
+                            // Session semantics: a fresh connection must never
+                            // be replayed a previous one's frames.
+                            cur.retained_replay_started = 1;
+                            cur.retained_replay_done = 1;
+                            cur.phase = Phase::WsAwaitAdmit;
+                        }
+                    }
+                    // ws_validate_upgrade has already populated send_buf and
+                    // switched phase on the failure path.
+                }
                 HANDLER_WEBSOCKET | HANDLER_WEBSOCKET_FANOUT | HANDLER_WEBSOCKET_SESSION => {
                     if begin_ws_upgrade(s) {
                         if let Some(cur) = cur_slot_mut(s) {
@@ -1569,6 +1595,64 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     build_error(s, b"500 Internal Server Error", b"Unknown handler\n");
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::DrainSend;
+                    }
+                }
+            }
+        }
+
+        Phase::WsAwaitAdmit => {
+            // Offer the request until the channel takes it. A request dropped
+            // because the channel was briefly full would leave the peer
+            // waiting on a decision nobody was ever asked for.
+            let sent = cur_slot(s).is_some_and(|c| c.ws_admit_sent != 0);
+            if !sent {
+                if ws_offer_admission(s) {
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.ws_admit_sent = 1;
+                    }
+                }
+                return 0;
+            }
+
+            let conn = u32::from(cur_conn_id(s));
+            match ws_poll_admission(s, conn) {
+                AdmitPoll::Accept(protocol, plen) => {
+                    let accept = cur_slot(s).map_or([0u8; 28], |c| c.ws_accept);
+                    ws_compose_accept(s, &accept, &protocol[..plen]);
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.ws_admit_pending = 0;
+                        cur.phase = Phase::WsHandshake;
+                    }
+                }
+                AdmitPoll::Reject(status, reason, rlen) => {
+                    // A refusal is an HTTP status the browser reports as a
+                    // failed connection, not a socket that opens and goes
+                    // quiet.
+                    let mut line = [0u8; 32];
+                    let n = http_status_line(status, &mut line);
+                    build_error(s, &line[..n], &reason[..rlen]);
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.ws_admit_pending = 0;
+                        cur.ws_fan_out = 0;
+                        cur.phase = Phase::DrainSend;
+                    }
+                }
+                AdmitPoll::Waiting => {
+                    let expired = if let Some(cur) = cur_slot_mut(s) {
+                        cur.ws_admit_ticks = cur.ws_admit_ticks.saturating_add(1);
+                        cur.ws_admit_ticks >= WS_ADMIT_TIMEOUT_TICKS
+                    } else {
+                        false
+                    };
+                    if expired {
+                        // The refusal is this module's, and it says so rather
+                        // than leaving the peer holding an upgrade forever.
+                        build_error(s, b"503 Service Unavailable", b"No admission decision\n");
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.ws_admit_pending = 0;
+                            cur.ws_fan_out = 0;
+                            cur.phase = Phase::DrainSend;
+                        }
                     }
                 }
             }
@@ -2179,6 +2263,20 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
                 log(s, b"[http] websocket upgraded");
+                // The upgrade is committed: the frames on this connection are
+                // live from here. Reported once, and only for a connection
+                // that actually opened.
+                let already = cur_slot(s).is_some_and(|c| c.ws_opened_sent != 0);
+                if !already {
+                    let conn = u32::from(cur_conn_id(s));
+                    // `ws_report_event` either delivers or defers; either way
+                    // the event is owed exactly once, so the latch is correct
+                    // here and the retry belongs to the ring, not this slot.
+                    ws_report_event(s, conn, WS_EV_OPENED, WS_ORIGIN_LOCAL, 0, b"");
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.ws_opened_sent = 1;
+                    }
+                }
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.send_offset = 0;
                 }

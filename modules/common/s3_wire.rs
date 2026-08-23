@@ -1,15 +1,11 @@
 // Wire format for the `s3_client` PIC's request/response ports.
 //
-// The connector used to be a BOOT PROBE: params named one endpoint, and on
-// connect it signed a single `GET /` and reported the status. That proves the
-// crypto works and nothing else — a caller could not ask for a different object,
-// because there was nothing to ask THROUGH.
-//
-// These two records are that missing seam. They are the client-side mirror of
-// wave's HTTP application fan-out (`HttpRequest`/`HttpResponse` on `req_out` /
-// `resp_in`): there a graph node ANSWERS requests a gateway hands it; here a
-// graph node ISSUES requests a connector performs. A pipeline that terminates
-// HTTP on one side and stores blobs on the other needs both halves.
+// These two records are the seam a caller asks THROUGH: one object operation
+// and its answer. They are the client-side mirror of wave's HTTP application
+// fan-out (`HttpRequest`/`HttpResponse` on `req_out` / `resp_in`) — there a
+// graph node ANSWERS requests a gateway hands it; here a graph node ISSUES
+// requests a connector performs. A pipeline that terminates HTTP on one side
+// and stores blobs on the other needs both halves.
 //
 // Layouts (multi-byte ints LE):
 //

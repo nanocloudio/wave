@@ -1,0 +1,38 @@
+version          = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+# timer_class: this module reads no clock at all. It is driven entirely by the
+# records that arrive and the room downstream has for what it produces, so a
+# variable cadence changes nothing about what it emits (RFC adaptive_tick §8
+# rule 2).
+timer_class      = "agnostic"
+
+# Inbound message spans (in[0]): `MailChunk` records — see
+# modules/common/mail_wire.rs. One record begins a message; a message larger
+# than one record continues over further records under the same correlation id.
+[[ports]]
+name         = "message_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+# Format facts (out[0]): one `MailFacts` record per message, carrying the
+# addresses that parsed, the subject and date as written, and the identifier
+# fields verbatim. Which conversation a message belongs to is not decided here.
+[[ports]]
+name         = "facts_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 8192
+
+# The body (out[1]): `MailBody` records carrying everything after the header
+# block, forwarded as it arrives so no whole message is ever held.
+[[ports]]
+name         = "body_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16384
+
+[observability]
+exempt = "format parser — it moves no bytes of its own accord; throughput is the ingress module's concern and message outcomes are reported as facts on its own port"

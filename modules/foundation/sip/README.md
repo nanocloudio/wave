@@ -43,7 +43,32 @@ driven over `rtp_ctrl` with `SET_ENDPOINT` / `START` / `STOP`.
 | `rtp_net_out` | 1 | output | `OctetStream` | RTP receive endpoint commands |
 | `ulaw_out` | 2 | output | `OctetStream` | Playout µ-law at `ptime` cadence |
 | `rtp_ctrl` | 3 | output | `OctetStream` | 8-byte control frames to the `rtp` transmitter |
+| `command_in` | 2 | input | `OctetStream` | `SipCommand` records: dial, accept, reject, hang up, cancel |
+| `event_out` | 4 | output | `OctetStream` | `SipEvent` records: one per call transition |
 | `call` | — | ctrl_input | `FmpMessage` | Any byte: place a call from `Ready`, hang up from `Active` |
+
+### Commands and events
+
+A `SipCommand` names one call and what to do about it, carrying the peer and
+media endpoints with it rather than taking them from construction-time
+parameters: a connector that can only ever call one address is not a connector.
+
+`SipEvent` reports what happened to that call — offered, provisional,
+established with the negotiated remote media endpoint and payload type, and
+exactly one terminal outcome: rejected with its status, timed out, failed,
+hung up by the peer, closed locally, or declined by this end. Every call
+reaches exactly one terminal event, which is what lets a caller free what it
+was holding without guessing.
+
+**An incoming call is not answered until a decision names it.** While
+`command_in` is wired the module holds the `INVITE`, reports it as offered, and
+answers only on an accept — or refuses with the status a reject chose. Ringing
+a caller and then having nobody able to accept is a worse outcome than a
+refusal, so the decision comes first.
+
+When `command_in` is wired, `auto_answer` does not apply. A graph that wired a
+decision port and also let the module answer on its own would answer twice, and
+the first answer would be the one nobody authorised.
 
 ## Parameters
 
@@ -54,7 +79,7 @@ driven over `rtp_ctrl` with `SET_ENDPOINT` / `START` / `STOP`.
 | 3 | `peer_ip` | 0 | Peer address |
 | 4 | `peer_sip_port` | 5060 | Peer signalling port |
 | 5 | `rtp_port` | 5004 | Local RTP receive port, advertised in SDP |
-| 6 | `auto_answer` | 1 | Answer an inbound INVITE without asking above |
+| 6 | `auto_answer` | 1 | Answer an inbound INVITE without asking above. Ignored while `command_in` is wired |
 | 8 | `ptime` | 20 | Packet time in ms; also the playout cadence |
 
 Id 7 is unused — the ids are wire positions, so the gap is preserved rather than

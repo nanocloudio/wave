@@ -1,0 +1,25 @@
+version          = "0.1.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# timer_class: this module reads no clock. A Binding request is answered from
+# the datagram it arrived in, with no transaction table and no retransmission
+# of its own, so a variable cadence changes nothing about what it emits
+# (RFC adaptive_tick §8 rule 2).
+timer_class      = "agnostic"
+
+# The datagram surface: net_in reads MSG_DG_BOUND / MSG_DG_RX_FROM, net_out
+# writes CMD_DG_BIND / CMD_DG_SEND_TO.
+[[ports]]
+name         = "net_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+[[ports]]
+name         = "net_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+[observability]
+exempt = "answers one request per datagram with no state of its own; throughput is the datagram provider's concern"

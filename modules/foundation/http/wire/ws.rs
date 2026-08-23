@@ -53,6 +53,11 @@ const MAGIC_GUID_LEN: usize = 36;
 // opcodes and oversized control frames that this side rejected (T2.2.4).
 include!("../../../common/ws_frame_core.rs");
 
+// The admission record layouts. Mounted here beside the frame core because
+// both describe the same connection: one what the application decides about
+// it, the other what travels on it once admitted.
+include!("../../../common/ws_admit.rs");
+
 mod sdkcrypto {
     include!("../../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs");
     include!("../../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");

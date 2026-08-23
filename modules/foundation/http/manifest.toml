@@ -268,6 +268,11 @@ access = "read"
 #         dropped rather than delayed, so the application believes it answered
 #         a client that never was.
 # id 12 = ws_envelopes_dropped, id 13 = h2_streams_refused.
+# id 16 = ws_events_dropped: a WebSocket lifecycle event lost because the retry
+#         ring was already full. Non-zero means an application's view of which
+#         connections exist has diverged from this module's — it is tracking a
+#         connection that has closed, or receiving frames from one it was never
+#         told opened.
 # id 14 = h3_handler_unavailable, id 15 = h3_field_limit_refused: HTTP/3's two
 #         refusal paths, both CONFIGURATION signals rather than load ones.
 #         `handler_unavailable` means a route serving fine over h1/h2 is
@@ -292,8 +297,40 @@ metrics = [
   "h2_streams_refused",
   "h3_handler_unavailable",
   "h3_field_limit_refused",
+  "ws_events_dropped",
 ]
 # Span 0: one `http.server.request` span per request (head parsed -> response
 # drained), SERVER kind. Minted only when a telemetry consumer is subscribed
 # (zero-cost otherwise). Keepalive re-latches the span per request.
 spans = ["http.server.request"]
+
+# WebSocket admission (in[7] / out[7]) and lifecycle (out[8]).
+#
+# A route using `HANDLER_WEBSOCKET_ADMIT` reports its upgrade on
+# `ws_admit_out` and waits for a decision on `ws_admit_in` before composing the
+# 101. Nothing downstream ever sees a frame from a connection the application
+# did not admit, and a refusal reaches the browser as an HTTP status rather
+# than a socket that opens and goes quiet.
+[[ports]]
+name = "ws_admit_out"
+index = 7
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "ws_admit_in"
+index = 7
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# Committed lifecycle facts: `opened` once an upgrade is on the wire, `closed`
+# once the connection has actually ended, with the origin and close code. A
+# close REQUESTED is not reported here; only what happened is.
+[[ports]]
+name = "ws_event_out"
+index = 8
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192

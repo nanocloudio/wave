@@ -52,6 +52,32 @@ index = 3
 direction = "output"
 content_type = "OctetStream"
 
+# Application commands (in[2]): `SipCommand` records — see
+# modules/common/sip_wire.rs. Dial, accept, reject, hang up or cancel one call,
+# with the peer and media endpoints travelling with the command rather than
+# being fixed when the module was built.
+#
+# When this port is wired, `auto_answer` does not apply: a graph that wired a
+# decision port and also let the module answer on its own would answer twice,
+# and the first answer would be the one nobody authorised.
+[[ports]]
+name = "command_in"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 1024
+
+# Call events (out[4]): `SipEvent` records. An offered call, the provisional
+# responses to one placed, establishment with the negotiated media endpoint,
+# and exactly one terminal outcome — rejected, timed out, failed, hung up by
+# the peer, or closed locally.
+[[ports]]
+name = "event_out"
+index = 4
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 2048
+
 [[ports]]
 name = "call"
 direction = "ctrl_input"

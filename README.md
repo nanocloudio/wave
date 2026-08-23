@@ -2,8 +2,10 @@
 
 Wave is the application-protocol module palette for the
 [fluxor](../fluxor/) runtime: HTTP/1.1, HTTP/2 and HTTP/3, WebSocket,
-RTP, SIP, SMTP and a SigV4 S3 client, with gRPC available as a
-composition of the HTTP/2 client. The modules ship as
+RTP, SIP, SMTP, internet mail parsing (RFC 5322 and MIME), the NAT
+traversal codecs STUN and TURN, SFrame media framing and the WebRTC
+session-description attributes, plus a SigV4 S3 client, with gRPC
+available as a composition of the HTTP/2 client. The modules ship as
 position-independent `no_std` ELFs and run on a wired fluxor module
 graph, from a single-connection rp2350 server to a multi-connection
 Linux or bcm2712 host.
@@ -15,6 +17,16 @@ packetisation, and dialog transactions. It owns no protocol meaning
 what lets Nanocloud, Quantum, Truffle, Grove, Zedex and Conclave
 share one HTTP implementation without any of them, or fluxor,
 becoming the owner of what a request means.
+
+The STUN and TURN modules are where that line is easiest to cross, so
+it is stated: Wave owns how a Binding request is encoded, which
+attributes it carries, and how message integrity and a long-term
+credential key are computed. Whether to send one, to whom, in what
+order, which candidate pair wins, whether to allocate a relay, and
+when to give up are reachability decisions and belong to
+[wormhole](../wormhole/). A wire format is a codec; a decision about
+the network is not. The same line puts the WebRTC session-description
+attributes here and ICE policy there.
 
 ```text
         application bytes or records

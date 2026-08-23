@@ -19,15 +19,37 @@ name         = "net_out"
 direction    = "output"
 content_type = "OctetStream"
 
-# Delivery result (out[1]): a short human-readable status line — "smtp: delivered"
-# once the server accepts the message (250 to end-of-data, 221 to QUIT), or a
-# rejection/timeout/network-error line otherwise.
+# Status line (out[1]): a short human-readable line describing how the current
+# submission ended. Enough for a statically configured graph; `result_out` is the
+# surface a connector consumes, because a line of prose cannot carry the reply
+# code, the enhanced status, the phase reached, or the correlation id.
 [[ports]]
 name         = "status_out"
 index        = 1
 direction    = "output"
 content_type = "OctetStream"
 
-[observability]
-exempt = "outbound mail-submission connector — throughput is the transport's (net) concern; this module runs one lockstep delivery conversation"
+# Submissions (in[1]): `SmtpRequest` records — see modules/common/smtp_wire.rs.
+# One record begins a submission; a message larger than one record continues
+# over further records under the same correlation id. Sized for two whole
+# records so a caller writing the next one is not blocked by the one in hand.
+[[ports]]
+name         = "request_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 16384
 
+# Results (out[2]): exactly one `SmtpResult` per accepted submission, carrying
+# the caller's correlation id, the outcome classification a retry policy needs,
+# the SMTP phase reached, the final reply code with its enhanced status and
+# bounded text, and the peer address the message was submitted to.
+[[ports]]
+name         = "result_out"
+index        = 2
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+[observability]
+exempt = "outbound mail-submission connector — throughput is the transport's (net) concern; this module runs one lockstep delivery conversation at a time"
