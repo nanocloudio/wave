@@ -64,13 +64,16 @@ include!("../../common/hex_core.rs");
 mod s3_wire;
 use s3_wire::*;
 
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
+// The NetProto opcodes and identity accessors come from the owning contract
+// — never redeclared locally, so a wire change there is a compile change here
+// (rfc_hardening.md §5.2). This module is where that discipline earned its
+// name: the conn_id u8→u16 widening missed exactly this file's hand-rolled
+// offsets.
+use abi::contracts::net::net_proto::{
+    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT, CMD_SEND as NET_CMD_SEND,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR,
+};
 
 const NET_BUF: usize = 2048;
 /// Signed request staging. Sized to hold the largest signed PUT: the head is a
@@ -427,7 +430,8 @@ unsafe fn flush_command(s: &mut S3State, now: u64) {
 unsafe fn fail_driven(s: &mut S3State, status: u16, now: u64) {
     if s.busy != 0 {
         if s.conn_present != 0 {
-            let close = s.conn_id.to_le_bytes();
+            let mut close = [0u8; 2];
+            net_proto::put_conn_id(&mut close, s.conn_id);
             stage_command(s, NET_CMD_CLOSE, &close, now);
         }
         emit_response(s, status, 0, 0);
@@ -438,7 +442,8 @@ unsafe fn fail_driven(s: &mut S3State, status: u16, now: u64) {
 
 unsafe fn fail(s: &mut S3State, now: u64) {
     if s.conn_present != 0 {
-        let close = s.conn_id.to_le_bytes();
+        let mut close = [0u8; 2];
+        net_proto::put_conn_id(&mut close, s.conn_id);
         stage_command(s, NET_CMD_CLOSE, &close, now);
     }
     s.conn_id = 0;
@@ -902,11 +907,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if msg == 0 {
                     break;
                 }
-                let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
+                let payload = core::slice::from_raw_parts(s.nbuf.as_ptr().add(NET_FRAME_HDR), plen);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == CONNECTING => {
-                        if plen >= 3 && *payload.add(2) == s.tag {
-                            s.conn_id = u16::from_le_bytes([*payload, *payload.add(1)]);
+                        let (cid, tag) = if plen >= 3 {
+                            net_proto::connected_parts(payload)
+                        } else {
+                            (0, net_proto::REQUESTER_TAG_NONE)
+                        };
+                        if plen >= 3 && tag == s.tag {
+                            s.conn_id = cid;
                             s.conn_present = 1;
                             if s.busy != 0 {
                                 // Driven: sign the caller's request now the
@@ -921,7 +931,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     // Could not build the request at all —
                                     // a path or buffer bound. 500 names this
                                     // connector as the failing party.
-                                    let close = s.conn_id.to_le_bytes();
+                                    let mut close = [0u8; 2];
+                                    net_proto::put_conn_id(&mut close, s.conn_id);
                                     stage_command(s, NET_CMD_CLOSE, &close, now);
                                     emit_response(s, 500, 0, 0);
                                 }
@@ -969,13 +980,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     NET_MSG_DATA if s.phase == AWAIT_RESPONSE => {
-                        if plen > 2 && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id
-                        {
+                        if plen > 2 && net_proto::conn_id(payload) == s.conn_id {
                             let data_len = plen - 2;
                             let space = ACC_BUF - s.acc_len as usize;
                             let take = if data_len < space { data_len } else { space };
                             core::ptr::copy_nonoverlapping(
-                                payload.add(2),
+                                payload.as_ptr().add(2),
                                 s.acc.as_mut_ptr().add(s.acc_len as usize),
                                 take,
                             );
@@ -984,8 +994,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     NET_MSG_CLOSED if s.phase == AWAIT_RESPONSE => {
                         // Connection: close — the response is complete.
-                        if plen >= 2 && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id
-                        {
+                        if plen >= 2 && net_proto::conn_id(payload) == s.conn_id {
                             if s.busy != 0 {
                                 finish_driven(s);
                             } else {
@@ -1004,10 +1013,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // `conn_present`, or a peer's failed dial carrying
                         // conn_id 0 would be claimed by this module while its
                         // own `conn_id` is still zero-initialised.
-                        let ours = (s.phase == CONNECTING && plen >= 4 && *payload.add(3) == s.tag)
-                            || (s.conn_present != 0
-                                && plen >= 2
-                                && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id);
+                        // The established clause additionally requires the
+                        // error to be UNTAGGED: a tagged error is some
+                        // module's connect failure, and its meaningless
+                        // conn_id colliding with ours must not read as our
+                        // established connection failing.
+                        let ours = if plen >= 3 {
+                            let (cid, _errno, tag) = net_proto::error_parts(payload);
+                            (s.phase == CONNECTING && tag == s.tag)
+                                || (s.conn_present != 0
+                                    && tag == net_proto::REQUESTER_TAG_NONE
+                                    && cid == s.conn_id)
+                        } else {
+                            false
+                        };
                         if ours {
                             if s.phase == AWAIT_RESPONSE && s.acc_len > 0 {
                                 if s.busy != 0 {
@@ -1042,12 +1061,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     max_chunk
                 };
                 let total_payload = chunk + 2;
-                let cb = s.conn_id.to_le_bytes();
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
                 s.nbuf[2] = (total_payload >> 8) as u8;
-                s.nbuf[3] = cb[0];
-                s.nbuf[4] = cb[1];
+                net_proto::put_conn_id(&mut s.nbuf[NET_FRAME_HDR..], s.conn_id);
                 core::ptr::copy_nonoverlapping(
                     s.req.as_ptr().add(s.req_sent as usize),
                     s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 2),

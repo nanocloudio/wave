@@ -1,19 +1,17 @@
 version = "1.0.1"
 hardware_targets = ["rp2350", "bcm2712"]
 
-# timer_class: both of this module's clocks are wall-clock `dev_millis` — the
-# RFC 3261 T1 retransmit timer (500 ms, in-transaction states) and the jitter
-# buffer's `ptime` playout cadence. Playout in particular MUST track real time
-# rather than scheduler passes: a relaxed tick that stretched it would stretch
-# the audio. Reading the wall clock is what makes that safe under a variable
-# cadence, and declaring it is what lets the validator know (RFC adaptive_tick
-# §8 rule 2 — absent means "assume step-counted" and blocks admission).
+# timer_class: the RFC 3261 T1 retransmit timer (500 ms, in-transaction
+# states) reads wall-clock `dev_millis`. Playout's clock moved to the `jitter`
+# module with the playout (rfc_hardening §9.6). Declaring the class is what
+# lets the validator know (RFC adaptive_tick §8 rule 2 — absent means "assume
+# step-counted" and blocks admission).
 timer_class = "wall_clock"
 
-# SIP voice-signalling user-agent. Owns two datagram endpoints — SIP signalling
-# (in[0]/out[0]) and RTP receive/jitter (in[1]/out[1]) — emits playout µ-law on
-# out[2], and drives the separate `rtp` transmitter over out[3]. Logic is the
-# tested modules/common sip_core/sip_dialog/jitter_core; this is the wrapper.
+# SIP voice-signalling user-agent — signalling ONLY (rfc_hardening §9.6). One
+# datagram endpoint (SIP, in[0]/out[0]); the media path is the separate `rtp`
+# and `jitter` modules, driven over the control records on out[1]. Logic is
+# the tested modules/common sip_core/sip_dialog; this is the wrapper.
 
 [[ports]]
 name = "sip_net_in"
@@ -28,31 +26,15 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 640
 
-[[ports]]
-name = "rtp_net_in"
-index = 1
-direction = "input"
-content_type = "OctetStream"
-
-[[ports]]
-name = "rtp_net_out"
-index = 1
-direction = "output"
-content_type = "OctetStream"
-
-[[ports]]
-name = "ulaw_out"
-index = 2
-direction = "output"
-content_type = "OctetStream"
-
+# Media control (out[1]): SET_ENDPOINT/START/STOP records, fanned by the graph
+# to `rtp.endpoint` and `jitter.media_ctrl`.
 [[ports]]
 name = "rtp_ctrl"
-index = 3
+index = 1
 direction = "output"
 content_type = "OctetStream"
 
-# Application commands (in[2]): `SipCommand` records — see
+# Application commands (in[1]): `SipCommand` records — see
 # modules/common/sip_wire.rs. Dial, accept, reject, hang up or cancel one call,
 # with the peer and media endpoints travelling with the command rather than
 # being fixed when the module was built.
@@ -62,18 +44,18 @@ content_type = "OctetStream"
 # and the first answer would be the one nobody authorised.
 [[ports]]
 name = "command_in"
-index = 2
+index = 1
 direction = "input"
 content_type = "OctetStream"
 buffer_size = 1024
 
-# Call events (out[4]): `SipEvent` records. An offered call, the provisional
+# Call events (out[2]): `SipEvent` records. An offered call, the provisional
 # responses to one placed, establishment with the negotiated media endpoint,
 # and exactly one terminal outcome — rejected, timed out, failed, hung up by
 # the peer, or closed locally.
 [[ports]]
 name = "event_out"
-index = 4
+index = 2
 direction = "output"
 content_type = "OctetStream"
 buffer_size = 2048

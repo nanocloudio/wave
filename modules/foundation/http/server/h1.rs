@@ -25,8 +25,8 @@
 //! `super::proxy` to relay. This file owns the ORDER, not the work.
 
 use super::super::connection::{
-    NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND,
-    NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
+    net_proto, NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
 };
 use super::super::wire;
 use super::body::{
@@ -265,10 +265,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // still binding. Allocate a slot directly — the
                     // slot table is the queue. Multi-anchor demux: claim
                     // only accepts on our bound port (see the demux path).
-                    let conn = u16::from_le_bytes([
-                        *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                        *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                    ]);
+                    let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                        s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                        payload_len,
+                    ));
                     let ours = payload_len < 4 || {
                         let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
                         let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
@@ -286,10 +286,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
                 NET_MSG_DATA if payload_len > 2 => {
                     // Append directly to the owning slot's `recv_buf`.
-                    let conn = u16::from_le_bytes([
-                        *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                        *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                    ]);
+                    let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                        s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                        payload_len,
+                    ));
                     let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
                     let data_len = payload_len - 2;
                     if let Some(idx) = find_slot_by_conn_id(s, conn) {
@@ -310,10 +310,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     return 2;
                 }
                 NET_MSG_CLOSED if payload_len >= 2 => {
-                    let conn = u16::from_le_bytes([
-                        *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                        *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                    ]);
+                    let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                        s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                        payload_len,
+                    ));
                     if let Some(idx) = find_slot_by_conn_id(s, conn) {
                         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                         slot.peer_closed = 1;
@@ -330,7 +330,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // own `traceparent` parents `http.server.request` under it.
                     if dev_telemetry_enabled(&*s.syscalls) {
                         let p = s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                        let conn = u16::from_le_bytes([*p, *p.add(1)]);
+                        let conn = net_proto::conn_id(core::slice::from_raw_parts(p, payload_len));
                         if let Some(idx) = find_slot_by_conn_id(s, conn) {
                             let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                             core::ptr::copy_nonoverlapping(

@@ -10,23 +10,23 @@
 //! the top-level module's scope by `include!`. Submodules reach them
 //! via `super::net_write_frame` etc.
 
-// ── Inbound messages from the IP module ──
-pub(crate) const NET_MSG_ACCEPTED: u8 = 0x01;
-pub(crate) const NET_MSG_DATA: u8 = 0x02;
-pub(crate) const NET_MSG_CLOSED: u8 = 0x03;
-pub(crate) const NET_MSG_BOUND: u8 = 0x04;
-pub(crate) const NET_MSG_CONNECTED: u8 = 0x05;
-pub(crate) const NET_MSG_ERROR: u8 = 0x06;
-/// Observability trace context (see ../fluxor/modules/sdk/contracts/net/net_proto.rs). Received from
-/// IP (plain HTTP) or TLS (HTTPS) to parent `http.server.request` under the
-/// upstream span. 0x07/0x08 are the IP-private RETRANSMIT/ACK opcodes.
-pub(crate) const NET_MSG_TRACE_CTX: u8 = 0x09;
-
-// ── Outbound commands to the IP module ──
-pub(crate) const NET_CMD_BIND: u8 = 0x10;
-pub(crate) const NET_CMD_SEND: u8 = 0x11;
-pub(crate) const NET_CMD_CLOSE: u8 = 0x12;
-pub(crate) const NET_CMD_CONNECT: u8 = 0x13;
+// The opcodes and identity accessors come from the owning contract — values
+// were previously restated here as literals, which is exactly the drift the
+// identity-accessor guard now refuses (rfc_hardening.md §5.2). The local
+// NET_-prefixed names are kept so call sites read unchanged; `net_proto`
+// itself is re-exported for the accessors (`conn_id`, `put_conn_id`,
+// `connected_parts`, `error_parts`, `accepted_parts`).
+pub(crate) use super::abi::contracts::net::net_proto;
+/// Observability trace context: received from IP (plain HTTP) or TLS (HTTPS)
+/// to parent `http.server.request` under the upstream span. 0x07/0x08 are the
+/// IP-private RETRANSMIT/ACK opcodes.
+pub(crate) use net_proto::MSG_TRACE_CTX as NET_MSG_TRACE_CTX;
+pub(crate) use net_proto::{
+    CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT,
+    CMD_SEND as NET_CMD_SEND, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR,
+};
 
 /// Scratch buffer size for assembling outbound and reading inbound
 /// frames. Must be ≥ the IP module's largest single MSG_DATA payload

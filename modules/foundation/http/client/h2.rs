@@ -39,8 +39,8 @@
 //!   module wrapping the cleartext channel.
 
 use super::super::connection::{
-    NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED,
+    NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 use super::super::wire::h2 as h2w;
 use super::super::wire::ws;
@@ -211,19 +211,18 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
                         // Claim only our own outbound connection by requester tag
                         // (see client.rs). Untagged or our tag → ours.
-                        let tag = if payload_len >= 3 {
-                            *buf.add(NET_FRAME_HDR + 2)
-                        } else {
-                            0
-                        };
+                        let (_, tag) = net_proto::connected_parts(core::slice::from_raw_parts(
+                            buf.add(NET_FRAME_HDR),
+                            payload_len,
+                        ));
                         let me = dev_requester_tag(sys);
                         if tag != 0 && tag != me {
                             return 0;
                         }
-                        s.client.conn_id = u16::from_le_bytes([
-                            *buf.add(NET_FRAME_HDR),
-                            *buf.add(NET_FRAME_HDR + 1),
-                        ]);
+                        s.client.conn_id = net_proto::conn_id(core::slice::from_raw_parts(
+                            buf.add(NET_FRAME_HDR),
+                            payload_len,
+                        ));
                         s.client.conn_present = 1;
                         log(s, b"[http] connected (h2c)");
                         build_preface(s);
@@ -232,10 +231,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     } else if msg_type == NET_MSG_ERROR {
                         // Connect failure carries our tag at payload[3]; ignore
                         // another consumer's error on a fanned net_in.
-                        let etag = if payload_len >= 4 {
-                            *buf.add(NET_FRAME_HDR + 3)
+                        let etag = if payload_len >= 3 {
+                            net_proto::error_parts(core::slice::from_raw_parts(
+                                buf.add(NET_FRAME_HDR),
+                                payload_len,
+                            ))
+                            .2
                         } else {
-                            0
+                            net_proto::REQUESTER_TAG_NONE
                         };
                         if etag == 0 || etag == dev_requester_tag(sys) {
                             log(s, b"[http] connect error");
@@ -1083,7 +1086,8 @@ unsafe fn drain_request_buf(s: &mut HttpState) -> bool {
         let to_send = remaining.min(max_data);
         let scratch = s.net_buf.as_mut_ptr();
         let payload_len = 2 + to_send;
-        let cb = conn_id.to_le_bytes();
+        let mut cb = [0u8; 2];
+        net_proto::put_conn_id(&mut cb, conn_id);
         *scratch = NET_CMD_SEND;
         *scratch.add(1) = (payload_len & 0xFF) as u8;
         *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
@@ -1137,8 +1141,10 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
     // connections sharing a fanned net_in (e.g. an OTLP exporter).
     if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
         && payload_len >= 2
-        && u16::from_le_bytes([*buf.add(NET_FRAME_HDR), *buf.add(NET_FRAME_HDR + 1)])
-            != s.client.conn_id
+        && net_proto::conn_id(core::slice::from_raw_parts(
+            buf.add(NET_FRAME_HDR),
+            payload_len,
+        )) != s.client.conn_id
     {
         return false;
     }

@@ -37,6 +37,16 @@ description = "Off-DUT load harness for Wave: open-loop multi-protocol generator
 # shape production runs in — see .context/perf_benchmarks.md §5 "No TLS".
 
 [dependencies]
+# `quiche` (Cloudflare) passes the same scrutiny as rustls, on stronger terms:
+# for HTTP/3 the ENTIRE independent side - QUIC transport AND h3 codec - must
+# be someone else's reading of the RFCs, because the aioquic functional oracle
+# cannot hold an offered rate and a hand-rolled h3 here would be Wave-adjacent
+# reasoning tested against itself. Its first act was finding a real fluxor TLS
+# defect (fixed 32-byte session-id echo) that aioquic silently tolerated.
+# `log` exists because quiche reports its TLS detail through it; wave-loadgen
+# arms a stderr logger under WAVE_H3_DEBUG so a refused handshake says why.
+log = "0.4.34"
+quiche = "0.29.3"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 
 # Tool-shaped package: prints JSON to stdout, unwraps on arg parsing. Mirrors

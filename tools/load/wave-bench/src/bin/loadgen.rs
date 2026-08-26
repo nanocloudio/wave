@@ -26,12 +26,14 @@
 //!   wave-loadgen --host 127.0.0.1:8080 --protocol h1 --rate 2000 --duration 10 \
 //!       --conns 8 --path / --payload 64
 //!
-//! Protocols: `h1`, `h2c`, `ws`, `grpc`. Std-only; see `../lib.rs` on why this
+//! Protocols: `h1`, `h2c`, `h3`, `ws`, `grpc`. `h3` rides `quiche`
+//! (independent QUIC + HTTP/3, see `../h3.rs`); the rest are std-only; see `../lib.rs` on why this
 //! shares no code with Wave.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use wave_bench::h3::H3Client;
 use wave_bench::proto::{H1Client, H2Client, LoadClient, Outcome, WsClient};
 use wave_bench::{JsonObj, LatencyHist};
 
@@ -50,7 +52,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "wave-loadgen --host <addr:port> [--protocol h1|h2c|ws|grpc] [--tls] [--rate N]\n\
+        "wave-loadgen --host <addr:port> [--protocol h1|h2c|h3|ws|grpc] [--tls] [--rate N]\n\
          \x20  [--duration N] [--conns N] [--path P] [--authority H] [--payload B]\n\
          \x20  [--warmup N]"
     );
@@ -97,7 +99,7 @@ fn parse_args() -> Args {
     if a.authority.is_empty() {
         a.authority = a.host.clone();
     }
-    if !matches!(a.protocol.as_str(), "h1" | "h2c" | "ws" | "grpc") {
+    if !matches!(a.protocol.as_str(), "h1" | "h2c" | "h3" | "ws" | "grpc") {
         eprintln!("unknown protocol: {}", a.protocol);
         usage();
     }
@@ -137,6 +139,26 @@ impl ShardResult {
     }
 }
 
+/// This process's user+system CPU seconds (`/proc/self/stat` fields 14/15).
+/// 0.0 where /proc is unreadable — the field then reads as a driver that used
+/// no CPU, which the verdict discipline treats as suspicious rather than
+/// clean.
+fn self_cpu_seconds() -> f64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0.0;
+    };
+    // Fields after the parenthesised comm; utime is the 14th overall.
+    let Some(rest) = stat.rsplit(") ").next() else {
+        return 0.0;
+    };
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let (Some(ut), Some(st)) = (f.get(11), f.get(12)) else {
+        return 0.0;
+    };
+    let ticks: f64 = ut.parse::<f64>().unwrap_or(0.0) + st.parse::<f64>().unwrap_or(0.0);
+    ticks / 100.0 // USER_HZ
+}
+
 fn make_client(a: &Args, shard: u64) -> std::io::Result<Box<dyn LoadClient>> {
     Ok(match a.protocol.as_str() {
         "h1" => Box::new(H1Client::connect(&a.host, &a.path, &a.authority, a.tls)?),
@@ -154,6 +176,7 @@ fn make_client(a: &Args, shard: u64) -> std::io::Result<Box<dyn LoadClient>> {
             true,
             a.tls,
         )?),
+        "h3" => Box::new(H3Client::connect(&a.host, &a.path, &a.authority)?),
         "ws" => Box::new(WsClient::connect(
             &a.host,
             &a.path,
@@ -305,6 +328,7 @@ fn main() {
     // Wall clock starts after the shards have warmed up, so connection setup
     // does not deflate the achieved rate and trip a false HARNESS_BOUND.
     let wall = Instant::now() + Duration::from_secs(a.warmup_secs);
+    let cpu_start = self_cpu_seconds();
 
     let mut agg = ShardResult::empty();
     for s in rx {
@@ -322,6 +346,10 @@ fn main() {
     }
 
     let elapsed = wall.elapsed().as_secs_f64().max(0.001);
+    // Driver self-attribution (rfc_hardening §7.2): the generator's own CPU
+    // over the measured window, as a percentage of ONE core. A driver near a
+    // core per shard is measuring itself, whatever the latency numbers say.
+    let cpu_pct = (self_cpu_seconds() - cpu_start).max(0.0) / elapsed * 100.0;
     let achieved = agg.sent as f64 / elapsed;
     let ratio = achieved / a.rate as f64;
 
@@ -360,6 +388,7 @@ fn main() {
         .num("warmup_failed", agg.warmup_failed)
         .raw("ok_tail", agg.ok.tail_json())
         .raw("rejected_tail", agg.rejected.tail_json())
+        .num("driver_cpu_pct", format!("{cpu_pct:.0}"))
         .str("headroom_verdict", verdict)
         .str("clean", if clean { "true" } else { "false" })
         .render();

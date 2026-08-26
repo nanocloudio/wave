@@ -5,8 +5,9 @@
 // SMTP is a LOCKSTEP command/reply session, not a single-shot req/reply: the
 // client sends one command, waits for a multi-line reply whose FINAL line's
 // 3-digit code decides the next command, and walks a fixed sequence
-//   220 greeting -> EHLO/250 -> MAIL FROM/250 -> RCPT TO/250 -> DATA/354
-//   -> <message>.CRLF/250 -> QUIT/221
+//   220 greeting -> EHLO/250 -> [AUTH PLAIN/235] -> MAIL FROM/250
+//   -> RCPT TO/250 -> DATA/354 -> <message>.CRLF/250 -> QUIT/221
+// where the AUTH step is present only when the caller configured credentials,
 // with the message body dot-stuffed and terminated by `\r\n.\r\n`. A reply-code
 // -dependent, multi-round-trip conversation over a server-chosen greeting is not
 // expressible in a stateless codec, so it is a compiled module.
@@ -63,6 +64,156 @@ pub fn smtp_ehlo(domain: &[u8], out: &mut [u8]) -> Option<usize> {
     smtp_put(out, &mut p, domain)?;
     smtp_put(out, &mut p, b"\r\n")?;
     Some(p)
+}
+
+/// Does this EHLO reply line offer `AUTH PLAIN`?
+///
+/// One line at a time, because that is how the pump sees them: a multi-line
+/// 250 carries its capabilities on the continuation lines, and the offer may
+/// be on any of them.
+///
+/// PLAIN is the only mechanism recognised. It completes in one round trip, so
+/// it needs no continuation state; LOGIN and CRAM-MD5 each add a
+/// challenge/response exchange, and LOGIN puts the same secret in the same
+/// clear while doing so. An unrecognised mechanism is one this module will not
+/// use, which is the direction that fails visibly.
+#[must_use]
+pub fn smtp_offers_auth_plain(line: &[u8]) -> bool {
+    // `250-AUTH PLAIN LOGIN` or `250 AUTH PLAIN`: three digits and a separator,
+    // then the capability keyword and its parameters.
+    if line.len() < 4 {
+        return false;
+    }
+    let rest = &line[4..];
+    // Keyword and mechanisms are compared as WHOLE tokens. `AUTHPLAIN` is one
+    // unknown capability rather than AUTH offering PLAIN, and `AUTH PLAINTEXT`
+    // is not an offer of PLAIN — a substring match would answer offers nobody
+    // made.
+    if rest.len() < 5 || !rest[..4].eq_ignore_ascii_case(b"AUTH") {
+        return false;
+    }
+    if !matches!(rest[4], b' ' | b'\t') {
+        return false;
+    }
+    let mut at = 4;
+    while at < rest.len() {
+        while at < rest.len() && matches!(rest[at], b' ' | b'\t') {
+            at += 1;
+        }
+        let start = at;
+        while at < rest.len() && !matches!(rest[at], b' ' | b'\t' | b'\r') {
+            at += 1;
+        }
+        if at == start {
+            break;
+        }
+        if rest[start..at].eq_ignore_ascii_case(b"PLAIN") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Base64, standard alphabet with padding — the form SASL carries.
+///
+/// `mime` decodes and does not encode, and an encoder this size is cheaper
+/// than a dependency between two protocol cores that share nothing else.
+pub fn smtp_b64_encode(input: &[u8], out: &mut [u8]) -> Option<usize> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let need = input.len().div_ceil(3).checked_mul(4)?;
+    if out.len() < need {
+        return None;
+    }
+    let mut p = 0;
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let word = (b0 << 16) | (b1 << 8) | b2;
+        out[p] = ALPHABET[((word >> 18) & 0x3F) as usize];
+        out[p + 1] = ALPHABET[((word >> 12) & 0x3F) as usize];
+        out[p + 2] = if chunk.len() > 1 {
+            ALPHABET[((word >> 6) & 0x3F) as usize]
+        } else {
+            b'='
+        };
+        out[p + 3] = if chunk.len() > 2 {
+            ALPHABET[(word & 0x3F) as usize]
+        } else {
+            b'='
+        };
+        p += 4;
+    }
+    Some(p)
+}
+
+/// Longest `authzid \0 authcid \0 passwd` this core will assemble.
+pub const SMTP_SASL_MAX: usize = 256;
+
+/// `AUTH PLAIN <base64(authzid \0 authcid \0 passwd)>\r\n` (RFC 4616).
+///
+/// The authzid is empty: in ordinary submission the account authenticating is
+/// the account submitting.
+///
+/// A NUL anywhere in a credential is refused rather than encoded. NUL is this
+/// mechanism's own field separator, so a password containing one would be read
+/// by the server as a shorter password in a different field — a credential
+/// that authenticates as something other than what was configured.
+pub fn smtp_auth_plain(user: &[u8], pass: &[u8], out: &mut [u8]) -> Option<usize> {
+    if user.is_empty()
+        || contains_nul(user)
+        || contains_nul(pass)
+        || user.len() + pass.len() + 2 > SMTP_SASL_MAX
+    {
+        return None;
+    }
+    let mut sasl = [0u8; SMTP_SASL_MAX];
+    let mut n = 0;
+    sasl[n] = 0;
+    n += 1;
+    sasl[n..n + user.len()].copy_from_slice(user);
+    n += user.len();
+    sasl[n] = 0;
+    n += 1;
+    sasl[n..n + pass.len()].copy_from_slice(pass);
+    n += pass.len();
+
+    let mut p = 0;
+    let built = (|| {
+        smtp_put(out, &mut p, b"AUTH PLAIN ")?;
+        p += smtp_b64_encode(&sasl[..n], out.get_mut(p..)?)?;
+        smtp_put(out, &mut p, b"\r\n")?;
+        Some(p)
+    })();
+    // The cleartext credential does not outlive the call. Volatile, because a
+    // plain `fill` of a local nothing reads again is a store the optimiser is
+    // free to delete.
+    zero(&mut sasl);
+    built
+}
+
+/// Overwrite `bytes` with zeroes in a way the optimiser may not elide.
+fn zero(bytes: &mut [u8]) {
+    for b in bytes {
+        // SAFETY: `b` is a live, aligned, unaliased `&mut u8`.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+}
+
+/// Is there a NUL anywhere in `bytes`?
+///
+/// Not `slice::contains`: that lowers to `core::slice::memchr`, which the
+/// bare-metal PIC link has no symbol for (the same reason `h1` scans by hand).
+/// The explicit scan also runs to the end rather than returning early, so how
+/// long it takes says nothing about where in a password the byte sat.
+fn contains_nul(bytes: &[u8]) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        found |= bytes[i] == 0;
+        i += 1;
+    }
+    found
 }
 
 /// `MAIL FROM:<addr>\r\n`.
@@ -165,6 +316,9 @@ pub enum SmtpPhase {
     Connecting,
     Greet,
     Ehlo,
+    /// `AUTH PLAIN` sent, awaiting 235. Reached only when the graph
+    /// configured credentials; an unauthenticated submission skips it.
+    Auth,
     MailFrom,
     RcptTo,
     Data,
@@ -178,6 +332,7 @@ pub enum SmtpPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SmtpCmd {
     SendEhlo,
+    SendAuth,
     SendMailFrom,
     SendRcptTo,
     SendData,
@@ -215,6 +370,7 @@ pub fn smtp_phase_code(phase: SmtpPhase) -> u8 {
         SmtpPhase::Quit => 8,
         SmtpPhase::Done => 9,
         SmtpPhase::Failed => 10,
+        SmtpPhase::Auth => 11,
     }
 }
 
@@ -238,13 +394,44 @@ pub fn smtp_reply_text(buf: &[u8], line_len: usize) -> Option<(usize, usize)> {
     Some((4, end - 4))
 }
 
+/// What the session must do about credentials once EHLO is answered.
+///
+/// Threaded in rather than read from the phase: "this deployment has
+/// credentials, on a channel it calls confidential, to a server that offered a
+/// mechanism" is a fact about the graph and the greeting, and the state machine
+/// stays pure by being told it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpAuthPlan {
+    /// No credentials configured: submit unauthenticated.
+    None,
+    /// Credentials configured, and they can be sent.
+    Plain,
+    /// Credentials configured that cannot be sent — the graph did not declare
+    /// the channel confidential, or the server offered no mechanism this
+    /// module speaks.
+    ///
+    /// A distinct outcome rather than a quiet fall back to [`Self::None`]. A
+    /// submission meant to be authenticated that silently was not is one the
+    /// relay may accept and attribute to nobody, and the operator who
+    /// configured a username would have no way to find out. It fails instead.
+    Refuse,
+}
+
 /// Decide the next command from the current phase and a FINAL reply code. Every
-/// step demands its specific success code (220/250/250/250/354/250/221); any
-/// other code aborts (`Fail`). Pure and total.
-pub fn smtp_on_reply(phase: SmtpPhase, code: u16) -> (SmtpCmd, SmtpPhase) {
+/// step demands its specific success code (220/250/[235]/250/250/354/250/221);
+/// any other code aborts (`Fail`). Pure and total.
+pub fn smtp_on_reply(phase: SmtpPhase, code: u16, auth: SmtpAuthPlan) -> (SmtpCmd, SmtpPhase) {
     match phase {
         SmtpPhase::Greet if code == 220 => (SmtpCmd::SendEhlo, SmtpPhase::Ehlo),
-        SmtpPhase::Ehlo if code == 250 => (SmtpCmd::SendMailFrom, SmtpPhase::MailFrom),
+        SmtpPhase::Ehlo if code == 250 => match auth {
+            SmtpAuthPlan::None => (SmtpCmd::SendMailFrom, SmtpPhase::MailFrom),
+            SmtpAuthPlan::Plain => (SmtpCmd::SendAuth, SmtpPhase::Auth),
+            SmtpAuthPlan::Refuse => (SmtpCmd::Fail, SmtpPhase::Failed),
+        },
+        // 235 is the only success. 535 and friends abort rather than retry: a
+        // relay that refused these credentials will refuse them again, and
+        // retrying turns a configuration error into a lockout.
+        SmtpPhase::Auth if code == 235 => (SmtpCmd::SendMailFrom, SmtpPhase::MailFrom),
         SmtpPhase::MailFrom if code == 250 => (SmtpCmd::SendRcptTo, SmtpPhase::RcptTo),
         SmtpPhase::RcptTo if code == 250 => (SmtpCmd::SendData, SmtpPhase::Data),
         SmtpPhase::Data if code == 354 => (SmtpCmd::SendBody, SmtpPhase::Body),

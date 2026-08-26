@@ -1,0 +1,47 @@
+version = "0.1.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# timer_class: playout paces on `dev_millis` at the `ptime` cadence, and MUST —
+# a relaxed scheduler tick that stretched the interval would stretch the audio.
+# Reading the wall clock is what makes a variable cadence safe here, and
+# declaring it is what lets the validator know (RFC adaptive_tick §8 rule 2).
+timer_class = "wall_clock"
+
+# The RTP-family reorder/playout adapter (rfc_hardening §9.6): validated RTP
+# payloads in as `[seq: u16 LE][payload…]` records, loss-concealed µ-law
+# playout out at `ptime` cadence. The buffer is modules/common/jitter_core.rs;
+# call policy stays with `sip`, adaptive playout with Grove.
+
+# Validated RTP payloads (in[0]): one `[seq][payload]` record per packet, from
+# `rtp.packets`.
+[[ports]]
+name = "rx_in"
+index = 0
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# Media control (in[1]): the same START/STOP records `sip.rtp_ctrl` drives the
+# transmitter with, fanned here. SET_ENDPOINT addresses the transmitter and is
+# ignored.
+[[ports]]
+name = "media_ctrl"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 256
+
+# Playout (out[0]): loss-concealed µ-law at `ptime` cadence.
+[[ports]]
+name = "ulaw_out"
+index = 0
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 2048
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "bounded reorder adapter — media throughput is observed at the rtp transport"

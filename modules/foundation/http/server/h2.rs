@@ -38,7 +38,7 @@
 //! - frames whose declared length exceeds `RECV_BUF_SIZE` are refused
 //!   with `GOAWAY(FRAME_SIZE_ERROR)`.
 
-use super::super::connection::{NET_BUF_SIZE, NET_CMD_SEND};
+use super::super::connection::{net_proto, NET_BUF_SIZE, NET_CMD_SEND};
 #[cfg(feature = "app")]
 use super::routes::HANDLER_APP;
 use super::routes::{
@@ -2409,7 +2409,8 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
     let conn_id = cur_conn_id(s);
     let scratch = s.net_buf.as_mut_ptr();
     let payload_len = 2 + to_send;
-    let cb = conn_id.to_le_bytes();
+    let mut cb = [0u8; 2];
+    net_proto::put_conn_id(&mut cb, conn_id);
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;

@@ -56,12 +56,13 @@ use sdkcrypto::sha1;
 // SDK's crypto out of the core's scope.
 include!("../../common/stun_core.rs");
 
-// The relay extension, mounted here because TURN IS STUN: it reuses this
-// module's header, attribute walk and integrity machinery wholesale, and a
-// second module mounting `stun_core.rs` again would compile two copies of the
-// same message mechanics. This responder does not itself relay anything; the
-// codec is here so that whatever holds an allocation has one spelling to use.
-include!("../../common/turn_core.rs");
+// `turn_core` is NOT included here. This module answers STUN Binding
+// requests and nothing else; TURN's methods, relay attributes and
+// ChannelData framing are unused by it, and a codec mounted only so tests
+// can reach it presents relay mechanics as functionality of this server
+// (rfc_hardening §9.6). The TURN codec's conformance fixture reaches it
+// directly in the harness, sharing `stun_core` there exactly as a real
+// consumer would.
 
 const NET_BUF: usize = 1600;
 const MSG_BUF: usize = 1500;
@@ -206,8 +207,16 @@ unsafe fn ensure_bound(s: &mut StunState) -> bool {
         let poll = (sys.channel_poll)(s.net_in, POLL_IN);
         if poll > 0 && (poll as u32) & POLL_IN != 0 {
             let (msg_type, plen) = net_read_frame(sys, s.net_in, s.net_buf.as_mut_ptr(), NET_BUF);
-            if msg_type == DG_MSG_BOUND && plen >= 1 {
-                s.ep_id = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+            if msg_type == DG_MSG_BOUND && plen >= 3 {
+                // Port-matched claim (see dg_bound_parts): on a fanned
+                // provider output the first BOUND polled may be another
+                // module's endpoint.
+                let (ep, port) = abi::contracts::net::datagram::dg_bound_parts(
+                    core::slice::from_raw_parts(s.net_buf.as_ptr().add(NET_FRAME_HDR), plen),
+                );
+                if port == s.port {
+                    s.ep_id = ep;
+                }
             }
         }
         return false;

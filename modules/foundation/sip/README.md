@@ -1,16 +1,17 @@
 # `sip` — RFC 3261 subset UAC/UAS for two-party PCMU voice
 
 Voice is split three ways and this module holds the middle: **Spectra** owns the
-G.711 codec, **Wave** owns the signalling and the receive-side recovery, and
-**Conclave** owns the call semantics above both. This module is a UDP endpoint
-wrapper around three cores in `modules/common` — `sip_core` (message formatters
-and response/SDP parsers), `sip_dialog` (the transaction FSM), and `jitter_core`
-(reorder window and playout).
+G.711 codec, **Wave** owns the wire mechanics, and **Conclave** owns the call
+semantics above both. This module is SIGNALLING ONLY (rfc_hardening §9.6): a
+UDP endpoint wrapper around two cores in `modules/common` — `sip_core` (message
+formatters and response/SDP parsers) and `sip_dialog` (the transaction FSM).
+The media path is the separate `rtp` (endpoint, packetise/depacketise) and
+`jitter` (reorder/playout) modules, driven over control records.
 
 ## What it owns, and what it does not
 
-It owns **protocol facts**: when an INVITE is legal, what an ACK answers, when a
-transaction has timed out, and how a reordered RTP stream is played back. It owns
+It owns **protocol facts**: when an INVITE is legal, what an ACK answers, and
+when a transaction has timed out. It owns
 no **call policy** — who may call whom, what a busy answer means, how a call is
 recorded — that is Conclave's, above this module. It owns neither transport (the
 datagram endpoints are Fluxor's) nor codec (µ-law is Spectra's `g711`).
@@ -20,18 +21,17 @@ registration, and authentication are not implemented and are not claimed.
 
 ## Shape
 
-Two datagram endpoints and two media edges:
+One datagram endpoint, and control records fanned to the media modules:
 
 ```text
-  peer UA  <--- sip_net_in/out (SIP signalling, 5060) --->  sip_dialog FSM
-  peer RTP  ---> rtp_net_in ---> jitter_core ---> ulaw_out ---> g711 decoder
-                                                  rtp_ctrl ---> `rtp` module (TX)
+  peer UA  <--- sip_net_in/out (SIP signalling) --->  sip_dialog FSM
+                                    rtp_ctrl ---> `rtp` (endpoint) + `jitter` (ctrl)
 ```
 
-Receive and transmit are deliberately asymmetric in ownership: this module holds
-the **receive** path (reorder + loss-concealing playout) because that is
-recovery, which is protocol work; transmission is the separate `rtp` module,
-driven over `rtp_ctrl` with `SET_ENDPOINT` / `START` / `STOP`.
+The dialog decides when media runs; the media modules do the running. On
+establishment this module emits `SET_ENDPOINT` (the negotiated peer) and
+`START`; on BYE, `STOP` — the same records to both consumers, fanned by the
+graph.
 
 ## Ports
 
@@ -39,12 +39,9 @@ driven over `rtp_ctrl` with `SET_ENDPOINT` / `START` / `STOP`.
 | --- | --- | --- | --- | --- |
 | `sip_net_in` | 0 | input | `OctetStream` | Inbound SIP datagrams |
 | `sip_net_out` | 0 | output | `OctetStream` | Outbound SIP datagrams |
-| `rtp_net_in` | 1 | input | `OctetStream` | Inbound RTP for the jitter buffer |
-| `rtp_net_out` | 1 | output | `OctetStream` | RTP receive endpoint commands |
-| `ulaw_out` | 2 | output | `OctetStream` | Playout µ-law at `ptime` cadence |
-| `rtp_ctrl` | 3 | output | `OctetStream` | 8-byte control frames to the `rtp` transmitter |
-| `command_in` | 2 | input | `OctetStream` | `SipCommand` records: dial, accept, reject, hang up, cancel |
-| `event_out` | 4 | output | `OctetStream` | `SipEvent` records: one per call transition |
+| `rtp_ctrl` | 1 | output | `OctetStream` | 8-byte control records to `rtp.endpoint` and `jitter.media_ctrl` |
+| `command_in` | 1 | input | `OctetStream` | `SipCommand` records: dial, accept, reject, hang up, cancel |
+| `event_out` | 2 | output | `OctetStream` | `SipEvent` records: one per call transition |
 | `call` | — | ctrl_input | `FmpMessage` | Any byte: place a call from `Ready`, hang up from `Active` |
 
 ### Commands and events

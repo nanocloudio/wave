@@ -2,17 +2,17 @@
 //!
 //! Composes the tested `modules/common` logic with datagram I/O:
 //!   * `sip_core` formats/parses the INVITE/ACK/BYE/200-OK messages and SDP;
-//!   * `sip_dialog` is the UAC/UAS transaction FSM;
-//!   * `jitter_core` is the RTP receive reorder/playout buffer.
+//!   * `sip_dialog` is the UAC/UAS transaction FSM.
 //!
-//! It owns two datagram endpoints (SIP signalling, RTP receive) and drives the
-//! RTP *transmitter* — the separate `rtp` module — over a control channel. The
-//! G.711 codec sits outside it (Spectra's `g711` module): playout emits µ-law on
-//! `ulaw_out`, and outbound audio is encoded before the `rtp` module.
+//! Signalling ONLY (rfc_hardening §9.6): it owns the SIP datagram endpoint
+//! and drives the media path — the separate `rtp` module and the `jitter`
+//! reorder/playout adapter — over shared control records on `rtp_ctrl`. It
+//! holds no media socket, no jitter state and no playout clock; those moved
+//! to `rtp` and `jitter` (see .context/planning/sip-rtp-decomposition.md).
 //!
-//! Assembled from `fluxor/modules/app/voip` (the SIP + jitter halves) under
-//! Conclave plan S4.3. Byte/behaviour parity lives in the shared-core vectors;
-//! this module is the endpoint/orchestration wrapper.
+//! Assembled from `fluxor/modules/app/voip` under Conclave plan S4.3.
+//! Byte/behaviour parity lives in the shared-core vectors; this module is the
+//! endpoint/orchestration wrapper.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -47,21 +47,6 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 // private off host-test. `modules/**` has a hard inline-test ban
 // (../standards/tests.md §1), so reaching them through the rlib is the only route.
 #[cfg(not(feature = "host-test"))]
-#[path = "../../common/jitter_core.rs"]
-mod jitter_core;
-#[cfg(feature = "host-test")]
-#[path = "../../common/jitter_core.rs"]
-pub mod jitter_core;
-// RFC 3550 header decode, shared with `rtp`: one answer to which bytes of a
-// packet are payload, for the module that sends them and the one that plays them.
-#[cfg(not(feature = "host-test"))]
-#[path = "../../common/rtp_core.rs"]
-mod rtp_core;
-#[cfg(feature = "host-test")]
-#[path = "../../common/rtp_core.rs"]
-pub mod rtp_core;
-use rtp_core::{rtp_parse, RTP_HEADER_SIZE};
-#[cfg(not(feature = "host-test"))]
 #[path = "../../common/sip_core.rs"]
 mod sip_core;
 #[cfg(feature = "host-test")]
@@ -80,7 +65,6 @@ mod sip_wire;
 #[path = "../../common/sip_wire.rs"]
 pub mod sip_wire;
 
-use jitter_core::{JitterBuffer, Playout};
 use sip_core::SipDialog;
 use sip_dialog::{MediaCmd, SipDialogFsm, SipEvent, SipSend, SipState};
 use sip_wire::{
@@ -94,7 +78,6 @@ const NET_BUF_SIZE: usize = 600;
 const SIP_TX_BUF_SIZE: usize = 512;
 const SIP_RX_BUF_SIZE: usize = 512;
 const CALL_ID_SIZE: usize = 16;
-const PLAYOUT_BUF: usize = jitter_core::JITTER_SLOT_SIZE;
 
 // Control-channel protocol to the `rtp` transmitter (8-byte messages).
 const CTRL_SET_ENDPOINT: u8 = 0x01;
@@ -111,21 +94,16 @@ struct SipModState {
     syscalls: *const SyscallTable,
 
     // Ports.
-    sip_net_in: i32,     // in[0]
-    sip_net_out: i32,    // out[0]
-    jitter_net_in: i32,  // in[1]
-    jitter_net_out: i32, // out[1]
-    ulaw_out: i32,       // out[2]: playout µ-law to the g711 decoder
-    rtp_ctrl_out: i32,   // out[3]: control to the rtp transmitter
-    call_ctrl_in: i32,   // ctrl: local call/hangup trigger
-    command_in: i32,     // in[2]: SipCommand records
-    event_out: i32,      // out[4]: SipEvent records
+    sip_net_in: i32,   // in[0]
+    sip_net_out: i32,  // out[0]
+    rtp_ctrl_out: i32, // out[3]: control to the rtp transmitter
+    call_ctrl_in: i32, // ctrl: local call/hangup trigger
+    command_in: i32,   // in[2]: SipCommand records
+    event_out: i32,    // out[4]: SipEvent records
 
     // Datagram endpoint ids (0xFF = unallocated).
     sip_ep_id: u8,
-    jitter_ep_id: u8,
     sip_bound: u8,
-    jitter_bound: u8,
 
     // Config.
     local_ip: u32,
@@ -173,19 +151,15 @@ struct SipModState {
     call_id_len: u8,
     _pad2: u8,
 
-    // FSM + retransmit + jitter (from cores).
+    // FSM + retransmit (from cores).
     fsm: SipDialogFsm,
     last_retransmit_ms: u64,
-    last_playout_ms: u64,
-    target_fill: u16,
-    playing: u8,
     /// Ordered media-control commands awaiting the transmitter's channel.
     /// Depth covers the longest run this module emits (`SET_ENDPOINT` then
     /// `START`) with room for a `STOP` behind them.
     ctrl_queue: [u8; CTRL_QUEUE],
     ctrl_len: u8,
     _pad3: u8,
-    jitter: JitterBuffer,
 
     // Buffers.
     call_id: [u8; CALL_ID_SIZE],
@@ -200,7 +174,6 @@ struct SipModState {
     sip_tx_pending: u8,
     _pad4: u16,
     sip_rx_buf: [u8; SIP_RX_BUF_SIZE],
-    playout_buf: [u8; PLAYOUT_BUF],
     net_buf: [u8; NET_BUF_SIZE],
 }
 
@@ -209,9 +182,6 @@ impl SipModState {
         self.syscalls = syscalls;
         self.sip_net_in = -1;
         self.sip_net_out = -1;
-        self.jitter_net_in = -1;
-        self.jitter_net_out = -1;
-        self.ulaw_out = -1;
         self.rtp_ctrl_out = -1;
         self.call_ctrl_in = -1;
         self.command_in = -1;
@@ -222,9 +192,7 @@ impl SipModState {
         self.event_owed = 0;
         self.event_len = 0;
         self.sip_ep_id = 0xFF;
-        self.jitter_ep_id = 0xFF;
         self.sip_bound = 0;
-        self.jitter_bound = 0;
         self.local_ip = 0;
         self.peer_ip = 0;
         self.local_sip_port = 5060;
@@ -243,10 +211,6 @@ impl SipModState {
         self.call_id_len = 0;
         self.fsm = SipDialogFsm::new();
         self.last_retransmit_ms = 0;
-        self.last_playout_ms = 0;
-        self.target_fill = 3;
-        self.playing = 0;
-        self.jitter = JitterBuffer::new();
         self.sip_tx_len = 0;
         self.sip_tx_pending = 0;
         self.ctrl_queue = [0; CTRL_QUEUE];
@@ -580,9 +544,11 @@ unsafe fn apply(s: &mut SipModState, step: sip_dialog::SipStep) {
     }
 }
 
-/// TEMPORARY: emit `[sip] st=<hex> rx=<hex> sip=<hex>` once a second so the
-/// rig can see whether the module is stepping, whether datagrams reach it at
-/// all, and what the dialog thinks its state is.
+/// Bounded state beat: `[sip] s=<state> rx=<n> sip=<n>` once a second, so a
+/// rig capture can see whether the module is stepping, whether datagrams reach
+/// it at all, and what the dialog thinks its state is. Rate-limited to one
+/// line per second and carrying counters and an FSM state only — never message
+/// bodies, peer credentials or media (RFC hardening §4.2/§10).
 unsafe fn dbg_beat(s: &mut SipModState) {
     let sys = &*s.syscalls;
     let now = dev_millis(sys);
@@ -590,14 +556,23 @@ unsafe fn dbg_beat(s: &mut SipModState) {
         return;
     }
     s.dbg_last_ms = now;
-    let mut line = [0u8; 32];
+    // `b=` carries the signalling bind flag and `ep=` its endpoint id —
+    // startup and bind evidence must ride the beat, because one-shot records
+    // at module_new are emitted before DHCP binds and never leave the board
+    // over UDP telemetry (rig run 2026-08-26). Media bind evidence lives with
+    // the modules that own media now: `[rtp]`'s beat and `[jit]`'s records.
+    let mut line = [0u8; 42];
     line[..8].copy_from_slice(b"[sip] s=");
     write_hex16(&mut line[8..12], s.fsm.state() as u16);
     line[12..16].copy_from_slice(b" rx=");
     write_hex16(&mut line[16..20], s.dbg_rx);
     line[20..25].copy_from_slice(b" sip=");
     write_hex16(&mut line[25..29], s.dbg_sip);
-    dev_log(sys, 3, line.as_ptr(), 29);
+    line[29..32].copy_from_slice(b" b=");
+    line[32] = b'0' + s.sip_bound;
+    line[33..37].copy_from_slice(b" ep=");
+    write_hex16(&mut line[37..41], s.sip_ep_id as u16);
+    dev_log(sys, 3, line.as_ptr(), 41);
 }
 
 unsafe fn step_sip(s: &mut SipModState) {
@@ -622,6 +597,13 @@ unsafe fn step_sip(s: &mut SipModState) {
         );
         if wrote != 0 {
             s.sip_bound = 1;
+            // Bind evidence (RFC hardening §4.2): the request left this module.
+            // Its absence isolates a wiring/backpressure fault before the IP
+            // module; the `ep=` line below isolates one after it.
+            let mut l = [0u8; 20];
+            l[..15].copy_from_slice(b"[sip] bind sip=");
+            write_hex16(&mut l[15..19], s.local_sip_port);
+            dev_log(sys, 3, l.as_ptr(), 19);
         }
         return;
     }
@@ -633,8 +615,22 @@ unsafe fn step_sip(s: &mut SipModState) {
         if poll > 0 && (poll as u32) & POLL_IN != 0 {
             let (msg_type, plen) =
                 net_read_frame(sys, s.sip_net_in, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
-            if msg_type == DG_MSG_BOUND && plen >= 1 {
-                s.sip_ep_id = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+            if msg_type == DG_MSG_BOUND && plen >= 3 {
+                // A fanned provider output delivers every BOUND to every
+                // leg. Claim ONLY the bind we asked for, by port — grabbing
+                // the first BOUND polled claims another module's endpoint
+                // and then filters every later datagram against the wrong
+                // identity (Pi 5 rig, 2026-08-26).
+                let (ep, port) = abi::contracts::net::datagram::dg_bound_parts(
+                    core::slice::from_raw_parts(s.net_buf.as_ptr().add(NET_FRAME_HDR), plen),
+                );
+                if port == s.local_sip_port {
+                    s.sip_ep_id = ep;
+                    let mut l = [0u8; 18];
+                    l[..13].copy_from_slice(b"[sip] sip ep=");
+                    write_hex16(&mut l[13..17], s.sip_ep_id as u16);
+                    dev_log(sys, 3, l.as_ptr(), 17);
+                }
             }
         }
         return;
@@ -714,24 +710,40 @@ unsafe fn step_sip(s: &mut SipModState) {
             let (msg_type, plen) =
                 net_read_frame(sys, s.sip_net_in, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
             if msg_type == DG_MSG_RX_FROM && plen > DG_V4_PREFIX {
-                let data_len = (plen - DG_V4_PREFIX).min(SIP_RX_BUF_SIZE);
-                core::ptr::copy_nonoverlapping(
-                    s.net_buf.as_ptr().add(NET_FRAME_HDR + DG_V4_PREFIX),
-                    s.sip_rx_buf.as_mut_ptr(),
-                    data_len,
-                );
-                s.dbg_rx = s.dbg_rx.wrapping_add(1);
-                if data_len > 4 && (s.sip_rx_buf[0] as char).is_ascii_uppercase() {
-                    s.dbg_sip = s.dbg_sip.wrapping_add(1);
-                    let mut l = [0u8; 24];
-                    l[..8].copy_from_slice(b"[sip] m=");
-                    let n = data_len.min(12);
-                    l[8..8 + n].copy_from_slice(&s.sip_rx_buf[..n]);
-                    dev_log(sys, 3, l.as_ptr(), 8 + n);
-                }
-                if let Some(ev) = classify_and_extract(s, data_len) {
-                    let step = s.fsm.on_event(ev);
-                    apply(s, step);
+                // The signalling ring is one leg of the ingress fan-out, so
+                // it also carries RTP addressed to the media endpoints.
+                // Filter by endpoint id BEFORE parsing: media bytes are not
+                // SIP, and `dbg_rx` counts signalling-endpoint traffic only,
+                // so the beat's evidence names this endpoint unambiguously.
+                if *s.net_buf.as_ptr().add(NET_FRAME_HDR) == s.sip_ep_id {
+                    let data_len = (plen - DG_V4_PREFIX).min(SIP_RX_BUF_SIZE);
+                    core::ptr::copy_nonoverlapping(
+                        s.net_buf.as_ptr().add(NET_FRAME_HDR + DG_V4_PREFIX),
+                        s.sip_rx_buf.as_mut_ptr(),
+                        data_len,
+                    );
+                    s.dbg_rx = s.dbg_rx.wrapping_add(1);
+                    if data_len > 4 && (s.sip_rx_buf[0] as char).is_ascii_uppercase() {
+                        s.dbg_sip = s.dbg_sip.wrapping_add(1);
+                    }
+                    if let Some(ev) = classify_and_extract(s, data_len) {
+                        // Bounded, payload-free: a stable class code for the
+                        // classified event (1=INVITE, 2=ACK, 3=BYE, else the
+                        // response status), not the message bytes (§4.2/§10).
+                        let code: u16 = match ev {
+                            SipEvent::RxInvite { .. } => 1,
+                            SipEvent::RxAck => 2,
+                            SipEvent::RxBye => 3,
+                            SipEvent::RxResponse { code } => code,
+                            _ => 0,
+                        };
+                        let mut l = [0u8; 16];
+                        l[..9].copy_from_slice(b"[sip] ev=");
+                        write_hex16(&mut l[9..13], code);
+                        dev_log(sys, 3, l.as_ptr(), 13);
+                        let step = s.fsm.on_event(ev);
+                        apply(s, step);
+                    }
                 }
             }
         }
@@ -739,7 +751,8 @@ unsafe fn step_sip(s: &mut SipModState) {
 }
 
 // ---------------------------------------------------------------------------
-// Media control — drive the rtp transmitter + the jitter receive path.
+// Media control — drive the rtp transmitter and the jitter adapter over
+// the shared control records (fanned by the graph).
 // ---------------------------------------------------------------------------
 
 /// Queue an ordered media-control command for the RTP transmitter.
@@ -801,97 +814,12 @@ unsafe fn send_rtp_ctrl(s: &mut SipModState, cmd: u8) -> bool {
 }
 
 unsafe fn media_start(s: &mut SipModState) {
-    s.jitter.reset();
-    s.playing = 1;
-    s.last_playout_ms = dev_millis(&*s.syscalls);
     queue_rtp_ctrl(s, CTRL_SET_ENDPOINT);
     queue_rtp_ctrl(s, CTRL_START);
 }
 
 unsafe fn media_stop(s: &mut SipModState) {
-    s.playing = 0;
     queue_rtp_ctrl(s, CTRL_STOP);
-}
-
-/// Bind the RTP-receive endpoint and pump packets into the jitter buffer.
-unsafe fn step_jitter(s: &mut SipModState) {
-    let sys = &*s.syscalls;
-    if s.jitter_bound == 0 {
-        if s.jitter_net_out < 0 {
-            return;
-        }
-        let port = s.rtp_port.to_le_bytes();
-        let payload = [port[0], port[1], 0u8];
-        let wrote = net_write_frame(
-            sys,
-            s.jitter_net_out,
-            DG_CMD_BIND,
-            payload.as_ptr(),
-            3,
-            s.net_buf.as_mut_ptr(),
-            NET_BUF_SIZE,
-        );
-        if wrote != 0 {
-            s.jitter_bound = 1;
-        }
-        return;
-    }
-    if s.jitter_ep_id == 0xFF {
-        if s.jitter_net_in >= 0 {
-            let poll = (sys.channel_poll)(s.jitter_net_in, POLL_IN);
-            if poll > 0 && (poll as u32) & POLL_IN != 0 {
-                let (msg_type, plen) =
-                    net_read_frame(sys, s.jitter_net_in, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
-                if msg_type == DG_MSG_BOUND && plen >= 1 {
-                    s.jitter_ep_id = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                }
-            }
-        }
-        return;
-    }
-
-    // Drain inbound RTP into the jitter buffer.
-    if s.jitter_net_in >= 0 {
-        loop {
-            let poll = (sys.channel_poll)(s.jitter_net_in, POLL_IN);
-            if poll <= 0 || (poll as u32) & POLL_IN == 0 {
-                break;
-            }
-            let (msg_type, plen) =
-                net_read_frame(sys, s.jitter_net_in, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
-            if msg_type != DG_MSG_RX_FROM || plen <= DG_V4_PREFIX {
-                break;
-            }
-            let rtp_len = plen - DG_V4_PREFIX;
-            let pkt = s.net_buf.as_ptr().add(NET_FRAME_HDR + DG_V4_PREFIX);
-            let Some(h) = rtp_parse(core::slice::from_raw_parts(pkt, rtp_len)) else {
-                continue;
-            };
-            let payload = core::slice::from_raw_parts(pkt.add(h.payload_start), h.payload_len());
-            s.jitter.insert(h.seq, payload);
-        }
-    }
-
-    // Playout at ptime cadence once we have buffered enough.
-    if s.playing == 0 || s.ulaw_out < 0 {
-        return;
-    }
-    if s.jitter.fill_count() < s.target_fill && s.last_playout_ms != 0 {
-        // still buffering (before first playout)
-    }
-    let now = dev_millis(sys);
-    if now.wrapping_sub(s.last_playout_ms) < s.ptime as u64 {
-        return;
-    }
-    let out_poll = (sys.channel_poll)(s.ulaw_out, POLL_OUT);
-    if out_poll <= 0 || (out_poll as u32) & POLL_OUT == 0 {
-        return;
-    }
-    let out_len = (s.ptime as usize * 8).min(PLAYOUT_BUF);
-    if s.jitter.playout(out_len, &mut s.playout_buf).is_some() {
-        let _ = (sys.channel_write)(s.ulaw_out, s.playout_buf.as_ptr(), out_len);
-        s.last_playout_ms = now;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -955,24 +883,15 @@ pub extern "C" fn module_new(
         s.sip_net_in = in_chan;
         s.sip_net_out = out_chan;
         s.call_ctrl_in = ctrl_chan;
-        s.command_in = dev_channel_port(sys, 0, 2);
-        s.event_out = dev_channel_port(sys, 1, 4);
-        let ch = dev_channel_port(sys, 0, 1);
-        if ch >= 0 {
-            s.jitter_net_in = ch;
-        }
+        // Post-decomposition port map: in[1] = command_in, out[1] = rtp_ctrl,
+        // out[2] = event_out. The media ports left with the media
+        // (rfc_hardening §9.6).
+        s.command_in = dev_channel_port(sys, 0, 1);
         let ch = dev_channel_port(sys, 1, 1);
-        if ch >= 0 {
-            s.jitter_net_out = ch;
-        }
-        let ch = dev_channel_port(sys, 1, 2);
-        if ch >= 0 {
-            s.ulaw_out = ch;
-        }
-        let ch = dev_channel_port(sys, 1, 3);
         if ch >= 0 {
             s.rtp_ctrl_out = ch;
         }
+        s.event_out = dev_channel_port(sys, 1, 2);
 
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
@@ -988,6 +907,18 @@ pub extern "C" fn module_new(
             s.from_tag = now ^ 0x5349;
             s.branch = now;
         }
+
+        // Startup evidence (RFC hardening §4.2): the record a rig capture keys
+        // on to distinguish "module never instantiated" from every later
+        // failure class. Local ports and the active flag only.
+        let mut line = [0u8; 34];
+        line[..13].copy_from_slice(b"[sip] new sp=");
+        write_hex16(&mut line[13..17], s.local_sip_port);
+        line[17..21].copy_from_slice(b" rp=");
+        write_hex16(&mut line[21..25], s.rtp_port);
+        line[25..28].copy_from_slice(b" a=");
+        line[28] = b'0' + s.sip_active;
+        dev_log(sys, 3, line.as_ptr(), 29);
         0
     }
 }
@@ -1012,7 +943,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // And the one event the last transition owes.
             flush_event(s);
         }
-        step_jitter(s);
         0
     }
 }

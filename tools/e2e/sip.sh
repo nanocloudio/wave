@@ -72,7 +72,11 @@ echo "   ok  the answer's SDP names the configured media port"
 # is up, concealing gaps, which is the behaviour a voice path must have.
 rtp_in="$(sed -n 's/.*RTP-RECEIVED \([0-9]*\).*/\1/p' "$WORK/ua.log")"
 [ -n "$rtp_in" ] && [ "$rtp_in" -gt 0 ] || fail "no RTP came back from the DUT"
-echo "   ok  audio returned from the DUT ($rtp_in packets)"
+rtp_tone="$(sed -n 's/.*RTP-TONE \([0-9]*\).*/\1/p' "$WORK/ua.log")"
+# Tone, not merely packets: the jitter adapter conceals losses at cadence, so
+# a DUT that never heard a frame still returns a full run of silence.
+[ -n "$rtp_tone" ] && [ "$rtp_tone" -gt 0 ] || fail "audio returned but ALL SILENCE — the receive path heard nothing"
+echo "   ok  audio returned from the DUT ($rtp_in packets, $rtp_tone tone)"
 
 grep -q "^BYE-ANSWERED" "$WORK/ua.log" || fail "BYE was not answered"
 echo "   ok  BYE answered"

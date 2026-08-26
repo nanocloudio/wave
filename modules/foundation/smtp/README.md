@@ -14,8 +14,9 @@ long-running instance submits many messages without its graph being rebuilt.
 The conversation is lockstep and server-led:
 
 ```text
-  connect -> 220 greeting -> EHLO/250 -> MAIL FROM/250 -> RCPT TO/250
-          -> DATA/354 -> <dot-stuffed message>.CRLF/250 -> QUIT/221
+  connect -> 220 greeting -> EHLO/250 -> [AUTH PLAIN/235] -> MAIL FROM/250
+          -> RCPT TO/250 -> DATA/354 -> <dot-stuffed message>.CRLF/250
+          -> QUIT/221
 ```
 
 Every command waits on the 3-digit code of the previous — possibly multi-line —
@@ -53,8 +54,8 @@ output pressure never loses one.
 
 The outcome classification distinguishes acceptance, a permanent refusal (5xx),
 a transient refusal (4xx), a protocol error, a failed connect, a timeout, a
-connection lost mid-conversation, a cancelled submission, and a request that
-could not be used. It states what the protocol showed and stops there: none of
+connection lost mid-conversation, a cancelled submission, a request that could
+not be used, and credentials that were configured but could not be sent. It states what the protocol showed and stops there: none of
 those values claims a person received or read anything.
 
 **The 250 answering end-of-data is the acceptance.** From that moment the server
@@ -76,6 +77,9 @@ outcome a person reads.
 | 3 | `mail_from` | Envelope sender |
 | 4 | `rcpt_to` | Envelope recipient (one) |
 | 5 | `body` | Message headers and body; dot-stuffed on the way out |
+| 6 | `auth_user` | SASL PLAIN username; its presence is what configures authentication |
+| 7 | `auth_pass` | SASL PLAIN password |
+| 8 | `channel_confidential` | u32 LE; non-zero asserts a `tls` node sits in front. Anything else, including absent, reads as zero |
 
 Params describe a single submission. When an envelope is configured, that
 submission is performed once at startup as if its record had arrived — which is
@@ -88,15 +92,44 @@ and drives `request_in` instead.
 `CONNECT_TIMEOUT_MS` (10 s) and `REPLY_TIMEOUT_MS` (15 s). A stalled server
 produces `smtp: timeout` and a closed connection, never an indefinite wait.
 
+## Authentication
+
+`AUTH PLAIN` (RFC 4616) only, sent with an empty authzid and an initial
+response, so authentication costs one round trip and no continuation state.
+Setting `auth_user` is what turns it on; a password with no username is not a
+credential and is ignored.
+
+**A credential is only ever sent on a channel the graph has declared
+confidential.** `AUTH PLAIN` is cleartext, and this module cannot see whether a
+`tls` node sits in front of it — that is what composing transports means. So the
+deployment says, with `channel_confidential`, and the default is to refuse.
+
+Two things refuse: an undeclared channel, and a server that offered no mechanism
+this module speaks. Both fail the submission rather than quietly falling back to
+an unauthenticated one, and both report `SMTP_OUT_AUTH_UNAVAILABLE` rather than a
+refusal code — the server never saw a credential, so nothing about the message or
+the account is in question, only the graph. Falling back is the tempting
+behaviour and the wrong one: the relay may well accept the message, attribute it
+to nobody, and the operator who configured a username would never learn their
+credentials did not travel.
+
+LOGIN and CRAM-MD5 are not implemented. LOGIN puts the same secret in the same
+clear over two extra round trips; CRAM-MD5 needs challenge/response state for a
+mechanism whose hash is long past recommending. A mechanism this module does not
+recognise is one it will not use.
+
 ## Scope — read this before wiring it
 
-**Unauthenticated submission only: no STARTTLS, no AUTH, no pipelining, one
-recipient per submission.** That is the class of deployment
-that submits to a trusted relay or sink behind a security boundary. It is *not*
-safe to point at a public MX over the open internet: the envelope and body cross
-the wire in the clear. TLS is not this module's concern either way — wire
-Fluxor's `tls` module between the transport and `net_in`/`net_out` for an
-implicit-TLS submission port, exactly as `websocket` does for `wss://`.
+**No STARTTLS, no pipelining, one recipient per submission.** STARTTLS is absent
+on purpose, not for want of effort: it asks a module to renegotiate its own
+transport mid-stream, which is the thing a dataflow graph expresses by composing
+nodes instead. Wire Fluxor's `tls` module in client mode between the transport
+and `net_in`/`net_out` for an implicit-TLS submission port — the port 465 shape —
+exactly as `websocket` does for `wss://`, and set `channel_confidential`.
+
+Without that, the envelope and body cross the wire in the clear, which suits a
+trusted relay or sink behind a security boundary and does *not* suit a public MX
+over the open internet.
 
 No MX resolution, no queue, no retry, no DSN parsing, no 8BITMIME/SMTPUTF8
 negotiation. Queuing, the retry schedule and idempotency belong to the caller,

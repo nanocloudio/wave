@@ -30,6 +30,9 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 
+# Validated receive records (out[1]): `[seq: u16 LE][payload…]`, one per
+# accepted packet — what a reorder buffer needs to see loss. Consumed by the
+# `jitter` adapter.
 [[ports]]
 name = "packets"
 index = 1

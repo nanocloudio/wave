@@ -18,8 +18,8 @@ pub(crate) mod h3;
 pub mod h3;
 
 use super::connection::{
-    NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED,
+    NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 use super::wire;
 use super::HttpState;
@@ -214,7 +214,8 @@ pub(crate) unsafe fn send_close_frame(s: &mut HttpState) -> bool {
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
-    let payload = s.client.conn_id.to_le_bytes();
+    let mut payload = [0u8; 2];
+    net_proto::put_conn_id(&mut payload, s.client.conn_id);
     if net_write_frame(
         sys,
         chan,
@@ -247,6 +248,8 @@ pub(crate) unsafe fn is_foreign_frame(
 ) -> bool {
     matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
         && payload_len >= 2
-        && u16::from_le_bytes([*nbuf.add(NET_FRAME_HDR), *nbuf.add(NET_FRAME_HDR + 1)])
-            != s.client.conn_id
+        && net_proto::conn_id(core::slice::from_raw_parts(
+            nbuf.add(NET_FRAME_HDR),
+            payload_len,
+        )) != s.client.conn_id
 }

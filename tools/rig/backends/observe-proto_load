@@ -73,7 +73,7 @@ import subprocess
 import sys
 import time
 
-VALID_PROTOCOLS = ("h1", "h2c", "ws", "grpc", "h3", "h3load", "sip")
+VALID_PROTOCOLS = ("h1", "h2c", "ws", "grpc", "h3", "h3load", "h3bench", "sip")
 
 # h3 is the one protocol wave-loadgen cannot drive: it has no QUIC client, and
 # adding one would mean a QUIC implementation in the load generator — the very
@@ -82,6 +82,11 @@ VALID_PROTOCOLS = ("h1", "h2c", "ws", "grpc", "h3", "h3load", "sip")
 # borrows the same oracle rather than growing a second one.
 H3_PROTOCOL = "h3"
 H3_LOAD_PROTOCOL = "h3load"
+# The COMPILED HTTP/3 load path (rfc_hardening §7.2): wave-loadgen's `h3`
+# protocol, riding quiche — the ladder driver whose headroom verdicts are
+# trustworthy, unlike the Python `h3load` phase, which stays as the
+# independent functional oracle and low-rate cross-check.
+H3_BENCH_PROTOCOL = "h3bench"
 SIP_PROTOCOL = "sip"
 
 
@@ -422,9 +427,13 @@ def run_sip(binding):
     # this backend is reached through a symlink in ~/.local/share/fluxor/, so
     # abspath resolves the repo relative to THAT directory and finds nothing.
     # It cost a rig cycle, reported as "the DUT did not answer".
+    # The UA lives with the other independent-side drivers in tools/peers/,
+    # NOT beside this backend — the old default pointed into tools/rig/ and
+    # cost a rig cycle reported as "the UA is not at …".
     ua = binding_str(binding, "sip_ua") or os.path.normpath(
-        os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-                     "sip_ua.py"))
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+            "peers", "sip_ua.py"))
     if not os.path.isfile(ua):
         emit_line(f"[proto_load] phase=sip ERR the UA is not at {ua} "
                   "(set `sip_ua` in the rig profile to override)")
@@ -462,17 +471,37 @@ def run_sip(binding):
                   "connect_errors=0 ERR call not answered")
         return False
     rtp_in = 0
+    rtp_tone = 0
     for line in out.splitlines():
         if line.startswith("RTP-SENT"):
+            # "RTP-SENT n RTP-RECEIVED m RTP-TONE t PAYLOAD-BYTES b" — one
+            # line per call. Take the MAX across calls: the diag run's second
+            # call sends no media and its tone is legitimately zero, and the
+            # last-line-wins parse this replaces let it erase the media
+            # call's evidence.
             parts = line.split()
             if len(parts) >= 4:
                 try:
-                    rtp_in = int(parts[3])
+                    rtp_in = max(rtp_in, int(parts[3]))
                 except ValueError:
-                    rtp_in = 0
+                    pass
+            if len(parts) >= 6 and parts[4] == "RTP-TONE":
+                try:
+                    rtp_tone = max(rtp_tone, int(parts[5]))
+                except ValueError:
+                    pass
     if rtp_in <= 0:
         emit_line("[proto_load] phase=sip committed=1 failed=1 rejected=0 "
                   "connect_errors=0 ERR no audio returned from the DUT")
+        return False
+    if rtp_tone <= 0:
+        # Packets came back but every one was concealment silence: the DUT's
+        # transmit path works and its RECEIVE path heard nothing. A packet
+        # count alone passed the §4.3 media-path mutation (rtp bound off the
+        # SDP port); the tone gate is what detects it.
+        emit_line("[proto_load] phase=sip committed=1 failed=1 rejected=0 "
+                  "connect_errors=0 ERR audio returned but ALL SILENCE - the "
+                  "DUT's receive path heard nothing")
         return False
     if "BYE-ANSWERED" not in out:
         emit_line("[proto_load] phase=sip committed=2 failed=1 rejected=0 "
@@ -480,7 +509,7 @@ def run_sip(binding):
         return False
 
     emit_line(f"[proto_load] phase=sip committed=3 rejected=0 rc=0 OK "
-              f"(answered + {rtp_in} rtp back + bye)")
+              f"(answered + {rtp_in} rtp back, {rtp_tone} tone + bye)")
     return True
 
 
@@ -640,8 +669,16 @@ def run_h3_load(binding):
     return True
 
 
-def run_protocol(loadgen, proto, binding):
-    """Drive one protocol; return True if the run completed cleanly."""
+def run_protocol(loadgen, proto, binding, rate_override=None, tag=None, soft=False):
+    """Drive one protocol; return True if the run completed cleanly.
+
+    `rate_override` replaces the bound rate for one run and `tag` suffixes the
+    phase name in every emitted line — the ladder driver below uses both to
+    report each rung separately. `soft` marks a ladder rung: a rung that still
+    commits work but sheds or misses the offered rate is the KNEE the sweep
+    exists to find, and reports as SATURATED rather than ERR so the scenario's
+    error guard does not fire on the measurement working as intended.
+    """
     host = binding_str(binding, "host")
     # Per-protocol path first: a WebSocket endpoint and an HTTP route live at
     # different paths on the SAME listener, so a single `path` for every
@@ -652,13 +689,16 @@ def run_protocol(loadgen, proto, binding):
         loadgen,
         "--host", host,
         "--protocol", proto,
-        "--rate", str(binding_int(binding, "rate", 50)),
+        "--rate", str(rate_override if rate_override is not None
+                      else binding_int(binding, "rate", 50)),
         "--duration", str(binding_int(binding, "duration", 10)),
         "--conns", str(binding_int(binding, "conns", 4)),
         "--path", path,
         "--payload", str(binding_int(binding, "payload", 0)),
         "--warmup", str(binding_int(binding, "warmup", 1)),
     ]
+    if tag:
+        proto = f"{proto}:{tag}"
     authority = binding_str(binding, "authority")
     if authority:
         argv += ["--authority", authority]
@@ -711,6 +751,16 @@ def run_protocol(loadgen, proto, binding):
     failed = summary.get("failed", 0)
     rejected = summary.get("rejected", 0)
     connect_errors = summary.get("connect_errors", 0)
+    if soft and committed > 0 and not connect_errors:
+        # Ladder rung: shedding or a missed offered rate at altitude is the
+        # knee, reported as data. Only a rung that commits NOTHING or cannot
+        # connect is an error.
+        if failed or rejected:
+            emit_line(
+                f"[proto_load] phase={proto} committed={committed} "
+                f"failed={failed} rejected={rejected} SATURATED"
+            )
+            return True
     if committed == 0 or failed or connect_errors:
         emit_line(
             f"[proto_load] phase={proto} committed={committed} failed={failed} "
@@ -798,7 +848,8 @@ def main():
         ready = True
     else:
         ready = (wait_for_h3_host(host, boot_wait)
-                 if all(p in (H3_PROTOCOL, H3_LOAD_PROTOCOL) for p in protocols)
+                 if all(p in (H3_PROTOCOL, H3_LOAD_PROTOCOL, H3_BENCH_PROTOCOL)
+                        for p in protocols)
                  else wait_for_host(host, boot_wait))
     if not ready:
         fail(f"{host} did not accept a connection within {boot_wait}s — "
@@ -816,6 +867,30 @@ def main():
             continue
         if proto == SIP_PROTOCOL:
             all_ok &= run_sip(binding)
+            continue
+        if proto == H3_BENCH_PROTOCOL:
+            # wave-loadgen speaks h3 natively now; same driver, same
+            # accounting, compiled all the way down. `h3bench_ladder`
+            # ("50,200,800") runs one rung per offered rate so a single
+            # scenario measures the §7.3 sweep; without it, one run at the
+            # bound rate.
+            ladder = binding_str(binding, "h3bench_ladder", "")
+            if ladder:
+                for rung in ladder.split(","):
+                    rung = rung.strip()
+                    if not rung:
+                        continue
+                    ok = run_protocol(loadgen, "h3", binding,
+                                      rate_override=int(rung), tag=f"r{rung}",
+                                      soft=True)
+                    # A refused HIGH rung is the knee, not a failure — the
+                    # sweep exists to find it. Only a rung that cannot even
+                    # connect (or the first rung failing outright) marks the
+                    # run itself bad.
+                    if not ok and rung == ladder.split(",")[0].strip():
+                        all_ok = False
+                continue
+            all_ok &= run_protocol(loadgen, "h3", binding)
             continue
         if not run_protocol(loadgen, proto, binding):
             all_ok = False

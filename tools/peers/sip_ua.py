@@ -117,7 +117,7 @@ def rtp_packet(seq, ts, ssrc, payload):
 
 
 def one_call(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, tag):
-    """Run a whole dialog and return (answered, media_port, rtp_in, bye_ok)."""
+    """Run a whole dialog: (answered, media_port, rtp_in, bye_ok, rtp_tone)."""
     return _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, tag)
 
 
@@ -129,7 +129,7 @@ def main(argv):
         dut_ip, dut_port = argv[1], int(argv[2])
         local_ip, local_port, rtp_port = argv[3], int(argv[4]), int(argv[5])
         a = _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, 50, "wave-diag-a", "8801")
-        print(f"DIAG call-a-media answered={int(a[0])} rtp_in={a[2]} bye={int(a[3])}", flush=True)
+        print(f"DIAG call-a-media answered={int(a[0])} rtp_in={a[2]} rtp_tone={a[4]} bye={int(a[3])}", flush=True)
         time.sleep(1)
         # Same local SIP port as call A, deliberately: the module answers to its
         # CONFIGURED peer_sip_port, so a second call on a different local port
@@ -137,7 +137,7 @@ def main(argv):
         # defect until the port was the thing that changed.
         b = _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port + 2, 0,
                     "wave-diag-b", "8802")
-        print(f"DIAG call-b-nomedia answered={int(b[0])} rtp_in={b[2]} bye={int(b[3])}", flush=True)
+        print(f"DIAG call-b-nomedia answered={int(b[0])} rtp_in={b[2]} rtp_tone={b[4]} bye={int(b[3])}", flush=True)
         return 0
     if len(argv) < 6 or argv[0] != "call":
         print(__doc__)
@@ -147,7 +147,7 @@ def main(argv):
     frames = 50
     if "--frames" in argv:
         frames = int(argv[argv.index("--frames") + 1])
-    answered, media_port, received, bye_ok = _dialog(
+    answered, media_port, received, bye_ok, tone = _dialog(
         dut_ip, dut_port, local_ip, local_port, rtp_port, frames, "wave-l4-test", "9911")
     if not answered:
         print("RESULT fail=no-answer", flush=True)
@@ -155,9 +155,11 @@ def main(argv):
     if media_port is None:
         print("RESULT fail=no-sdp-media-port", flush=True)
         return 1
-    ok = received > 0 and bye_ok
+    # Tone, not merely packets: the jitter adapter conceals losses at cadence,
+    # so a DUT that never heard a frame still returns a full run of silence.
+    ok = received > 0 and tone > 0 and bye_ok
     print(f"RESULT {'pass' if ok else 'fail'} answered=1 media_port={media_port} "
-          f"rtp_in={received} bye={int(bye_ok)}", flush=True)
+          f"rtp_in={received} rtp_tone={tone} bye={int(bye_ok)}", flush=True)
     return 0 if ok else 1
 
 
@@ -210,6 +212,23 @@ def _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, t
     payload = bytes([0x55]) * SAMPLES_PER_FRAME  # a constant, non-silence tone
     received = 0
     got_payload_bytes = 0
+    tone_frames = 0
+
+    def _count(pkt):
+        # Concealment is µ-law silence (0xFF): a frame carrying ANY tone byte
+        # proves the DUT's RECEIVE path heard us. Counting packets alone is
+        # blind to a dead receive path — the jitter adapter conceals losses at
+        # cadence, so a DUT that never hears a single frame still transmits
+        # a full run of silence (found by the §4.3 media-path mutation, which
+        # a packet count did not detect).
+        nonlocal received, got_payload_bytes, tone_frames
+        if len(pkt) >= 12 and (pkt[0] >> 6) == 2:
+            received += 1
+            body = pkt[12:]
+            got_payload_bytes += len(body)
+            if any(b != ULAW_SILENCE for b in body):
+                tone_frames += 1
+
     for i in range(frames):
         rtp.sendto(rtp_packet(i, i * SAMPLES_PER_FRAME, ssrc, payload), (dut_ip, media_port))
         # Hold the cadence while draining whatever has arrived.
@@ -219,9 +238,7 @@ def _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, t
                 pkt, _ = rtp.recvfrom(2048)
             except socket.timeout:
                 continue
-            if len(pkt) >= 12 and (pkt[0] >> 6) == 2:
-                received += 1
-                got_payload_bytes += len(pkt) - 12
+            _count(pkt)
     # Drain anything still in flight.
     drain_until = time.monotonic() + 1.0
     while time.monotonic() < drain_until:
@@ -229,12 +246,10 @@ def _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, t
             pkt, _ = rtp.recvfrom(2048)
         except socket.timeout:
             continue
-        if len(pkt) >= 12 and (pkt[0] >> 6) == 2:
-            received += 1
-            got_payload_bytes += len(pkt) - 12
+        _count(pkt)
 
-    print(f"RTP-SENT {frames} RTP-RECEIVED {received} PAYLOAD-BYTES {got_payload_bytes}",
-          flush=True)
+    print(f"RTP-SENT {frames} RTP-RECEIVED {received} RTP-TONE {tone_frames} "
+          f"PAYLOAD-BYTES {got_payload_bytes}", flush=True)
 
     # ── BYE ─────────────────────────────────────────────────────────────
     # Retransmit per RFC 3261 §17.1.2.1 (timer E): BYE is a non-INVITE request
@@ -271,7 +286,7 @@ def _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, t
 
     sip.close()
     rtp.close()
-    return (True, media_port, received, bye_ok)
+    return (True, media_port, received, bye_ok, tone_frames)
 
 
 if __name__ == "__main__":

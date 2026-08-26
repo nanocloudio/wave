@@ -57,30 +57,25 @@ mod rtp_core;
 pub mod rtp_core;
 use rtp_core::{rtp_parse, RTP_HEADER_SIZE};
 
-// SFrame framing, mounted here because it is the media path: a sealed frame
-// travels inside RTP payloads, and the split between the readable header a
-// relay routes on and the payload it must not read is the same concern this
-// module already owns for RTP itself. Nothing in this module encrypts; the
-// framing says where sealed bytes go and what a cipher must authenticate.
-#[cfg(not(feature = "host-test"))]
-#[path = "../../common/sframe_core.rs"]
-mod sframe_core;
-#[cfg(feature = "host-test")]
-#[path = "../../common/sframe_core.rs"]
-pub mod sframe_core;
+// Shared hex codec, for the bounded bind-evidence line — the same core `s3`,
+// `smtp` and `websocket` already consume, rather than a module-local formatter.
+#[path = "../../common/hex_core.rs"]
+mod hex_core;
+use hex_core::hex_encode;
 
-// The WebRTC session-description attributes, mounted alongside for the same
-// reason: they describe the media path this module carries. `sip_core.rs`
-// writes an SDP body for a call to a telephone, which is the wrong shape for a
-// browser — it carries no ICE credentials, no candidates and no DTLS
-// fingerprint — and adding them there would put browser concerns inside a
-// telephony codec.
+// The receive-record seam to `jitter` — one owner for the layout.
 #[cfg(not(feature = "host-test"))]
-#[path = "../../common/webrtc_sdp.rs"]
-mod webrtc_sdp;
+#[path = "../../common/rtp_wire.rs"]
+mod rtp_wire;
 #[cfg(feature = "host-test")]
-#[path = "../../common/webrtc_sdp.rs"]
-pub mod webrtc_sdp;
+#[path = "../../common/rtp_wire.rs"]
+pub mod rtp_wire;
+use rtp_wire::{put_rtp_rx_seq, REC_RTP_RX, RTP_RX_SEQ_LEN};
+
+// `sframe_core` and `webrtc_sdp` are NOT mounted here. Nothing in this
+// module uses them, and a core mounted merely to give tests a production
+// path overstates the module (rfc_hardening §9.6). Their conformance
+// fixtures reach them directly in the harness.
 
 // Host-build equivalents of the ARM EABI memory intrinsics.
 //
@@ -185,6 +180,10 @@ struct RtpState {
     peer_ip: u32,
     peer_port: u16,
     local_port: u16,
+    /// Beat rate limiter (`dbg_beat`): steps since the last emission. Counted
+    /// in steps, not milliseconds — this module attests `timer_class =
+    /// "agnostic"` and must not read a clock for telemetry pacing.
+    dbg_steps: u32,
     ssrc: u32,
     // TX state
     seq_num: u16,
@@ -200,6 +199,9 @@ struct RtpState {
     packets_lost: u32,
     /// Inbound packets refused for exceeding `RX_MAX_PAYLOAD`.
     rx_truncated: u32,
+    /// Frames addressed to this endpoint, consumed while the receive output
+    /// is unwired. Counted, never silent (RFC hardening §10).
+    rx_unrouted: u32,
     pending_out: u16,
     pending_offset: u16,
     // Buffers
@@ -207,7 +209,7 @@ struct RtpState {
     acc_buf: [u8; MAX_PAYLOAD],
     pkt_buf: [u8; PKT_BUF_SIZE],
     rx_buf: [u8; RX_BUF_SIZE],
-    out_buf: [u8; RX_MAX_PAYLOAD],
+    out_buf: [u8; RTP_RX_SEQ_LEN + RX_MAX_PAYLOAD],
     net_buf: [u8; NET_BUF_SIZE],
 }
 
@@ -228,6 +230,7 @@ impl RtpState {
         self.peer_ip = 0;
         self.peer_port = 5004;
         self.local_port = 5004;
+        self.dbg_steps = 0;
         self.ssrc = 0x46585254; // "FXRT"
         self.seq_num = 0;
         self.ptime_bytes = 160; // 20ms * 8 samples/ms
@@ -240,6 +243,7 @@ impl RtpState {
         self.packets_received = 0;
         self.packets_lost = 0;
         self.rx_truncated = 0;
+        self.rx_unrouted = 0;
         self.pending_out = 0;
         self.pending_offset = 0;
     }
@@ -378,6 +382,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return -1;
         }
 
+        dbg_beat(s);
         match s.phase {
             RtpPhase::Idle => step_idle(s),
             RtpPhase::Init => step_init(s),
@@ -387,6 +392,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             _ => -1,
         }
     }
+}
+
+/// Bounded state beat: `[rtp] ph=<phase> ep=<id> p=<port>` once per
+/// `DBG_BEAT_STEPS` steps (~1 s at the audio graph's 1 ms tick; a relaxed
+/// cadence stretches the interval, which telemetry tolerates — this module is
+/// `timer_class = "agnostic"` and reads no clock). Startup and bind evidence
+/// must ride the beat, because one-shot records at module_new ([rtp] ready)
+/// are emitted before DHCP binds and never leave the board over UDP telemetry
+/// (rig run 2026-08-26). Phase, endpoint id and local port only — never
+/// payload (RFC hardening §4.2/§10).
+const DBG_BEAT_STEPS: u32 = 1024;
+
+unsafe fn dbg_beat(s: &mut RtpState) {
+    let sys = &*s.syscalls;
+    s.dbg_steps = s.dbg_steps.wrapping_add(1);
+    if !s.dbg_steps.is_multiple_of(DBG_BEAT_STEPS) {
+        return;
+    }
+    let mut l = [0u8; 26];
+    l[..9].copy_from_slice(b"[rtp] ph=");
+    l[9] = b'0' + s.phase as u8;
+    l[10..14].copy_from_slice(b" ep=");
+    let _ = hex_encode(&[s.ep_id], &mut l[14..16]);
+    l[16..19].copy_from_slice(b" p=");
+    let _ = hex_encode(&s.local_port.to_be_bytes(), &mut l[19..23]);
+    dev_log(sys, 3, l.as_ptr(), 23);
 }
 
 // ============================================================================
@@ -458,6 +489,14 @@ unsafe fn step_init(s: &mut RtpState) -> i32 {
         return 0; // Channel full, retry next tick
     }
 
+    // Bind evidence (RFC hardening §4.2): the request left this module, with
+    // the local port it named. Distinguishes a wiring fault before the IP
+    // module from a bind refusal after it (`[rtp] bound` / `[rtp] bind fail`).
+    let mut l = [0u8; 20];
+    l[..13].copy_from_slice(b"[rtp] bind p=");
+    let _ = hex_encode(&s.local_port.to_be_bytes(), &mut l[13..17]);
+    dev_log(sys, 3, l.as_ptr(), 17);
+
     s.phase = RtpPhase::BindWait;
     2 // Burst — handle MSG_DG_BOUND immediately
 }
@@ -489,11 +528,22 @@ unsafe fn step_bind_wait(s: &mut RtpState) -> i32 {
         s.phase = RtpPhase::Error;
         return -1;
     }
-    if msg_type != DG_MSG_BOUND || payload_len < 1 {
+    if msg_type != DG_MSG_BOUND || payload_len < 3 {
         return 0;
     }
 
-    s.ep_id = *buf.add(NET_FRAME_HDR);
+    // Port-matched claim: a fanned provider output delivers every BOUND to
+    // every leg, and taking the first one claims another module's endpoint
+    // (Pi 5 rig, 2026-08-26). A BOUND for a port we did not ask for is
+    // another consumer's answer — keep waiting for ours.
+    let (ep, port) = abi::contracts::net::datagram::dg_bound_parts(core::slice::from_raw_parts(
+        buf.add(NET_FRAME_HDR),
+        payload_len,
+    ));
+    if port != s.local_port {
+        return 0;
+    }
+    s.ep_id = ep;
     dev_log(sys, 3, b"[rtp] bound".as_ptr(), 11);
     s.phase = RtpPhase::Running;
     2 // Burst — start data flow immediately
@@ -538,10 +588,13 @@ unsafe fn step_running(s: &mut RtpState) -> i32 {
         step_tx(s);
     }
 
-    // RX path
-    if s.out_chan >= 0 {
-        step_rx(s);
-    }
+    // RX path — ALWAYS, even when the receive output is unwired. `net_in` is
+    // one leg of the ingress fan-out, so it receives every inbound datagram
+    // including those addressed to other endpoints; a leg nobody drains fills
+    // its ring and stalls ingress for EVERY module on the fan-out. That is
+    // not hypothetical: on the Pi 5 rig the undrained ring stalled the edge
+    // for 42 s and the peer's BYE never reached sip (2026-08-26).
+    step_rx(s);
 
     0
 }
@@ -584,35 +637,58 @@ unsafe fn step_tx(s: &mut RtpState) {
 // RX: receive RTP, validate, extract payload, write to channel
 // ============================================================================
 
+/// Frames consumed from the ingress fan-out per step. Bounds the drain loop
+/// (no unbounded loop in a module step) while comfortably outrunning any
+/// admitted media cadence: at a 1 ms tick this is 4000 frames/s against a
+/// 50/s PCMU stream.
+const RX_DRAIN_BUDGET: u32 = 4;
+
 unsafe fn step_rx(s: &mut RtpState) {
     let sys = &*s.syscalls;
     let out_chan = s.out_chan;
 
-    // Drain any pending output from previous step
-    if !drain_pending(
-        sys,
-        out_chan,
-        s.out_buf.as_ptr(),
-        &mut s.pending_out,
-        &mut s.pending_offset,
-    ) {
-        return;
+    // Re-offer a record a full channel refused. While a packet of OURS is
+    // parked on backpressure, nothing more is read — the ring holds the
+    // ordering. The record is re-framed whole (`net_write_frame` is
+    // all-or-nothing), so a refusal leaves the FIFO aligned.
+    if out_chan >= 0 && s.pending_out != 0 {
+        let wrote = net_write_frame(
+            sys,
+            out_chan,
+            REC_RTP_RX,
+            s.out_buf.as_ptr(),
+            s.pending_out as usize,
+            s.rx_buf.as_mut_ptr(),
+            RX_BUF_SIZE,
+        );
+        if wrote == 0 {
+            return;
+        }
+        s.pending_out = 0;
     }
 
-    // Check output channel ready
-    let out_poll = (sys.channel_poll)(out_chan, POLL_OUT);
-    if out_poll <= 0 || ((out_poll as u32) & POLL_OUT) == 0 {
-        return;
-    }
-
-    // Try to receive a MSG_DATA frame from net channel
     if s.net_in_chan < 0 {
         return;
     }
 
+    let mut budget = RX_DRAIN_BUDGET;
+    while budget > 0 {
+        budget -= 1;
+        if !step_rx_one(s) {
+            break;
+        }
+    }
+}
+
+/// Consume one frame from the ingress fan-out. Returns whether the caller may
+/// read another this step.
+unsafe fn step_rx_one(s: &mut RtpState) -> bool {
+    let sys = &*s.syscalls;
+    let out_chan = s.out_chan;
+
     let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
     if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-        return;
+        return false;
     }
 
     let buf = s.rx_buf.as_mut_ptr();
@@ -628,18 +704,36 @@ unsafe fn step_rx(s: &mut RtpState) {
         // an unexplained quality problem.
         s.rx_truncated = s.rx_truncated.wrapping_add(1);
         dev_log(sys, 2, b"[rtp] rx pkt too large".as_ptr(), 22);
-        return;
+        return true;
     }
 
     // MSG_DG_RX_FROM payload:
     //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][rtp_data...]
     if msg_type != DG_MSG_RX_FROM || payload_len < DG_V4_PREFIX + RTP_HEADER_SIZE {
-        return;
+        return true;
+    }
+    // Another endpoint's datagram: the fan-out delivers every inbound frame
+    // to every leg, and this one is addressed elsewhere. Consuming and
+    // skipping it IS the routing contract — the addressed module holds its
+    // own copy on its own leg.
+    if s.ep_id != 0xFF && *buf.add(NET_FRAME_HDR) != s.ep_id {
+        return true;
     }
     // Verify address family is IPv4
     if *buf.add(NET_FRAME_HDR + 1) != DG_AF_INET {
-        return;
+        return true;
     }
+    // Ours, but the receive path is unwired in this graph (transmit-only
+    // role, e.g. the voice-echo composition where sip owns receive). Counted,
+    // never silent — and never left in the ring, which would stall the
+    // fan-out for everyone.
+    if out_chan < 0 {
+        s.rx_unrouted = s.rx_unrouted.wrapping_add(1);
+        return true;
+    }
+    // Output backpressured: leave the frame processing to a later step. The
+    // frame is already consumed, so it must be processed now or counted; the
+    // pending mechanism below parks the extracted payload, so proceed.
 
     let pkt_len = payload_len - DG_V4_PREFIX;
     let data_start = NET_FRAME_HDR + DG_V4_PREFIX;
@@ -650,14 +744,14 @@ unsafe fn step_rx(s: &mut RtpState) {
     );
 
     if pkt_len < RTP_HEADER_SIZE {
-        return;
+        return true;
     }
 
     // Validate the header and locate the payload — version, CSRC list, §5.3.1
     // extension and §5.1 padding, all in the shared core.
     let pkt = s.rx_buf.as_ptr();
     let Some(h) = rtp_parse(core::slice::from_raw_parts(pkt, pkt_len)) else {
-        return;
+        return true;
     };
     let header_len = h.payload_start;
     let payload_end = h.payload_end;
@@ -689,15 +783,31 @@ unsafe fn step_rx(s: &mut RtpState) {
         payload_len
     };
 
-    __aeabi_memcpy(s.out_buf.as_mut_ptr(), pkt.add(header_len), copy_len);
-
-    // Write to output channel
-    let written = (sys.channel_write)(out_chan, s.out_buf.as_ptr(), copy_len);
-    if written < 0 && written != E_AGAIN {
-        return;
+    // One `packets` record, framed with the shared TLV so records never
+    // concatenate on the byte-stream channel: payload is `[seq][audio]`.
+    put_rtp_rx_seq(&mut s.out_buf, seq);
+    __aeabi_memcpy(
+        s.out_buf.as_mut_ptr().add(RTP_RX_SEQ_LEN),
+        pkt.add(header_len),
+        copy_len,
+    );
+    let rec_len = RTP_RX_SEQ_LEN + copy_len;
+    let wrote = net_write_frame(
+        sys,
+        out_chan,
+        REC_RTP_RX,
+        s.out_buf.as_ptr(),
+        rec_len,
+        s.rx_buf.as_mut_ptr(),
+        RX_BUF_SIZE,
+    );
+    if wrote == 0 {
+        // Refused whole: park the payload; the retry above re-offers it.
+        // Reading further frames this step would overwrite `out_buf`.
+        s.pending_out = rec_len as u16;
+        return false;
     }
-
-    track_pending(written, copy_len, &mut s.pending_out, &mut s.pending_offset);
+    true
 }
 
 // ============================================================================

@@ -86,9 +86,9 @@ server_mod!(
 
 use super::abi::SyscallTable;
 use super::connection::{
-    NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_ACCEPTED,
-    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
-    NET_MSG_TRACE_CTX,
+    net_proto, NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND,
+    NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA,
+    NET_MSG_ERROR, NET_MSG_TRACE_CTX,
 };
 use super::wire;
 use super::HttpState;
@@ -1635,7 +1635,8 @@ pub(crate) unsafe fn close_net_conn(s: &mut HttpState, conn_id: u16) {
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
-    let payload = conn_id.to_le_bytes();
+    let mut payload = [0u8; 2];
+    net_proto::put_conn_id(&mut payload, conn_id);
     net_write_frame(
         sys,
         chan,
@@ -1701,7 +1702,8 @@ pub(crate) unsafe fn net_send_conn(
     let chan = s.net_out_chan;
     let scratch = s.net_buf.as_mut_ptr();
     let payload_len = 2 + to_send;
-    let cb = conn_id.to_le_bytes();
+    let mut cb = [0u8; 2];
+    net_proto::put_conn_id(&mut cb, conn_id);
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
@@ -1777,7 +1779,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
             if peeked < NET_FRAME_HDR as i32 + 2 {
                 return;
             }
-            let conn = u16::from_le_bytes([hdr[NET_FRAME_HDR], hdr[NET_FRAME_HDR + 1]]);
+            let conn = net_proto::conn_id(&hdr[NET_FRAME_HDR..]);
             let data_len = peeked_payload_len - 2;
             if let Some(idx) = find_slot_by_conn_id(s, conn) {
                 let slot = &*s.server.slots.as_ptr().add(idx);
@@ -1837,10 +1839,10 @@ unsafe fn demux_inbound(s: &mut HttpState) {
         let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
         match msg_type {
             NET_MSG_ACCEPTED if payload_len >= 2 => {
-                let conn = u16::from_le_bytes([
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                ]);
+                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    payload_len,
+                ));
                 // Multi-anchor demux: when the accept carries a listener
                 // port (payload_len >= 4), claim it only if it matches our
                 // bound port — a fanned net_out delivers every consumer's
@@ -1879,10 +1881,10 @@ unsafe fn demux_inbound(s: &mut HttpState) {
             // static bind is consumed pre-`bound` by slot 0's WaitBound).
             // Payload `[conn_id:1][port:2 LE]`.
             NET_MSG_BOUND if payload_len >= 4 => {
-                let conn = u16::from_le_bytes([
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                ]) as i32;
+                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    payload_len,
+                )) as i32;
                 let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
                 let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
                 let port = (lo as u16) | ((hi as u16) << 8);
@@ -1900,10 +1902,10 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 s.server.listeners.mark_refused(port);
             }
             NET_MSG_DATA if payload_len > 2 => {
-                let conn = u16::from_le_bytes([
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                ]);
+                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    payload_len,
+                ));
                 let data_ptr = s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
                 let data_len = payload_len - 2;
                 if let Some(idx) = find_slot_by_conn_id(s, conn) {
@@ -1951,16 +1953,15 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 // co-wired client) another consumer's connect would otherwise
                 // be latched as this server's backend, binding one request's
                 // client to another module's socket.
-                let conn = u16::from_le_bytes([
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                ]);
+                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    payload_len,
+                ));
                 let me = dev_requester_tag(sys);
-                let tag = if payload_len >= 3 {
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2)
-                } else {
-                    0
-                };
+                let (_, tag) = net_proto::connected_parts(core::slice::from_raw_parts(
+                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    payload_len,
+                ));
                 if tag == 0 || tag == me {
                     let owner = s.server.proxy_connect_owner;
                     if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
@@ -1989,14 +1990,18 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 // — so any peer reset anywhere aborted an unrelated backend
                 // dial and charged a spurious failover against a healthy
                 // upstream.
-                let conn = u16::from_le_bytes([
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                ]);
-                let tag = if payload_len >= 4 {
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3)
+                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    payload_len,
+                ));
+                let tag = if payload_len >= 3 {
+                    net_proto::error_parts(core::slice::from_raw_parts(
+                        s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                        payload_len,
+                    ))
+                    .2
                 } else {
-                    0
+                    net_proto::REQUESTER_TAG_NONE
                 };
                 if tag != 0 {
                     // TAGGED: a connect-phase failure, attributed to the
@@ -2040,10 +2045,10 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 }
             }
             NET_MSG_CLOSED if payload_len >= 2 => {
-                let conn = u16::from_le_bytes([
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                    *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1),
-                ]);
+                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                    payload_len,
+                ));
                 if let Some(idx) = find_slot_by_conn_id(s, conn) {
                     let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                     slot.peer_closed = 1;

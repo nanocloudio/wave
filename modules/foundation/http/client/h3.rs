@@ -223,7 +223,7 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
     if payload.len() < mux::SESSION_ID_BYTES {
         return c.state;
     }
-    let session = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let session = mux::session_id(payload);
 
     // Session-scoped events first: their bytes 4..8 are not a stream
     // handle, and reading them as one would address a stream that does not
@@ -265,7 +265,7 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
     if payload.len() < mux::STREAM_DATA_PREFIX {
         return c.state;
     }
-    let handle = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let handle = mux::stream_id(payload);
 
     match msg_type {
         mux::MSG_MUX_STREAM_ACCEPTED => {
@@ -439,7 +439,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             let mut open = [0u8; FRAME_HDR + mux::SESSION_ID_BYTES + 1];
             open[0] = mux::CMD_MUX_STREAM_OPEN;
             open[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-            open[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&s.h3_client.session_id.to_le_bytes());
+            mux::put_session_id(&mut open[FRAME_HDR..], s.h3_client.session_id);
             open[FRAME_HDR + 4] = mux::STREAM_FLAG_BIDI;
             let poll = (sys.channel_poll)(out_chan, super::super::POLL_OUT);
             if poll > 0
@@ -581,8 +581,8 @@ unsafe fn client_send_request(s: &mut super::super::HttpState) {
         let mut frame = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 512];
         frame[0] = mux::CMD_MUX_STREAM_SEND;
         frame[1..3].copy_from_slice(&(body_len as u16).to_le_bytes());
-        frame[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-        frame[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
+        mux::put_session_id(&mut frame[FRAME_HDR..], session);
+        mux::put_stream_id(&mut frame[FRAME_HDR..], stream);
         frame[FRAME_HDR + mux::STREAM_DATA_PREFIX..FRAME_HDR + mux::STREAM_DATA_PREFIX + n]
             .copy_from_slice(&req[..n]);
         let total = FRAME_HDR + body_len;
@@ -597,8 +597,8 @@ unsafe fn client_send_request(s: &mut super::super::HttpState) {
     let mut close = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 1];
     close[0] = mux::CMD_MUX_STREAM_CLOSE;
     close[1..3].copy_from_slice(&(cplen as u16).to_le_bytes());
-    close[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-    close[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
+    mux::put_session_id(&mut close[FRAME_HDR..], session);
+    mux::put_stream_id(&mut close[FRAME_HDR..], stream);
     close[FRAME_HDR + 8] = mux::STATUS_OK;
     if (sys.channel_write)(out_chan, close.as_ptr(), close.len()) > 0 {
         s.h3_client.fin_sent = true;

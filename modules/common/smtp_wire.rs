@@ -89,6 +89,15 @@ pub const SMTP_OUT_CLOSED: u8 = 6;
 pub const SMTP_OUT_CANCELLED: u8 = 7;
 /// The request record itself could not be used.
 pub const SMTP_OUT_MALFORMED: u8 = 8;
+/// Credentials were configured but could not be sent: the graph did not
+/// declare the channel confidential, or the server offered no mechanism this
+/// module speaks.
+///
+/// Distinct from a refusal because the server never saw a credential — nothing
+/// about the message or the account is in question, only the deployment. A
+/// retry policy should not repeat the submission; an operator should read the
+/// graph.
+pub const SMTP_OUT_AUTH_UNAVAILABLE: u8 = 9;
 
 /// Classify a final reply code for a caller's retry policy.
 ///

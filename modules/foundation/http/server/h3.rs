@@ -85,8 +85,17 @@ use super::super::wire::h3::{
 };
 use super::super::wire::qpack;
 
-/// Maximum concurrent h3 request streams handled per connection.
-/// Mirrors h2's `MAX_STREAMS = 4` so the slot table size is unchanged.
+/// Maximum concurrent h3 request streams, GLOBAL across sessions (the slot
+/// table is module-scope). 16 on aarch64 — two streams per session at the
+/// 8-session table, ~3.2 KB of buffers per slot (~51 KB total), with the
+/// refusal at the ceiling pinned by test and the Pi 5 ladder measuring the
+/// latency cost (rfc_hardening §7.4).
+#[cfg(target_arch = "aarch64")]
+pub const MAX_H3_STREAMS: usize = 16;
+/// Non-aarch64 keeps the small table: h3 rides fluxor `quic`, which targets
+/// bcm2712 only, so on rp2350 this state is structurally idle and pays for
+/// nothing beyond existing.
+#[cfg(not(target_arch = "aarch64"))]
 pub const MAX_H3_STREAMS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -240,6 +249,14 @@ pub struct H3State {
     /// module-globally lets one connection's limits govern how another
     /// connection's responses are encoded.
     pub sessions: [H3Session; MAX_H3_SESSIONS],
+    /// Sessions the table could not hold, owed an explicit transport close —
+    /// a client whose session opened and then answers nothing is a hang,
+    /// which is the §7.5 failure shape. Bounded ring; a refusal that cannot
+    /// even queue is dropped counted.
+    pub refused_sessions: [u32; 4],
+    pub refused_len: u8,
+    /// Total sessions refused at the ceiling.
+    pub sessions_refused: u32,
     /// Round-robin cursor for session-scoped emission (preamble opens,
     /// control-stream writes, connection closes), so one session's
     /// preamble cannot hold up another's.
@@ -255,14 +272,18 @@ pub struct H3State {
 impl H3State {
     pub const fn new() -> Self {
         Self {
-            slots: [
-                H3StreamSlot::empty(),
-                H3StreamSlot::empty(),
-                H3StreamSlot::empty(),
-                H3StreamSlot::empty(),
-            ],
+            slots: {
+                const EMPTY_SLOT: H3StreamSlot = H3StreamSlot::empty();
+                [EMPTY_SLOT; MAX_H3_STREAMS]
+            },
             emit_cursor: 0,
-            sessions: [H3Session::empty(), H3Session::empty()],
+            sessions: {
+                const EMPTY: H3Session = H3Session::empty();
+                [EMPTY; MAX_H3_SESSIONS]
+            },
+            refused_sessions: [0; 4],
+            refused_len: 0,
+            sessions_refused: 0,
             sess_cursor: 0,
             draining: false,
         }
@@ -285,6 +306,9 @@ impl H3State {
 
 /// Concurrent HTTP/3 sessions. Matches the QUIC engine's connection pool,
 /// so a session the transport can carry always has somewhere to live.
+#[cfg(target_arch = "aarch64")]
+pub const MAX_H3_SESSIONS: usize = 8;
+#[cfg(not(target_arch = "aarch64"))]
 pub const MAX_H3_SESSIONS: usize = 2;
 
 /// Peer-initiated unidirectional streams tracked per session: control,
@@ -2171,7 +2195,7 @@ pub(crate) unsafe fn pump_mux_frame(
     if payload.len() < mux::SESSION_ID_BYTES {
         return H3StreamOutcome::Ignored;
     }
-    let session = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let session = mux::session_id(payload);
 
     // ── session-scoped events ──────────────────────────────────────
     // Handled before the stream-prefix parse, because their bytes 4..8
@@ -2193,6 +2217,14 @@ pub(crate) unsafe fn pump_mux_frame(
             let alpn = &b[3..3 + alpn_len];
             let Some(i) = session_alloc(st, session) else {
                 // More sessions than this device advertises it can hold.
+                // Queue an explicit transport close: the peer's session is
+                // OPEN at the QUIC layer, and a server that just stops
+                // answering turns a bounded refusal into a client-side hang.
+                st.sessions_refused = st.sessions_refused.wrapping_add(1);
+                if (st.refused_len as usize) < st.refused_sessions.len() {
+                    st.refused_sessions[st.refused_len as usize] = session;
+                    st.refused_len += 1;
+                }
                 return H3StreamOutcome::SlotsExhausted;
             };
             // The ALPN arrives as opaque bytes and means nothing to the
@@ -2230,7 +2262,7 @@ pub(crate) unsafe fn pump_mux_frame(
     if payload.len() < mux::STREAM_DATA_PREFIX {
         return H3StreamOutcome::Ignored;
     }
-    let handle = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let handle = mux::stream_id(payload);
     let body = &payload[mux::STREAM_DATA_PREFIX..];
 
     let Some(si) = session_slot(st, session) else {
@@ -2258,10 +2290,7 @@ pub(crate) unsafe fn pump_mux_frame(
             if body.len() < mux::STREAM_ACCEPTED_BODY {
                 return H3StreamOutcome::Ignored;
             }
-            let flags = body[0];
-            let quic_id = u64::from_le_bytes([
-                body[1], body[2], body[3], body[4], body[5], body[6], body[7], body[8],
-            ]);
+            let (flags, quic_id) = mux::stream_accepted_parts(body);
             if flags & mux::STREAM_FLAG_UNI != 0 {
                 // A peer unidirectional stream. What it IS is decided from
                 // its first bytes, which have not arrived yet — so it is
@@ -2498,6 +2527,8 @@ pub enum SessCommit {
 pub enum H3Commit {
     /// A session-scoped frame from the session at this index.
     Session(usize, SessCommit),
+    /// The close refusing an unadmitted session has gone out; pop it.
+    RefusedCloseSent,
     /// The slot's RESET_STREAM has gone out; the slot is now free.
     ResetSent(usize),
     /// The slot's close has gone out; the slot is now free.
@@ -2536,6 +2567,18 @@ pub(crate) fn commit_session(sess: &mut H3Session, what: SessCommit) {
 /// in favour of its neighbour.
 pub fn commit_out(st: &mut H3State, what: H3Commit) {
     match what {
+        H3Commit::RefusedCloseSent => {
+            // Pop the head of the refused ring.
+            let n = st.refused_len as usize;
+            if n > 0 {
+                let mut k = 1;
+                while k < n {
+                    st.refused_sessions[k - 1] = st.refused_sessions[k];
+                    k += 1;
+                }
+                st.refused_len -= 1;
+            }
+        }
         H3Commit::Session(si, w) => {
             commit_session(&mut st.sessions[si], w);
             st.sess_cursor = ((si + 1) % MAX_H3_SESSIONS) as u8;
@@ -2580,6 +2623,23 @@ pub fn commit_out(st: &mut H3State, what: H3Commit) {
 /// the handles the first time it answered out of order. The cost is a
 /// scheduler round trip per stream, once per connection.
 fn session_next_out(st: &H3State, out: &mut [u8]) -> Option<(usize, H3Commit)> {
+    // A refused session's close outranks everything: until it goes out, a
+    // client the table never admitted is waiting on a connection that will
+    // never answer.
+    if st.refused_len > 0 {
+        let session = st.refused_sessions[0];
+        let plen = mux::SESSION_ID_BYTES + 1 + mux::APP_ERROR_BYTES;
+        if out.len() >= FRAME_HDR + plen {
+            out[0] = mux::CMD_MUX_SESSION_CLOSE;
+            out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
+            mux::put_session_id(&mut out[FRAME_HDR..], session);
+            out[FRAME_HDR + 4] = mux::STATUS_OK;
+            // H3_REQUEST_REJECTED (RFC 9114 §8.1): the peer may retry
+            // elsewhere; nothing it sent was processed.
+            out[FRAME_HDR + 5..FRAME_HDR + 13].copy_from_slice(&0x10Bu64.to_le_bytes());
+            return Some((FRAME_HDR + plen, H3Commit::RefusedCloseSent));
+        }
+    }
     for step in 0..MAX_H3_SESSIONS {
         let si = (st.sess_cursor as usize + step) % MAX_H3_SESSIONS;
         let sess = &st.sessions[si];
@@ -2656,8 +2716,8 @@ fn session_drain_out(sess: &H3Session, out: &mut [u8]) -> Option<(usize, SessCom
         }
         out[0] = mux::CMD_MUX_STREAM_SEND;
         out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-        out[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-        out[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&sess.ctrl.handle.to_le_bytes());
+        mux::put_session_id(&mut out[FRAME_HDR..], session);
+        mux::put_stream_id(&mut out[FRAME_HDR..], sess.ctrl.handle);
         out[FRAME_HDR + 8..FRAME_HDR + 8 + total].copy_from_slice(&framed[..total]);
         return Some((FRAME_HDR + plen, SessCommit::GoawaySent));
     }
@@ -2668,7 +2728,7 @@ fn session_drain_out(sess: &H3Session, out: &mut [u8]) -> Option<(usize, SessCom
     }
     out[0] = mux::CMD_MUX_SESSION_CLOSE;
     out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-    out[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
+    mux::put_session_id(&mut out[FRAME_HDR..], session);
     out[FRAME_HDR + 4] = mux::STATUS_OK;
     out[FRAME_HDR + 5..FRAME_HDR + 13].copy_from_slice(&0u64.to_le_bytes());
     Some((FRAME_HDR + plen, SessCommit::Closed))
@@ -2705,7 +2765,7 @@ pub(crate) fn session_preamble_out(
         }
         out[0] = mux::CMD_MUX_SESSION_CLOSE;
         out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-        out[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
+        mux::put_session_id(&mut out[FRAME_HDR..], session);
         out[FRAME_HDR + 4] = mux::STATUS_PROTOCOL_ERROR;
         out[FRAME_HDR + 5..FRAME_HDR + 13].copy_from_slice(&code.to_le_bytes());
         return Some((FRAME_HDR + plen, SessCommit::ConnError));
@@ -2726,7 +2786,7 @@ pub(crate) fn session_preamble_out(
                 }
                 out[0] = mux::CMD_MUX_STREAM_OPEN;
                 out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-                out[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
+                mux::put_session_id(&mut out[FRAME_HDR..], session);
                 out[FRAME_HDR + 4] = mux::STREAM_FLAG_UNI;
                 return Some((FRAME_HDR + plen, SessCommit::UniOpening(which as u8)));
             }
@@ -2755,8 +2815,8 @@ pub(crate) fn session_preamble_out(
                 }
                 out[0] = mux::CMD_MUX_STREAM_SEND;
                 out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-                out[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-                out[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&uni.handle.to_le_bytes());
+                mux::put_session_id(&mut out[FRAME_HDR..], session);
+                mux::put_stream_id(&mut out[FRAME_HDR..], uni.handle);
                 out[FRAME_HDR + 8..FRAME_HDR + 8 + n].copy_from_slice(&body[..n]);
                 return Some((FRAME_HDR + plen, SessCommit::UniReady(which as u8)));
             }
@@ -2878,8 +2938,8 @@ pub fn stage_next_out(st: &H3State, out: &mut [u8]) -> Option<(usize, H3Commit)>
         }
         out[0] = mux::CMD_MUX_STREAM_RESET;
         out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-        out[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-        out[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
+        mux::put_session_id(&mut out[FRAME_HDR..], session);
+        mux::put_stream_id(&mut out[FRAME_HDR..], stream);
         out[FRAME_HDR + 8..FRAME_HDR + 16].copy_from_slice(&code.to_le_bytes());
         return Some((FRAME_HDR + plen, H3Commit::ResetSent(idx)));
     }
@@ -2900,8 +2960,8 @@ pub fn stage_next_out(st: &H3State, out: &mut [u8]) -> Option<(usize, H3Commit)>
             }
             out[0] = mux::CMD_MUX_STREAM_CLOSE;
             out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-            out[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
-            out[FRAME_HDR + 4..FRAME_HDR + 8].copy_from_slice(&stream.to_le_bytes());
+            mux::put_session_id(&mut out[FRAME_HDR..], session);
+            mux::put_stream_id(&mut out[FRAME_HDR..], stream);
             out[FRAME_HDR + 8] = mux::STATUS_OK;
             return Some((FRAME_HDR + plen, H3Commit::CloseSent(idx)));
         }
@@ -2923,7 +2983,7 @@ pub fn stage_next_out(st: &H3State, out: &mut [u8]) -> Option<(usize, H3Commit)>
         let plen = mux::STREAM_DATA_PREFIX + take;
         out[0] = mux::CMD_MUX_STREAM_SEND;
         out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
-        out[FRAME_HDR..FRAME_HDR + 4].copy_from_slice(&session.to_le_bytes());
+        mux::put_session_id(&mut out[FRAME_HDR..], session);
         out[FRAME_HDR + 4..hdr].copy_from_slice(&stream.to_le_bytes());
         let start = st.slots[idx].send_off;
         out[hdr..hdr + take].copy_from_slice(&st.slots[idx].send_buf[start..start + take]);

@@ -230,7 +230,11 @@ pub(crate) unsafe fn ws_begin_close(s: &mut HttpState, code: u16) {
 //
 // One mailbox-style write per frame, capped at CHANNEL_BUFFER_SIZE.
 
-pub(crate) const WS_FRAME_HDR: usize = 8;
+// The WsFrame envelope layout is the fluxor `ws_frame` contract's — the
+// header size, u32 conn id and all-ones unclaimed sentinel were previously
+// restated here (rfc_hardening.md §5.2).
+pub(crate) use super::super::abi::contracts::net::ws_frame;
+pub(crate) use ws_frame::FRAME_HDR as WS_FRAME_HDR;
 
 /// Header bytes to reserve at the front of `send_buf` when sizing a
 /// WS wire fragment. RFC 6455 §5.2 server-to-client frame headers
@@ -268,12 +272,13 @@ pub(crate) unsafe fn ws_emit_fanout_frame(
         return true;
     }
     let mut frame_buf = [0u8; super::super::abi::CHANNEL_BUFFER_SIZE];
-    let conn_id = cur_conn_id(s) as u32;
-    frame_buf[0..4].copy_from_slice(&conn_id.to_le_bytes());
-    frame_buf[4] = opcode;
-    frame_buf[5] = fin;
-    let plen = payload_len as u16;
-    frame_buf[6..8].copy_from_slice(&plen.to_le_bytes());
+    ws_frame::put_header(
+        &mut frame_buf,
+        cur_conn_id(s) as u32,
+        opcode,
+        fin,
+        payload_len as u16,
+    );
     if payload_len > 0 {
         core::ptr::copy_nonoverlapping(
             payload,
@@ -343,7 +348,7 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
     if n < WS_FRAME_HDR as i32 {
         return false;
     }
-    let payload_len = u16::from_le_bytes([frame_buf[6], frame_buf[7]]) as usize;
+    let payload_len = ws_frame::payload_len(&frame_buf) as usize;
     let total = WS_FRAME_HDR + payload_len;
     if (n as usize) < total {
         // The envelope claims more than one channel read carries. It has
@@ -352,8 +357,8 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
         s.server.ws_envelopes_dropped = s.server.ws_envelopes_dropped.wrapping_add(1);
         return false;
     }
-    let opcode = frame_buf[4];
-    let fin = frame_buf[5] != 0;
+    let opcode = ws_frame::opcode(&frame_buf);
+    let fin = ws_frame::fin(&frame_buf) != 0;
 
     // Route by envelope conn_id. ws_stream stamps the recipient
     // conn_id at bytes 0-3 of every envelope; the active slot
@@ -368,17 +373,16 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
     // default id of 0 would alias slot 0, which is typically the
     // IP listener and never a fan-out target.
     //
-    // Real conn_ids are u8 and originate from the IP module's TCP
-    // slot index (`MAX_TCP_CONNS`, independent of HTTP's
-    // `MAX_CONCURRENT_CONNS`). On the wire bytes 1..4 are
-    // zero-padding for real ids; they're all `0xFF` for the
-    // sentinel, which is how we distinguish "no real id yet" from
-    // a valid id 255. `find_slot_by_conn_id` returns `None` when
-    // no slot owns the requested id (the conn may have closed
-    // between the producer's write and our read), so it doubles
-    // as the validity check.
-    let conn_u32 = u32::from_le_bytes([frame_buf[0], frame_buf[1], frame_buf[2], frame_buf[3]]);
-    let target_idx = if conn_u32 == u32::MAX {
+    // Real conn_ids fit the net_proto u16 width and originate from the IP
+    // module's TCP slot table (`MAX_TCP_CONNS`, independent of HTTP's
+    // `MAX_CONCURRENT_CONNS`); on the wire bytes 2..4 are zero for a real
+    // id. The contract's all-ones CONN_UNCLAIMED is how "no real id yet" is
+    // told apart from a valid id — including a valid id 0.
+    // `find_slot_by_conn_id` returns `None` when no slot owns the requested
+    // id (the conn may have closed between the producer's write and our
+    // read), so it doubles as the validity check.
+    let conn_u32 = ws_frame::conn_id(&frame_buf);
+    let target_idx = if conn_u32 == ws_frame::CONN_UNCLAIMED {
         match find_sentinel_ws_fanout_slot(s) {
             Some(i) => i,
             None => {

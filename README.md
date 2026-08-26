@@ -50,17 +50,27 @@ and add no second ABI.
 | `http` | HTTP/1.1, HTTP/2 and HTTP/3 server and client; WebSocket upgrade; gRPC-over-HTTP/2 | rp2350, bcm2712 |
 | `websocket` | RFC 6455 HTTP/1.1 client: upgrade, verified accept, masked frames | bcm2712 |
 | `ws_stream` | `WsFrame` ⇄ `OctetStream` adapter for the server fan-out path | rp2350, bcm2712, linux, wasm |
-| `rtp` | RFC 3550 transmitter and receiver, PCMU/G.711 | rp2350, bcm2712 |
-| `sip` | RFC 3261 subset UAC/UAS for two-party PCMU voice, with receive-side jitter and playout | rp2350, bcm2712 |
-| `smtp` | RFC 5321 mail submission client: lockstep ESMTP, unauthenticated | bcm2712 |
+| `rtp` | RFC 3550 media endpoint, transmit and receive on one symmetric port, PCMU/G.711 | rp2350, bcm2712 |
+| `sip` | RFC 3261 subset UAC/UAS for two-party PCMU voice — signalling only | rp2350, bcm2712 |
+| `jitter` | RTP reorder and loss-concealing playout adapter | rp2350, bcm2712 |
+| `smtp` | RFC 5321 mail submission client: lockstep ESMTP, optional SASL PLAIN on a confidential channel | bcm2712 |
+| `mail` | RFC 5322 inbound parser: bounded facts record and streamed body per message | bcm2712 |
+| `stun` | RFC 5389 STUN Binding server; not an ICE agent, not a TURN relay | rp2350, bcm2712 |
 | `s3` | SigV4-signed S3 object client: GET/PUT/HEAD/DELETE, driven or probe | bcm2712 |
 
 Roles are deliberately asymmetric: `http` is both server and client,
-`websocket`, `smtp` and `s3` are clients only, `ws_stream` is an
-adapter, and `rtp`/`sip` are peer user agents. Nothing here promises
-a server for every protocol with a client. Targets are asymmetric
-too: the smallest silicon serves WebSocket without being able to dial
-one.
+`websocket`, `smtp` and `s3` are clients only, `ws_stream`,
+`mail` and `jitter` are adapters, `rtp`/`sip` are peer user agents,
+and `stun` is a server. Nothing here promises a server for every protocol with a
+client. Targets are asymmetric too: the smallest silicon serves
+WebSocket without being able to dial one.
+
+The TURN, SFrame and WebRTC session-description capabilities are
+codec cores, not modules: `turn_core` spells TURN messages and
+ChannelData without any relay existing, `sframe_core` is framing
+with nothing yet encrypting, and `webrtc_sdp` carries bounded
+session-description facts, not a WebRTC stack. Each is
+conformance-tested directly; none is deployable on its own.
 
 `http` ships as four variants selected in its manifest: `web`
 (HTTP/1.1 + WebSocket), `app` (HTTP/1.1 + the application fan-out,
@@ -138,7 +148,7 @@ the lockfile.
 
 | Path | Contents |
 | --- | --- |
-| `modules/foundation/` | The protocol modules: `http`, `websocket`, `ws_stream`, `rtp`, `sip`, `smtp`, `s3`. `fluxor modules build` packs each into a `.fmod`, plus one per declared variant. |
+| `modules/foundation/` | The protocol modules: `http`, `websocket`, `ws_stream`, `rtp`, `sip`, `jitter`, `smtp`, `mail`, `stun`, `s3`. `fluxor modules build` packs each into a `.fmod`, plus one per declared variant. |
 | `modules/common/` | I/O-free `no_std` codec cores, `include!`d verbatim by the modules. See [modules/common/README.md](modules/common/README.md). |
 | `tools/` | Repository scripts. |
 | `docs/` | Stable reference: guides, architecture, reference. Indexed by [docs/overview.md](docs/overview.md). |

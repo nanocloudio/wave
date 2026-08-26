@@ -78,7 +78,11 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-const WS_FRAME_HDR: usize = 8;
+// The WsFrame envelope layout is the fluxor `ws_frame` contract's — header
+// size, u32 conn id and the all-ones unclaimed sentinel were previously
+// restated here (rfc_hardening.md §5.2).
+use abi::contracts::net::ws_frame;
+use ws_frame::FRAME_HDR as WS_FRAME_HDR;
 const FRAME_BUF_BYTES: usize = abi::CHANNEL_BUFFER_SIZE;
 const WS_OPCODE_BINARY: u8 = 0x2;
 
@@ -161,14 +165,12 @@ pub extern "C" fn module_new(
     s.rx_out = unsafe { dev_channel_port(sys_ref, 1, 1) };
     s.tlm = TlmCounters::new();
     s.tlm_last_ms = 0;
-    // `u32::MAX` is the "unclaimed" sentinel: stamped on outbound
-    // envelopes when no inbound frame has arrived yet. The HTTP
-    // server's `ws_drain_fanout_input` recognises this sentinel and
-    // delivers to the first ws-fan-out slot rather than routing by
-    // a default-0 conn_id (which would collide with whatever
-    // connection happens to occupy slot 0). Real conn_ids fit in
-    // u8 (0..255), so u32::MAX is unambiguously distinguishable.
-    s.active_conn_id = u32::MAX;
+    // `CONN_UNCLAIMED` (all ones) is stamped on outbound envelopes when no
+    // inbound frame has arrived yet. The HTTP server's
+    // `ws_drain_fanout_input` recognises the sentinel and delivers to the
+    // active ws-fan-out slot rather than routing by a default-0 conn_id
+    // (which would collide with the connection legitimately holding id 0).
+    s.active_conn_id = ws_frame::CONN_UNCLAIMED;
     s.has_conn = false;
     s.tx_pending = [0u8; FRAME_BUF_BYTES];
     s.tx_pending_len = 0;
@@ -290,16 +292,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // on following steps before more bytes are pulled from `rx_in`.
             let mut parked = false;
             while off + WS_FRAME_HDR <= n {
-                let conn_id = u32::from_le_bytes([
-                    s.scratch[off],
-                    s.scratch[off + 1],
-                    s.scratch[off + 2],
-                    s.scratch[off + 3],
-                ]);
-                let opcode = s.scratch[off + 4];
-                let _fin = s.scratch[off + 5];
-                let payload_len =
-                    u16::from_le_bytes([s.scratch[off + 6], s.scratch[off + 7]]) as usize;
+                let conn_id = ws_frame::conn_id(&s.scratch[off..]);
+                let opcode = ws_frame::opcode(&s.scratch[off..]);
+                let payload_len = ws_frame::payload_len(&s.scratch[off..]) as usize;
                 if off + WS_FRAME_HDR + payload_len > n {
                     // Incomplete trailing frame. Frame writes upstream are
                     // atomic and the read buffer spans the whole channel,
@@ -463,16 +458,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             let payload_len = n as usize;
-            let conn_le = s.active_conn_id.to_le_bytes();
-            s.tx_pending[0] = conn_le[0];
-            s.tx_pending[1] = conn_le[1];
-            s.tx_pending[2] = conn_le[2];
-            s.tx_pending[3] = conn_le[3];
-            s.tx_pending[4] = WS_OPCODE_BINARY;
-            s.tx_pending[5] = 1;
-            let plen_le = (payload_len as u16).to_le_bytes();
-            s.tx_pending[6] = plen_le[0];
-            s.tx_pending[7] = plen_le[1];
+            ws_frame::put_header(
+                &mut s.tx_pending,
+                s.active_conn_id,
+                WS_OPCODE_BINARY,
+                1,
+                payload_len as u16,
+            );
             let total = WS_FRAME_HDR + payload_len;
             // Try direct write first.
             // SAFETY: `total = WS_FRAME_HDR + payload_len`; `payload_len`

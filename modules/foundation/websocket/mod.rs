@@ -60,13 +60,14 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs"); // sha1
 include!("../../common/ws_frame_core.rs");
 include!("../../common/ws_core.rs");
 
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
+// The NetProto opcodes and identity accessors come from the owning contract
+// — never redeclared locally, so a wire change there is a compile change here
+// (rfc_hardening.md §5.2).
+use abi::contracts::net::net_proto::{
+    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT, CMD_SEND as NET_CMD_SEND,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR,
+};
 
 const NET_BUF: usize = 2048;
 const REQ_BUF: usize = 512;
@@ -398,7 +399,8 @@ unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
         }
         WsAct::Fail => {
             if s.conn_present != 0 {
-                let close = s.conn_id.to_le_bytes();
+                let mut close = [0u8; 2];
+                net_proto::put_conn_id(&mut close, s.conn_id);
                 net_write_frame(
                     sys,
                     s.net_out,
@@ -457,23 +459,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if msg == 0 {
                     break;
                 }
-                let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
+                let payload = core::slice::from_raw_parts(s.nbuf.as_ptr().add(NET_FRAME_HDR), plen);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == WsPhase::Connecting => {
-                        if plen >= 3 && *payload.add(2) == s.tag {
-                            s.conn_id = u16::from_le_bytes([*payload, *payload.add(1)]);
-                            s.conn_present = 1;
-                            feed(s, sys, WsEv::Connected, now);
+                        if plen >= 3 {
+                            let (cid, tag) = net_proto::connected_parts(payload);
+                            if tag == s.tag {
+                                s.conn_id = cid;
+                                s.conn_present = 1;
+                                feed(s, sys, WsEv::Connected, now);
+                            }
                         }
                     }
                     NET_MSG_DATA if s.phase != WsPhase::Disconnected => {
-                        if plen > 2 && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id
-                        {
+                        if plen > 2 && net_proto::conn_id(payload) == s.conn_id {
                             let data_len = plen - 2;
                             let space = ACC_BUF - s.acc_len as usize;
                             let take = if data_len < space { data_len } else { space };
                             core::ptr::copy_nonoverlapping(
-                                payload.add(2),
+                                payload.as_ptr().add(2),
                                 s.acc.as_mut_ptr().add(s.acc_len as usize),
                                 take,
                             );
@@ -518,8 +522,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     NET_MSG_CLOSED if s.phase != WsPhase::Disconnected => {
-                        if plen >= 2 && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id
-                        {
+                        if plen >= 2 && net_proto::conn_id(payload) == s.conn_id {
                             feed(s, sys, WsEv::PeerClosed, now);
                         }
                     }
@@ -529,16 +532,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // when the dial failed before a slot was allocated,
                         // indistinguishable from a valid id 0). The
                         // established-connection clause is gated on
-                        // `conn_present`, not on the phase — during
-                        // `Connecting` this module's `conn_id` is still
-                        // zero-initialised, so a peer's failed dial carrying
-                        // conn_id 0 would otherwise be claimed here.
-                        let ours = (s.phase == WsPhase::Connecting
-                            && plen >= 4
-                            && *payload.add(3) == s.tag)
-                            || (s.conn_present != 0
-                                && plen >= 2
-                                && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id);
+                        // `conn_present` AND on the error being UNTAGGED — a
+                        // tagged error is some module's connect failure, and
+                        // its meaningless conn_id colliding with ours must not
+                        // read as our established connection failing.
+                        let ours = if plen >= 3 {
+                            let (cid, _errno, tag) = net_proto::error_parts(payload);
+                            (s.phase == WsPhase::Connecting && tag == s.tag)
+                                || (s.conn_present != 0
+                                    && tag == net_proto::REQUESTER_TAG_NONE
+                                    && cid == s.conn_id)
+                        } else {
+                            false
+                        };
                         if ours {
                             feed(s, sys, WsEv::NetError, now);
                         }
@@ -566,12 +572,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     max_chunk
                 };
                 let total_payload = chunk + 2;
-                let cb = s.conn_id.to_le_bytes();
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
                 s.nbuf[2] = (total_payload >> 8) as u8;
-                s.nbuf[3] = cb[0];
-                s.nbuf[4] = cb[1];
+                net_proto::put_conn_id(&mut s.nbuf[NET_FRAME_HDR..], s.conn_id);
                 core::ptr::copy_nonoverlapping(
                     s.req.as_ptr().add(s.req_sent as usize),
                     s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 2),
@@ -608,7 +612,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // retries next step.
         if s.draining == 1 && matches!(s.phase, WsPhase::Disconnected | WsPhase::Ready) {
             if s.conn_present != 0 {
-                let close = s.conn_id.to_le_bytes();
+                let mut close = [0u8; 2];
+                net_proto::put_conn_id(&mut close, s.conn_id);
                 if net_write_frame(
                     sys,
                     s.net_out,

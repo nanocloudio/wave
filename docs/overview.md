@@ -10,8 +10,10 @@ front door. This page indexes the doc set.
   bring-up: the `http` module on a Linux host, config embedded,
   smoke checked with curl.
 - [specification.md](specification.md) — what Wave is and is not:
-  the ownership boundary with fluxor, per-module scope and declared
-  limits, correctness and bounds requirements.
+  the normative definition, the four protocol families and their
+  maturity catalogue, the admission and rejection rules for future
+  protocols, the ecosystem ownership table, per-module scope and
+  declared limits, correctness and bounds requirements.
 
 ## Architecture
 

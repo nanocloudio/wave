@@ -11,6 +11,7 @@
 //! must stay that way — see this crate's `Cargo.toml`. The measuring instrument
 //! may not share code with the thing measured.
 
+pub mod h3;
 pub mod proto;
 
 use std::time::Duration;

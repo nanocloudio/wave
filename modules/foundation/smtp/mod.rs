@@ -1,7 +1,7 @@
 //! SMTP connector — a GENUINE per-protocol Fluxor foundation module for mail
 //! SUBMISSION: the lockstep ESMTP conversation
-//!   220 greeting -> EHLO/250 -> MAIL FROM/250 -> RCPT TO/250 -> DATA/354
-//!   -> <message>.CRLF/250 -> QUIT/221
+//!   220 greeting -> EHLO/250 -> [AUTH PLAIN/235] -> MAIL FROM/250
+//!   -> RCPT TO/250 -> DATA/354 -> <message>.CRLF/250 -> QUIT/221
 //! where each command waits on the 3-digit code of the previous multi-line
 //! reply, and the message body is RFC 5321 dot-stuffed and terminated by
 //! `\r\n.\r\n`. A reply-code-driven, multi-round-trip session over a
@@ -33,9 +33,25 @@
 //! Ports:  net_in/net_out (transport), status_out (human-readable status),
 //!         request_in (submissions), result_out (one result each).
 //! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `helo` (EHLO domain),
-//!         `mail_from`, `rcpt_to`, `body` (message headers+body).
-//! Scope:  unauthenticated submission (no STARTTLS / AUTH) — the class most
-//!         relay/sink deployments use behind a trusted boundary.
+//!         `mail_from`, `rcpt_to`, `body` (message headers+body),
+//!         `auth_user`/`auth_pass` (SASL PLAIN credentials),
+//!         `channel_confidential` (the graph's assertion that a `tls` node
+//!         sits in front — required before any credential is sent).
+//! Scope:  submission, authenticated or not. No STARTTLS: compose `tls`.
+//!
+//! **AUTH, and why not STARTTLS.** `AUTH PLAIN` (RFC 4616) is implemented, so a
+//! relay requiring authenticated submission is reachable. STARTTLS is not, and
+//! its absence is a position rather than a gap: it asks a module to renegotiate
+//! its own transport mid-stream, which is the thing a dataflow graph expresses
+//! by composing nodes instead. Confidentiality comes from putting `tls` in
+//! client mode in front of this module — the implicit-TLS submission shape,
+//! port 465 — and this module is then unchanged and unaware, which is the
+//! property that makes the composition worth having.
+//!
+//! The cost is that it cannot SEE whether it is confidential, so
+//! `channel_confidential` is how the deployment says so. It defaults to
+//! refusing, because a password on a plaintext wire is the failure nobody
+//! notices.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -80,9 +96,10 @@ mod smtp_core;
 #[path = "../../common/smtp_core.rs"]
 pub mod smtp_core;
 use smtp_core::{
-    smtp_body, smtp_body_chunk, smtp_body_end, smtp_data, smtp_ehlo, smtp_mail_from, smtp_on_reply,
-    smtp_phase_code, smtp_quit, smtp_rcpt_to, smtp_reply_accepts, smtp_reply_line, smtp_reply_text,
-    SmtpCmd, SmtpPhase,
+    smtp_auth_plain, smtp_body, smtp_body_chunk, smtp_body_end, smtp_data, smtp_ehlo,
+    smtp_mail_from, smtp_offers_auth_plain, smtp_on_reply, smtp_phase_code, smtp_quit,
+    smtp_rcpt_to, smtp_reply_accepts, smtp_reply_line, smtp_reply_text, SmtpAuthPlan, SmtpCmd,
+    SmtpPhase,
 };
 
 #[cfg(not(feature = "host-test"))]
@@ -94,22 +111,23 @@ pub mod smtp_wire;
 use smtp_wire::{
     parse_smtp_request, smtp_classify_code, smtp_enhanced_status, smtp_op_is_known,
     write_smtp_result, SmtpResultHead, SMTP_FLAG_MORE_BODY, SMTP_OP_BODY, SMTP_OP_CANCEL,
-    SMTP_OP_SUBMIT, SMTP_OUT_ACCEPTED, SMTP_OUT_CANCELLED, SMTP_OUT_CLOSED,
-    SMTP_OUT_CONNECT_FAILED, SMTP_OUT_MALFORMED, SMTP_OUT_PROTOCOL_ERROR, SMTP_OUT_TIMEOUT,
-    SMTP_REQ_HDR, SMTP_RES_HDR,
+    SMTP_OP_SUBMIT, SMTP_OUT_ACCEPTED, SMTP_OUT_AUTH_UNAVAILABLE, SMTP_OUT_CANCELLED,
+    SMTP_OUT_CLOSED, SMTP_OUT_CONNECT_FAILED, SMTP_OUT_MALFORMED, SMTP_OUT_PROTOCOL_ERROR,
+    SMTP_OUT_TIMEOUT, SMTP_REQ_HDR, SMTP_RES_HDR,
 };
 
 #[path = "../../common/hex_core.rs"]
 mod hex_core;
 use hex_core::hex_decode;
 
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
+// The NetProto opcodes and identity accessors come from the owning contract
+// — never redeclared locally, so a wire change there is a compile change here
+// (rfc_hardening.md §5.2).
+use abi::contracts::net::net_proto::{
+    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT, CMD_SEND as NET_CMD_SEND,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR,
+};
 
 const NET_BUF: usize = 2048;
 /// Raw body bytes held between arriving on `request_in` and reaching the wire.
@@ -126,6 +144,11 @@ const REQ_BUF: usize = 2 * CHUNK_BUF + 64;
 const STATUS_BUF: usize = 64;
 const ACC_BUF: usize = 2048;
 const NAME_BUF: usize = 256;
+/// Longest username or password. Sized so `\0user\0pass` always fits
+/// `SMTP_SASL_MAX` with room for both at full length. Like every other string
+/// param here, a longer value is truncated at this bound rather than rejected;
+/// the relay then answers 535 and the result says so.
+const CRED_BUF: usize = 120;
 /// Bounded reply text kept for the result. A server explaining a refusal in
 /// more words than this has its explanation truncated, not the module's buffers
 /// grown by whatever it chose to send.
@@ -151,6 +174,26 @@ struct SmtpState {
     ep_hex_len: u16,
     helo: [u8; NAME_BUF],
     helo_len: u16,
+    auth_user: [u8; CRED_BUF],
+    auth_user_len: u16,
+    auth_pass: [u8; CRED_BUF],
+    auth_pass_len: u16,
+    /// The graph's assertion that this connection is confidential.
+    ///
+    /// `AUTH PLAIN` sends the password in the clear, and this module cannot
+    /// tell whether a `tls` node sits in front of it — that is what composing
+    /// transports means, and it is why the deployment declares this rather
+    /// than the module guessing. A graph that wires `tls` in client mode ahead
+    /// of `smtp` sets it to 1.
+    ///
+    /// Default `0` refuses to send credentials at all: refusing is a failed
+    /// submission someone investigates, proceeding is a password on the wire
+    /// nobody notices.
+    channel_confidential: u32,
+    /// Set while draining the EHLO reply, when a line offered `AUTH PLAIN`.
+    /// Cleared with the rest of the submission, because it describes the
+    /// greeting of one connection and each submission opens its own.
+    saw_auth_plain: u8,
 
     // ── the submission in flight ──────────────────────────────────────────
     /// 1 while a submission is in flight. One at a time: the transport is a
@@ -269,6 +312,19 @@ define_params! {
             s.chunk[s.chunk_len as usize] = *d.add(i); s.chunk_len += 1; i += 1;
         }
     };
+    6, auth_user, str, 0 => |s, d, len| {
+        let mut i = 0usize;
+        while i < len && (s.auth_user_len as usize) < CRED_BUF {
+            s.auth_user[s.auth_user_len as usize] = *d.add(i); s.auth_user_len += 1; i += 1;
+        }
+    };
+    7, auth_pass, str, 0 => |s, d, len| {
+        let mut i = 0usize;
+        while i < len && (s.auth_pass_len as usize) < CRED_BUF {
+            s.auth_pass[s.auth_pass_len as usize] = *d.add(i); s.auth_pass_len += 1; i += 1;
+        }
+    };
+    8, channel_confidential, u32, 0 => |s, d, len| { s.channel_confidential = p_u32(d, len, 0, 0); };
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -321,6 +377,9 @@ pub extern "C" fn module_new(
         s.port = 0;
         s.ep_hex_len = 0;
         s.helo_len = 0;
+        s.auth_user_len = 0;
+        s.auth_pass_len = 0;
+        s.saw_auth_plain = 0;
         s.op_active = 0;
         s.cid = 0;
         s.mail_from_len = 0;
@@ -519,6 +578,17 @@ unsafe fn stage_req(s: &mut SmtpState, bytes: &[u8], now: u64) {
     s.started_ms = now;
 }
 
+/// Overwrite `bytes` with zeroes in a way the optimiser may not elide.
+///
+/// A plain `fill(0)` on a local nothing reads again is a dead store the
+/// compiler is free to delete, which is exactly the case every caller here is.
+fn zero_bytes(bytes: &mut [u8]) {
+    for b in bytes {
+        // SAFETY: `b` is a live, aligned, unaliased `&mut u8`.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+}
+
 /// Build the command for `cmd` into a scratch buffer and stage it.
 unsafe fn stage_cmd(s: &mut SmtpState, cmd: SmtpCmd, now: u64) {
     let mut out = [0u8; REQ_BUF];
@@ -540,6 +610,26 @@ unsafe fn stage_cmd(s: &mut SmtpState, cmd: SmtpCmd, now: u64) {
             let mut r = [0u8; NAME_BUF];
             r[..rl].copy_from_slice(&s.rcpt_to[..rl]);
             smtp_rcpt_to(&r[..rl], &mut out)
+        }
+        SmtpCmd::SendAuth => {
+            let ul = s.auth_user_len as usize;
+            let pl = s.auth_pass_len as usize;
+            let mut u = [0u8; CRED_BUF];
+            let mut w = [0u8; CRED_BUF];
+            u[..ul].copy_from_slice(&s.auth_user[..ul]);
+            w[..pl].copy_from_slice(&s.auth_pass[..pl]);
+            let built = smtp_auth_plain(&u[..ul], &w[..pl], &mut out);
+            // Every stack copy of the credential dies with the command it
+            // built. `out` is included and is not optional: it holds the
+            // encoded secret, it is reused by the next command, and on the
+            // `None` path it holds a half-built one nothing else would clear.
+            zero_bytes(&mut u);
+            zero_bytes(&mut w);
+            if let Some(n) = built {
+                stage_req(s, &out[..n], now);
+            }
+            zero_bytes(&mut out);
+            return;
         }
         SmtpCmd::SendData => smtp_data(&mut out),
         // The body is streamed rather than built in one piece; entering `Body`
@@ -593,6 +683,27 @@ unsafe fn pump_body(s: &mut SmtpState, now: u64) {
 
 // ── reply handling ────────────────────────────────────────────────────────
 
+/// What this session must do about credentials, once EHLO has been answered.
+///
+/// Credentials count as configured when a username is present. A password
+/// without a username is not a credential and is treated as none: the
+/// alternative is authenticating as the empty user, which no relay accepts and
+/// which would surface as a rejected submission rather than the configuration
+/// error it is.
+fn auth_plan(s: &SmtpState) -> SmtpAuthPlan {
+    if s.auth_user_len == 0 {
+        return SmtpAuthPlan::None;
+    }
+    // Either refusal fails the submission rather than falling back to an
+    // unauthenticated one: a message meant to carry credentials that did not
+    // is one nobody can attribute, and the operator who configured a username
+    // would never learn it did not travel.
+    if s.channel_confidential == 0 || s.saw_auth_plain == 0 {
+        return SmtpAuthPlan::Refuse;
+    }
+    SmtpAuthPlan::Plain
+}
+
 /// Advance the conversation on a FINAL reply `code`.
 unsafe fn on_reply(s: &mut SmtpState, code: u16, now: u64) {
     // Acceptance is decided against the phase the reply answers, before the
@@ -604,8 +715,18 @@ unsafe fn on_reply(s: &mut SmtpState, code: u16, now: u64) {
         emit_result(s, SMTP_OUT_ACCEPTED, answered);
         emit_status(s, b"smtp: delivered\n");
     }
-    let (cmd, next) = smtp_on_reply(s.phase, code);
+    let plan = auth_plan(s);
+    let (cmd, next) = smtp_on_reply(s.phase, code, plan);
     s.phase = next;
+    // A plan of `Refuse` fails the EHLO step with a 250 in hand. Classifying
+    // that by reply code would report a protocol error against a reply that
+    // was perfectly good, and point the operator at the server rather than at
+    // the graph that configured credentials it could not send.
+    //
+    // The 250 is part of the condition, not decoration: a server that refuses
+    // EHLO outright refused it for its own reasons, and that refusal is the
+    // server's to report however the credentials were configured.
+    let refused_auth = answered == SmtpPhase::Ehlo && code == 250 && plan == SmtpAuthPlan::Refuse;
     match cmd {
         SmtpCmd::Complete => {
             // The 221 to QUIT. The message was already accounted for at
@@ -614,8 +735,13 @@ unsafe fn on_reply(s: &mut SmtpState, code: u16, now: u64) {
         }
         SmtpCmd::Fail => {
             s.errors = s.errors.wrapping_add(1);
-            emit_result(s, smtp_classify_code(code), answered);
-            emit_status(s, b"smtp: rejected\n");
+            if refused_auth {
+                emit_result(s, SMTP_OUT_AUTH_UNAVAILABLE, answered);
+                emit_status(s, b"smtp: auth unavailable\n");
+            } else {
+                emit_result(s, smtp_classify_code(code), answered);
+                emit_status(s, b"smtp: rejected\n");
+            }
             close_connection(s);
         }
         other => stage_cmd(s, other, now),
@@ -633,6 +759,13 @@ unsafe fn drain_replies(s: &mut SmtpState, now: u64) {
             Some(v) => v,
             None => break,
         };
+        // ESMTP capabilities arrive on the EHLO reply, and a multi-line 250
+        // puts them on the CONTINUATION lines — which the branch below only
+        // ever sees the last of. Scanned here, before the line is consumed,
+        // so `AUTH PLAIN` is noticed wherever the server chose to put it.
+        if matches!(s.phase, SmtpPhase::Ehlo) && smtp_offers_auth_plain(&s.acc[..len]) {
+            s.saw_auth_plain = 1;
+        }
         if is_final {
             if let Some((at, text_len)) = smtp_reply_text(&s.acc[..s.acc_len as usize], len) {
                 let mut text = [0u8; TEXT_BUF];
@@ -662,7 +795,8 @@ unsafe fn close_connection(s: &mut SmtpState) {
     if s.conn_present == 0 {
         return;
     }
-    let close = s.conn_id.to_le_bytes();
+    let mut close = [0u8; 2];
+    net_proto::put_conn_id(&mut close, s.conn_id);
     net_write_frame(
         &*s.syscalls,
         s.net_out,
@@ -695,6 +829,11 @@ unsafe fn finish_op(s: &mut SmtpState) {
     s.at_line_start = 1;
     s.ends_crlf = 0;
     s.body_terminated = 0;
+    // The capability belongs to the connection this submission opened, and the
+    // next one opens its own. Carried over, a server that offered AUTH once
+    // would have credentials sent to it on a later greeting that offered
+    // nothing.
+    s.saw_auth_plain = 0;
     s.phase = SmtpPhase::Disconnected;
     s.req_len = 0;
     s.req_sent = 0;
@@ -969,11 +1108,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if msg == 0 {
                     break;
                 }
-                let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
+                let payload = core::slice::from_raw_parts(s.nbuf.as_ptr().add(NET_FRAME_HDR), plen);
                 match msg {
                     NET_MSG_CONNECTED if s.phase == SmtpPhase::Connecting => {
-                        if plen >= 3 && *payload.add(2) == s.tag {
-                            s.conn_id = u16::from_le_bytes([*payload, *payload.add(1)]);
+                        let (cid, tag) = if plen >= 3 {
+                            net_proto::connected_parts(payload)
+                        } else {
+                            (0, net_proto::REQUESTER_TAG_NONE)
+                        };
+                        if plen >= 3 && tag == s.tag {
+                            s.conn_id = cid;
                             s.conn_present = 1;
                             s.phase = SmtpPhase::Greet; // await 220
                             s.started_ms = now;
@@ -982,13 +1126,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     NET_MSG_DATA
                         if !matches!(s.phase, SmtpPhase::Disconnected | SmtpPhase::Connecting) =>
                     {
-                        if plen > 2 && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id
-                        {
+                        if plen > 2 && net_proto::conn_id(payload) == s.conn_id {
                             let data_len = plen - 2;
                             let space = ACC_BUF - s.acc_len as usize;
                             let take = if data_len < space { data_len } else { space };
                             core::ptr::copy_nonoverlapping(
-                                payload.add(2),
+                                payload.as_ptr().add(2),
                                 s.acc.as_mut_ptr().add(s.acc_len as usize),
                                 take,
                             );
@@ -998,7 +1141,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     NET_MSG_CLOSED if !matches!(s.phase, SmtpPhase::Disconnected) => {
                         if plen >= 2
-                            && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id
+                            && net_proto::conn_id(payload) == s.conn_id
                             && !matches!(s.phase, SmtpPhase::Done)
                         {
                             s.phase = SmtpPhase::Failed;
@@ -1021,12 +1164,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // `Connecting` this module's `conn_id` is still
                         // zero-initialised, so a peer's failed dial carrying
                         // conn_id 0 would otherwise be claimed here.
-                        let connecting = s.phase == SmtpPhase::Connecting
-                            && plen >= 4
-                            && *payload.add(3) == s.tag;
+                        // The established clause additionally requires the
+                        // error to be UNTAGGED: a tagged error is some
+                        // module's connect failure, and its meaningless
+                        // conn_id colliding with ours must not read as our
+                        // established connection failing.
+                        let (err_cid, err_tag) = if plen >= 3 {
+                            let (c, _e, t) = net_proto::error_parts(payload);
+                            (c, t)
+                        } else {
+                            (0, net_proto::REQUESTER_TAG_NONE)
+                        };
+                        let connecting =
+                            s.phase == SmtpPhase::Connecting && plen >= 4 && err_tag == s.tag;
                         let established = s.conn_present != 0
-                            && plen >= 2
-                            && u16::from_le_bytes([*payload, *payload.add(1)]) == s.conn_id;
+                            && plen >= 3
+                            && err_tag == net_proto::REQUESTER_TAG_NONE
+                            && err_cid == s.conn_id;
                         if (connecting || established)
                             && !matches!(s.phase, SmtpPhase::Done | SmtpPhase::Failed)
                         {
@@ -1065,12 +1219,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     max_chunk
                 };
                 let total_payload = chunk + 2;
-                let cb = s.conn_id.to_le_bytes();
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
                 s.nbuf[2] = (total_payload >> 8) as u8;
-                s.nbuf[3] = cb[0];
-                s.nbuf[4] = cb[1];
+                net_proto::put_conn_id(&mut s.nbuf[NET_FRAME_HDR..], s.conn_id);
                 core::ptr::copy_nonoverlapping(
                     s.req.as_ptr().add(s.req_sent as usize),
                     s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 2),
@@ -1125,7 +1277,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // receives.
         if s.draining == 1 && s.res_owed == 0 && s.status_len == 0 && s.op_active == 0 {
             if s.conn_present != 0 {
-                let close = s.conn_id.to_le_bytes();
+                let mut close = [0u8; 2];
+                net_proto::put_conn_id(&mut close, s.conn_id);
                 if net_write_frame(
                     sys,
                     s.net_out,

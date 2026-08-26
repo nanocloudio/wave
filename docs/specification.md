@@ -2,14 +2,123 @@
 
 ## Definition
 
-Wave is the fluxor-native home for portable application-protocol
-capabilities — HTTP, WebSocket, gRPC, RTP, SIP, SMTP and S3 — in both
-client and server roles. It exists so applications consume bounded
-protocol modules without fluxor becoming the owner of application or
-session protocol semantics.
+Wave is the fluxor-native home for reusable, bounded application-wire
+mechanics above fluxor transports. It began with HTTP-based
+protocols, but its boundary is the mechanism rather than HTTP
+ancestry:
 
-Wave is not a network stack, proxy product, API gateway, message
-broker, media session product, identity provider, or service mesh.
+- message parsing and serialisation;
+- framing and header compression;
+- bounded connection, stream and transaction state machines;
+- protocol-defined acknowledgement, retry, close and error
+  behaviour;
+- wire-level authentication and canonicalisation mechanics using
+  fluxor-owned cryptographic operations; and
+- portable conformance-tested adapters between a transport surface
+  and an application/domain record surface.
+
+It exists so applications consume bounded protocol modules without
+fluxor becoming the owner of application or session protocol
+semantics.
+
+Wave is not an unrestricted protocol collection. It does not own the
+meaning of a request, conversation, message, call, media session,
+route, identity, topic, database operation or network-reachability
+decision. It is not a network stack, proxy product, API gateway,
+message broker, media session product, identity provider, or service
+mesh.
+
+## Protocol families
+
+Wave's capabilities group into four families. These are catalogue and
+ownership families, not source directories or separately versioned
+packages: every fmod remains independently built, admitted, packaged
+and loaded, and a target pays only for the modules its graph selects.
+
+| Family | Mechanics |
+| --- | --- |
+| Web | HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC transport composition and the S3 HTTP/SigV4 profile |
+| Mail | SMTP submission, RFC 5322 parsing, MIME structure and bounded inbound mail records |
+| Realtime | SIP signalling, RTP/RTCP, SRTP/SRTCP framing and replay mechanics, SFrame framing, and WebRTC session-description facts |
+| Traversal | STUN and TURN wire and bounded transaction mechanics |
+
+Each capability is stated at one of five maturity levels, and the
+catalogue below names the level rather than letting a lower one read
+as a higher:
+
+1. an I/O-free codec core;
+2. a bounded transaction/state-machine core;
+3. a deployable fmod;
+4. a complete client, server or peer role; and
+5. an end-to-end composition with independent-peer and target
+   evidence.
+
+A core mounted for tests is not a deployable protocol role. Framing
+is not encryption, a TURN codec is not a relay, and WebRTC SDP
+attributes are not a WebRTC implementation.
+
+## Admission and rejection
+
+A future protocol belongs in Wave only when every rule below holds:
+
+1. It operates above a fluxor transport or generic stream/datagram
+   surface.
+2. Its mechanics can exist without owning application policy,
+   product meaning or durable domain state.
+3. It contains reusable bounded parsing, serialisation, framing or
+   transaction behaviour rather than only application-specific
+   request handling.
+4. It serves more than one application, connector profile or
+   independently useful composition.
+5. No sibling already owns state that is inseparable from its wire
+   behaviour.
+6. It can be tested against normative vectors and, where an
+   implementation exists, an independent peer.
+7. Its maximum memory, records, connections, streams, transactions,
+   work per step, timer behaviour, backpressure and failure outcomes
+   can be declared honestly for every target it names.
+8. It can consume current fluxor SDK contracts without creating a
+   private transport, security, scheduler or content-type surface.
+
+Admission is an architectural decision recorded in context history
+before a new public module identity is introduced. Reuse of a small
+codec by only one module is not by itself a reason to create another
+module or repository.
+
+The following are insufficient reasons to place work in Wave: the
+mechanism is described by an RFC; it travels over HTTP; it has a
+network-shaped name; its current consumer already depends on Wave; or
+its policy engine happens to drive a Wave codec. Application
+conventions over HTTP remain application compositions unless they
+contain independently reusable bounded wire mechanics. This
+explicitly keeps REST, GraphQL, webhooks, OCI registry lifecycle,
+PromQL and identity-provider behaviour in their application or
+Chronicle compositions; TCP, UDP, DNS, TLS, DTLS, QUIC, crypto
+operations and opaque key handles in fluxor; MQTT, AMQP and Kafka in
+Quantum; database protocols and their operation adapters in Lattice;
+codec algorithms in Spectra; and reachability, conversation and
+media-topology policy with the owners in the table below.
+
+## Ecosystem ownership
+
+| Project | Responsibility |
+| --- | --- |
+| Fluxor | ABI, scheduling, channels, content contracts, TCP/UDP, endpoint allocation, DNS, TLS, DTLS, QUIC, cryptographic operations and opaque key handles |
+| Wave | Reusable wire encoding, decoding, framing, protocol facts and bounded application-protocol transaction mechanics |
+| Wormhole | Candidate gathering policy, ICE pair formation, check scheduling and nomination, relay selection, allocation policy and relay operation |
+| Conclave | Conversation identity, participants, call/message intent, connector policy and authorisation |
+| Grove | Media topology, clocks, routing, advanced jitter/adaptation, mixing and distributed media-session execution |
+| Spectra | Audio, image and video codec algorithms and media-container mechanics |
+| Quantum | MQTT, AMQP and Kafka broker/session protocols, topics, queues, retained/offline state, routing and durability |
+| Lattice | Database and key/value protocol adapters coupled to database operations and consistency semantics |
+
+Where a composition crosses this table, the seam is an explicit
+fluxor content contract or a documented bounded record carried over
+an existing surface. A shared concept is not permission for private
+cross-repository state. Conclave's WebRTC profile records the same
+assignments from its side; the masterplan places SDP in Wave and ICE
+policy in Wormhole for the same reason integrity computation is here
+and "whether to send" is not.
 
 ## Ownership
 
@@ -85,9 +194,10 @@ and application `OctetStream`.
 ## Modules
 
 Roles are not uniform. `http` is server and client; `websocket`,
-`smtp` and `s3` are clients only; `ws_stream` is an adapter; `rtp`
-and `sip` are peer user agents. Nothing in this document promises a
-server for every protocol that has a client, or the reverse.
+`smtp` and `s3` are clients only; `ws_stream`, `mail` and `jitter`
+are adapters; `rtp` and `sip` are peer user agents; `stun` is a
+Binding server. Nothing in this document promises a server for every
+protocol that has a client, or the reverse.
 
 ### `http`
 
@@ -124,11 +234,13 @@ lossless steady-state backpressure.
 
 ### `rtp`
 
-A combined transmitter and receiver: RFC 3550 packet handling,
-PCMU/G.711 input, UDP `NetProto` binding, and endpoint controls. It
-declares rp2350 and bcm2712, so the media path builds for the same
-targets as `sip`, which drives it. Broader payload formats, RTCP,
-SRTP, and multi-party session policy are not implemented.
+The media endpoint: RFC 3550 packet handling both ways on one
+symmetric port — G.711 in, packets out; datagrams in, validated
+`[seq][payload]` records out for the `jitter` adapter. It declares
+rp2350 and bcm2712, so the media path builds for the same targets as
+`sip`, which drives it over control records. Broader payload
+formats, RTCP, SRTP, and multi-party session policy are not
+implemented.
 
 Transmit and receive bounds are deliberately different numbers. Wave
 transmits at most 40 ms per packet, a policy choice; it accepts up
@@ -139,14 +251,24 @@ to fit.
 
 ### `sip`
 
-An RFC 3261 subset UAC/UAS for a two-party PCMU call:
-INVITE/ACK/BYE/200-OK, a bounded transaction FSM, and receive-side
-reorder with loss-concealing playout. It owns protocol facts only —
-call policy is Conclave's, the G.711 codec is Spectra's, and
-transmission is the separate `rtp` module, driven over a control
-port. `wall_clock` timer class, because the T1 retransmit timer and
-the `ptime` playout cadence both read real time; playout must, or a
-relaxed scheduler tick would stretch the audio.
+An RFC 3261 subset UAC/UAS for a two-party PCMU call, signalling
+only: INVITE/ACK/BYE/200-OK, a bounded transaction FSM, and SDP
+negotiation facts. It owns protocol facts and no media path — call
+policy is Conclave's, the G.711 codec is Spectra's, and the media
+endpoint and reorder/playout are the separate `rtp` and `jitter`
+modules, driven over shared control records. `wall_clock` timer
+class for the T1 retransmit timer.
+
+### `jitter`
+
+The realtime family's reorder/playout adapter: validated
+`[seq][payload]` records from `rtp` in, loss-concealed µ-law playout
+out at `ptime` cadence, obeying the same START/STOP records `sip`
+drives the transmitter with. The ring is the host-vectored
+`jitter_core`; `wall_clock` timer class, because playout must track
+real time or a relaxed scheduler tick would stretch the audio.
+Adaptive playout, clock recovery and topology-aware buffering are
+Grove's, not Wave's.
 
 Registration, authentication, TLS/SIPS, re-INVITE, transfer, hold,
 forking, multi-party mixing, RTCP and SRTP are not implemented.
@@ -154,16 +276,57 @@ forking, multi-party mixing, RTCP and SRTP are not implemented.
 ### `smtp`
 
 An RFC 5321 mail submission client: the lockstep ESMTP conversation
-from the server's 220 greeting through a dot-stuffed DATA body to
+from the server's 220 greeting, through an optional SASL PLAIN
+authentication step, then a dot-stuffed DATA body to
 QUIT, with delivery reported on a status port only when end-of-data
 (250) and QUIT (221) are both accepted. `wall_clock` timer class for
 the connect and reply deadlines. Message meaning belongs to
 Conclave; Wave owns the wire mechanics.
 
-Scope is unauthenticated submission — no STARTTLS, no AUTH, no
-pipelining, one recipient per instance — which suits a trusted relay
-or sink behind a security boundary and does not suit a public MX. As
+Submission may be authenticated: `AUTH PLAIN` (RFC 4616) only, and
+only on a channel the graph has declared confidential, since the
+module cannot see whether `tls` sits in front of it. Neither an
+undeclared channel nor a server offering no mechanism falls back to
+an unauthenticated submission; both fail, because a message meant to
+carry credentials that did not is one nobody can attribute.
+
+Scope otherwise is narrow — no STARTTLS, no pipelining, one recipient
+per instance. Unauthenticated and untrusted, that suits a relay or
+sink behind a security boundary and does not suit a public MX. As
 everywhere in Wave, TLS is a fluxor module wired in front.
+
+### `mail`
+
+An RFC 5322 inbound message parser: spans of a message in, one
+bounded facts record and a streamed body out, correlated by a
+caller-chosen id. The format mechanics live in the host-tested
+`rfc5322` and `mime` cores; the module is the pump around them,
+holding only the header block until it is complete and forwarding
+the body as it arrives. `timer_class = "agnostic"` — no clock is
+read.
+
+The facts state the addresses that parsed, the subject and date as
+written, and the `Message-ID` / `In-Reply-To` / `References`
+identifiers verbatim, as evidence only. Which conversation a message
+belongs to, whether an attachment is retained, and what an address
+means are Conclave's; a parser that picked a thread would be deciding
+conversation membership from a header the sender chose. `mail` owns
+no network endpoint — ingress is whatever the graph wires in front.
+
+### `stun`
+
+An RFC 5389 STUN Binding server: it tells a peer the address its
+packets arrived from, which is the one fact a peer behind a NAT
+cannot learn any other way and the first thing an ICE agent gathers.
+The message mechanics live in the host-tested `stun_core`; the
+module owns the datagram endpoint and answers each request from the
+datagram it arrived in — no transaction table, no retransmission,
+`timer_class = "agnostic"`.
+
+It is not an ICE agent and not a TURN relay: it gathers no
+candidates, forms no pairs, schedules no checks, nominates nothing
+and relays nothing. Those are reachability decisions and belong to
+Wormhole.
 
 ### `s3`
 
@@ -181,6 +344,38 @@ probe, which signs a ListBuckets on boot and reports the status, as
 the cheapest proof that credentials work against a real endpoint.
 Which bucket backs which namespace, and what a key denotes, are the
 consumer's — Wave owns the wire mechanics and the signature.
+
+## Family catalogue and maturity
+
+Every module and core has one family and one maturity level. The
+modules above are all deployable fmods (level 3) or better; the
+cores in `modules/common/` are level 1 or 2 and are stated as such —
+none of them is a protocol role, however complete its vectors.
+
+| Capability | Family | Maturity |
+| --- | --- | --- |
+| `http` (h1/h2/h3, WS upgrade, gRPC client path) | Web | End-to-end composition: independent-peer interop and Pi 5 load evidence for h1/TLS and h3 |
+| `websocket` | Web | Complete client role; server-path interop against Python `websockets`, an independent RFC 6455 peer |
+| `ws_stream` | Web | Deployable adapter fmod |
+| `s3` | Web | Complete client role; SigV4 host-tested, with probe mode as the live-endpoint credential check — no recorded independent-endpoint run is claimed here |
+| gRPC | Web | Composition of the HTTP/2 client, not a module |
+| `smtp` | Mail | Complete submission-client role with independent-peer evidence (Exim) |
+| `mail` | Mail | Deployable adapter fmod over the `rfc5322`/`mime` cores |
+| `rfc5322`, `mime`, `smtp_core`/`smtp_wire`, `mail_wire` | Mail | I/O-free codec and transaction cores |
+| `sip` | Realtime | Peer-UA role: end-to-end composition — Linux L4 and the Pi 5 rig scenario both pass (2026-08-26) |
+| `rtp` | Realtime | The symmetric media endpoint, transmit and receive; end-to-end with `sip` on the Pi 5 rig |
+| `jitter` | Realtime | Deployable adapter fmod over `jitter_core` |
+| `jitter_core` | Realtime | Bounded reorder/playout core, mounted by `jitter` |
+| `sframe_core` | Realtime | I/O-free framing core, RFC 9605 header layout pinned to all 289 published vectors. Framing only: no composition yet encrypts, authenticates, handles replay or rotates keys, so this is not SFrame end-to-end encryption |
+| `webrtc_sdp` | Realtime | I/O-free codec core for the SDP attributes that make a description a WebRTC one — bounded session-description facts, not a WebRTC stack |
+| `sip_core`, `sip_dialog`, `sip_wire`, `rtp_core` | Realtime | Codec and transaction cores mounted by `sip`/`rtp` |
+| `stun` | Traversal | Deployable server fmod for STUN Binding, RFC 5769-pinned |
+| `stun_core` | Traversal | I/O-free codec core shared by `stun` and `turn_core` |
+| `turn_core` | Traversal | I/O-free codec core: TURN methods, relay attributes, long-term credential key and ChannelData framing, tested directly against its own vectors. There is no TURN module, client, server or relay; a TURN module identity would need a concrete bounded transaction role and an admission decision first |
+
+SRTP/SRTCP and RTCP appear in the Realtime family as planned
+mechanics; nothing in this checkout implements them, and no
+capability above may be cited as if it did.
 
 ## HTTP/3
 
@@ -206,6 +401,17 @@ state (file handles, relay connections) that the stream-multiplexed
 pump cannot yet carry per stream. Dispatch answers those with a 501
 naming the situation rather than serving one concurrent request
 correctly and the rest wrongly.
+
+Deployment limits, all failing closed: eight concurrent sessions
+(matching the QUIC engine's connection table — a ninth connection
+receives a stateless CONNECTION_REFUSED from the transport, and a
+session the table cannot hold is closed with H3_REQUEST_REJECTED,
+never left unanswered), sixteen concurrent request streams, and a
+2 KiB per-stream response buffer. A response that does not fit is
+refused whole with a tested refusal rather than truncated;
+incremental DATA framing for larger bodies is deliberately deferred
+until load evidence establishes its shape
+(.context/rfc_hardening.md §7.4).
 
 ## Transport and security boundary
 

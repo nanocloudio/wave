@@ -42,6 +42,14 @@ gathering, pair formation, connectivity checks and nomination are an
 ICE agent's work, and an agent's decisions are NAT-traversal policy
 rather than protocol mechanics — a different concern, in Wormhole.
 
+`rtp`'s `packets` port and `jitter`'s `rx_in` carry the realtime
+family's receive-record seam: one validated RTP payload per TLV frame,
+`[REC_RTP_RX][len][seq: u16 LE][payload]`, layout owned once in
+`modules/common/rtp_wire.rs`. The sequence rides the record because
+the reorder buffer keys on it. `sip.rtp_ctrl` carries the shared
+8-byte media-control records (SET_ENDPOINT/START/STOP), fanned by the
+graph to `rtp.endpoint` and `jitter.media_ctrl`.
+
 `sip`'s `command_in` and `event_out` carry the same kind of layout.
 A command names one call and what to do about it — dial, accept,
 reject, hang up, cancel — with the peer and media endpoints travelling
