@@ -9,6 +9,8 @@
 // Per-generation front ends onto this core, one file each — the same shape as
 // `super::server`. `h3` rides Fluxor's `mux` contract rather than net_proto, so
 // it shares this core's shape but not its `ClientState`.
+#[cfg(feature = "exchange")]
+pub(crate) mod exchange;
 pub(crate) mod h1;
 #[cfg(feature = "h2")]
 pub(crate) mod h2;
@@ -32,9 +34,54 @@ use super::{
 // ── Sizes / capacities ─────────────────────────────────────────────────────
 
 pub(crate) const RECV_BUF_SIZE: usize = 2048;
+
+/// A path plus its query string.
+///
+/// The one-shot client's path is a build-time parameter, so it is short by
+/// construction. A graph-driven one carries whatever the producer put in the
+/// record — a query string is the ordinary way to parameterise a GET — so the
+/// exchange build takes the larger bound and pays for it in `REQUEST_BUF_SIZE`
+/// below.
+#[cfg(not(feature = "exchange"))]
 pub(crate) const MAX_PATH_LEN: usize = 128;
-pub(crate) const REQUEST_BUF_SIZE: usize = 256;
+#[cfg(feature = "exchange")]
+pub(crate) const MAX_PATH_LEN: usize = 1024;
+
+/// Scratch for the composed request HEAD. Derived from `MAX_PATH_LEN`, never
+/// chosen independently: `write_request_head` fails closed when the head does
+/// not fit, so a buffer too small for the longest admissible path would refuse
+/// requests this client had already accepted.
+pub(crate) const REQUEST_BUF_SIZE: usize = MAX_PATH_LEN + 256;
+
+/// One-shot param client: a small body configured at build time.
+#[cfg(not(feature = "exchange"))]
 pub(crate) const REQUEST_BODY_SIZE: usize = 256;
+/// Graph-driven client: a body the graph supplies, at the contract's ceiling.
+#[cfg(feature = "exchange")]
+pub(crate) const REQUEST_BODY_SIZE: usize = super::exchange::PAYLOAD_MAX;
+
+/// Exchange sizes come from the contract, not from numbers chosen here: the
+/// surface names one payload ceiling so a producer can stay under it, and a
+/// response above it is answered with a typed OVERSIZE refusal rather than
+/// truncated.
+#[cfg(feature = "exchange")]
+pub(crate) use super::exchange::{
+    KEY_MAX as EXCHANGE_KEY_MAX, PAYLOAD_MAX as EXCHANGE_REPLY_MAX, PUBLISH_FRAME_MAX,
+    REPLY_FRAME_MAX,
+};
+
+/// Staging for one frame in either direction, envelope included.
+///
+/// One buffer serves both: a publish is decoded out of it before a reply is
+/// composed into it, so the two are never live together. Sized to whichever
+/// frame is larger — they are equal today, and taking the max keeps that a
+/// fact the code checks rather than one a reader has to.
+#[cfg(feature = "exchange")]
+pub(crate) const EXCHANGE_STAGE_SIZE: usize = 3 + if PUBLISH_FRAME_MAX > REPLY_FRAME_MAX {
+    PUBLISH_FRAME_MAX
+} else {
+    REPLY_FRAME_MAX
+};
 
 pub(crate) const CONNECT_TIMEOUT_MS: u64 = 10_000;
 
@@ -94,6 +141,10 @@ pub(crate) struct ClientState {
     /// Wire protocol — 0 = HTTP/1.1, 1 = HTTP/2 cleartext (h2c).
     /// Read by `mod.rs::module_step` to pick the right state machine.
     pub(crate) protocol: u8,
+    /// The request verb, a `wire::method` code. `post_params` defaults it to
+    /// `METHOD_GET`; a graph-driven request overwrites it per exchange. Zero
+    /// (`METHOD_NONE`) is not a verb and composes no request head.
+    pub(crate) method: u8,
     /// HTTP/2 client sub-state. Interpreted as `client_h2::H2Phase` when
     /// `protocol == 1`; ignored otherwise.
     pub(crate) h2_phase: u8,
@@ -141,6 +192,43 @@ pub(crate) struct ClientState {
     pub(crate) recv_buf: [u8; RECV_BUF_SIZE],
     pub(crate) request_buf: [u8; REQUEST_BUF_SIZE],
     pub(crate) request_body: [u8; REQUEST_BODY_SIZE],
+
+    // ── Exchange mode (`stream.ordered_ack` with `reply = "yes"`) ──
+    //
+    // An exchange serves many requests over time, each arriving on a channel
+    // and each answered by correlation id. These fields hold the request in
+    // flight; the phase machine that performs it is the same one a param
+    // client uses, re-armed per request rather than duplicated.
+    /// in[8]: `publish_in`, where requests arrive.
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_in_chan: i32,
+    /// out[9]: `reply_out`, where answers leave.
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_out_chan: i32,
+    /// Correlation id of the request in flight; 0 when idle.
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_corr: u64,
+    /// The request's `msg_key`, echoed unchanged on the reply so a downstream
+    /// stage can rejoin without holding state.
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_key: [u8; EXCHANGE_KEY_MAX],
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_key_len: u16,
+    /// Response body accumulated across `RecvBody` chunks. A reply is ONE
+    /// frame, so it cannot stream the way `file_ctrl` does.
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_reply: [u8; EXCHANGE_REPLY_MAX],
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_reply_len: u16,
+    /// Set when the response outgrew `EXCHANGE_REPLY_MAX`; the reply becomes
+    /// a typed refusal instead of a truncated body.
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_oversize: u8,
+    /// Staging for one frame in either direction. Its own buffer because a
+    /// frame at the ceiling does not fit in `recv_buf`, which is holding the
+    /// response while the reply is being composed.
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_stage: [u8; EXCHANGE_STAGE_SIZE],
 }
 
 // ClientState lives inside HttpState, which the kernel allocates as a
@@ -179,6 +267,15 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
         s.client.path[0] = b'/';
         s.client.path_len = 1;
     }
+    // Zeroed state means `METHOD_NONE`, which composes no head at all.
+    // Nothing in the param set names a verb, so a param-configured request
+    // is a GET.
+    if s.client.method == wire::method::METHOD_NONE {
+        s.client.method = wire::method::METHOD_GET;
+    }
+
+    #[cfg(feature = "exchange")]
+    exchange::init(s);
 
     log(s, b"[http] client configured");
 }
@@ -188,16 +285,25 @@ pub(crate) unsafe fn log(s: &HttpState, msg: &[u8]) {
     dev_log(&*s.syscalls, 3, msg.as_ptr(), msg.len());
 }
 
-pub(crate) unsafe fn build_request(s: &mut HttpState) {
-    let len = wire::h1::write_request_line(
+/// Compose the request head into `request_buf`.
+///
+/// Returns false when the head does not fit or names a verb the writer does
+/// not know — a request that cannot be composed is not one to send in part.
+#[must_use]
+pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
+    let len = wire::h1::write_request_head(
         s.client.request_buf.as_mut_ptr(),
         REQUEST_BUF_SIZE,
+        s.client.method,
         s.client.path.as_ptr(),
         s.client.path_len as usize,
         s.client.host_ip,
+        s.client.request_body_len as usize,
     );
     s.client.request_len = len as u16;
     s.client.request_sent = 0;
+    s.client.request_body_sent = 0;
+    len > 0
 }
 
 /// Close the client's connection. Returns whether the transport took the

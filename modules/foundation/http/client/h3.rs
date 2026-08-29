@@ -44,8 +44,10 @@ const H3_FIELD_SCRATCH: usize = 512;
 /// different questions, and importing the server's would make the client
 /// depend on the role it is deliberately separate from.
 pub const H3_CLIENT_RECV_BUF: usize = 1024;
-/// Response body accumulated for one client exchange.
-pub const H3_CLIENT_BODY_BUF: usize = 1024;
+/// Response body accumulated for one client exchange, at the contract's
+/// payload ceiling — the same number h1 and h2 accumulate to, so a response
+/// this client can hold does not depend on which generation carried it.
+pub const H3_CLIENT_BODY_BUF: usize = super::super::exchange::PAYLOAD_MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum H3ClientState {
@@ -520,6 +522,19 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             p += 3;
             super::super::dev_log(sys, 3, lb.as_ptr(), p);
         }
+        // Graph-driven: answer the request that produced this response
+        // instead of streaming it to `file_ctrl`. h3 has already accumulated
+        // the whole body, so there is nothing to re-assemble here.
+        #[cfg(feature = "exchange")]
+        if super::exchange::busy(s) {
+            let n = s.h3_client.body_len;
+            let src = s.h3_client.body.as_ptr();
+            super::exchange::accumulate(s, src, n);
+            super::exchange::complete(s);
+            s.h3_client.body_emitted = true;
+            return 0;
+        }
+
         let chan = s.client.out_chan;
         if chan >= 0 && s.h3_client.body_len > 0 {
             let poll = (sys.channel_poll)(chan, super::super::POLL_OUT);

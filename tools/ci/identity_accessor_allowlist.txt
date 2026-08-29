@@ -73,3 +73,6 @@ modules/foundation/smtp/mod.rs|let chunk_len = u32::from_le_bytes([buf[10], buf[
 modules/foundation/smtp/mod.rs|u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]])|caller-chosen correlation id of a Wave-local record; this module owns the layout
 modules/foundation/smtp/mod.rs|let port = s.port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/http/server/h3.rs|out[FRAME_HDR + 5..FRAME_HDR + 13].copy_from_slice(&0x10Bu64.to_le_bytes());|H3_REQUEST_REJECTED close-reason code on the refused-session close, not an identity
+modules/foundation/http/client/exchange.rs|s.client.exchange_stage[1..ENVELOPE].copy_from_slice(&(n as u16).to_le_bytes());|TLV envelope length field, not an identity; the payload is composed in this same buffer, so net_write_frame's copy into a separate scratch would overlap itself
+modules/foundation/http/client/exchange.rs|u16::from_le_bytes([p[1], p[2]]) as usize,|owning parser of the Wave exchange request record — this file defines the layout
+modules/foundation/http/client/exchange.rs|u16::from_le_bytes([p[3], p[4]]) as usize,|owning parser of the Wave exchange request record — this file defines the layout

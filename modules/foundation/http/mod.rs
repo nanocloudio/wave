@@ -135,6 +135,22 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+// The ordered-ack exchange surface. Mounted unconditionally, not behind the
+// `exchange` feature: the sizes it anchors (`PAYLOAD_MAX`) bound buffers in
+// every variant, and gating the definition would mean gating every consumer
+// of a shared size too. Unused items are dropped by `--gc-sections`.
+//
+// Spliced with `include!` rather than mounted with `#[path]`, for the same
+// reason `runtime.rs` above is: rustfmt follows a `#[path]` module into the
+// generated tree and reports it as unformatted, and `fluxor build` re-syncs
+// that file from the published pin on every build — so formatting it is a
+// change that cannot stick. `include!` is not followed, and the contract is
+// self-contained (it names nothing outside `core`).
+#[allow(dead_code, reason = "each variant consumes a subset of the surface")]
+mod exchange {
+    include!("../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs");
+}
+
 // `pub` under host-test only, matching how `server` is exposed: the suites are
 // separate crates and need real `pub` to reach in, while the firmware links one
 // crate and keeps its symbol surface unchanged.
@@ -682,6 +698,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         let rc = if s.mode == MODE_CLIENT {
+            // Graph-driven client: take the next request off `publish_in`
+            // before stepping, so an idle client picks work up promptly and a
+            // busy one is left alone until it has answered.
+            #[cfg(feature = "exchange")]
+            if client::exchange::armed(s) {
+                let _ = client::exchange::poll_request(s);
+                if !client::exchange::busy(s) {
+                    tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
+                    return 0;
+                }
+            }
+
             // HTTP/3 client: the request rides the `mux` contract, exactly as
             // the server path does, so the transport stays protocol-free.
             #[cfg(feature = "h3")]

@@ -359,6 +359,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
+                        // A body-less response (204, a bare 200) is still an
+                        // answer; an empty payload is not a refusal.
+                        #[cfg(feature = "exchange")]
+                        super::exchange::complete(s);
                         return 1;
                     }
                     FrameAction::Error => {
@@ -395,6 +399,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     log_done(s);
                     let _ = send_close_frame(s);
                     set_phase(s, H2Phase::Done);
+                    #[cfg(feature = "exchange")]
+                    super::exchange::complete(s);
                     return 1;
                 }
                 // Bidirectional mode: if `in[1]` is wired and has
@@ -421,6 +427,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
+                        // A body-less response (204, a bare 200) is still an
+                        // answer; an empty payload is not a refusal.
+                        #[cfg(feature = "exchange")]
+                        super::exchange::complete(s);
                         return 1;
                     }
                     FrameAction::Error => {
@@ -431,6 +441,30 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             H2Phase::Writing => {
+                // Graph-driven: a reply is ONE frame, so the body is
+                // accumulated rather than streamed to `file_ctrl`. Same rule
+                // as h1 — the protocols differ in where the bytes come from,
+                // not in what an exchange does with them.
+                #[cfg(feature = "exchange")]
+                if super::exchange::busy(s) {
+                    let plen = data_frame_payload_len(s);
+                    let end = data_frame_end_stream(s);
+                    let n = plen.min(super::RECV_BUF_SIZE - h2w::FRAME_HEADER_LEN);
+                    let src = s.client.recv_buf.as_ptr().add(h2w::FRAME_HEADER_LEN);
+                    super::exchange::accumulate(s, src, n);
+                    s.client.bytes_received += plen as u32;
+                    consume_data_frame(s);
+                    if end {
+                        log_done(s);
+                        let _ = send_close_frame(s);
+                        set_phase(s, H2Phase::Done);
+                        super::exchange::complete(s);
+                        return 1;
+                    }
+                    set_phase(s, H2Phase::WaitResponse);
+                    continue;
+                }
+
                 if s.client.out_chan < 0 {
                     // No data sink — drop the body silently and resume.
                     let plen = data_frame_payload_len(s);
@@ -441,6 +475,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
+                        #[cfg(feature = "exchange")]
+                        super::exchange::complete(s);
                         return 1;
                     }
                     set_phase(s, H2Phase::WaitResponse);
@@ -464,6 +500,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
+                        #[cfg(feature = "exchange")]
+                        super::exchange::complete(s);
                         return 1;
                     }
                     set_phase(s, H2Phase::WaitResponse);
@@ -491,11 +529,16 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 
             H2Phase::Done => {
                 let _ = send_close_frame(s);
+                #[cfg(feature = "exchange")]
+                super::exchange::complete(s);
                 return 1;
             }
 
             H2Phase::Error => {
                 let _ = send_close_frame(s);
+                // No silent drops: a failed exchange is answered.
+                #[cfg(feature = "exchange")]
+                super::exchange::fail(s);
                 return -1;
             }
         }

@@ -40,10 +40,11 @@ MODE="${1:-}"
 # silently omits an artefact is worse than no budget, because the omission
 # reads as coverage.
 BUDGETS="
-rp2350|http.fmod|150000|149172 (2026-08-26, +4.3K: h3 ceiling fails closed — refused-session CMD_MUX_SESSION_CLOSE queue and the table-generic slot/session initialisation. Deliberate: a session past the table used to hang the client)
+rp2350|http.fmod|162000|150332 (2026-08-29, +1.2K: the client request head carries a real verb and a Content-Length, and fails closed instead of truncating)
 rp2350|http-h2.fmod|119000|110760 (2026-08-12, +5.1K)
-rp2350|http-web.fmod|78600|78332 (2026-08-23, +332 B: WebSocket lifecycle events retried rather than dropped when the event channel is full)
+rp2350|http-web.fmod|85000|78868 (2026-08-29, +536 B: the client request head carries a real verb and a Content-Length, and fails closed instead of truncating)
 rp2350|http-app.fmod|80000|73368 (2026-08-16, first row; h1 + app fan-out only)
+rp2350|http-exchange.fmod|167000|154236 (2026-08-29, first row; the full variant plus the graph-driven client exchange — publish_in/reply_out, the reply accumulator and the staging frame)
 rp2350|rtp.fmod|4600|4192 (2026-08-12)
 rp2350|sip.fmod|17000|16295 (2026-08-23, +2.7K: the application command/event contract — a call is offered and decided rather than auto-answered, and every terminal outcome is reported)
 rp2350|stun.fmod|6000|4881 (2026-08-23, first row; STUN Binding responder with HMAC-SHA-1 and CRC-32)
@@ -54,6 +55,7 @@ bcm2712|http.fmod|309000|305212 (2026-08-26, +9.9K: h3 ceiling fails closed — 
 bcm2712|http-h2.fmod|270000|250032 (2026-08-12, +6.2K)
 bcm2712|http-web.fmod|196000|182504 (2026-08-16, +1.3K for the shedding counters)
 bcm2712|http-app.fmod|203000|187064 (2026-08-16, first row; h1 + app fan-out only)
+bcm2712|http-exchange.fmod|333000|308092 (2026-08-29, first row; the full variant plus the graph-driven client exchange — publish_in/reply_out, the reply accumulator and the staging frame)
 bcm2712|s3.fmod|22000|19647 (2026-08-16, first row; SigV4 signing connector)
 bcm2712|smtp.fmod|14000|13231 (2026-08-26, +3.7K: SASL PLAIN submission — base64 encoder, EHLO capability parsing, the AUTH phase, its credential buffers, and the volatile zeroing of every stack copy of a credential)
 bcm2712|websocket.fmod|12700|10912 (2026-08-12)
@@ -76,6 +78,8 @@ http-app.fmod|http-h2.fmod|rp2350
 http-app.fmod|http-h2.fmod|bcm2712
 http-app.fmod|http.fmod|rp2350
 http-app.fmod|http.fmod|bcm2712
+http.fmod|http-exchange.fmod|rp2350
+http.fmod|http-exchange.fmod|bcm2712
 "
 
 fail=0

@@ -18,7 +18,17 @@ timer_class = "wall_clock"
 # tls-fronted 443 edge additionally requires `transport.anchor.stream.secure`
 # on the tls module in front. `.secure` is an orthogonal child, so the
 # cleartext http anchor declares the base `transport.anchor.stream`.
-capabilities = ["transport.anchor.stream"]
+#
+# `stream.ordered_ack.exchange` is the graph-driven client (see the exchange
+# ports below). One manifest describes every variant this module builds, so
+# this list is the UNION: the surface is compiled only under the `exchange`
+# feature, and the other artefacts wire the ports but have no code behind
+# them. That is the same arrangement the `app` fan-out ports at index 6
+# already have, and it is a property of the variant split rather than of this
+# surface — a graph names `http`, and which .fmod satisfies it is a
+# deployment choice. A deployment that wires publish_in/reply_out must ship
+# http-exchange.fmod.
+capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 
 # Feature-set variants (RFC module_variants). `full` (default) emits the
 # unsuffixed http.fmod with every protocol generation; `http-web.fmod` drops
@@ -58,6 +68,17 @@ features = ["h1", "app"]
 name = "h2"
 features = ["h1", "h2", "ws", "app"]
 
+
+# Every protocol generation plus the graph-driven client exchange: requests
+# arrive on `publish_in` at run time instead of being fixed by params, and
+# responses leave on `reply_out` as an ordered-ack exchange.
+#
+# Feature-gated because the accumulator, the key buffer and the staging frame
+# are ~26 KiB of state, and the wider path and request bodies that come with
+# them are real cost an embedded one-shot client should not carry.
+[[variant]]
+name = "exchange"
+features = ["h1", "h2", "h3", "ws", "app", "exchange"]
 
 [[variant]]
 name = "full"
@@ -334,3 +355,61 @@ index = 8
 direction = "output"
 content_type = "OctetStream"
 buffer_size = 8192
+
+# ── Exchange ports (client mode, `exchange` variant) ──────────────────
+#
+# The provider half of `stream.ordered_ack.exchange` — the role that
+# ANSWERS, which the capability name states rather than a fact. A request
+# arrives as a `Publish` whose payload is
+# `[method:u8][path_len:u16][body_len:u16][path…][body…]`; the response leaves
+# as a `Reply` carrying the body and echoing the request's `msg_key`, so a
+# downstream stage rejoins without holding state.
+#
+# Both are optional: a graph using the one-shot param client wires neither and
+# nothing changes for it.
+#
+# `max_record` is the contract's `PUBLISH_FRAME_MAX` / `REPLY_FRAME_MAX`
+# (13 overhead + 512 key + 8192 payload = 8717) PLUS the 3-byte channel
+# envelope the frames ride, because a record is what one `channel_write` puts
+# on the ring and this module writes envelope and frame together. Declaring
+# the frame alone would under-declare every full-size record by 3 bytes — the
+# rejection nobody sees until the largest payload in production. The ring
+# holds two, so a producer can write the next while one is being performed.
+#
+# in[8] and out[9], not in[7]/out[7]: WebSocket admission already holds index 7
+# in BOTH directions, and the `exchange` variant compiles `ws` too. Sharing an
+# index would have this client read admission decisions as publish frames and
+# write replies onto the admission request port. Indices are per-direction, so
+# the two numbers differ — appended is what matters, not matched.
+[[ports]]
+name = "publish_in"
+index = 8
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 17440
+max_record = 8720
+
+[[ports]]
+name = "reply_out"
+index = 9
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 17440
+max_record = 8720
+
+# Facts are declared under the parent surface `stream.ordered_ack`: both roles
+# carry the same terms, and the capability NAME is what says which role this
+# is. That answers-with-data is not a fact here — `.exchange` already says it,
+# and the registry admits no `reply` fact to say it twice.
+[capability_facts."stream.ordered_ack.exchange"]
+# A 2xx means the origin accepted the request, not that anything was made
+# durable — HTTP has no durability contract to offer.
+ack         = "transport"
+# One connection per exchange and one request in flight, so ordering is
+# trivially preserved: there is never a second record to reorder against.
+ordering    = "single"
+# `FLAG_BROADCAST` is refused rather than ignored. This client dials one
+# origin, and acking a fan-out that reached one destination would report a
+# delivery that did not happen.
+broadcast   = "unsupported"
+max_payload = 8192

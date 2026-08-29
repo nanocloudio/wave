@@ -726,70 +726,100 @@ pub fn parse_range_header(value: &[u8], size: u32) -> RangeParse {
     }
 }
 
-/// Write an HTTP/1.0 GET request line plus `Host:` header (using the
-/// peer's dotted-quad IP) and the `Connection: close` terminator into
-/// `dst`. Returns the total request length.
+/// Write an HTTP/1.0 request head into `dst`: request line, `Host:` (the
+/// peer's dotted-quad IP), a `Content-Length` when `body_len` is non-zero,
+/// and the `Connection: close` terminator. Returns the head's length, or
+/// **0 if it does not fit**.
 ///
-/// Capped at 256 bytes total — `dst_cap` must reflect the caller's
-/// scratch capacity. The host IP is written in big-endian dotted-quad.
+/// Fails closed rather than truncating. A head cut off at `dst_cap` is not a
+/// short request, it is a malformed one — the version token, the `Host:`, or
+/// the blank line separating head from body can all be the part that goes
+/// missing, and the server answers a request nobody wrote. The caller gets a
+/// zero it must handle; `dst` may hold a partial head, which is harmless
+/// because a zero length means nothing is sent.
+///
+/// `method` is a `wire::method` verb code. An unknown code writes no head:
+/// guessing `GET` for a verb the caller asked for by number would perform a
+/// different request than the one requested, and a read where a write was
+/// meant is the worst direction to guess in.
+///
+/// The body itself is NOT written here — it is sent after this head, from
+/// wherever the caller holds it — but `body_len` must be declared here,
+/// because `Content-Length` belongs to the head and a body without one is
+/// unreadable on a `Connection: close` request.
 ///
 /// # Safety
 /// `dst` must be valid for writes of `dst_cap` bytes.
-pub unsafe fn write_request_line(
+pub unsafe fn write_request_head(
     dst: *mut u8,
     dst_cap: usize,
+    method: u8,
     path: *const u8,
     path_len: usize,
     host_ip_be: u32,
+    body_len: usize,
 ) -> usize {
+    let verb = method::method_name(method);
+    if verb.is_empty() {
+        return 0;
+    }
+
     let mut off = 0usize;
 
+    // Every write is bounds-checked and overflow returns 0 rather than
+    // truncating. `dst` may hold a partial head on that path; the caller must
+    // not send on a zero, which is why the length is the return value rather
+    // than something it has to derive.
     macro_rules! put {
         ($data:expr) => {
             let src = $data;
-            let mut i = 0;
-            while i < src.len() && off < dst_cap {
-                *dst.add(off) = *src.as_ptr().add(i);
-                off += 1;
-                i += 1;
+            if off + src.len() > dst_cap {
+                return 0;
             }
+            core::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(off), src.len());
+            off += src.len();
         };
     }
 
-    put!(b"GET ");
-
-    let mut i = 0;
-    while i < path_len && off < dst_cap {
-        *dst.add(off) = *path.add(i);
-        off += 1;
-        i += 1;
+    put!(verb);
+    put!(b" ");
+    if off + path_len > dst_cap {
+        return 0;
     }
-
+    core::ptr::copy_nonoverlapping(path, dst.add(off), path_len);
+    off += path_len;
     put!(b" HTTP/1.0\r\nHost: ");
 
     // host IP, big-endian dotted-quad
     let ip = host_ip_be.to_be_bytes();
-    let octets = [ip[0], ip[1], ip[2], ip[3]];
     let mut o = 0;
     while o < 4 {
-        let b = octets[o];
-        if b >= 100 && off < dst_cap {
-            *dst.add(off) = b'0' + (b / 100);
-            off += 1;
+        let b = ip[o];
+        if b >= 100 {
+            put!(&[b'0' + (b / 100)]);
         }
-        if b >= 10 && off < dst_cap {
-            *dst.add(off) = b'0' + ((b / 10) % 10);
-            off += 1;
+        if b >= 10 {
+            put!(&[b'0' + ((b / 10) % 10)]);
         }
-        if off < dst_cap {
-            *dst.add(off) = b'0' + (b % 10);
-            off += 1;
-        }
-        if o < 3 && off < dst_cap {
-            *dst.add(off) = b'.';
-            off += 1;
+        put!(&[b'0' + (b % 10)]);
+        if o < 3 {
+            put!(b".");
         }
         o += 1;
+    }
+
+    if body_len > 0 {
+        put!(b"\r\nContent-Length: ");
+        let mut digits = [0u8; 20];
+        let mut n = body_len;
+        let mut d = digits.len();
+        while {
+            d -= 1;
+            digits[d] = b'0' + (n % 10) as u8;
+            n /= 10;
+            n > 0
+        } {}
+        put!(&digits[d..]);
     }
 
     put!(b"\r\nConnection: close\r\n\r\n");

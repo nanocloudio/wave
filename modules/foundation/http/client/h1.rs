@@ -102,7 +102,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         ));
                         s.client.conn_present = 1;
                         log(s, b"[http] connected");
-                        build_request(s);
+                        if !build_request(s) {
+                            // The head does not fit or names no verb. Failing
+                            // here, before a byte goes out, is what keeps a
+                            // half-composed request off the wire.
+                            log(s, b"[http] request too long");
+                            s.client.phase = Phase::Error;
+                            return E_SEND_FAILED;
+                        }
                         s.client.phase = Phase::SendRequest;
                         continue;
                     } else if msg_type == NET_MSG_ERROR {
@@ -139,12 +146,27 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let sys = &*s.syscalls;
                 let out_chan = s.net_out_chan;
                 let conn_id = s.client.conn_id;
-                let remaining = (s.client.request_len - s.client.request_sent) as usize;
-                let data_ptr = s
-                    .client
-                    .request_buf
-                    .as_ptr()
-                    .add(s.client.request_sent as usize);
+                // Head first, then the body. Two buffers, one drain loop:
+                // `Content-Length` was declared in the head, so the body is
+                // just the bytes that follow it on the same connection.
+                let head_left = (s.client.request_len - s.client.request_sent) as usize;
+                let (data_ptr, remaining) = if head_left > 0 {
+                    (
+                        s.client
+                            .request_buf
+                            .as_ptr()
+                            .add(s.client.request_sent as usize),
+                        head_left,
+                    )
+                } else {
+                    (
+                        s.client
+                            .request_body
+                            .as_ptr()
+                            .add(s.client.request_body_sent as usize),
+                        (s.client.request_body_len - s.client.request_body_sent) as usize,
+                    )
+                };
 
                 let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 2;
                 let to_send = remaining.min(max_data);
@@ -165,8 +187,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     return 0;
                 }
 
-                s.client.request_sent += to_send as u16;
-                if s.client.request_sent >= s.client.request_len {
+                if head_left > 0 {
+                    s.client.request_sent += to_send as u16;
+                } else {
+                    s.client.request_body_sent += to_send as u16;
+                }
+                if s.client.request_sent >= s.client.request_len
+                    && s.client.request_body_sent >= s.client.request_body_len
+                {
                     log(s, b"[http] request sent");
                     s.client.headers_done = 0;
                     s.client.recv_len = 0;
@@ -200,6 +228,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 if msg_type == NET_MSG_CLOSED {
                     log(s, b"[http] premature close");
                     s.client.phase = Phase::Done;
+                    // Emitted HERE, not in the `Phase::Done` arm: this path
+                    // returns straight to the caller and never falls through
+                    // to it, so a hook there answers nothing.
+                    #[cfg(feature = "exchange")]
+                    super::exchange::complete(s);
                     return 1;
                 }
 
@@ -274,6 +307,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 if msg_type == NET_MSG_CLOSED {
                     log(s, b"[http] transfer done");
                     s.client.phase = Phase::Done;
+                    // Emitted HERE, not in the `Phase::Done` arm: this path
+                    // returns straight to the caller and never falls through
+                    // to it, so a hook there answers nothing.
+                    #[cfg(feature = "exchange")]
+                    super::exchange::complete(s);
                     return 1;
                 }
 
@@ -298,6 +336,19 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             Phase::Writing => {
+                // Graph-driven: a reply is ONE frame, so the body is
+                // accumulated here rather than streamed to `file_ctrl`.
+                #[cfg(feature = "exchange")]
+                if super::exchange::busy(s) {
+                    let off = s.client.pending_offset as usize;
+                    let end = (s.client.recv_len as usize).max(off);
+                    let src = s.client.recv_buf.as_ptr().add(off);
+                    super::exchange::accumulate(s, src, end - off);
+                    s.client.pending_offset = s.client.recv_len;
+                    s.client.phase = Phase::RecvBody;
+                    return 0;
+                }
+
                 if s.client.out_chan < 0 {
                     s.client.phase = Phase::RecvBody;
                     continue;
@@ -332,11 +383,20 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 
             Phase::Done => {
                 let _ = send_close_frame(s);
+                // Answer the request that produced this response, then go
+                // idle so the next one on `publish_in` can be taken.
+                #[cfg(feature = "exchange")]
+                super::exchange::complete(s);
                 return 1;
             }
 
             Phase::Error => {
                 let _ = send_close_frame(s);
+                // A failed exchange is still an answer: the contract admits
+                // no silent drops, so the producer gets a typed refusal
+                // rather than waiting out its own timeout.
+                #[cfg(feature = "exchange")]
+                super::exchange::fail(s);
                 return -1;
             }
 
