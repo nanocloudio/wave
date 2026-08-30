@@ -37,10 +37,10 @@ and loaded, and a target pays only for the modules its graph selects.
 
 | Family | Mechanics |
 | --- | --- |
-| Web | HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC transport composition and the S3 HTTP/SigV4 profile |
+| Web | HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC transport composition, the ordered-ack exchange provider role, and the S3 HTTP/SigV4 profile |
 | Mail | SMTP submission, RFC 5322 parsing, MIME structure and bounded inbound mail records |
-| Realtime | SIP signalling, RTP/RTCP, SRTP/SRTCP framing and replay mechanics, SFrame framing, and WebRTC session-description facts |
-| Traversal | STUN and TURN wire and bounded transaction mechanics |
+| Realtime | SIP signalling, RTP media and the RTCP control plane, SRTP/SRTCP framing and replay mechanics, SFrame framing, and WebRTC session-description facts |
+| Traversal | STUN Binding in both roles, TURN wire, and bounded transaction mechanics |
 
 Each capability is stated at one of five maturity levels, and the
 catalogue below names the level rather than letting a lower one read
@@ -214,6 +214,37 @@ client and surfaces the `grpc-status` trailer. Service definitions,
 method dispatch, protobuf schemas and reflection are application
 concerns.
 
+A fifth variant, `exchange`, adds the graph-driven client: requests
+arrive as records at run time instead of being fixed by params, which
+makes `http` a provider of fluxor's `stream.ordered_ack.exchange`
+surface — the role a producer binds to reach a destination that
+ANSWERS, as opposed to a sink that only accepts. A request record is
+`[method:u8][path_len:u16][body_len:u16][path…][body…]` on
+`publish_in`; the response body returns on `reply_out`, correlated by
+`corr` and echoing the publish's `msg_key` so a downstream stage
+rejoins it without holding state.
+
+What Wave owns here is only the mapping between that surface and an
+HTTP request: the verb vocabulary, the head, and which reply status a
+failure earns. The surface itself, its frames and its correlation
+rules are fluxor's, and what a payload MEANS stays with the producer.
+
+The declared terms are `ack = "transport"` (a 2xx is the origin
+accepting the request, not a durability claim HTTP has no way to
+make), `ordering = "single"` (one connection per exchange and one
+request in flight, so there is never a second record to reorder
+against), `broadcast = "unsupported"` (refused rather than ignored —
+this client dials one origin, and acking a fan-out that reached one
+destination would report a delivery that did not happen) and
+`max_payload = 8192`. Credentials, retry policy and the meaning of a
+refusal belong to the producer.
+
+`capabilities` is declared per module rather than per variant, so the
+manifest states this surface for artefacts that do not compile it.
+That is a property of the variant split — the `app` fan-out ports have
+it too — and it means a deployment wiring `publish_in`/`reply_out`
+must ship `http-exchange.fmod`.
+
 ### `websocket`
 
 An RFC 6455 HTTP/1.1 client — upgrade request, verified accept
@@ -248,6 +279,36 @@ to one Ethernet MTU, because packet duration is the sender's choice
 and RFC 3551 sets no ceiling on it. A packet too large to accept is
 refused and counted, never delivered as the fraction that happened
 to fit.
+
+### `rtcp`
+
+The control plane RTP does not have. RTP carries media and says
+nothing about how it arrived; RTCP is the only channel on which a
+receiver tells a sender what it actually got — loss, jitter, round
+trip — and the only one on which a sender publishes the mapping
+between its RTP timestamp and real time. A media path without it
+cannot adapt and cannot synchronise, and neither failure is visible
+from the media itself.
+
+A module rather than a role inside `rtp`, on grounds recorded before
+the identity was introduced: RTCP has its own endpoint, its own
+wall-clock deadline where `rtp` attests `agnostic`, and a cost the
+smallest artefact in the tree should not carry unasked. This is the
+split `jitter` already uses.
+
+Statistics reach it over `rtp`'s appended `rtcp_stats` output as two
+tagged records: one per accepted packet, and the transmit counters
+after each packet sent. Which arrive decides which report goes out.
+Neither carries a wall-clock time, because `rtp` reads no clock;
+`rtcp` stamps time from its own, which is exact for the reception
+record and an approximation of simultaneity for the transmit one.
+The module README works through why.
+
+It decides nothing: rate adaptation, teardown on a BYE and quality
+policy read these numbers and act. Not implemented: SDES items beyond
+CNAME, RFC 4585 feedback, and the full §6.3 membership and
+reconsideration algorithm; the interval assumes the two-party session
+`rtp` and `sip` compose.
 
 ### `sip`
 
@@ -315,18 +376,37 @@ no network endpoint — ingress is whatever the graph wires in front.
 
 ### `stun`
 
-An RFC 5389 STUN Binding server: it tells a peer the address its
-packets arrived from, which is the one fact a peer behind a NAT
-cannot learn any other way and the first thing an ICE agent gathers.
-The message mechanics live in the host-tested `stun_core`; the
-module owns the datagram endpoint and answers each request from the
-datagram it arrived in — no transaction table, no retransmission,
-`timer_class = "agnostic"`.
+STUN Binding in both roles over one datagram endpoint.
+
+The **responder** tells a peer the address its packets arrived from —
+the one fact a peer behind a NAT cannot learn any other way, and the
+first thing an ICE agent gathers. The **client** asks that question of
+a server and reports the answer as
+`[status:u8][ip:4 BE][port:u16 LE][code:u16 LE]` on `result_out`.
+Setting `server_ip` arms the client; leaving it zero is the
+responder-only module.
+
+One module rather than two because it is one protocol over one
+socket: a Binding request and its response differ by two bits of the
+message type, and separating them would duplicate the parse, the
+FINGERPRINT check and the endpoint pump to no end.
+
+The client retransmits on the RFC 5389 §7.2.1 schedule — seven
+transmissions, 500 ms doubling, 39.5 s total — because over UDP an
+unanswered request is indistinguishable from an undelivered one. A
+response is accepted only when its source address AND its transaction
+id both match: being told your own address by a stranger is the one
+thing this exchange must not allow, since a reflexive address becomes
+an ICE candidate and a forged one points a media path wherever the
+forger likes. Every transaction produces exactly one result, timeouts
+included — a client that reported nothing would leave whatever wired
+it waiting forever.
 
 It is not an ICE agent and not a TURN relay: it gathers no
-candidates, forms no pairs, schedules no checks, nominates nothing
-and relays nothing. Those are reachability decisions and belong to
-Wormhole.
+candidates, forms no pairs, schedules no connectivity checks and
+nominates nothing. Those are reachability decisions, and reachability
+policy belongs to Wormhole. It asks a question and answers one; it
+does not decide what to do with either.
 
 ### `s3`
 
@@ -355,6 +435,7 @@ none of them is a protocol role, however complete its vectors.
 | Capability | Family | Maturity |
 | --- | --- | --- |
 | `http` (h1/h2/h3, WS upgrade, gRPC client path) | Web | End-to-end composition: independent-peer interop and Pi 5 load evidence for h1/TLS and h3 |
+| `http` as `stream.ordered_ack.exchange` provider (`exchange` variant) | Web | Complete provider role, end-to-end from an independent consumer: chronicle's `../chronicle/tools/e2e/http-exchange.sh` drives a request through it and asserts the reply is correlated and the `msg_key` echoed |
 | `websocket` | Web | Complete client role; server-path interop against Python `websockets`, an independent RFC 6455 peer |
 | `ws_stream` | Web | Deployable adapter fmod |
 | `s3` | Web | Complete client role; SigV4 host-tested, with probe mode as the live-endpoint credential check — no recorded independent-endpoint run is claimed here |
@@ -364,18 +445,35 @@ none of them is a protocol role, however complete its vectors.
 | `rfc5322`, `mime`, `smtp_core`/`smtp_wire`, `mail_wire` | Mail | I/O-free codec and transaction cores |
 | `sip` | Realtime | Peer-UA role: end-to-end composition — Linux L4 and the Pi 5 rig scenario both pass (2026-08-26) |
 | `rtp` | Realtime | The symmetric media endpoint, transmit and receive; end-to-end with `sip` on the Pi 5 rig |
+| `rtcp` | Realtime | Deployable fmod, both report directions: RFC 3550 §6 compound framing, SR and RR with SDES, the §A.3/§A.8 receiver statistics, the §6.2 interval, and the round trip closed against a peer's echo of our own Sender Report |
+| `rtcp_core` | Realtime | I/O-free codec and arithmetic core: compound framing, SR/RR/SDES/BYE, report blocks, the receiver statistics and the interval, pinned to the RFC's own formulas |
 | `jitter` | Realtime | Deployable adapter fmod over `jitter_core` |
 | `jitter_core` | Realtime | Bounded reorder/playout core, mounted by `jitter` |
 | `sframe_core` | Realtime | I/O-free framing core, RFC 9605 header layout pinned to all 289 published vectors. Framing only: no composition yet encrypts, authenticates, handles replay or rotates keys, so this is not SFrame end-to-end encryption |
 | `webrtc_sdp` | Realtime | I/O-free codec core for the SDP attributes that make a description a WebRTC one — bounded session-description facts, not a WebRTC stack |
 | `sip_core`, `sip_dialog`, `sip_wire`, `rtp_core` | Realtime | Codec and transaction cores mounted by `sip`/`rtp` |
-| `stun` | Traversal | Deployable server fmod for STUN Binding, RFC 5769-pinned |
+| `stun` | Traversal | Deployable fmod, BOTH Binding roles: the responder is RFC 5769-pinned, and the client is a complete role — RFC 5389 §7.2.1 retransmission, source- and transaction-matched responses, one result per transaction |
+| `stun_txn` | Traversal | Bounded transaction core: the §7.2.1 schedule and the response-matching rule, mounted by `stun` |
 | `stun_core` | Traversal | I/O-free codec core shared by `stun` and `turn_core` |
 | `turn_core` | Traversal | I/O-free codec core: TURN methods, relay attributes, long-term credential key and ChannelData framing, tested directly against its own vectors. There is no TURN module, client, server or relay; a TURN module identity would need a concrete bounded transaction role and an admission decision first |
 
-SRTP/SRTCP and RTCP appear in the Realtime family as planned
-mechanics; nothing in this checkout implements them, and no
-capability above may be cited as if it did.
+RTCP is implemented as the `rtcp` module above, in both report
+directions. A participant that has received media reports what it
+got; one that has transmitted sends a Sender Report carrying the
+NTP/RTP pair and its packet and octet counts; one that has done both
+sends a Sender Report with reception blocks in it. A peer's reports
+about this participant are decoded back out, and the round trip
+closes against the peer's echo of an NTP timestamp we published.
+
+The NTP field is a LOCAL timebase unless a graph supplies
+`ntp_epoch_offset_s`. That is exact for round-trip calculation, which
+subtracts only values the same participant issued, and NOT sufficient
+for synchronising two sources against each other, which needs a
+shared epoch.
+
+SRTP and SRTCP appear in the Realtime family as planned mechanics;
+nothing in this checkout implements them, and no capability above may
+be cited as if it did. `rtcp` sends and receives in the clear.
 
 ## HTTP/3
 

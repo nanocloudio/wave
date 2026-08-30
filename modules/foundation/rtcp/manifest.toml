@@ -1,0 +1,65 @@
+version          = "0.1.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# timer_class: RFC 3550 §6.2 puts the reporting interval in real time — it
+# scales with the session so total RTCP traffic stays a fixed fraction of the
+# session bandwidth, and §6.3.1 randomises it over [0.5, 1.5] to stop every
+# participant reporting in lockstep. An interval counted in scheduler passes
+# would stretch and compress with the cadence, which is the drift RFC
+# adaptive_tick §8 rule 2 forbids. The arrival timestamps that feed the jitter
+# estimate are wall-clock for the same reason.
+#
+# This is why RTCP is a module and not a role inside `rtp`: `rtp` attests
+# `agnostic` and carries an explicit warning that pacing must revisit that.
+timer_class      = "wall_clock"
+
+# The datagram surface for RTCP itself. RFC 3550 §11: RTCP rides the odd port
+# one above RTP's, which is a SEPARATE endpoint — another reason this is not
+# `rtp` wearing a second hat.
+[[ports]]
+name         = "net_in"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+[[ports]]
+name         = "net_out"
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 4096
+
+# Statistics from `rtp`'s out[2]: tagged records, one RX per accepted packet
+# and a TX carrying the transmit counters. Which arrive decides which report
+# this participant sends — RX alone makes it a receiver, any TX makes it a
+# sender with an NTP/RTP pair to publish. Unwired leaves an endpoint that still
+# parses a peer's reports but has nothing of its own to say.
+[[ports]]
+name         = "rtp_stats"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 4096
+max_record   = 13
+
+# What this participant learned about ITSELF from the peer's reports (out[1]):
+# `[ssrc: u32 LE][fraction_lost: u8][_pad: u8][cumulative_lost: i32 LE]
+#  [jitter: u32 LE][rtt_ms: u32 LE][have_rtt: u8][_pad: u8 x3]`.
+#
+# The direction that matters: this is the peer telling us how OUR stream
+# arrived, which is the only channel on which a sender can learn that at all.
+[[ports]]
+name         = "reports_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 1024
+max_record   = 24
+
+# `ntp_epoch_offset_s` (param 7) lifts the local millisecond clock into the NTP
+# epoch. Zero leaves a LOCAL timebase, which is exact for round-trip
+# calculation — that only ever subtracts values this participant issued — and
+# NOT sufficient for synchronising two sources, which compares timestamps from
+# different participants and needs a shared epoch.
+
+[observability]
+exempt = "one participant's control plane — a handful of packets per reporting interval; media throughput is rtp's concern"

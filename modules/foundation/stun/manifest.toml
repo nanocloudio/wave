@@ -1,11 +1,16 @@
 version          = "0.1.0"
 hardware_targets = ["rp2350", "bcm2712"]
 
-# timer_class: this module reads no clock. A Binding request is answered from
-# the datagram it arrived in, with no transaction table and no retransmission
-# of its own, so a variable cadence changes nothing about what it emits
-# (RFC adaptive_tick §8 rule 2).
-timer_class      = "agnostic"
+# timer_class: the CLIENT role holds a deadline. RFC 5389 §7.2.1 puts the
+# retransmission schedule in milliseconds — 500 ms doubling to a 39.5 s total —
+# and a schedule counted in scheduler passes would stretch or compress with the
+# cadence, which is exactly the drift rule 2 forbids (RFC adaptive_tick §8).
+#
+# The server role still reads no clock: a Binding request is answered from the
+# datagram it arrived in. But a module attests once, for everything it
+# compiles, and attesting `agnostic` while holding a wall-clock deadline is the
+# claim the guard exists to catch.
+timer_class      = "wall_clock"
 
 # The datagram surface: net_in reads MSG_DG_BOUND / MSG_DG_RX_FROM, net_out
 # writes CMD_DG_BIND / CMD_DG_SEND_TO.
@@ -21,5 +26,16 @@ direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 4096
 
+# Client results (out[1]): one `[status:u8][ip:4 BE][port:u16 LE][code:u16 LE]`
+# per transaction. Unwired in server-only mode, and nothing is written to it —
+# a module that starts no transaction owes no result.
+[[ports]]
+name         = "result_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 256
+max_record   = 9
+
 [observability]
-exempt = "answers one request per datagram with no state of its own; throughput is the datagram provider's concern"
+exempt = "answers one request per datagram and asks at most one of its own; throughput is the datagram provider's concern"

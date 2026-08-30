@@ -70,7 +70,10 @@ mod rtp_wire;
 #[cfg(feature = "host-test")]
 #[path = "../../common/rtp_wire.rs"]
 pub mod rtp_wire;
-use rtp_wire::{put_rtp_rx_seq, REC_RTP_RX, RTP_RX_SEQ_LEN};
+use rtp_wire::{
+    put_rtcp_stat_rx, put_rtcp_stat_tx, put_rtp_rx_seq, REC_RTP_RX, RTCP_STAT_MAX_LEN,
+    RTP_RX_SEQ_LEN,
+};
 
 // `sframe_core` and `webrtc_sdp` are NOT mounted here. Nothing in this
 // module uses them, and a core mounted merely to give tests a production
@@ -202,6 +205,17 @@ struct RtpState {
     /// Frames addressed to this endpoint, consumed while the receive output
     /// is unwired. Counted, never silent (RFC hardening §10).
     rx_unrouted: u32,
+    /// out[2]: `rtcp_stats`. −1 when no `rtcp` module is wired, which is the
+    /// ordinary media-only graph.
+    stats_chan: i32,
+    /// Stats records the channel had no room for. Best-effort by design (see
+    /// `emit_rtcp_stats`), but never silent.
+    stats_dropped: u32,
+    /// Transmit counters, for the sender information in an RFC 3550 Sender
+    /// Report. `rtp` does not build the report — it does not know the time —
+    /// but it is the only place that knows these numbers.
+    packets_sent: u32,
+    octets_sent: u32,
     pending_out: u16,
     pending_offset: u16,
     // Buffers
@@ -244,6 +258,10 @@ impl RtpState {
         self.packets_lost = 0;
         self.rx_truncated = 0;
         self.rx_unrouted = 0;
+        self.stats_chan = -1;
+        self.stats_dropped = 0;
+        self.packets_sent = 0;
+        self.octets_sent = 0;
         self.pending_out = 0;
         self.pending_offset = 0;
     }
@@ -338,6 +356,10 @@ pub extern "C" fn module_new(
         if ch >= 0 {
             s.out_chan = ch;
         }
+
+        // out[2] = per-packet reception stats for an `rtcp` module. Optional:
+        // a media-only graph wires nothing here and pays one branch per packet.
+        s.stats_chan = dev_channel_port(sys, 1, 2);
 
         // ctrl channel
         s.ctrl_chan = ctrl_chan;
@@ -682,6 +704,63 @@ unsafe fn step_rx(s: &mut RtpState) {
 
 /// Consume one frame from the ingress fan-out. Returns whether the caller may
 /// read another this step.
+/// One `[seq:u16 LE][rtp_ts:u32 LE]` per accepted packet, for a module that
+/// builds RFC 3550 reception reports.
+///
+/// **Best-effort, and deliberately so.** A stats record the channel cannot
+/// take is dropped and counted, never retried: media must not stall because a
+/// report consumer fell behind, and jitter is a smoothed estimate that a
+/// missing sample perturbs rather than corrupts.
+///
+/// No arrival time is carried, because this module reads no clock and is
+/// attested `agnostic`. The consumer stamps arrival from its own clock; §A.8
+/// takes a difference of differences, so a constant offset between the two
+/// modules' views of "now" cancels exactly.
+unsafe fn emit_stat(s: &mut RtpState, rec: &[u8]) {
+    if s.stats_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.stats_chan, POLL_OUT);
+    if poll <= 0 || (poll as u32) & POLL_OUT == 0 {
+        s.stats_dropped = s.stats_dropped.wrapping_add(1);
+        return;
+    }
+    if (sys.channel_write)(s.stats_chan, rec.as_ptr(), rec.len()) != rec.len() as i32 {
+        s.stats_dropped = s.stats_dropped.wrapping_add(1);
+    }
+}
+
+/// One reception record per accepted packet.
+unsafe fn emit_rtcp_stats(s: &mut RtpState, seq: u16, rtp_ts: u32) {
+    if s.stats_chan < 0 {
+        return;
+    }
+    let mut rec = [0u8; RTCP_STAT_MAX_LEN];
+    let Some(n) = put_rtcp_stat_rx(&mut rec, seq, rtp_ts) else {
+        return;
+    };
+    emit_stat(s, &rec[..n]);
+}
+
+/// The transmit counters, after each packet goes out.
+///
+/// A LATEST-VALUE record, which is why dropping one costs nothing: the next
+/// packet supersedes it, and the consumer only ever needs the counters as they
+/// stood when it composes a report. That is also why this is emitted per
+/// packet rather than accumulated — there is no request channel on which a
+/// report could ask.
+unsafe fn emit_rtcp_tx_stats(s: &mut RtpState, sent_ts: u32) {
+    if s.stats_chan < 0 {
+        return;
+    }
+    let mut rec = [0u8; RTCP_STAT_MAX_LEN];
+    let Some(n) = put_rtcp_stat_tx(&mut rec, s.packets_sent, s.octets_sent, sent_ts) else {
+        return;
+    };
+    emit_stat(s, &rec[..n]);
+}
+
 unsafe fn step_rx_one(s: &mut RtpState) -> bool {
     let sys = &*s.syscalls;
     let out_chan = s.out_chan;
@@ -782,6 +861,11 @@ unsafe fn step_rx_one(s: &mut RtpState) -> bool {
     } else {
         payload_len
     };
+
+    // One `rtcp_stats` record per accepted packet, for whatever builds
+    // reception reports. Emitted before the media record because it describes
+    // THIS packet and must not be reordered against the next one.
+    emit_rtcp_stats(s, seq, h.timestamp);
 
     // One `packets` record, framed with the shared TLV so records never
     // concatenate on the byte-stream channel: payload is `[seq][audio]`.
@@ -911,9 +995,24 @@ unsafe fn send_rtp_packet(s: &mut RtpState) {
         }
     }
 
+    // The timestamp of the packet just sent, captured BEFORE the advance
+    // below. A Sender Report says "this RTP timestamp and this wallclock name
+    // the same instant", and the advanced value names the NEXT packet — one
+    // packet time in the future, which is a 20 ms lie at the default ptime.
+    let sent_ts = s.timestamp;
+
     // Advance sequence and timestamp
     s.seq_num = s.seq_num.wrapping_add(1);
     s.timestamp = s.timestamp.wrapping_add(payload_len as u32);
+
+    // §6.4.1's sender counters, advancing WITH the sequence number rather than
+    // with the transport's verdict on the write above. That write can be
+    // skipped or refused, and it is logged when it is — but the sequence
+    // number has already moved, so a count that disagreed with the stream's
+    // own numbering would describe a stream nobody sent.
+    s.packets_sent = s.packets_sent.wrapping_add(1);
+    s.octets_sent = s.octets_sent.wrapping_add(payload_len as u32);
+    emit_rtcp_tx_stats(s, sent_ts);
 
     // Shift remaining data in accumulator
     let remaining = s.acc_len as usize - payload_len;

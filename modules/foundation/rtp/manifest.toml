@@ -39,6 +39,26 @@ index = 1
 direction = "output"
 content_type = "OctetStream"
 
+# RTCP statistics (out[2]): tagged records for a module building RFC 3550
+# reports — one RX record per accepted packet, and a TX record carrying the
+# transmit counters after each packet sent. APPENDED, so out[0] and out[1] keep
+# their indices and every existing graph rewires nothing.
+#
+# No wall-clock time in either: this module reads no clock (see `timer_class`
+# above) and the consumer stamps time from its own. What that costs each record
+# is worked through in modules/common/rtp_wire.rs, which owns the layout.
+#
+# Best-effort. A record the channel cannot take is dropped and counted rather
+# than retried: media must not stall because a report consumer fell behind, and
+# a TX record is a latest-value that the next packet supersedes anyway.
+[[ports]]
+name = "rtcp_stats"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 1024
+max_record = 13
+
 [[ports]]
 name = "endpoint"
 direction = "ctrl_input"

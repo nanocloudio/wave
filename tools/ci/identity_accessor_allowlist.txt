@@ -76,3 +76,4 @@ modules/foundation/http/server/h3.rs|out[FRAME_HDR + 5..FRAME_HDR + 13].copy_fro
 modules/foundation/http/client/exchange.rs|s.client.exchange_stage[1..ENVELOPE].copy_from_slice(&(n as u16).to_le_bytes());|TLV envelope length field, not an identity; the payload is composed in this same buffer, so net_write_frame's copy into a separate scratch would overlap itself
 modules/foundation/http/client/exchange.rs|u16::from_le_bytes([p[1], p[2]]) as usize,|owning parser of the Wave exchange request record — this file defines the layout
 modules/foundation/http/client/exchange.rs|u16::from_le_bytes([p[3], p[4]]) as usize,|owning parser of the Wave exchange request record — this file defines the layout
+modules/foundation/rtcp/mod.rs|let port = s.port.to_le_bytes();|UDP port in a CMD_DG_BIND payload — transport addressing, not a connection identity (same site and reason as stun/mod.rs)
