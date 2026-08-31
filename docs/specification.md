@@ -203,10 +203,22 @@ protocol that has a client, or the reverse.
 
 A combined client and server carrying HTTP/1.1, HTTP/2 and HTTP/3,
 the WebSocket upgrade, routing, file and provider bindings,
-connection limits, and the gRPC client path. Four variants — `web`
-(h1 + ws), `app` (h1 + the application fan-out), `h2` (adds HTTP/2)
-and `full` (the default, adds HTTP/3) — let a target take only the
-generations it serves. Source: `modules/foundation/http/manifest.toml`.
+connection limits, and the gRPC client path. Five variants — `web`
+(h1 + ws), `app` (h1 + the application fan-out), `h2` (adds HTTP/2),
+`full` (the default, adds HTTP/3) and `exchange` (adds the
+graph-driven client) — let a target take only what it serves.
+Source: `modules/foundation/http/manifest.toml`.
+
+When a `tls` module in front supplies verified peer identities, a
+request forwarded to an application carries the peer's key
+fingerprint as a typed trailer. Wave owns the join — matching an
+identity to the connection it belongs to, and releasing it when that
+connection ends — and nothing else: whether a given peer may perform
+a given request is the application's decision, and the checks behind
+the identity are the TLS module's. An identity binds only for a
+handshake that succeeded, whose chain validated, and whose peer
+proved possession of the key; a certificate that was merely presented
+is a different fact from a peer that was authenticated.
 
 gRPC is a composition, not a module: the `grpc` parameter sets
 `content-type: application/grpc` and `te: trailers` on the HTTP/2
@@ -214,7 +226,7 @@ client and surfaces the `grpc-status` trailer. Service definitions,
 method dispatch, protobuf schemas and reflection are application
 concerns.
 
-A fifth variant, `exchange`, adds the graph-driven client: requests
+The `exchange` variant carries the graph-driven client: requests
 arrive as records at run time instead of being fixed by params, which
 makes `http` a provider of fluxor's `stream.ordered_ack.exchange`
 surface — the role a producer binds to reach a destination that

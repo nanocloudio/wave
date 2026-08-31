@@ -191,6 +191,26 @@ something else owns what the request means.
   [hdr_len u16][body_len u16]` then the content type, the
   application's own headers and the body.
 
+**Peer identity.** `flags` bit 1 marks a request whose connection
+completed a handshake that verified the peer. The fingerprint follows
+the body as `[svid_len u16 LE][svid]`, past every length in the fixed
+head, so a consumer that does not read the bit sees exactly what it
+saw before. The three section lengths are the envelope's ABI — every
+consumer reads path, headers and body by them — which is why the
+identity is a trailer rather than a fourth field.
+
+It is not a synthetic header such as `X-Forwarded-Client-Cert`
+either. A header is forgeable by the client unless the server strips
+every copy of it first, and one missed strip promotes an anonymous
+caller to whoever it claims to be; a trailer sits in a structure the
+client cannot reach at all.
+
+The identity belongs to the connection, not the request. It arrives
+once per handshake on `peer_identity` (in[9]) — often before the
+accept it belongs to — and is released when the connection ends,
+because connection ids are recycled and a stale entry would
+authenticate the next holder as the previous one.
+
 `drain_responses` routes an envelope by `(conn_id, stream_id)` —
 never `conn_id` alone, because h2 multiplexes many requests over one
 connection and an application is entitled to answer them out of

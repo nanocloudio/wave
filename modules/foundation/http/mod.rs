@@ -685,6 +685,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // never enters the retention path.
         if s.mode == MODE_SERVER {
             s.server.retained_idle_ticks = s.server.retained_idle_ticks.saturating_add(1);
+            // Peer identities arrive on their own schedule — one per
+            // handshake, ahead of the request that will carry them — so they
+            // are drained every step rather than at request time. An identity
+            // still in the channel when a request is serialised makes an
+            // authenticated caller anonymous for that request alone, which is
+            // a fault that reproduces only under the timing that caused it.
+            server::drain_peer_identities(s);
         }
 
         // A CLOSE the transport refused leaves `conn_present` set; retry it
@@ -923,6 +930,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     16,
                     s.server.ws_events_dropped as u64,
                 );
+                dev_telemetry_metric(sys, -1, midx, t, counter, 17, s.server.peers_unbound as u64);
             }
         }
 

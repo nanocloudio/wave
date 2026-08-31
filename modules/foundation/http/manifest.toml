@@ -301,6 +301,12 @@ access = "read"
 #         means a peer advertised a header-size limit tighter than our smallest
 #         response, so nothing can be sent to it at all. Each otherwise presents
 #         as a client that gets no useful answer with no error naming why.
+# id 17 = peers_unbound: a peer-identity record arrived and bound nothing —
+#         the handshake failed, the chain did not validate, or the peer proved
+#         no key. On a listener configured for mutual TLS this is the signal
+#         that callers are reaching the application anonymous, which nothing at
+#         request level shows: the request succeeds and the application simply
+#         never learns who made it.
 metrics = [
   "bytes_in",
   "bytes_out",
@@ -319,6 +325,7 @@ metrics = [
   "h3_handler_unavailable",
   "h3_field_limit_refused",
   "ws_events_dropped",
+  "peers_unbound",
 ]
 # Span 0: one `http.server.request` span per request (head parsed -> response
 # drained), SERVER kind. Minted only when a telemetry consumer is subscribed
@@ -413,3 +420,26 @@ ordering    = "single"
 # delivery that did not happen.
 broadcast   = "unsupported"
 max_payload = 8192
+
+# Per-session peer identity from the `tls` module, carrying what a handshake
+# established about the peer. It is what lets an application behind this module
+# authorise on WHO is calling: the identity is proved at the TLS boundary and
+# has no other way across it.
+#
+# OPTIONAL. Unwired, every request is anonymous and the request envelope
+# carries no identity trailer — the plaintext deployment, unchanged.
+[[ports]]
+name = "peer_identity"
+# Input index 9. Explicit, like every port past the first: these are ABI
+# positions the module resolves by number, not by declaration order.
+index = 9
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+# The largest record the contract's layout admits: frame header, fixed fields,
+# a 32-byte fingerprint and a 128-byte principal. A port that cannot take one
+# whole is not a short read — the length check fails, no identity binds, every
+# authenticated client is silently anonymous, and the undelivered bytes desync
+# whatever follows.
+max_record = 195
+

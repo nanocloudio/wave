@@ -23,8 +23,10 @@ generations it serves:
 
 | Variant | Artefact | Features |
 | --- | --- | --- |
-| `full` (default) | `http.fmod` | h1, h2, ws, h3 |
-| `h2` | `http-h2.fmod` | h1, h2, ws |
+| `full` (default) | `http.fmod` | h1, h2, ws, h3, app |
+| `exchange` | `http-exchange.fmod` | `full` plus the graph-driven client |
+| `h2` | `http-h2.fmod` | h1, h2, ws, app |
+| `app` | `http-app.fmod` | h1, app |
 | `web` | `http-web.fmod` | h1, ws |
 
 The point is flash. `web` is roughly 45% smaller than `full`, which is what makes
@@ -54,6 +56,16 @@ shared request path — so it is worth doing against a specific flash target the
 | `ws_out` / `ws_in` | 2 / 3 | out / in | `WsFrame` | WebSocket fan-out (handler 5) |
 | `routes_sink` / `routes_changes` | 4 | out / in | `OctetStream` | Compiled-route subscription self-edge |
 | `listeners_sink` / `listeners_changes` | 5 | out / in | `OctetStream` | Dynamic-listener subscription self-edge |
+| `req_out` / `resp_in` | 6 | out / in | `HttpRequest` / `HttpResponse` | Application fan-out (handler 11) |
+| `ws_admit_out` / `ws_admit_in` | 7 | out / in | `OctetStream` | WebSocket admission request and decision |
+| `ws_event_out` | 8 | output | `OctetStream` | Committed WebSocket lifecycle facts |
+| `publish_in` | 8 | input | `OctetStream` | Graph-driven client requests (`exchange` variant) |
+| `reply_out` | 9 | output | `OctetStream` | Graph-driven client responses (`exchange` variant) |
+| `peer_identity` | 9 | input | `OctetStream` | Verified peer from a mutual-TLS handshake |
+
+Indices are per direction, so an input and an output may share a number
+without sharing an edge. Every port past the first is optional: a graph wires
+what its deployment uses, and an unwired port is silent rather than an error.
 
 ## Parameters
 
@@ -121,6 +133,37 @@ which shows the two edges alongside them.
 Behind the `app` feature, so the `web` variant does not carry it — an rp2350
 serving h1 from config should not pay for a handler that forwards to a module it
 does not run.
+
+### Who is calling
+
+A TLS handshake establishes who the peer is. The request that follows is where
+an application decides what that peer may do, and the two facts arrive on
+different channels: the identity on `peer_identity`, the request on the
+transport. Joining them is this module's job.
+
+When `peer_identity` is wired and a handshake verified the peer, the request
+envelope sets flag bit 1 and carries the peer's key fingerprint as a trailer
+after the body — `[svid_len u16 LE][svid]`, past every length in the fixed
+head. A consumer that does not read the flag sees exactly what it saw before.
+
+A trailer rather than a synthetic header such as `X-Forwarded-Client-Cert`: a
+header is forgeable by the client unless the server strips every copy of it
+first, and one missed strip promotes an anonymous caller to whoever it claims
+to be. A trailer sits in a structure the client cannot reach.
+
+An identity binds only for a handshake that succeeded, whose certificate chain
+validated, and whose peer proved possession of the key. A certificate that was
+merely presented is a different fact from a peer that was authenticated. The
+identity is held against the CONNECTION rather than the request, because it
+arrives once per handshake — often before the accept it belongs to — and it is
+released the moment the connection ends, since connection ids are recycled and
+a stale entry would authenticate the next holder as the previous one.
+
+Wire nothing and every request is anonymous, with no trailer and no flag. The
+`peers_unbound` counter is the signal that something in between is wrong:
+non-zero on a listener configured for mutual TLS means callers are reaching the
+application anonymous, which nothing at request level shows — the request
+succeeds, and the application simply never learns who made it.
 
 ## Declared deviations
 

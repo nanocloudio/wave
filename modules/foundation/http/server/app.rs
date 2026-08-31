@@ -60,6 +60,22 @@ pub(crate) const RESP_HDR: usize = 12;
 /// `(conn_id, stream_id)`. Reserved by this phase and honoured by the streaming
 /// path; a single-envelope request/response leaves it clear.
 pub(crate) const FLAG_MORE_BODY: u8 = 0x01;
+/// Request flag: a PEER IDENTITY trailer follows the body.
+///
+/// `[svid_len:u16 LE][svid]`, appended after `body`, present only when the
+/// connection completed an mTLS handshake that actually verified the peer.
+///
+/// A trailer behind a flag rather than a field in the fixed head, because the
+/// three section lengths are the envelope's ABI: every consumer reads path,
+/// headers and body by them. A consumer that does not know this bit reads
+/// exactly what it did before and never looks past `body_len`.
+///
+/// And a trailer rather than a synthetic header such as
+/// `X-Forwarded-Client-Cert`: a header is forgeable by the client unless the
+/// server strips every copy of it first, and one missed strip promotes an
+/// anonymous caller to whoever it claims to be. A typed trailer sits in a
+/// structure the client cannot reach at all.
+pub(crate) const FLAG_PEER_IDENTITY: u8 = 0x02;
 
 /// Longest request header block forwarded to the application, in bytes.
 ///
@@ -98,7 +114,12 @@ pub(crate) unsafe fn write_request_envelope(
     hdrs: &[u8],
     body: &[u8],
 ) -> EmitResult {
-    let total = REQ_HDR + path.len() + hdrs.len() + body.len();
+    // The peer identity belongs to the CONNECTION, not the request, so it is
+    // looked up here rather than threaded through callers: h1 and h2 reach this
+    // function by different paths and both must carry it.
+    let peer = super::peer_svid(s, conn_id);
+    let peer_len = peer.map_or(0, |p| 2 + p.len());
+    let total = REQ_HDR + path.len() + hdrs.len() + body.len() + peer_len;
     if total > super::super::abi::CHANNEL_BUFFER_SIZE {
         return EmitResult::TooLarge;
     }
@@ -107,7 +128,11 @@ pub(crate) unsafe fn write_request_envelope(
     buf[0..2].copy_from_slice(&conn_id.to_le_bytes());
     buf[2..4].copy_from_slice(&stream_id.to_le_bytes());
     buf[4] = verb;
-    buf[5] = 0; // flags: whole body in this envelope
+    buf[5] = if peer.is_some() {
+        FLAG_PEER_IDENTITY
+    } else {
+        0
+    }; // whole body in this envelope
     buf[6..8].copy_from_slice(&(path.len() as u16).to_le_bytes());
     buf[8..10].copy_from_slice(&(hdrs.len() as u16).to_le_bytes());
     buf[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
@@ -118,6 +143,14 @@ pub(crate) unsafe fn write_request_envelope(
             core::ptr::copy_nonoverlapping(part.as_ptr(), buf.as_mut_ptr().add(off), part.len());
             off += part.len();
         }
+    }
+    // The trailer goes AFTER the body, past every length in the fixed head, so
+    // it is invisible to a reader that does not know the flag.
+    if let Some(svid) = peer {
+        buf[off..off + 2].copy_from_slice(&(svid.len() as u16).to_le_bytes());
+        off += 2;
+        core::ptr::copy_nonoverlapping(svid.as_ptr(), buf.as_mut_ptr().add(off), svid.len());
+        off += svid.len();
     }
 
     let sys = &*s.syscalls;

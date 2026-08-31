@@ -243,6 +243,40 @@ pub(crate) enum Phase {
     Error = 255,
 }
 
+// ── Verified peers ────────────────────────────────────────────────────────
+
+/// Longest peer fingerprint retained, taken from the contract that defines the
+/// record rather than chosen here — a second opinion about a field's width is
+/// how the two drift apart.
+///
+/// A fingerprint longer than this is refused rather than truncated: half a
+/// fingerprint is not a weaker identity, it is a different one, and it can
+/// collide with somebody else's.
+pub(crate) const MAX_PEER_SVID: usize = crate::abi::contracts::net::peer_identity::MAX_FINGERPRINT;
+
+/// One verified peer, keyed by CONNECTION rather than by slot.
+///
+/// The identity does not arrive in step with the slot. `tls` emits it the
+/// moment a handshake completes, which can be before this module has processed
+/// the `MSG_ACCEPTED` for that connection, so an identity keyed by slot would
+/// find none and be dropped — and a dropped identity is not a visible error,
+/// it is a caller the application sees as anonymous.
+#[derive(Clone, Copy)]
+pub(crate) struct PeerEntry {
+    /// `-1` when free.
+    pub(crate) conn_id: i32,
+    pub(crate) svid: [u8; MAX_PEER_SVID],
+    pub(crate) len: u8,
+}
+
+/// A free entry. `conn_id = -1` and not zero, because zero is a valid
+/// connection id: a table left zeroed reads as "connection 0 is this peer".
+pub(crate) const PEER_EMPTY: PeerEntry = PeerEntry {
+    conn_id: -1,
+    svid: [0; MAX_PEER_SVID],
+    len: 0,
+};
+
 // ── Server state ──────────────────────────────────────────────────────────
 
 /// Per-connection state. `ServerState` holds an array of these and
@@ -530,17 +564,144 @@ unsafe fn slot_init_zero(slot: &mut ConnSlot) {
     slot.proxy_dyn_idx = -1;
 }
 
+/// Drain every pending `peer_identity` record onto its connection.
+///
+/// Bounded per step so a burst cannot starve the protocol work: identities are
+/// small and one per handshake, and whatever is left is read on the next tick.
+///
+/// # Safety
+/// Single-threaded module step; `s` is the live module state.
+pub(crate) unsafe fn drain_peer_identities(s: &mut HttpState) {
+    use crate::abi::contracts::net::peer_identity as pid;
+    const PER_STEP: usize = 8;
+    let chan = s.server.peer_chan;
+    if chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    for _ in 0..PER_STEP {
+        let poll = (sys.channel_poll)(chan, POLL_IN);
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            return;
+        }
+        // Sized from the contract, so the buffer holds the largest record the
+        // layout admits. One too small is not a short read: the length check
+        // fails, no identity binds, and the undelivered bytes desync whatever
+        // follows.
+        let mut buf = [0u8; pid::MAX_TOTAL];
+        let n = (sys.channel_read)(chan, buf.as_mut_ptr(), buf.len());
+        if n <= 0 {
+            return;
+        }
+        // The contract's accessor rather than literal offsets: this module does
+        // not own the layout, and a reader counting somebody else's bytes is
+        // invisible to review and to the compiler when a field moves.
+        let Some((msg_type, plen)) =
+            pid::frame_parts(&buf[..n as usize]).map(|(t, p)| (t, p.len()))
+        else {
+            continue;
+        };
+        if msg_type != pid::MSG_PEER_IDENTITY {
+            continue;
+        }
+        // A record that arrives and binds NOTHING presents exactly as
+        // plaintext: the application sees an anonymous caller either way.
+        // Counted rather than logged — one line per handshake is noise, and a
+        // counter is the same evidence without it.
+        if note_peer_identity(s, &buf[pid::FRAME_HDR..pid::FRAME_HDR + plen]) {
+            s.server.peers_bound = s.server.peers_bound.wrapping_add(1);
+        } else {
+            s.server.peers_unbound = s.server.peers_unbound.wrapping_add(1);
+        }
+    }
+}
+
+/// The verified peer fingerprint bound to `conn_id`, if any.
+///
+/// Looked up by connection rather than passed down, because both HTTP
+/// generations reach the envelope writer by different paths and the identity is
+/// a property of the connection either way.
+pub(crate) unsafe fn peer_svid(s: &HttpState, conn_id: u16) -> Option<&[u8]> {
+    for i in 0..MAX_CONCURRENT_CONNS {
+        let e = &*s.server.peers.as_ptr().add(i);
+        if e.conn_id == i32::from(conn_id) && e.len > 0 {
+            return Some(&e.svid[..e.len as usize]);
+        }
+    }
+    None
+}
+
+/// Forget the peer bound to `conn_id`. Called when the connection ends:
+/// connection ids are RECYCLED, and an identity left behind would authenticate
+/// the next holder of the id as the previous one.
+pub(crate) unsafe fn forget_peer(s: &mut HttpState, conn_id: i32) {
+    for i in 0..MAX_CONCURRENT_CONNS {
+        let e = &mut *s.server.peers.as_mut_ptr().add(i);
+        if e.conn_id == conn_id {
+            *e = PEER_EMPTY;
+        }
+    }
+}
+
+/// Record a verified peer identity against its connection.
+///
+/// Whether a record binds at all is the contract's decision, not this
+/// module's: `fingerprint` yields bytes only for a handshake that succeeded,
+/// whose chain validated, and whose peer proved possession of the key. A
+/// certificate that was merely presented is a different fact from a peer that
+/// was authenticated, and treating the first as the second is the
+/// confused-deputy shape mutual TLS exists to close.
+pub(crate) unsafe fn note_peer_identity(s: &mut HttpState, payload: &[u8]) -> bool {
+    use crate::abi::contracts::net::peer_identity as pid;
+    if payload.len() < pid::PAYLOAD_FIXED {
+        return false;
+    }
+    let conn_id = i32::from(pid::conn_id(payload));
+    let fingerprint = pid::fingerprint(payload);
+
+    // Always CLEAR first: a record that does not bind an identity, for a
+    // connection that previously had one, must REMOVE it — a renegotiation
+    // that downgrades the peer must not leave the old identity standing.
+    forget_peer(s, conn_id);
+    let Some(fp) = fingerprint else {
+        return false;
+    };
+    if fp.len() > MAX_PEER_SVID {
+        return false;
+    }
+    for i in 0..MAX_CONCURRENT_CONNS {
+        let e = &mut *s.server.peers.as_mut_ptr().add(i);
+        if e.conn_id >= 0 {
+            continue;
+        }
+        e.conn_id = conn_id;
+        e.svid[..fp.len()].copy_from_slice(fp);
+        e.len = fp.len() as u8;
+        return true;
+    }
+    false
+}
+
 /// Free a slot's heap allocations (recv_buf, send_buf, h2),
 /// zero its metadata, and clear its bit in the ready bitmap.
 /// Called from `free_slot` (close path) and as the cleanup half
 /// of `alloc_free_slot` when a buffer's allocation fails.
 unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
+    // Connection ids are RECYCLED, so the peer bound to this one must go with
+    // it — otherwise the next holder of the id inherits somebody's identity.
+    {
+        let cid = (*s.server.slots.as_ptr().add(idx)).conn_id;
+        if cid >= 0 {
+            forget_peer(s, cid);
+        }
+    }
     // A connection that opened owes a committed closure. Reported here, where
     // every path that ends a connection converges, so it is reported once and
     // for exactly the connections that opened — not where a close was
     // REQUESTED, which is a different fact.
     {
         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+
         if slot.ws_opened_sent != 0 {
             let conn = if slot.conn_id >= 0 {
                 slot.conn_id as u32
@@ -685,6 +846,10 @@ pub(crate) struct ServerState {
     pub(crate) ws_admit_out_chan: i32,
     /// Where admission decisions arrive.
     pub(crate) ws_admit_in_chan: i32,
+    /// Where verified peer identities arrive, or `-1` when the graph left the
+    /// port unwired. Unwired is the plaintext deployment and is silent, not an
+    /// error: every request is simply anonymous.
+    pub(crate) peer_chan: i32,
     /// Where committed lifecycle facts are reported.
     pub(crate) ws_event_out_chan: i32,
     /// Input channel for `ws_in` (manifest port in[3]). Carries
@@ -747,6 +912,17 @@ pub(crate) struct ServerState {
     /// the first free slot, the close path resets the slot back to
     /// free.
     pub(crate) slots: [ConnSlot; MAX_CONCURRENT_CONNS],
+    /// Verified peers, by connection. One per concurrent connection — a
+    /// connection can only have one peer.
+    pub(crate) peers: [PeerEntry; MAX_CONCURRENT_CONNS],
+    /// Peer records that bound an identity, and those that did not.
+    ///
+    /// The second is the load-bearing one: non-zero on a listener configured
+    /// for mutual TLS means callers are reaching the application anonymous.
+    /// Nothing at request level shows that — the request succeeds, and the
+    /// application simply never learns who made it.
+    pub(crate) peers_bound: u32,
+    pub(crate) peers_unbound: u32,
     /// Index of the currently-active slot. `-1` when no connection
     /// is being ticked.
     pub(crate) cur_slot: i32,
@@ -1318,6 +1494,15 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.out_chan = -1;
     s.server.ws_out_chan = -1;
     s.server.ws_admit_out_chan = -1;
+    s.server.peer_chan = -1;
+    // `conn_id = -1` is FREE. The arena arrives zeroed, and zero is a valid
+    // connection id — an uninitialised table would read as "connection 0 has
+    // this identity" and hand it to whoever connected first.
+    for i in 0..MAX_CONCURRENT_CONNS {
+        *s.server.peers.as_mut_ptr().add(i) = PEER_EMPTY;
+    }
+    s.server.peers_bound = 0;
+    s.server.peers_unbound = 0;
     s.server.ws_admit_in_chan = -1;
     s.server.ws_event_out_chan = -1;
     s.server.ws_in_chan = -1;
@@ -1405,6 +1590,8 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     //   in[7]  = ws_admit_in       (OctetStream, admission decisions)
     //   out[7] = ws_admit_out      (OctetStream, admission requests)
     //   out[8] = ws_event_out      (OctetStream, committed lifecycle facts)
+    //   in[9]  = peer_identity     (OctetStream, mTLS only; -1 when unwired)
+    s.server.peer_chan = dev_channel_port(sys, 0, 9);
     s.server.ws_admit_in_chan = dev_channel_port(sys, 0, 7);
     s.server.ws_admit_out_chan = dev_channel_port(sys, 1, 7);
     s.server.ws_event_out_chan = dev_channel_port(sys, 1, 8);
