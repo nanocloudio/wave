@@ -82,7 +82,7 @@ VALID_PROTOCOLS = ("h1", "h2c", "ws", "grpc", "h3", "h3load", "h3bench", "sip")
 # borrows the same oracle rather than growing a second one.
 H3_PROTOCOL = "h3"
 H3_LOAD_PROTOCOL = "h3load"
-# The COMPILED HTTP/3 load path (rfc_hardening §7.2): wave-loadgen's `h3`
+# The COMPILED HTTP/3 load path: wave-loadgen's `h3`
 # protocol, riding quiche — the ladder driver whose headroom verdicts are
 # trustworthy, unlike the Python `h3load` phase, which stays as the
 # independent functional oracle and low-rate cross-check.

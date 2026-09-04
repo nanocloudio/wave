@@ -6,8 +6,7 @@ domain-neutral by construction: framing only, no session, no I/O, no allocation.
 Each file carries no inner attributes and no test module, so the PIC module
 build can `include!` it verbatim — every consumer compiles the same bytes. A
 core with no module mount is a level-1 capability, tested through its own
-direct fixture in `tests/harness` and never presented as a deployable role
-(rfc_hardening §9.6).
+direct fixture in `tests/harness` and never presented as a deployable role.
 
 | Core | Owns | Mounted by |
 | --- | --- | --- |

@@ -230,9 +230,9 @@ pub(crate) unsafe fn ws_begin_close(s: &mut HttpState, code: u16) {
 //
 // One mailbox-style write per frame, capped at CHANNEL_BUFFER_SIZE.
 
-// The WsFrame envelope layout is the fluxor `ws_frame` contract's — the
-// header size, u32 conn id and all-ones unclaimed sentinel were previously
-// restated here (rfc_hardening.md §5.2).
+// The WsFrame envelope layout belongs to the `ws_frame` contract — the header
+// size, the u32 conn id and the all-ones unclaimed sentinel are taken from it
+// rather than restated, so a widening cannot pass unnoticed here.
 pub(crate) use super::super::abi::contracts::net::ws_frame;
 pub(crate) use ws_frame::FRAME_HDR as WS_FRAME_HDR;
 

@@ -396,7 +396,7 @@ pub(crate) unsafe fn emit_request_span(s: &mut HttpState) {
     };
     // Head-sampling gate FIRST — before any clock read or RNG. A propagated
     // `traceparent` carries the caller's decision; a minted root is sampled. An
-    // unsampled flow emits nothing (RFC observability bit test); the client
+    // unsampled flow emits nothing; the client
     // controls this, so the early gate matters.
     let propagated = tp_trace != [0u8; 16];
     let eff_flags = if propagated {

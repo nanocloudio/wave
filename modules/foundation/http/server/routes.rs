@@ -6,7 +6,7 @@
 //! consumer off the `/dataplane/edge/<ns>/<name>` prefix and matched on host
 //! *and* path, with weights and readiness per backend.
 //!
-//! A request consults them in that order (rfc_dynamic_routes §3.2): the static
+//! A request consults them in that order: the static
 //! arena first, then the dynamic table, so a compiled route always outranks a
 //! programmed one. `HANDLER_*` names what a matched row does; the subsystem
 //! that does it lives elsewhere (`super::body`, `super::proxy`, `super::ws`).
@@ -348,7 +348,7 @@ pub(crate) unsafe fn content_type_from_path(path: *const u8, plen: usize) -> &'s
     }
 }
 
-// ── The dynamic route arena (rfc_dynamic_routes §3.2) ─────────────────────
+// ── The dynamic route arena ───────────────────────────────────────────────
 //
 // Rows are programmed at runtime by the table consumer from the compiled
 // `/dataplane/edge/<ns>/<name>` prefix, one key per route carrying the full
@@ -358,7 +358,7 @@ pub(crate) unsafe fn content_type_from_path(path: *const u8, plen: usize) -> &'s
 //
 // Host matching, weights and readiness are net-new capabilities the static
 // matcher does not have. The relay (`HANDLER_PROXY`, `super::proxy`) dials the
-// selected backend and streams both ways (rfc_workload_ingress P1); this table
+// selected backend and streams both ways; this table
 // is its runtime backend source.
 
 /// Host header buffer per dynamic route.

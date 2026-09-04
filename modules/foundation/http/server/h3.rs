@@ -89,7 +89,7 @@ use super::super::wire::qpack;
 /// table is module-scope). 16 on aarch64 — two streams per session at the
 /// 8-session table, ~3.2 KB of buffers per slot (~51 KB total), with the
 /// refusal at the ceiling pinned by test and the Pi 5 ladder measuring the
-/// latency cost (rfc_hardening §7.4).
+/// latency cost.
 #[cfg(target_arch = "aarch64")]
 pub const MAX_H3_STREAMS: usize = 16;
 /// Non-aarch64 keeps the small table: h3 rides fluxor `quic`, which targets

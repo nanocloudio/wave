@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Connection-identity accessor guard (.context/rfc_hardening.md §5.2).
+# Connection-identity accessor guard.
 #
 # The conn_id u8→u16 widening was missed in exactly one consumer because
 # call sites hand-rolled `from_le_bytes` against literal offsets — invisible
@@ -41,7 +41,7 @@ fail=0
 while IFS= read -r hit; do
   echo "identity-guard: locally redeclared contract width:" >&2
   echo "  $hit" >&2
-  echo "  use the contract's constant (rfc_hardening.md §5.2)" >&2
+  echo "  use the contract's constant" >&2
   fail=1
 done < <(grep -rn --include='*.rs' \
   -E 'const (WS_FRAME_HDR|CONN_ID_LEN|SESSION_ID_BYTES|STREAM_ID_BYTES)\b' \
@@ -76,7 +76,7 @@ while IFS= read -r file; do
     echo "identity-guard: unjustified hand-rolled byte decode:" >&2
     echo "  $file:$lineno: $trimmed" >&2
     echo "  use the owning contract accessor, or justify the site in" >&2
-    echo "  $ALLOWLIST (rfc_hardening.md §5.2)" >&2
+    echo "  $ALLOWLIST" >&2
     fail=1
   done < <(grep -n -E 'from_le_bytes|to_le_bytes' "$file" || true)
 done < <(scope)
@@ -92,7 +92,7 @@ done
 
 if [ "$fail" -ne 0 ]; then
   echo >&2
-  echo "identity-accessor guard FAILED (rfc_hardening.md §5.2)" >&2
+  echo "identity-accessor guard FAILED" >&2
   exit 1
 fi
 echo "identity-accessor guard: ok"

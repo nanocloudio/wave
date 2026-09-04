@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Flash budget for the built `.fmod` artefacts.
 #
-# Wave's variant split exists to fit smaller devices (`rfc_module_variants`). That
+# Wave's variant split exists to fit smaller devices. That
 # claim is a NUMBER, and until now nothing held it: the 37% saving `http-web`
 # gives over `http` on rp2350 was true because someone measured it once, and any
 # change could have eaten it silently. A variant that quietly stops being smaller

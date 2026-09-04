@@ -1,7 +1,7 @@
 //! `jitter` — the RTP-family reorder/playout adapter.
 //!
-//! The minimum receive-side buffering the realtime family owns
-//! (rfc_hardening §9.6): validated RTP payloads in, loss-concealed playout
+//! The minimum receive-side buffering the realtime family owns:
+//! validated RTP payloads in, loss-concealed playout
 //! out, at the codec's frame cadence. The data structure and both operations
 //! are `modules/common/jitter_core.rs`, mounted verbatim; this file is the
 //! pump — records in, a wall clock for pacing, backpressure out.

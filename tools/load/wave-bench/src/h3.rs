@@ -1,4 +1,4 @@
-//! HTTP/3 load client over `quiche` (RFC hardening §7.2).
+//! HTTP/3 load client over `quiche`.
 //!
 //! The compiled independent driver the HTTP/3 envelope needs: the Python
 //! oracle (aioquic) proved FUNCTIONAL correctness but cannot distinguish a

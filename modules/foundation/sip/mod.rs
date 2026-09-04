@@ -4,7 +4,7 @@
 //!   * `sip_core` formats/parses the INVITE/ACK/BYE/200-OK messages and SDP;
 //!   * `sip_dialog` is the UAC/UAS transaction FSM.
 //!
-//! Signalling ONLY (rfc_hardening §9.6): it owns the SIP datagram endpoint
+//! Signalling ONLY: it owns the SIP datagram endpoint
 //! and drives the media path — the separate `rtp` module and the `jitter`
 //! reorder/playout adapter — over shared control records on `rtp_ctrl`. It
 //! holds no media socket, no jitter state and no playout clock; those moved
@@ -548,7 +548,7 @@ unsafe fn apply(s: &mut SipModState, step: sip_dialog::SipStep) {
 /// rig capture can see whether the module is stepping, whether datagrams reach
 /// it at all, and what the dialog thinks its state is. Rate-limited to one
 /// line per second and carrying counters and an FSM state only — never message
-/// bodies, peer credentials or media (RFC hardening §4.2/§10).
+/// bodies, peer credentials or media.
 unsafe fn dbg_beat(s: &mut SipModState) {
     let sys = &*s.syscalls;
     let now = dev_millis(sys);
@@ -597,7 +597,7 @@ unsafe fn step_sip(s: &mut SipModState) {
         );
         if wrote != 0 {
             s.sip_bound = 1;
-            // Bind evidence (RFC hardening §4.2): the request left this module.
+            // Bind evidence: the request left this module.
             // Its absence isolates a wiring/backpressure fault before the IP
             // module; the `ep=` line below isolates one after it.
             let mut l = [0u8; 20];
@@ -883,9 +883,8 @@ pub extern "C" fn module_new(
         s.sip_net_in = in_chan;
         s.sip_net_out = out_chan;
         s.call_ctrl_in = ctrl_chan;
-        // Post-decomposition port map: in[1] = command_in, out[1] = rtp_ctrl,
-        // out[2] = event_out. The media ports left with the media
-        // (rfc_hardening §9.6).
+        // in[1] = command_in, out[1] = rtp_ctrl, out[2] = event_out. The
+        // media ports belong to the media modules, not to signalling.
         s.command_in = dev_channel_port(sys, 0, 1);
         let ch = dev_channel_port(sys, 1, 1);
         if ch >= 0 {
@@ -908,7 +907,7 @@ pub extern "C" fn module_new(
             s.branch = now;
         }
 
-        // Startup evidence (RFC hardening §4.2): the record a rig capture keys
+        // Startup evidence: the record a rig capture keys
         // on to distinguish "module never instantiated" from every later
         // failure class. Local ports and the active flag only.
         let mut line = [0u8; 34];

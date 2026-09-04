@@ -4,7 +4,7 @@ hardware_targets = ["bcm2712"]
 # timer_class: the two delivery deadlines (CONNECT_TIMEOUT_MS 10 s,
 # REPLY_TIMEOUT_MS 15 s) are read from wall-clock `dev_millis`. A lockstep
 # conversation waiting on a server-chosen reply has no tick-counted state at
-# all, so a variable cadence cannot warp it (RFC adaptive_tick §8 rule 2).
+# all, so a variable cadence cannot warp it.
 timer_class      = "wall_clock"
 
 # Transport to the SMTP server (net_proto): net_in reads NET_MSG_* events from

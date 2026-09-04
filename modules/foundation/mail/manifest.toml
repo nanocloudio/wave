@@ -3,7 +3,7 @@ hardware_targets = ["bcm2712"]
 
 # timer_class: this module reads no clock at all. It is driven entirely by the
 # records that arrive and the room downstream has for what it produces, so a
-# variable cadence changes nothing about what it emits (RFC adaptive_tick §8
+# variable cadence changes nothing about what it emits.
 # rule 2).
 timer_class      = "agnostic"
 

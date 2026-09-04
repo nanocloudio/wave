@@ -10,7 +10,7 @@
 //! client's masked writer. A codec that needed to know which side it was on
 //! would belong one directory up.
 //!
-//! Feature-gated per generation (RFC module_variants), so `http-web.fmod` links
+//! Feature-gated per generation, so `http-web.fmod` links
 //! neither `h2`/`hpack` nor `h3`/`qpack`. Each is `pub` only under `host-test`,
 //! keeping the firmware's symbol surface unchanged while letting the vectors
 //! reach it — `modules/**` has a hard inline-test ban.

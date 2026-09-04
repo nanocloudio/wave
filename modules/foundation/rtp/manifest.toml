@@ -10,7 +10,7 @@ hardware_targets = ["rp2350", "bcm2712"]
 # feeds `g711` (the codec/source) and to `sip`'s playout clock — not here.
 # NOTE this is an EXPLICIT attestation, not the absent-field default: absent
 # means "assume step-counted" and blocks admission to a variable-cadence
-# domain (RFC adaptive_tick §8 rule 2). If a future revision ever paces
+# domain. If a future revision ever paces
 # transmission itself, this must be revisited before it is `agnostic` again.
 timer_class = "agnostic"
 

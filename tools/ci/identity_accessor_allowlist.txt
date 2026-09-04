@@ -1,7 +1,7 @@
 # Justified non-identity byte-decode sites (identity_accessor_guard.sh rule 1).
 # Format: <path>|<exact trimmed line>|<justification>.
 # Adding a line here without a justification that survives review is itself
-# a defect (rfc_hardening.md §5.2): the allow-list may only describe sites
+# a defect: the allow-list may only describe sites
 # that decode something OTHER than connection/requester/stream/generation
 # identity, or the owning parser of a Wave-local record layout.
 

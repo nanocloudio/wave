@@ -4,8 +4,7 @@ A connector for S3-compatible object endpoints. The signing and canonical-form
 construction live in the shared `modules/common/s3_core.rs`, the
 request/response records in `modules/common/s3_wire.rs`; this module is the
 I/O pump around them. Object meaning — which bucket backs which namespace,
-what a key maps to — is the consumer's (loam's gateway makes that mapping);
-the wire mechanics are Wave's. Relocated from loam.
+what a key maps to — is the consumer's; the wire mechanics are Wave's.
 
 ## Why it is a compiled module and not a codec
 

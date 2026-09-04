@@ -66,7 +66,7 @@ scripts = [
   "tools/ci/host_crates.sh",
   "tools/ci/fmod_size_budget.sh",
   #   4. identity_accessor_guard.sh — connection-identity accessor guard
-  #      (rfc_hardening.md §5.2): module pumps must decode contract identities
+  #      module pumps must decode contract identities
   #      through the owning accessors, never literal offsets; every remaining
   #      byte-decode site carries an individual justification in
   #      tools/ci/identity_accessor_allowlist.txt, and a stale or unjustified

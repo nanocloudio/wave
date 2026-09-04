@@ -520,8 +520,7 @@ never left unanswered), sixteen concurrent request streams, and a
 2 KiB per-stream response buffer. A response that does not fit is
 refused whole with a tested refusal rather than truncated;
 incremental DATA framing for larger bodies is deliberately deferred
-until load evidence establishes its shape
-(.context/rfc_hardening.md §7.4).
+until load evidence establishes its shape.
 
 ## Transport and security boundary
 

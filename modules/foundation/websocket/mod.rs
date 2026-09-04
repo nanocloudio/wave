@@ -1,10 +1,3 @@
-//! Migrated from Chronicle (`modules/foundation/websocket`) per
-//! `rfc_connector_strategy.md` §10.1: an RFC-6455 HTTP/1.1 ws CLIENT. Fluxor has
-//! only server-side `ws_stream` + a WS-over-HTTP/2 client, so this filled a real
-//! gap and is NOT a duplicate. Wave now owns RFC 6455 byte semantics for both
-//! roles — this client, `ws_stream`'s `WsFrame` adapter, and the `http` server's
-//! upgrade path — over Fluxor transports.
-//!
 //! WebSocket (RFC 6455) connector — a GENUINE per-protocol Fluxor foundation
 //! module for the "protocol upgrade + masked bidirectional framing" class. The
 //! connection starts as HTTP: the client sends an Upgrade request with a random
@@ -53,16 +46,16 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 // Shared Wave codecs — `include!`d verbatim so the device and the host test
-// harness compile identical bytes (rfc_connector_strategy.md §9).
+// harness compile identical bytes.
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs"); // b64_encode
 include!("../../common/hex_core.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs"); // sha1
 include!("../../common/ws_frame_core.rs");
 include!("../../common/ws_core.rs");
 
-// The NetProto opcodes and identity accessors come from the owning contract
-// — never redeclared locally, so a wire change there is a compile change here
-// (rfc_hardening.md §5.2).
+// The NetProto opcodes and identity accessors come from the owning contract,
+// never redeclared locally, so a change to the wire is a compile error here
+// rather than a wrong answer.
 use abi::contracts::net::net_proto::{
     self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT, CMD_SEND as NET_CMD_SEND,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,

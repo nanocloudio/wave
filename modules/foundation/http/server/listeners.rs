@@ -1,4 +1,4 @@
-//! Dynamic listeners (rfc_workload_ingress §4.2).
+//! Dynamic listeners.
 //!
 //! A second table consumer beside `super::routes`: the anchor consumes
 //! `/dataplane/edge-listeners/<port> = proto=tcp;tls=<0|1>` and binds each
@@ -10,7 +10,7 @@
 //! between them is the work: bind what is newly desired, close what has been
 //! withdrawn.
 //!
-//! The kernel's endpoint-lease gate (rfc_endpoint_lease.md §5.3) enforces
+//! The kernel's endpoint-lease gate enforces
 //! "bind ∈ lease set": a port the edge owner was not granted is refused with
 //! `MSG_BIND_REFUSED`, so the listener never comes up. The grant model is a
 //! pre-leased port POOL — the edge owner's plan carries one lease per pool port
@@ -235,7 +235,7 @@ impl DynListeners {
     }
 
     /// A mid-life `CMD_BIND` was refused — `port` is outside the edge owner's
-    /// lease pool (rfc_endpoint_lease.md §5.3). Terminal: the reconciler does
+    /// lease pool. Terminal: the reconciler does
     /// not retry, because the lease set does not change at runtime.
     pub(crate) fn mark_refused(&mut self, port: u16) {
         if let Some(bi) = self.bound_slot_for(port) {
@@ -325,7 +325,7 @@ pub const LISTENER_STATE_REFUSED: u8 = LISTENER_REFUSED;
 
 /// Param setter for `listeners_prefix` (TLV tag 91). Empty leaves the
 /// dynamic-listener feature off (byte-identical server). Copies up to
-/// `MAX_DYN_PREFIX` bytes (rfc_workload_ingress §4.2).
+/// `MAX_DYN_PREFIX` bytes.
 ///
 /// # Safety
 /// `d` points at `len` readable bytes (the TLV value).
@@ -344,7 +344,7 @@ pub(crate) unsafe fn set_listeners_prefix(s: &mut HttpState, d: *const u8, len: 
 /// desired listener set against the runtime bind records: bind newly
 /// desired ports mid-life (`CMD_BIND`), tear down withdrawn ones
 /// (`CMD_CLOSE`). No-op when the feature is off (`listeners_prefix_len ==
-/// 0`), keeping the server byte-identical (rfc_workload_ingress §4.2).
+/// 0`), keeping the server byte-identical.
 ///
 /// The mid-life bind is issued only once the static listener is bound
 /// (`bound == 1`): the shared `net_out` / `net_in` pair carries the init
@@ -443,15 +443,17 @@ unsafe fn reconcile_listeners(s: &mut HttpState) {
     }
 }
 
-/// Fill a `NET_CMD_BIND` payload for `port`, optionally owner-stamped for a
-/// metal `net=own` workload (`rfc_workload_backend_metal.md` §3.4 / P3a). The
-/// base payload is `[port:u16 LE]` (host/wildcard, byte-identical to pre-P3a);
-/// when this http instance belongs to a workload owner (`dev_owner_tag != 0`,
-/// stamped by `apply_add`'s `set_module_owner` post-alloc) it appends
-/// `[owner_tag:u16 LE]`, which the ip module's P2 admission resolves to the
-/// workload's owned address (a wrong/unowned tag is refused EACCES). A
-/// host-owned (base-graph) http reads owner slot 0 and appends nothing.
-/// Returns the payload length (2 or 4).
+/// Fill a `NET_CMD_BIND` payload for `port`, owner-stamped when this instance
+/// belongs to a workload that owns its own address.
+///
+/// The base payload is `[port:u16 LE]`, which binds the host or wildcard
+/// address. An instance whose owner tag is non-zero appends
+/// `[owner_tag:u16 LE]`; the `ip` module resolves that tag to the workload's
+/// owned address and refuses an unowned one with `EACCES`. A host-owned
+/// instance reads owner slot 0 and appends nothing, so its payload is the
+/// two-byte form.
+///
+/// Returns the payload length, 2 or 4.
 #[inline]
 pub(crate) unsafe fn fill_bind_payload(sys: &SyscallTable, port: u16, out: &mut [u8; 4]) -> usize {
     out[0] = (port & 0xFF) as u8;

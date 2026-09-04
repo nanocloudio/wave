@@ -78,9 +78,9 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-// The WsFrame envelope layout is the fluxor `ws_frame` contract's — header
-// size, u32 conn id and the all-ones unclaimed sentinel were previously
-// restated here (rfc_hardening.md §5.2).
+// The WsFrame envelope layout belongs to the `ws_frame` contract — the header
+// size, the u32 conn id and the all-ones unclaimed sentinel are taken from it
+// rather than restated, so a widening cannot pass unnoticed here.
 use abi::contracts::net::ws_frame;
 use ws_frame::FRAME_HDR as WS_FRAME_HDR;
 const FRAME_BUF_BYTES: usize = abi::CHANNEL_BUFFER_SIZE;

@@ -162,19 +162,19 @@ mod connection;
 #[cfg(not(feature = "host-test"))]
 mod server;
 // Exposed under host-test so the harness can unit-test the DynRoute
-// arena matching/selection directly (rfc_dynamic_routes §3.2). The
+// arena matching/selection directly. The
 // firmware symbol surface is unchanged (private otherwise).
 #[cfg(feature = "host-test")]
 pub mod server;
 
-// Feature gates (RFC module_variants): HTTP/2 (h2 + hpack + wire_h2 +
+// Feature gates: HTTP/2 (h2 + hpack + wire_h2 +
 // client_h2) and HTTP/3 (h3 + qpack + wire_h3) compile only when their
 // feature is enabled. `[[variant]]` in manifest.toml drives which
 // prebuilt fmod carries them — `http.fmod` (default = full) has both;
 // `http-web.fmod` is h1+ws only, dropping ~4.65k LOC of flash the
 // embedded single-connection targets never exercise. h1 and ws are
 // always compiled (ws gating is deferred — its seams are ~10x wider;
-// see rfc_module_variants.md §9 O1).
+// see the README's variants section).
 // Wire codecs live in `wire/`, one file per generation, all I/O-free. See
 // `wire/mod.rs`; the per-generation feature gating is there rather than here.
 #[cfg(not(feature = "host-test"))]
@@ -504,7 +504,7 @@ mod params_def {
         89, route_7_fs_filter, str, 0
             => |s, d, len| { server::params::set_route_fs_filter(s, 7, d, len); };
 
-        // Dynamic-route prefix (rfc_dynamic_routes §3.2). Not a
+        // Dynamic-route prefix. Not a
         // `route_N_*` slot — it configures the store prefix the
         // table_consumer subscribes to (e.g. `/dataplane/edge/`). Empty
         // (default) leaves the whole dyn-route subsystem off, so an
@@ -512,7 +512,7 @@ mod params_def {
         90, routes_prefix, str, 0
             => |s, d, len| { server::params::set_routes_prefix(s, d, len); };
 
-        // Dynamic-listener prefix (rfc_workload_ingress §4.2). Configures
+        // Dynamic-listener prefix. Configures
         // the store prefix a SECOND table_consumer subscribes to (e.g.
         // `/dataplane/edge-listeners/`) for mid-life bind of pooled ports.
         // Empty (default) leaves the mid-life-bind subsystem off, so an
@@ -810,11 +810,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let counter = abi::contracts::telemetry::METRIC_COUNTER;
                 dev_telemetry_metric(sys, -1, midx, t, counter, 0, s.tlm.bytes_in as u64);
                 dev_telemetry_metric(sys, -1, midx, t, counter, 1, s.tlm.bytes_out as u64);
-                // id 2 = http.routes.dropped — dynamic-route arena /
-                // backend-set overflow (rfc_dynamic_routes §2.5, §6:
-                // a store reader surfaces degradation through
-                // telemetry, never a store key). Cumulative; 0 when the
-                // dyn-route feature is off.
+                // id 2 = http.routes.dropped — dynamic-route arena or
+                // backend-set overflow. Degradation is surfaced through
+                // telemetry rather than through a store key, so a reader
+                // sees it without consulting the route store. Cumulative;
+                // 0 when the dyn-route feature is off.
                 dev_telemetry_metric(
                     sys,
                     -1,
@@ -825,9 +825,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.server.dyn_routes.dropped as u64,
                 );
                 // id 3 = http.proxy.retries, id 4 = http.proxy.5xx —
-                // proxy-relay failover / terminal 5xx (rfc_workload_ingress
-                // §3; a reader surfaces these via telemetry, never a
-                // store key). Cumulative; 0 when no relay is configured.
+                // proxy-relay failover and terminal 5xx, surfaced through
+                // telemetry rather than a store key. Cumulative; 0 when no
+                // relay is configured.
                 dev_telemetry_metric(sys, -1, midx, t, counter, 3, s.server.proxy_retries as u64);
                 dev_telemetry_metric(sys, -1, midx, t, counter, 4, s.server.proxy_5xx as u64);
                 // id 5 = http.backpressure.steps. Counted at every send seam
@@ -1003,7 +1003,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             q += fmt_u32_raw(p.add(q), server::active_slot_count(s) as u32);
             dev_log(sys, 3, p, q);
         }
-        // §6 work signal (RFC adaptive_tick_extra): if the request/response path
+        // Work signal for the pacer: if the request/response path
         // moved bytes this step, keep the pacer hot. Redundant-but-harmless when
         // the sub-step already returned Burst (rc==2); fixes the case where it
         // did work but returned Continue.

@@ -346,7 +346,7 @@ fn main() {
     }
 
     let elapsed = wall.elapsed().as_secs_f64().max(0.001);
-    // Driver self-attribution (rfc_hardening §7.2): the generator's own CPU
+    // Driver self-attribution: the generator's own CPU
     // over the measured window, as a percentage of ONE core. A driver near a
     // core per shard is measuring itself, whatever the latency numbers say.
     let cpu_pct = (self_cpu_seconds() - cpu_start).max(0.0) / elapsed * 100.0;

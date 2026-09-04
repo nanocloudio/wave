@@ -7,11 +7,11 @@ hardware_targets = ["rp2350", "bcm2712"]
 # counts scheduler passes as time, so a variable cadence changes only WHEN a
 # deadline is sampled, never whether it is correct. Positively attested rather
 # than left absent: an unattested module is assumed step-counted and is refused
-# admission to a mechanism-(b) (variable-cadence) domain (RFC adaptive_tick §8
-# rule 2), which is a placement restriction this module does not need.
+# admission to a variable-cadence domain, which is a placement restriction this
+# module does not need.
 timer_class = "wall_clock"
 
-# Ingress anchor role (rfc_workload_ingress §2, rfc_protocols.md §8.1):
+# Ingress anchor role:
 # in proxy mode on a leased TCP port the http fmod is the client-visible
 # stream transport attachment. Declared so the `continuity` config
 # validator (class edge_anchored) accepts an http-fronted edge; the
@@ -30,7 +30,7 @@ timer_class = "wall_clock"
 # http-exchange.fmod.
 capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 
-# Feature-set variants (RFC module_variants). `full` (default) emits the
+# Feature-set variants. `full` (default) emits the
 # unsuffixed http.fmod with every protocol generation; `http-web.fmod` drops
 # HTTP/2 + HTTP/3 (h2/hpack/wire_h2/client_h2 + h3/qpack/wire_h3) for embedded
 # targets that serve single-connection HTTP/1 (+WebSocket). Measured saving:
@@ -38,8 +38,8 @@ capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 # Sizes are gated by tools/ci/fmod_size_budget.sh so they cannot drift silently.
 #
 # `h1` and `ws` are declared markers — always compiled. A `min` (h1-only)
-# variant needs the ws seams gated first (rfc_module_variants.md §9 O1: ws
-# scatter is ~10x h2's — 181 references in server.rs alone), and the prize looks
+# variant needs the ws seams gated first — ws scatter is roughly ten times
+# h2's, 181 references in the server core alone — and the prize looks
 # small: the ws-attributable NAMED symbols in http-web.elf total ~1.2 KiB of its
 # 66 KiB, the rest being inlined into the shared request path. Worth doing only
 # against a specific flash target that the `web` variant misses.
@@ -153,7 +153,7 @@ content_type = "WsFrame"
 buffer_size = { default = 65600, bcm2712 = 131072 }
 max_record  = 8192
 
-# Compiled-route subscription sink (rfc_dynamic_routes). The graph self-wires
+# Compiled-route subscription sink. The graph self-wires
 # `routes_sink` (out[4]) -> `routes_changes` (in[4]) so the store's
 # namespace.change SUBSCRIBE for the `/dataplane/edge/` prefix has a
 # module-owned sink.
@@ -171,7 +171,7 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 4096
 
-# Dynamic-listener subscription self-edge (rfc_workload_ingress §4.2).
+# Dynamic-listener subscription self-edge.
 # A SECOND table_consumer: the graph self-wires `listeners_sink` (out[5])
 # -> `listeners_changes` (in[5]) so the store's namespace.change SUBSCRIBE
 # for `listeners_prefix` (e.g. /dataplane/edge-listeners/) has a
@@ -261,10 +261,9 @@ access = "read"
 
 [observability]
 # id 2 = routes_dropped (http.routes.dropped): dynamic-route arena /
-# backend-set overflow (rfc_dynamic_routes §2.5).
+# backend-set overflow.
 # id 3 = proxy_retries (http.proxy.retries), id 4 = proxy_5xx
-# (http.proxy.5xx): proxy-relay failover / terminal 5xx
-# (rfc_workload_ingress §3).
+# (http.proxy.5xx): proxy-relay failover / terminal 5xx.
 #
 # ids 5-13 are the load-shedding surface. Every one of these paths refuses or
 # drops work under pressure, and before they were counted each presented to an

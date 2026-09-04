@@ -2,7 +2,7 @@
 
 Voice is split three ways and this module holds the middle: **Spectra** owns the
 G.711 codec, **Wave** owns the wire mechanics, and **Conclave** owns the call
-semantics above both. This module is SIGNALLING ONLY (rfc_hardening §9.6): a
+semantics above both. This module is SIGNALLING ONLY: a
 UDP endpoint wrapper around two cores in `modules/common` — `sip_core` (message
 formatters and response/SDP parsers) and `sip_dialog` (the transaction FSM).
 The media path is the separate `rtp` (endpoint, packetise/depacketise) and

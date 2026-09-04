@@ -86,8 +86,8 @@ use stun_txn::{
 // `turn_core` is NOT included here. This module answers STUN Binding
 // requests and nothing else; TURN's methods, relay attributes and
 // ChannelData framing are unused by it, and a codec mounted only so tests
-// can reach it presents relay mechanics as functionality of this server
-// (rfc_hardening §9.6). The TURN codec's conformance fixture reaches it
+// can reach it presents relay mechanics as functionality of this server.
+// The TURN codec's conformance fixture reaches it
 // directly in the harness, sharing `stun_core` there exactly as a real
 // consumer would.
 

@@ -1,4 +1,4 @@
-//! Proxy relay (rfc_workload_ingress §3).
+//! Proxy relay.
 //!
 //! A `HANDLER_PROXY` static route (`proxy_ip`/`proxy_port`) or a dynamic-route
 //! match dials an upstream backend and relays bytes both ways WITHIN THE SLOT'S

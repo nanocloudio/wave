@@ -23,9 +23,11 @@
 // digest, which re-stamps every `.fmod` in every workspace member and forces a
 // coordinated rebuild. A request/response pair between two modules that already
 // agree on a layout does not earn that cost — the same call loam's storage
-// ports make. (Relocated from loam per rfc_storage_capability_symmetry §7:
-// S3 framing + SigV4 are HTTP mechanics; the bucket/key ⇄ storage.object
-// mapping stays with the consumer.)
+// ports make.
+//
+// The boundary this sits on: S3 framing and SigV4 are HTTP mechanics and
+// belong here; mapping a bucket and key onto whatever the application calls an
+// object stays with the consumer.
 
 /// Retrieve an object. `body_len` must be 0.
 pub const S3_OP_GET: u8 = 0x50;

@@ -115,8 +115,8 @@ pub(crate) use super::abi::config::http::{
 // ── Table consumers ───────────────────────────────────────────────────────
 //
 // Two runtime tables are programmed from the store rather than from params:
-// the dynamic route arena (`routes`, rfc_dynamic_routes §2/§3.2) and the
-// dynamic listener set (`listeners`, rfc_workload_ingress §4.2). Both ride the
+// the dynamic route arena (`routes`) and the dynamic listener set
+// (`listeners`). Both ride the
 // reusable `cores/table_consumer` core, `include!`d here — it is an
 // implementation, not a wire contract, so it is included rather than linked
 // (see the file header). `SyscallTable` is brought into scope for the include
@@ -502,7 +502,7 @@ pub(crate) struct ConnSlot {
     /// W3C trace-flags from the connection's `MSG_TRACE_CTX`. Low bit = `sampled`.
     pub(crate) conn_flags: u8,
 
-    // ── Proxy relay state (rfc_workload_ingress §3) ────────────────
+    // ── Proxy relay state ──────────────────────────────────────────
     //
     // A HANDLER_PROXY route (static `proxy_ip/port`) or a dynamic-route
     // match dials an upstream backend and relays bytes both ways
@@ -979,7 +979,7 @@ pub(crate) struct ServerState {
     /// canonical runtime shell both have no reconnect logic).
     pub(crate) latest_fanout_slot: i32,
 
-    // ── Dynamic routes (rfc_dynamic_routes §3.2) ──────────────────
+    // ── Dynamic routes ─────────────────────────────────────────────
     //
     // Default-off: `routes_prefix_len == 0` means the whole subsystem
     // is dormant and the server behaves byte-for-byte as before.
@@ -998,7 +998,7 @@ pub(crate) struct ServerState {
     /// Scratch for the `CHANGES` relist response.
     pub(crate) routes_scratch: [u8; DYN_SCRATCH],
 
-    // ── Proxy relay bookkeeping (rfc_workload_ingress §3) ──────────
+    // ── Proxy relay bookkeeping ────────────────────────────────────
     /// Slot index owning the in-flight proxy `CONNECT` handshake, or
     /// `-1`. `MSG_CONNECTED`/`MSG_ERROR` carry only `[conn_id][tag]`
     /// and the tag is the module index (identical across slots), so
@@ -1101,7 +1101,7 @@ pub(crate) struct ServerState {
     /// nothing, with no error on either side naming the cause.
     pub(crate) h3_field_limit_refused: u32,
 
-    // ── Dynamic listeners (rfc_workload_ingress §4.2) ──────────────
+    // ── Dynamic listeners ──────────────────────────────────────────
     //
     // Default-off: `listeners_prefix_len == 0` leaves the whole
     // mid-life-bind subsystem dormant and the server byte-identical.
@@ -2078,7 +2078,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 s.server.listeners.mark_bound(port, conn);
             }
             // A mid-life bind was refused — the port is outside the edge
-            // owner's lease pool (rfc_endpoint_lease.md §5.3). linux_net
+            // owner's lease pool. linux_net
             // frames it `[port:2 LE][errno:1]`. Acted on ONLY with the
             // feature configured, so the metal `ip` module's 0x07
             // (RETRANSMIT) is never misread on the byte-identical path.

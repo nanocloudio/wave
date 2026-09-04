@@ -7,7 +7,7 @@
 //
 // The sequence rides the record because the reorder buffer downstream keys on
 // it — a consumer that cannot see the sequence cannot see loss, let alone
-// conceal it (rfc_hardening §9.6). This file owns the layout; `rtp` writes
+// conceal it. This file owns the layout; `rtp` writes
 // it, `jitter` reads it, and no third spelling exists.
 
 /// Frame type of one validated receive record.

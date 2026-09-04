@@ -1,7 +1,7 @@
 # `jitter` — RTP reorder and loss-concealing playout
 
-The minimum receive-side buffering the realtime family owns
-(`.context/rfc_hardening.md` §9.6): validated RTP payloads in, loss-concealed
+The minimum receive-side buffering the realtime family owns:
+validated RTP payloads in, loss-concealed
 µ-law playout out at the codec's frame cadence. The ring and both of its
 operations live in the host-tested `modules/common/jitter_core.rs`; this
 module is the pump around them.

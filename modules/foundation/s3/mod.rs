@@ -64,11 +64,10 @@ include!("../../common/hex_core.rs");
 mod s3_wire;
 use s3_wire::*;
 
-// The NetProto opcodes and identity accessors come from the owning contract
-// — never redeclared locally, so a wire change there is a compile change here
-// (rfc_hardening.md §5.2). This module is where that discipline earned its
-// name: the conn_id u8→u16 widening missed exactly this file's hand-rolled
-// offsets.
+// The NetProto opcodes and identity accessors come from the owning contract,
+// never redeclared locally, so a change to the wire is a compile error here
+// rather than a wrong answer. A connection id read at a hand-rolled offset is
+// invisible to review and to the compiler the moment the field widens.
 use abi::contracts::net::net_proto::{
     self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT, CMD_SEND as NET_CMD_SEND,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,

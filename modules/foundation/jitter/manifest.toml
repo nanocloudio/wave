@@ -4,10 +4,10 @@ hardware_targets = ["rp2350", "bcm2712"]
 # timer_class: playout paces on `dev_millis` at the `ptime` cadence, and MUST —
 # a relaxed scheduler tick that stretched the interval would stretch the audio.
 # Reading the wall clock is what makes a variable cadence safe here, and
-# declaring it is what lets the validator know (RFC adaptive_tick §8 rule 2).
+# declaring it is what lets the validator know.
 timer_class = "wall_clock"
 
-# The RTP-family reorder/playout adapter (rfc_hardening §9.6): validated RTP
+# The RTP-family reorder/playout adapter: validated RTP
 # payloads in as `[seq: u16 LE][payload…]` records, loss-concealed µ-law
 # playout out at `ptime` cadence. The buffer is modules/common/jitter_core.rs;
 # call policy stays with `sip`, adaptive playout with Grove.

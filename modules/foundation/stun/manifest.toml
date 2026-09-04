@@ -4,7 +4,7 @@ hardware_targets = ["rp2350", "bcm2712"]
 # timer_class: the CLIENT role holds a deadline. RFC 5389 §7.2.1 puts the
 # retransmission schedule in milliseconds — 500 ms doubling to a 39.5 s total —
 # and a schedule counted in scheduler passes would stretch or compress with the
-# cadence, which is exactly the drift rule 2 forbids (RFC adaptive_tick §8).
+# cadence, which is exactly the drift the attestation exists to prevent.
 #
 # The server role still reads no clock: a Binding request is answered from the
 # datagram it arrived in. But a module attests once, for everything it

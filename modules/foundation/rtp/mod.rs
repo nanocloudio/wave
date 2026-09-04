@@ -77,7 +77,7 @@ use rtp_wire::{
 
 // `sframe_core` and `webrtc_sdp` are NOT mounted here. Nothing in this
 // module uses them, and a core mounted merely to give tests a production
-// path overstates the module (rfc_hardening §9.6). Their conformance
+// path overstates the module. Their conformance
 // fixtures reach them directly in the harness.
 
 // Host-build equivalents of the ARM EABI memory intrinsics.
@@ -203,7 +203,7 @@ struct RtpState {
     /// Inbound packets refused for exceeding `RX_MAX_PAYLOAD`.
     rx_truncated: u32,
     /// Frames addressed to this endpoint, consumed while the receive output
-    /// is unwired. Counted, never silent (RFC hardening §10).
+    /// is unwired. Counted, never silent.
     rx_unrouted: u32,
     /// out[2]: `rtcp_stats`. −1 when no `rtcp` module is wired, which is the
     /// ordinary media-only graph.
@@ -423,7 +423,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// must ride the beat, because one-shot records at module_new ([rtp] ready)
 /// are emitted before DHCP binds and never leave the board over UDP telemetry
 /// (rig run 2026-08-26). Phase, endpoint id and local port only — never
-/// payload (RFC hardening §4.2/§10).
+/// payload.
 const DBG_BEAT_STEPS: u32 = 1024;
 
 unsafe fn dbg_beat(s: &mut RtpState) {
@@ -511,7 +511,7 @@ unsafe fn step_init(s: &mut RtpState) -> i32 {
         return 0; // Channel full, retry next tick
     }
 
-    // Bind evidence (RFC hardening §4.2): the request left this module, with
+    // Bind evidence: the request left this module, with
     // the local port it named. Distinguishes a wiring fault before the IP
     // module from a bind refusal after it (`[rtp] bound` / `[rtp] bind fail`).
     let mut l = [0u8; 20];

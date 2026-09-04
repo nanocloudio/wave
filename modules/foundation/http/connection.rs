@@ -10,10 +10,11 @@
 //! the top-level module's scope by `include!`. Submodules reach them
 //! via `super::net_write_frame` etc.
 
-// The opcodes and identity accessors come from the owning contract — values
-// were previously restated here as literals, which is exactly the drift the
-// identity-accessor guard now refuses (rfc_hardening.md §5.2). The local
-// NET_-prefixed names are kept so call sites read unchanged; `net_proto`
+// The opcodes and identity accessors come from the owning contract rather
+// than being restated here as literals. A value copied out of a contract is
+// invisible when the contract widens it, which is why
+// `tools/ci/identity_accessor_guard.sh` refuses one. The local NET_-prefixed
+// names are kept so call sites read unchanged; `net_proto`
 // itself is re-exported for the accessors (`conn_id`, `put_conn_id`,
 // `connected_parts`, `error_parts`, `accepted_parts`).
 pub(crate) use super::abi::contracts::net::net_proto;
