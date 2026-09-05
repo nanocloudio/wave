@@ -11,7 +11,12 @@
 // it shares this core's shape but not its `ClientState`.
 #[cfg(feature = "exchange")]
 pub(crate) mod exchange;
+#[cfg(not(feature = "host-test"))]
 pub(crate) mod h1;
+// Exposed under host-test so the harness can unit-test the status-line
+// parser feeding `surface_status`; the firmware symbol surface is unchanged.
+#[cfg(feature = "host-test")]
+pub mod h1;
 #[cfg(feature = "h2")]
 pub(crate) mod h2;
 #[cfg(all(feature = "h3", not(feature = "host-test")))]
@@ -56,6 +61,11 @@ pub(crate) const REQUEST_BUF_SIZE: usize = MAX_PATH_LEN + 256;
 /// One-shot param client: a small body configured at build time.
 #[cfg(not(feature = "exchange"))]
 pub(crate) const REQUEST_BODY_SIZE: usize = 256;
+
+/// Longest `Content-Type` a composed request will carry. Ample for the
+/// registered media types plus parameters; a longer value is truncated at this
+/// bound like every other string param here.
+pub(crate) const CONTENT_TYPE_MAX: usize = 64;
 /// Graph-driven client: a body the graph supplies, at the contract's ceiling.
 #[cfg(feature = "exchange")]
 pub(crate) const REQUEST_BODY_SIZE: usize = super::exchange::PAYLOAD_MAX;
@@ -135,6 +145,28 @@ pub(crate) struct ClientState {
     pub(crate) host_ip: u32,
     pub(crate) port: u16,
     pub(crate) path_len: u16,
+    /// Status code of the response in flight, parsed when its headers
+    /// complete. Zero before that, and for a status line this parser will not
+    /// read — a refusal is never minted from a guess. Cleared per exchange.
+    pub(crate) last_status: u16,
+    /// `surface_status` (param 103): when non-zero, an exchange whose response
+    /// carries a status of 400 or above answers as `REFUSE_UPSTREAM` with the
+    /// code as its payload, rather than as a successful exchange carrying the
+    /// error body.
+    ///
+    /// Opt-in, because for most consumers an error body IS the answer. It is
+    /// worth arming where the producer must act on the class of failure —
+    /// retrying a 503 or a 429, discarding a permanent 4xx — which it cannot
+    /// decide from a payload whose shape it does not know.
+    pub(crate) surface_status: u8,
+    /// `Content-Type` for the composed request (param 102), or empty to omit
+    /// the header entirely.
+    ///
+    /// A server that accepts a typed body is entitled to refuse one that
+    /// arrives unlabelled, so a graph POSTing a concrete format — protobuf,
+    /// say — sets this and a graph POSTing nothing does not.
+    pub(crate) content_type: [u8; CONTENT_TYPE_MAX],
+    pub(crate) content_type_len: u16,
 
     pub(crate) phase: Phase,
     pub(crate) headers_done: u8,
@@ -253,6 +285,10 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.client.out_chan = -1;
     s.client.data_in_chan = -1;
     s.client.port = 80;
+    s.client.content_type = [0; CONTENT_TYPE_MAX];
+    s.client.content_type_len = 0;
+    s.client.last_status = 0;
+    s.client.surface_status = 0;
     s.client.phase = Phase::Init;
     // h2 connection-level recv window starts at the spec default.
     s.client.recv_window = 65535;
@@ -299,6 +335,8 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
         s.client.path_len as usize,
         s.client.host_ip,
         s.client.request_body_len as usize,
+        s.client.content_type.as_ptr(),
+        s.client.content_type_len as usize,
     );
     s.client.request_len = len as u16;
     s.client.request_sent = 0;

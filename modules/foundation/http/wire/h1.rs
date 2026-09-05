@@ -750,6 +750,10 @@ pub fn parse_range_header(value: &[u8], size: u32) -> RangeParse {
 ///
 /// # Safety
 /// `dst` must be valid for writes of `dst_cap` bytes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a request head is a flat record; the callers' fields map 1:1"
+)]
 pub unsafe fn write_request_head(
     dst: *mut u8,
     dst_cap: usize,
@@ -758,6 +762,8 @@ pub unsafe fn write_request_head(
     path_len: usize,
     host_ip_be: u32,
     body_len: usize,
+    content_type: *const u8,
+    content_type_len: usize,
 ) -> usize {
     let verb = method::method_name(method);
     if verb.is_empty() {
@@ -806,6 +812,18 @@ pub unsafe fn write_request_head(
             put!(b".");
         }
         o += 1;
+    }
+
+    // `Content-Type` precedes `Content-Length`, so a typed body reads as one
+    // description of what follows. Omitted entirely when unset: a header with
+    // an empty value is a different claim from no header at all.
+    if content_type_len > 0 {
+        put!(b"\r\nContent-Type: ");
+        if off + content_type_len > dst_cap {
+            return 0;
+        }
+        core::ptr::copy_nonoverlapping(content_type, dst.add(off), content_type_len);
+        off += content_type_len;
     }
 
     if body_len > 0 {

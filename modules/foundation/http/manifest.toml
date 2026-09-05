@@ -325,12 +325,44 @@ metrics = [
   "h3_field_limit_refused",
   "ws_events_dropped",
   "peers_unbound",
+  # ids 18/19 are the per-request pair. Every other counter here measures
+  # bytes, shedding or refusal, none of which yields a request rate or a
+  # latency distribution; the span carries per-request detail but is
+  # head-sampled, so it answers "which request was slow" and not "how many,
+  # how slow".
+  #
+  # Both describe HTTP/1, whose responses drain through a single chokepoint;
+  # h2 and h3 complete on their own paths and are not counted here. Neither
+  # moves with the span sampling rate. `request_latency_us` is a 16-bucket
+  # histogram whose bounds are declared below and shipped to consumers through
+  # the id-table — bounds are metadata, and the record carries counts alone.
+  "requests_total",
+  "request_latency_us",
 ]
 # Span 0: one `http.server.request` span per request (head parsed -> response
 # drained), SERVER kind. Minted only when a telemetry consumer is subscribed
 # (zero-cost otherwise). Keepalive re-latches the span per request.
 spans = ["http.server.request"]
 
+
+# Per-instrument metadata (id-table rows). `bounds_us` MUST match
+# `server::body::LAT_BOUNDS_US`: the module classifies against its compiled
+# ladder while consumers label buckets from this declaration, so any drift
+# between them mislabels every bucket. `manifest_contract.rs` holds the two
+# identical.
+#
+# 250 µs to 10 s spans what this server actually sees — a healthy request
+# lands mid-ladder, and a stalled backend still resolves near the top rather
+# than piling into one saturated bucket.
+[[observability.instrument]]
+name      = "requests_total"
+kind      = "counter"
+
+[[observability.instrument]]
+name      = "request_latency_us"
+kind      = "histogram16"
+bounds_us = [250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000,
+             250000, 500000, 1000000, 2500000, 5000000, 10000000]
 # WebSocket admission (in[7] / out[7]) and lifecycle (out[8]).
 #
 # A route using `HANDLER_WEBSOCKET_ADMIT` reports its upgrade on

@@ -24,6 +24,26 @@ use super::{
     E_AGAIN, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED, RECV_BUF_SIZE,
 };
 
+/// The numeric status of an HTTP/1.x status line — the three digits after the
+/// first space, as in `HTTP/1.1 503 Service Unavailable`.
+///
+/// Zero for anything this will not read whole: a refusal carrying a status is
+/// only worth acting on if the status was actually sent, so a partial or
+/// non-numeric line yields nothing rather than a guess.
+pub fn parse_status_line(head: &[u8]) -> u16 {
+    let sp = head.iter().position(|&b| b == b' ');
+    let Some(sp) = sp else { return 0 };
+    if head.len() < sp + 4 {
+        return 0;
+    }
+    let d = &head[sp + 1..sp + 4];
+    if d.iter().all(|b| b.is_ascii_digit()) {
+        (d[0] - b'0') as u16 * 100 + (d[1] - b'0') as u16 * 10 + (d[2] - b'0') as u16
+    } else {
+        0
+    }
+}
+
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     loop {
         match s.client.phase {
@@ -232,7 +252,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     // returns straight to the caller and never falls through
                     // to it, so a hook there answers nothing.
                     #[cfg(feature = "exchange")]
-                    super::exchange::complete(s);
+                    {
+                        super::exchange::complete(s);
+                        if super::exchange::armed(s) {
+                            // A graph-driven client is RESIDENT: this ends one
+                            // exchange, not the module.
+                            return 0;
+                        }
+                    }
                     return 1;
                 }
 
@@ -255,6 +282,9 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     if let Some(body_start) =
                         h1::find_header_end(&s.client.recv_buf, s.client.recv_len as usize)
                     {
+                        // Capture the status BEFORE the body memmove below
+                        // overwrites the head in place.
+                        s.client.last_status = parse_status_line(&s.client.recv_buf[..body_start]);
                         let body_len = (s.client.recv_len as usize) - body_start;
                         if body_len > 0 {
                             let buf_ptr = s.client.recv_buf.as_mut_ptr();
@@ -311,7 +341,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     // returns straight to the caller and never falls through
                     // to it, so a hook there answers nothing.
                     #[cfg(feature = "exchange")]
-                    super::exchange::complete(s);
+                    {
+                        super::exchange::complete(s);
+                        if super::exchange::armed(s) {
+                            // A graph-driven client is RESIDENT: this ends one
+                            // exchange, not the module.
+                            return 0;
+                        }
+                    }
                     return 1;
                 }
 
@@ -386,7 +423,18 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // Answer the request that produced this response, then go
                 // idle so the next one on `publish_in` can be taken.
                 #[cfg(feature = "exchange")]
-                super::exchange::complete(s);
+                {
+                    super::exchange::complete(s);
+                    if super::exchange::armed(s) {
+                        // A graph-driven client is RESIDENT: `Done` ends one
+                        // exchange, not the module. Retiring here would answer
+                        // the first request and strand every one after it.
+                        // The step dispatch idles an armed client with nothing
+                        // in flight, and the next publish re-arms the phase
+                        // machine.
+                        return 0;
+                    }
+                }
                 return 1;
             }
 
@@ -396,7 +444,15 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // no silent drops, so the producer gets a typed refusal
                 // rather than waiting out its own timeout.
                 #[cfg(feature = "exchange")]
-                super::exchange::fail(s);
+                {
+                    super::exchange::fail(s);
+                    if super::exchange::armed(s) {
+                        // The same rule on the failure path: the refusal
+                        // answered THIS exchange. Faulting the module instead
+                        // would let one refused request end every later one.
+                        return 0;
+                    }
+                }
                 return -1;
             }
 

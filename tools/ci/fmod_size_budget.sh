@@ -47,9 +47,9 @@ MODE="${1:-}"
 # reads as coverage.
 BUDGETS='
 rp2350|http.fmod|162000|150332 (2026-08-29, +1.2K: the client request head carries a real verb and a Content-Length, and fails closed instead of truncating)
-rp2350|http-h2.fmod|119000|110760 (2026-08-12, +5.1K)
+rp2350|http-h2.fmod|129000|119538 (2026-09-05, +8.8K: the per-request counter and latency histogram, the request Content-Type, and upstream-status surfacing)
 rp2350|http-web.fmod|85000|78868 (2026-08-29, +536 B: the client request head carries a real verb and a Content-Length, and fails closed instead of truncating)
-rp2350|http-app.fmod|80000|73368 (2026-08-16, first row; h1 + app fan-out only)
+rp2350|http-app.fmod|87000|80706 (2026-09-05, +7.3K: the per-request counter and latency histogram, the request Content-Type, and upstream-status surfacing)
 rp2350|http-exchange.fmod|167000|154236 (2026-08-29, first row; the full variant plus the graph-driven client exchange — publish_in/reply_out, the reply accumulator and the staging frame)
 rp2350|rtp.fmod|5400|4980 (2026-08-30, +788 B: the appended rtcp_stats output — tagged reception and transmission records for the rtcp module, best-effort and counted)
 rp2350|rtcp.fmod|7000|6462 (2026-08-30, first row; RFC 3550 §6 control plane (see `rtcp_core.rs`) — compound framing, SR/RR/SDES, receiver statistics, the §6.2 interval)

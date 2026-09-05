@@ -381,7 +381,25 @@ pub(crate) unsafe fn step_legacy_file_dispatch(s: &mut HttpState) -> bool {
 /// (parsed into the slot at request start); otherwise mints a fresh root.
 /// `name_id = 0` is the first `[observability].spans` entry. No-op when the
 /// telemetry port is unwired or no span was started for this request.
+/// `request_latency_us` (id 19) bucket upper bounds, µs — 250 µs to 10 s.
+/// MUST match the manifest's `[[observability.instrument]] bounds_us` row:
+/// the id-table ships these to consumers; the record carries counts only.
+/// 15 bounds + implicit `+Inf` = 16 buckets.
+pub const LAT_BOUNDS_US: [u64; 15] = [
+    250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
+    2_500_000, 5_000_000, 10_000_000,
+];
+
 pub(crate) unsafe fn emit_request_span(s: &mut HttpState) {
+    // Counted before both gates below, so the request rate it yields tracks
+    // what the server did rather than what telemetry happened to be watching.
+    // The histogram cannot follow it there — a duration costs a clock read,
+    // and an unsubscribed server should not pay one — so the two reconcile
+    // only across a window in which a consumer stayed subscribed.
+    //
+    // Both are HTTP/1: `finish_response` is the drain chokepoint for that
+    // generation, and h2 and h3 complete their responses on their own paths.
+    s.server.requests_total = s.server.requests_total.wrapping_add(1);
     if !dev_telemetry_enabled(&*s.syscalls) {
         return;
     }
@@ -394,10 +412,23 @@ pub(crate) unsafe fn emit_request_span(s: &mut HttpState) {
         ),
         _ => return,
     };
-    // Head-sampling gate FIRST — before any clock read or RNG. A propagated
-    // `traceparent` carries the caller's decision; a minted root is sampled. An
-    // unsampled flow emits nothing; the client
-    // controls this, so the early gate matters.
+    let sys = &*s.syscalls;
+    let end_raw = dev_micros(sys);
+    let end = if end_raw < start { start } else { end_raw };
+    // The histogram is maintained before the SAMPLING gate, so a percentile
+    // drawn from it does not move with the sampling rate. Bucket i counts
+    // durations in (LAT_BOUNDS_US[i-1], LAT_BOUNDS_US[i]]; the last is `+Inf`.
+    {
+        let dur = end - start;
+        let mut bi = 0usize;
+        while bi < LAT_BOUNDS_US.len() && dur > LAT_BOUNDS_US[bi] {
+            bi += 1;
+        }
+        s.server.lat_hist[bi] = s.server.lat_hist[bi].wrapping_add(1);
+    }
+    // Head-sampling gate — before any RNG. A propagated `traceparent` carries
+    // the caller's decision; a minted root is sampled. An unsampled flow emits
+    // no SPAN; the client controls this, so the early gate matters.
     let propagated = tp_trace != [0u8; 16];
     let eff_flags = if propagated {
         tp_flags
@@ -410,13 +441,10 @@ pub(crate) unsafe fn emit_request_span(s: &mut HttpState) {
         }
         return;
     }
-    let sys = &*s.syscalls;
     let me = dev_self_index(sys);
     if me < 0 {
         return;
     }
-    let end_raw = dev_micros(sys);
-    let end = if end_raw < start { start } else { end_raw };
     let mut ctx = super::super::abi::contracts::telemetry::SpanContext {
         trace_id: [0u8; 16],
         span_id: [0u8; 8],

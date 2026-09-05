@@ -923,6 +923,19 @@ pub(crate) struct ServerState {
     /// application simply never learns who made it.
     pub(crate) peers_bound: u32,
     pub(crate) peers_unbound: u32,
+    /// id 18 `requests_total` — every HTTP/1 request whose response fully
+    /// drained, including those whose span was not sampled, so the rate it
+    /// yields does not shrink when sampling tightens.
+    pub(crate) requests_total: u64,
+    /// id 19 `request_latency_us` — 16-bucket duration histogram against
+    /// [`body::LAT_BOUNDS_US`], bucket 15 being the implicit `+Inf`.
+    /// Cumulative counts, emitted on the telemetry cadence.
+    ///
+    /// Maintained only while a telemetry consumer is subscribed, because a
+    /// duration costs a clock read. It therefore reconciles with
+    /// `requests_total` across a window in which one stayed subscribed, and
+    /// not across a server's whole lifetime.
+    pub(crate) lat_hist: [u64; 16],
     /// Index of the currently-active slot. `-1` when no connection
     /// is being ticked.
     pub(crate) cur_slot: i32,
@@ -1503,6 +1516,8 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     }
     s.server.peers_bound = 0;
     s.server.peers_unbound = 0;
+    s.server.requests_total = 0;
+    s.server.lat_hist = [0; 16];
     s.server.ws_admit_in_chan = -1;
     s.server.ws_event_out_chan = -1;
     s.server.ws_in_chan = -1;

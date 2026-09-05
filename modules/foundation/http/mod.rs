@@ -333,6 +333,22 @@ mod params_def {
             s.server.max_body = (p_u16(d, len, 0, 0) as u32).saturating_mul(1024);
         };
 
+    // `Content-Type` for a composed client request; empty omits the header.
+    102, content_type, str, 0 => |s, d, len| {
+        let n = len.min(s.client.content_type.len());
+        let mut i = 0usize;
+        while i < n {
+            s.client.content_type[i] = *d.add(i);
+            i += 1;
+        }
+        s.client.content_type_len = n as u16;
+    };
+
+    // Answer an exchange whose response is 400 or above as a typed refusal
+    // carrying the code, rather than as a success carrying the error body.
+    103, surface_status, u8, 0
+        => |s, d, len| { s.client.surface_status = p_u8(d, len, 0, 0); };
+
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };
 
@@ -931,6 +947,21 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.server.ws_events_dropped as u64,
                 );
                 dev_telemetry_metric(sys, -1, midx, t, counter, 17, s.server.peers_unbound as u64);
+                // id 18 = requests_total: every completed request, sampled
+                // or not.
+                dev_telemetry_metric(sys, -1, midx, t, counter, 18, s.server.requests_total);
+                // id 19 = request_latency_us: 16 cumulative bucket counts
+                // against `server::body::LAT_BOUNDS_US`. The id-table ships
+                // the bounds; the record carries counts alone.
+                dev_telemetry_histogram16(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    19,
+                    abi::contracts::telemetry::DIM_NONE,
+                    &s.server.lat_hist,
+                );
             }
         }
 

@@ -609,15 +609,17 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             }
                         };
                         cur.span_flags = flags;
-                        // Head-sampling: a propagated context carries the caller's
-                        // bit; a root (all-zero trace) is sampled. Latch the span
-                        // start ONLY when sampled, so an unsampled request does NO
-                        // end-of-request clock/RNG work (emit returns on start==0).
-                        let propagated = cur.span_trace_id != [0u8; 16];
-                        let sampled = !propagated
-                            || flags & super::super::abi::contracts::telemetry::TRACE_FLAGS_SAMPLED
-                                != 0;
-                        cur.span_start_us = if sampled { span_now } else { 0 };
+                        // Latched UNCONDITIONALLY, because the latency
+                        // histogram buckets every request's duration whether
+                        // or not its span is sampled. A percentile drawn only
+                        // from sampled requests moves with the sampling rate,
+                        // which makes it not a percentile.
+                        //
+                        // Head sampling therefore gates the SPAN alone,
+                        // re-derived at emit time from the latched flags. An
+                        // unsampled request pays one end-of-request clock read
+                        // and no RNG.
+                        cur.span_start_us = span_now;
                     }
                     // `Expect: 100-continue` — stage the interim response now.
                     // The client is WAITING for it and will not send the body

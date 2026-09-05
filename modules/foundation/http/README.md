@@ -71,8 +71,22 @@ what its deployment uses, and an unwired port is silent rather than an error.
 
 `mode` (0 server / 1 client), `port`, `body`, `path`, `host_ip`, `protocol`,
 `request_body`, `websocket`, `host_tcp`, `grpc`, then eight route blocks of
-`route_N_{path,body,handler,proxy_ip,proxy_port,source,content_type,fs_path,fs_list,fs_filter}`.
+`route_N_{path,body,handler,proxy_ip,proxy_port,source,content_type,fs_path,fs_list,fs_filter}`,
+and the high-tag set: `routes_prefix`, `listeners_prefix`, `max_body_kib`,
+`content_type`, `surface_status`.
 Tags are wire positions: append, never renumber.
+
+Two shape the client's requests and its answers:
+
+- `content_type` labels a composed request body, or is left empty to send no
+  `Content-Type` at all. A server that accepts a typed body may refuse one that
+  arrives unlabelled.
+- `surface_status` decides what an upstream failure looks like on the exchange
+  surface. Left at zero, a response is a successful exchange whatever its
+  status, and an error body is the answer — which is what most consumers want.
+  Set, a status of 400 or above answers as a typed refusal carrying the code,
+  so a producer can retry a 503 and discard a 404 without parsing a payload
+  whose shape it does not know.
 
 ## Timing
 

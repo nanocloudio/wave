@@ -251,6 +251,15 @@ destination would report a delivery that did not happen) and
 `max_payload = 8192`. Credentials, retry policy and the meaning of a
 refusal belong to the producer.
 
+What an upstream failure looks like is a deployment choice. By default
+a response is a completed exchange whatever its status, and an error
+body is the answer — which is what a consumer reading a problem
+document wants. A graph may instead ask for a status of 400 or above
+to answer as a typed refusal carrying the code, so a producer can
+retry a 503 and discard a 404 without parsing a payload whose shape it
+does not know. Wave classifies; what to do about a class stays with
+the producer.
+
 `capabilities` is declared per module rather than per variant, so the
 manifest states this surface for artefacts that do not compile it.
 That is a property of the variant split — the `app` fan-out ports have

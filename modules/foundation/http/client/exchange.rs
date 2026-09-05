@@ -37,7 +37,7 @@
 
 use super::super::exchange::{
     Publish, Reply, FLAG_BROADCAST, MSG_PUBLISH, MSG_REPLY, REFUSE_OVERSIZE, REFUSE_UNROUTABLE,
-    STATUS_OK,
+    REFUSE_UPSTREAM, STATUS_OK,
 };
 use super::super::HttpState;
 use super::{Phase, EXCHANGE_KEY_MAX, EXCHANGE_REPLY_MAX};
@@ -76,6 +76,11 @@ unsafe fn adopt(s: &mut HttpState, corr: u64, key: &[u8]) {
     s.client.exchange_corr = corr;
     s.client.exchange_reply_len = 0;
     s.client.exchange_oversize = 0;
+    // Cleared with the rest of the per-exchange state. A response that never
+    // reaches its status line — a connection closed mid-headers — would
+    // otherwise be answered with the code the PREVIOUS exchange saw, and a
+    // producer would retry or discard on a status this peer never sent.
+    s.client.last_status = 0;
 }
 
 /// Take one request off `publish_in` and arm the phase machine for it.
@@ -211,6 +216,21 @@ pub(crate) unsafe fn complete(s: &mut HttpState) {
     }
     if s.client.exchange_oversize != 0 {
         send_reply(s, REFUSE_OVERSIZE, 0);
+        return;
+    }
+    // With status surfacing armed, a response of 400 or above answers as a
+    // typed refusal carrying the code rather than as a successful exchange
+    // carrying an error body. That is what lets a producer tell a 503 worth
+    // retrying from a 404 worth dropping, which it cannot do from a payload
+    // whose shape it does not know.
+    //
+    // Off by default, because for most consumers an error body IS the answer:
+    // a 404 with a problem document is a result, not a transport failure.
+    if s.client.surface_status != 0 && s.client.last_status >= 400 {
+        let code = s.client.last_status.to_le_bytes();
+        s.client.exchange_reply[0] = code[0];
+        s.client.exchange_reply[1] = code[1];
+        send_reply(s, REFUSE_UPSTREAM, 2);
         return;
     }
     send_reply(s, STATUS_OK, s.client.exchange_reply_len as usize);
