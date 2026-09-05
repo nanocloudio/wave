@@ -46,8 +46,8 @@ use super::routes::{
 };
 use super::{
     cur_conn_id, cur_h2, cur_h2_mut, cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_recv_len,
-    cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_send_offset, cur_slot_mut, MAX_PATH,
-    RECV_BUF_SIZE, SEND_BUF_SIZE,
+    cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_send_offset, cur_slot, cur_slot_mut,
+    MAX_PATH, RECV_BUF_SIZE, SEND_BUF_SIZE,
 };
 
 /// Per-stream WebSocket reassembly buffer. Cross-DATA-frame WS frames
@@ -569,6 +569,39 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         }
         if cur_h2_mut(s).sub == Sub::Closing {
             return 1;
+        }
+    }
+
+    // Lifetime deadlines, with the connection's own knowledge of whether a
+    // stream is open. No stream and no bytes for the keepalive limit: the
+    // connection holds no admitted work and is told to go away (GOAWAY, then
+    // close) exactly as a drain would tell it. A stream open with no bytes
+    // either way for the stall limit: the peer has stopped sending a body or
+    // stopped reading a response, and the connection is closed rather than
+    // left pinning its buffers. Checked with `send_buf` drained, because
+    // GOAWAY needs it.
+    if cur_send_len(s) == 0 && cur_h2(s).sub == Sub::Active {
+        let open = any_stream_open(s);
+        let limit = if open {
+            s.server.stall_ms
+        } else {
+            super::keepalive_limit_ms(s)
+        };
+        if limit != 0 {
+            let progress = cur_slot(s).map(|c| c.progress_ms).unwrap_or(0);
+            if s.server.now_ms.saturating_sub(progress) >= limit as u64 {
+                super::count_deadline(
+                    s,
+                    if open {
+                        super::DeadlineKind::Stall
+                    } else {
+                        super::DeadlineKind::Idle
+                    },
+                );
+                queue_goaway(s, h2w::ERR_NO_ERROR);
+                cur_h2_mut(s).sub = Sub::Closing;
+                return 2;
+            }
         }
     }
 
@@ -1735,7 +1768,7 @@ unsafe fn try_dispatch_pending(s: &mut HttpState) {
         //
         // The reachable case is HANDLER_APP: `req_out` is a mailbox holding one
         // envelope, so the second of two concurrent streams dispatching to an
-        // application gets `Full`, stays Pending by design, and used to spin the
+        // application gets `Full`, stays Pending by design, and would spin the
         // connection — and the whole graph — until power was cycled. Two
         // concurrent streams to an application route is not an edge case; it is
         // what HTTP/2 is for.

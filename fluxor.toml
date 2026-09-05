@@ -72,6 +72,11 @@ scripts = [
   #      tools/ci/identity_accessor_allowlist.txt, and a stale or unjustified
   #      entry fails the gate.
   "tools/ci/identity_accessor_guard.sh",
+  #   5. envelope_table.sh — the connection envelope, generated from the
+  #      constants that compile it (SDK profile + Wave sources) and diffed
+  #      against docs/reference/envelope.md, so the ceiling a reader consults
+  #      is the ceiling the module compiled.
+  "tools/ci/envelope_table.sh",
 ]
 
 [ci.hygiene]

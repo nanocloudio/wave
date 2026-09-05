@@ -93,11 +93,11 @@ use super::connection::{
 use super::wire;
 use super::HttpState;
 use super::{
-    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_log, dev_micros, dev_millis,
-    dev_owner_tag, dev_requester_tag, dev_self_index, dev_telemetry_enabled, dev_telemetry_span,
-    fmt_u32_raw, heap_alloc, heap_free, heap_realloc, msg_read, net_read_frame, net_write_frame,
-    p_u16, p_u32, p_u8, IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR,
-    POLL_HUP, POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
+    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_input_flow_budget, dev_log,
+    dev_micros, dev_millis, dev_owner_tag, dev_requester_tag, dev_self_index,
+    dev_telemetry_enabled, dev_telemetry_span, fmt_u32_raw, heap_alloc, heap_free, heap_realloc,
+    msg_read, net_read_frame, net_write_frame, p_u16, p_u32, p_u8, IOCTL_FLUSH, IOCTL_NOTIFY,
+    IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
@@ -131,6 +131,8 @@ pub(crate) use table_consumer::{TableConsumer, TableSink};
 /// its stable identity across upsert and remove. One bound for both consumers:
 /// they subscribe to sibling prefixes of the same store.
 pub(crate) const MAX_DYN_KEY: usize = 64;
+/// Input port carrying `peer_identity` records from `tls` (manifest: index 9).
+pub(crate) const PEER_IDENTITY_PORT_INDEX: u8 = 9;
 
 /// Find the `;`-separated `tag=` field's value in a compact record.
 ///
@@ -403,6 +405,42 @@ pub(crate) struct ConnSlot {
     /// `dev_millis` value past which the pending request is answered 504.
     /// 0 when nothing is pending. See `app::APP_TIMEOUT_MS`.
     pub(crate) app_deadline_ms: u64,
+    /// `dev_millis` at the last observable progress on this connection: the
+    /// accept, a byte the demux appended, a byte the transport took, a
+    /// response completing. The idle and stall deadlines
+    /// (`enforce_slot_deadline`) are measured from here, so a connection
+    /// that is moving bytes — however slowly — is never closed as stalled.
+    pub(crate) progress_ms: u64,
+    /// `dev_millis` when the wait for the current request head began: the
+    /// accept for a connection's first request, and for each one after it the
+    /// first byte of the next request (or the end of the previous response,
+    /// when the next request's bytes were already buffered). The header
+    /// deadline is measured from here rather than from `progress_ms`, so a
+    /// head is bounded in total: a peer that trickles one byte per second
+    /// meets the limit at the same instant as one that sends nothing.
+    pub(crate) head_ms: u64,
+    /// `dev_millis` when the last idle ping was queued on a WebSocket slot;
+    /// 0 when none is outstanding. A ping older than `inbound_ms` has been
+    /// answered (the pong moved it) and a fresh one may be sent.
+    pub(crate) ws_ping_ms: u64,
+    /// `dev_millis` at the last byte the PEER sent. `progress_ms` also moves
+    /// when this end sends, which is right for stall detection (a peer that
+    /// stops reading) and wrong for WebSocket idleness: a ping this end sends
+    /// must not count as the peer being alive, or a silent socket would be
+    /// pinged forever and never closed.
+    pub(crate) inbound_ms: u64,
+    /// The phase `enforce_slot_deadline` last measured. A phase change
+    /// restarts the clock: the server composing a 504 or moving from body
+    /// read to response send is itself progress, and measuring the new phase
+    /// from a stamp the old one left would close a connection the server
+    /// just decided to answer.
+    pub(crate) deadline_phase: u8,
+    /// 1 once at least one response has completed on this connection. Decides
+    /// which limit an empty `RecvRequest` is measured against: a connection
+    /// that has never sent a request is on the header clock, one between
+    /// requests is on the keepalive clock, and only the second kind is a
+    /// candidate for idle eviction.
+    pub(crate) served: u8,
     /// 1 while a multi-envelope application response is mid-flight: the head
     /// has been sent and more body envelopes are expected.
     ///
@@ -579,7 +617,13 @@ pub(crate) unsafe fn drain_peer_identities(s: &mut HttpState) {
         return;
     }
     let sys = &*s.syscalls;
-    for _ in 0..PER_STEP {
+    let rounds = rounds_for_grant(
+        dev_input_flow_budget(sys, chan, PEER_IDENTITY_PORT_INDEX),
+        pid::MAX_TOTAL,
+        PER_STEP,
+        64,
+    );
+    for _ in 0..rounds {
         let poll = (sys.channel_poll)(chan, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             return;
@@ -995,7 +1039,7 @@ pub(crate) struct ServerState {
     // ── Dynamic routes ─────────────────────────────────────────────
     //
     // Default-off: `routes_prefix_len == 0` means the whole subsystem
-    // is dormant and the server behaves byte-for-byte as before.
+    // is dormant and costs nothing on the request path.
     /// Store prefix the table_consumer subscribes to (e.g.
     /// `/dataplane/edge/`). Empty (`routes_prefix_len == 0`) = feature
     /// off.
@@ -1020,10 +1064,10 @@ pub(crate) struct ServerState {
     /// itself (the long part) runs concurrently across slots.
     pub(crate) proxy_connect_owner: i16,
     _proxy_owner_pad: [u8; 2],
-    /// Cumulative failover retries (`http.proxy.retries`, §3). A reader
-    /// surfaces this via telemetry, never a store key (dynamic_routes §6).
+    /// Cumulative failover retries (`http.proxy.retries`). A reader
+    /// surfaces this via telemetry, never a store key.
     pub(crate) proxy_retries: u32,
-    /// Cumulative relay 5xx responses (`http.proxy.5xx`, §3).
+    /// Cumulative relay 5xx responses (`http.proxy.5xx`).
     pub(crate) proxy_5xx: u32,
 
     /// Next request generation stamped into an HTTP/1.1 application request's
@@ -1053,7 +1097,7 @@ pub(crate) struct ServerState {
 
     // ── Load-shedding counters ─────────────────────────────────────
     //
-    // Every path below sheds work under pressure, and each one used to
+    // Every path below sheds work under pressure, and each would otherwise
     // present to an operator as the same symptom — a slow or reset
     // client. They are separate counters because they have separate
     // fixes: the first two decide whether to raise the slot table or
@@ -1113,6 +1157,54 @@ pub(crate) struct ServerState {
     /// which otherwise presents as a client that connects and then gets
     /// nothing, with no error on either side naming the cause.
     pub(crate) h3_field_limit_refused: u32,
+
+    // ── Connection lifetime ────────────────────────────────────────
+    //
+    // Nothing else on the path closes an established connection that stops
+    // talking: not tls, and not ip, whose timers cover SYN retransmit and
+    // unacked data only. Without these a peer that connects and sends nothing
+    // holds a slot, its buffers and a TLS session for as long as it likes,
+    // and enough of them make a listener deaf with every drop counter at
+    // zero. Each limit is a parameter; 0 disables it.
+    /// `dev_millis` sampled once at the top of `step`, so every deadline in
+    /// the same pass compares against one clock read.
+    pub(crate) now_ms: u64,
+    /// Waiting for a complete request head: from accept, or from the first
+    /// byte of the next request on a keepalive, until the head parses.
+    /// Measured from the start of the wait, not from the last byte, so a peer
+    /// that trickles a header one byte at a time is closed at the same limit
+    /// as one that sends nothing.
+    pub(crate) header_timeout_ms: u32,
+    /// Keepalive with nothing buffered: from the end of a response until the
+    /// first byte of the next request.
+    pub(crate) keepalive_idle_ms: u32,
+    /// The keepalive limit once the slot table is at least three quarters
+    /// full. Idle connections are the first thing shed under pressure, which
+    /// is what lets the table empty again when load falls.
+    pub(crate) pressure_idle_ms: u32,
+    /// No progress in any phase that is moving bytes: body read, response
+    /// send, proxy relay, cache stream. Covers both a peer that stops sending
+    /// a body it announced and one that stops reading (zero window), so no
+    /// slot can pin its send buffer or the demux indefinitely.
+    pub(crate) stall_ms: u32,
+    /// WebSocket with no frame received. A ping goes out at half; the
+    /// connection closes 1001 at the full limit. Off by default: RFC 6455
+    /// does not require a server to ping, and a legitimately quiet socket is
+    /// the common case.
+    pub(crate) ws_idle_ms: u32,
+    /// Connections closed for each reason (`http.conns.timeout.*`; positional
+    /// ids 20-22).
+    pub(crate) conns_timeout_header: u32,
+    pub(crate) conns_timeout_idle: u32,
+    pub(crate) conns_timeout_stall: u32,
+    /// An accept found no free slot and took the longest-idle keepalive
+    /// connection's instead (`http.conns.evicted.idle`, id 23). A new caller
+    /// is never refused in favour of a silent one.
+    pub(crate) conns_evicted_idle: u32,
+    /// Most slots allocated at once since boot. Reported in the `[http]
+    /// state` heartbeat beside the live count, so a capture shows both what
+    /// the table is carrying now and the peak it had to carry.
+    pub(crate) slots_high_water: u16,
 
     // ── Dynamic listeners ──────────────────────────────────────────
     //
@@ -1259,6 +1351,15 @@ pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u16) -> Option<
     // are unactionable: "connections are being refused" does not say whether
     // to raise the slot table or the arena, and raising the wrong one changes
     // nothing while looking like a fix.
+    // Table full: before refusing, reclaim the longest-idle keepalive
+    // connection. A slot holding a connection that has finished its last
+    // request and buffered nothing since is occupancy, not work, and a new
+    // caller outranks it. Only when no such slot exists is the accept
+    // refused.
+    let chosen = match chosen {
+        Some(i) => Some(i),
+        None => evict_idle_keepalive(s),
+    };
     let idx = match chosen {
         Some(i) => i,
         None => {
@@ -1282,8 +1383,208 @@ pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u16) -> Option<
     slot.span_trace_id = [0u8; 16];
     slot.span_parent_id = [0u8; 8];
     slot.span_flags = 0;
+    slot.progress_ms = s.server.now_ms;
+    slot.head_ms = s.server.now_ms;
+    slot.inbound_ms = s.server.now_ms;
+    slot.ws_ping_ms = 0;
+    slot.deadline_phase = Phase::Init as u8;
+    slot.served = 0;
     ready_set(s, idx);
+    let live = active_slot_count(s) as u16;
+    if live > s.server.slots_high_water {
+        s.server.slots_high_water = live;
+    }
     Some(idx)
+}
+
+/// Close the longest-idle keepalive connection and return its slot, now
+/// free, or `None` when no connection qualifies.
+///
+/// Qualifies: an h1 slot in `RecvRequest` that has served at least one
+/// response and has nothing buffered — the definition of "between requests"
+/// — and whose peer has not already closed (that slot is about to free itself
+/// anyway). Connections mid-request, WebSockets, h2 sessions and anything
+/// with bytes waiting are admitted work and are never evicted.
+///
+/// Closing goes through `reset_connection` with the victim as the current
+/// slot, so it takes exactly the path a `CloseConn` phase would: CMD_CLOSE to
+/// the transport, buffers back to the arena, metadata zeroed. Counted as
+/// `conns_evicted_idle`.
+pub(crate) unsafe fn evict_idle_keepalive(s: &mut HttpState) -> Option<usize> {
+    let mut victim: Option<usize> = None;
+    let mut oldest: u64 = u64::MAX;
+    for i in 0..MAX_CONCURRENT_CONNS {
+        let slot = &*s.server.slots.as_ptr().add(i);
+        if slot.conn_id >= 0
+            && matches!(slot.phase, Phase::RecvRequest)
+            && slot.served != 0
+            && slot.recv_len == 0
+            && slot.peer_closed == 0
+            && slot.progress_ms < oldest
+        {
+            oldest = slot.progress_ms;
+            victim = Some(i);
+        }
+    }
+    let idx = victim?;
+    let saved = s.server.cur_slot;
+    s.server.cur_slot = idx as i32;
+    reset_connection(s);
+    s.server.cur_slot = saved;
+    s.server.conns_evicted_idle = s.server.conns_evicted_idle.wrapping_add(1);
+    Some(idx)
+}
+
+/// The lifetime limit, in milliseconds, that applies to the current slot's
+/// phase, or 0 when the phase carries no lifetime deadline (it has its own
+/// timer, or it is a wait on this server rather than on the peer).
+///
+/// Returned with the counter it charges, so the caller does not repeat the
+/// phase classification.
+pub(crate) unsafe fn slot_deadline_limit(s: &HttpState) -> (u32, DeadlineKind) {
+    let Some(cur) = cur_slot(s) else {
+        return (0, DeadlineKind::None);
+    };
+    match cur.phase {
+        Phase::RecvRequest => {
+            if cur.recv_len == 0 && cur.served != 0 {
+                (keepalive_limit_ms(s), DeadlineKind::Idle)
+            } else {
+                (s.server.header_timeout_ms, DeadlineKind::Header)
+            }
+        }
+        // `FetchContent` is deliberately absent: it waits on the file
+        // provider, which is this server's wait, not the peer's. `CacheStream`
+        // stays — bytes are moving to the client there, and a client that
+        // stops taking them is what the stall limit is for.
+        Phase::RecvBody
+        | Phase::SendHeaders
+        | Phase::SendBody
+        | Phase::DrainSend
+        | Phase::CacheStream
+        | Phase::ProxySendRequest
+        | Phase::ProxyRelayHeaders
+        | Phase::ProxyRelayBody
+        | Phase::WsHandshake
+        | Phase::WsClose => (s.server.stall_ms, DeadlineKind::Stall),
+        // Own timers: AwaitApp (APP_TIMEOUT_MS), AwaitFsStat, WsAwaitAdmit,
+        // ProxyConnect/ProxyWaitConnect. WsActive is the ping policy in
+        // `ws::ws_idle_policy`; H2Active is `h2::step`'s own check, which
+        // knows whether a stream is open.
+        _ => (0, DeadlineKind::None),
+    }
+}
+
+/// The keepalive limit in force right now: the pressure limit once the
+/// slot table is at least three quarters occupied, the ordinary one below
+/// that. The threshold is never below one, so on a table too small for
+/// three quarters to round to anything a single held slot is pressure —
+/// which is the truth of that device.
+pub(crate) unsafe fn keepalive_limit_ms(s: &HttpState) -> u32 {
+    let threshold = (MAX_CONCURRENT_CONNS * 3 / 4).max(1);
+    if active_slot_count(s) >= threshold && s.server.pressure_idle_ms != 0 {
+        // Under pressure the SHORTER of the two applies, so a graph that set
+        // an ordinary limit below the pressure one is not lengthened by it.
+        if s.server.keepalive_idle_ms != 0 && s.server.keepalive_idle_ms < s.server.pressure_idle_ms
+        {
+            s.server.keepalive_idle_ms
+        } else {
+            s.server.pressure_idle_ms
+        }
+    } else {
+        s.server.keepalive_idle_ms
+    }
+}
+
+/// Which counter a fired deadline charges.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeadlineKind {
+    None,
+    Header,
+    Idle,
+    Stall,
+}
+
+/// Charge a fired deadline to its counter.
+pub(crate) fn count_deadline(s: &mut HttpState, kind: DeadlineKind) {
+    match kind {
+        DeadlineKind::Header => {
+            s.server.conns_timeout_header = s.server.conns_timeout_header.wrapping_add(1)
+        }
+        DeadlineKind::Idle => {
+            s.server.conns_timeout_idle = s.server.conns_timeout_idle.wrapping_add(1)
+        }
+        DeadlineKind::Stall => {
+            s.server.conns_timeout_stall = s.server.conns_timeout_stall.wrapping_add(1)
+        }
+        DeadlineKind::None => {}
+    }
+}
+
+/// Close the current slot if it has outlived the limit for its phase.
+/// Returns true when it did; the caller re-steps so `CloseConn` runs in the
+/// same pass. A limit of 0 never fires.
+///
+/// The clock is `now_ms`, sampled once per step, against the slot's
+/// `head_ms` for the header deadline and its `progress_ms` for the others.
+/// A wrapped or reset clock reads as no elapsed time rather than as an
+/// expired one: the failure mode of a clock fault is a connection kept,
+/// never a connection cut.
+pub(crate) unsafe fn enforce_slot_deadline(s: &mut HttpState) -> bool {
+    // Entering a phase is progress: the clock for the new phase starts now.
+    let now = s.server.now_ms;
+    if let Some(cur) = cur_slot_mut(s) {
+        let ph = cur.phase as u8;
+        if cur.deadline_phase != ph {
+            cur.deadline_phase = ph;
+            cur.progress_ms = now;
+            return false;
+        }
+    }
+    let (limit, kind) = slot_deadline_limit(s);
+    if limit == 0 {
+        return false;
+    }
+    let since = match cur_slot(s) {
+        Some(c) if kind == DeadlineKind::Header => c.head_ms,
+        Some(c) => c.progress_ms,
+        None => return false,
+    };
+    let elapsed = s.server.now_ms.saturating_sub(since);
+    if elapsed < limit as u64 {
+        return false;
+    }
+    count_deadline(s, kind);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.phase = Phase::CloseConn;
+    }
+    true
+}
+
+/// Rounds a bounded pump may run this step, from the kernel's flow-budget
+/// grant for the port.
+///
+/// The grant is bytes per step derived from the edge's rate class and the
+/// live domain period, so an adaptive-cadence change is reflected without
+/// any module-local tuning. `unit` is the bytes one round moves. A port with
+/// no streaming class grants 0, and the harness has no kernel to grant at
+/// all, so `floor` is the least this returns and a pump keeps a fixed
+/// per-step bound there; `cap` keeps a generous grant from making one step
+/// unbounded.
+pub(crate) fn rounds_for_grant(grant: u32, unit: usize, floor: usize, cap: usize) -> usize {
+    if grant == 0 {
+        return floor;
+    }
+    let by_grant = (grant as usize).div_ceil(unit.max(1));
+    by_grant.max(floor).min(cap)
+}
+
+/// Stamp progress on the current slot. Called wherever bytes move for it.
+pub(crate) unsafe fn mark_progress(s: &mut HttpState) {
+    let now = s.server.now_ms;
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.progress_ms = now;
+    }
 }
 
 /// Free the slot at `idx`: returns its heap buffers to the arena
@@ -1606,7 +1907,7 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     //   out[7] = ws_admit_out      (OctetStream, admission requests)
     //   out[8] = ws_event_out      (OctetStream, committed lifecycle facts)
     //   in[9]  = peer_identity     (OctetStream, mTLS only; -1 when unwired)
-    s.server.peer_chan = dev_channel_port(sys, 0, 9);
+    s.server.peer_chan = dev_channel_port(sys, 0, PEER_IDENTITY_PORT_INDEX);
     s.server.ws_admit_in_chan = dev_channel_port(sys, 0, 7);
     s.server.ws_admit_out_chan = dev_channel_port(sys, 1, 7);
     s.server.ws_event_out_chan = dev_channel_port(sys, 1, 8);
@@ -1771,12 +2072,14 @@ pub(crate) unsafe fn release_file_chan_external(s: &mut HttpState) {
 }
 
 pub(crate) unsafe fn reset_connection(s: &mut HttpState) {
-    // Skip CMD_CLOSE if the peer already closed (`peer_closed` flag).
-    // Otherwise the IP module would either no-op (empty slot) OR —
-    // worse, under fast slot reuse — close the next browser connection
-    // that just landed on the same slot index.
-    let peer_closed = cur_slot(s).map(|c| c.peer_closed).unwrap_or(0);
-    if peer_closed == 0 && cur_phase(s) as u8 > Phase::WaitAccept as u8 && s.net_out_chan >= 0 {
+    // A connection the PEER closed still gets our CMD_CLOSE. net_proto keeps
+    // the id this consumer's for `CLOSED_ID_GRACE_MS` after MSG_CLOSED, so
+    // the close can never land on a newcomer, and fluxor's `ip` needs it to
+    // leave CloseWait promptly: a client-closed connection whose close is
+    // withheld holds its TCP slot for the transport's whole grace interval,
+    // and a burst of them fills the TCP table while this module's own table
+    // reads empty.
+    if cur_phase(s) as u8 > Phase::WaitAccept as u8 && s.net_out_chan >= 0 {
         close_net_conn(s, cur_conn_id(s));
     }
     // Close any FS_CONTRACT FD left open by a previous response. The
@@ -1916,6 +2219,9 @@ pub(crate) unsafe fn net_send_conn(
     let written = (sys.channel_write)(chan, scratch, total);
     if written == total as i32 {
         s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(to_send as u32);
+        // The transport took bytes for this slot's connection (client or
+        // backend side alike): the slot is moving.
+        mark_progress(s);
         to_send as i32
     } else {
         // Atomic FIFO write rejected — treat as backpressure.
@@ -1953,8 +2259,17 @@ unsafe fn demux_inbound(s: &mut HttpState) {
     let sys = &*s.syscalls;
     let chan = s.net_in_chan;
     // Bound the loop so a stuck channel can't monopolise a tick;
-    // anything left over rolls into the next demux call.
-    for _ in 0..16 {
+    // anything left over rolls into the next demux call. The bound is the
+    // kernel's per-step grant for `net_in` in MSS-sized frames, floored at
+    // 16, so an edge with a declared rate class drains at that rate and one
+    // without keeps a fixed per-step bound.
+    let rounds = rounds_for_grant(
+        dev_input_flow_budget(sys, chan, 0),
+        super::connection::MAX_DATA_FRAGMENT,
+        16,
+        256,
+    );
+    for _ in 0..rounds {
         let poll = (sys.channel_poll)(chan, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             return;
@@ -2078,7 +2393,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                     }
                 }
             }
-            // A dynamic listener's mid-life bind completed (§4.2). Post-
+            // A dynamic listener's mid-life bind completed. Post-
             // `bound`, a MSG_BOUND is only ever a pooled-listener bind (the
             // static bind is consumed pre-`bound` by slot 0's WaitBound).
             // Payload `[conn_id:1][port:2 LE]`.
@@ -2124,7 +2439,15 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                     if to_copy > 0 {
                         let dst = slot.recv_buf.add(slot.recv_len as usize);
                         core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
+                        // The first byte after a served response is the start
+                        // of the next head: the header clock begins here, the
+                        // keepalive clock ends.
+                        if slot.recv_len == 0 && slot.served != 0 {
+                            slot.head_ms = s.server.now_ms;
+                        }
                         slot.recv_len += to_copy as u16;
+                        slot.progress_ms = s.server.now_ms;
+                        slot.inbound_ms = s.server.now_ms;
                         s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(to_copy as u32);
                     }
                 } else if let Some(idx) = find_slot_by_backend_conn(s, conn) {
@@ -2139,6 +2462,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                             let dst = slot.send_buf.add(slot.send_len as usize);
                             core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
                             slot.send_len += to_copy as u16;
+                            slot.progress_ms = s.server.now_ms;
                             s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(to_copy as u32);
                         }
                     }
@@ -2187,11 +2511,10 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 //
                 // An ESTABLISHED-CONNECTION error carries the owning
                 // connection's conn_id, so it is routed by slot lookup like
-                // MSG_CLOSED. Previously this arm read NEITHER field and
-                // failed whichever slot happened to hold `proxy_connect_owner`
-                // — so any peer reset anywhere aborted an unrelated backend
-                // dial and charged a spurious failover against a healthy
-                // upstream.
+                // MSG_CLOSED — never to whichever slot happens to hold
+                // `proxy_connect_owner`, or a peer reset anywhere would abort
+                // an unrelated backend dial and charge a spurious failover
+                // against a healthy upstream.
                 let conn = net_proto::conn_id(core::slice::from_raw_parts(
                     s.net_buf.as_ptr().add(NET_FRAME_HDR),
                     payload_len,
@@ -2306,6 +2629,8 @@ pub(crate) unsafe fn pump_dyn_routes(s: &mut HttpState) {
 }
 
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
+    // `now_ms` was sampled by `module_step` before dispatch — one clock read
+    // per pass, shared by this path and the HTTP/3 mux path.
     demux_inbound(s);
     pump_dyn_routes(s);
     pump_listeners(s);
@@ -2410,6 +2735,7 @@ pub unsafe fn test_shed_metrics(state: *mut u8) -> ShedMetrics {
     ShedMetrics {
         bp_steps: s.tlm.bp_steps,
         idle_steps: s.tlm.idle_steps,
+        bytes_in: s.tlm.bytes_in,
         conns_refused_slots: s.server.conns_refused_slots,
         conns_refused_arena: s.server.conns_refused_arena,
         demux_stalls: s.server.demux_stalls,
@@ -2418,6 +2744,11 @@ pub unsafe fn test_shed_metrics(state: *mut u8) -> ShedMetrics {
         app_envelopes_oversize: s.server.app_envelopes_oversize,
         ws_envelopes_dropped: s.server.ws_envelopes_dropped,
         h2_streams_refused: s.server.h2_streams_refused,
+        conns_timeout_header: s.server.conns_timeout_header,
+        conns_timeout_idle: s.server.conns_timeout_idle,
+        conns_timeout_stall: s.server.conns_timeout_stall,
+        conns_evicted_idle: s.server.conns_evicted_idle,
+        slots_high_water: s.server.slots_high_water as u32,
     }
 }
 
@@ -2431,6 +2762,9 @@ pub struct ShedMetrics {
     /// down, so it is what "minimising hardware use under light load" means in
     /// practice.
     pub idle_steps: u32,
+    /// Payload bytes the demux has appended to connection buffers. Not a
+    /// shed counter; exposed so a test can see how much ONE step drained.
+    pub bytes_in: u32,
     pub conns_refused_slots: u32,
     pub conns_refused_arena: u32,
     pub demux_stalls: u32,
@@ -2439,4 +2773,13 @@ pub struct ShedMetrics {
     pub app_envelopes_oversize: u32,
     pub ws_envelopes_dropped: u32,
     pub h2_streams_refused: u32,
+    /// Connections closed by a lifetime deadline, by reason.
+    pub conns_timeout_header: u32,
+    pub conns_timeout_idle: u32,
+    pub conns_timeout_stall: u32,
+    /// Idle keepalive connections closed to admit a new caller.
+    pub conns_evicted_idle: u32,
+    /// Peak slot occupancy since boot (not a shed counter; reported here so
+    /// a scale-down test can assert the peak was reached AND released).
+    pub slots_high_water: u32,
 }

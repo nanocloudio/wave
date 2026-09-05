@@ -73,7 +73,19 @@ import subprocess
 import sys
 import time
 
-VALID_PROTOCOLS = ("h1", "h2c", "ws", "grpc", "h3", "h3load", "h3bench", "sip")
+VALID_PROTOCOLS = ("h1", "h2c", "ws", "grpc", "h3", "h3load", "h3bench", "sip",
+                   "churn", "h1ladder", "quiet")
+# `churn`: h1 with one connection per request (wave-loadgen --churn), so the
+# accept path — SYN admission, slot allocation, the TLS handshake, slot
+# release — is what the rate exercises. `h1ladder`: h1 at each connection
+# count in `h1_conns_ladder` ("1,16,64,72"), one rung past the TLS session
+# ceiling so the refusal is measured rather than assumed. `quiet`: no traffic
+# for `quiet_s`, so the monitor can watch the DUT let go of what the phase
+# before it built up — a scale-down scenario keys its pass rule on the
+# `[http] state ... act=0 hw=N` heartbeat inside this window.
+CHURN_PROTOCOL = "churn"
+H1_LADDER_PROTOCOL = "h1ladder"
+QUIET_PROTOCOL = "quiet"
 
 # h3 is the one protocol wave-loadgen cannot drive: it has no QUIC client, and
 # adding one would mean a QUIC implementation in the load generator — the very
@@ -168,9 +180,10 @@ def resolve_loadgen(binding):
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
     )
     # `tools/load/wave-bench` declares its own `[workspace]`: Wave has no root crate,
-    # so cargo writes the binary under the crate's OWN target dir. The old
-    # `<repo>/target/<profile>` guess named a workspace that no longer exists,
-    # which surfaced as "wave-loadgen not found" rather than as a layout change.
+    # so cargo writes the binary under the crate's OWN target dir. A
+    # `<repo>/target/<profile>` guess would name a workspace that does not
+    # exist, and surface as "wave-loadgen not found" rather than as a layout
+    # mismatch.
     # Built from components, so a repo-wide search-and-replace over path strings
     # does NOT catch a move — this line needs updating by hand if tools/ is
     # reorganised again.
@@ -497,8 +510,8 @@ def run_sip(binding):
     if rtp_tone <= 0:
         # Packets came back but every one was concealment silence: the DUT's
         # transmit path works and its RECEIVE path heard nothing. A packet
-        # count alone passed the §4.3 media-path mutation (rtp bound off the
-        # SDP port); the tone gate is what detects it.
+        # count alone passes the media-path mutation (rtp bound off the SDP
+        # port); the tone gate is what detects it.
         emit_line("[proto_load] phase=sip committed=1 failed=1 rejected=0 "
                   "connect_errors=0 ERR audio returned but ALL SILENCE - the "
                   "DUT's receive path heard nothing")
@@ -669,7 +682,19 @@ def run_h3_load(binding):
     return True
 
 
-def run_protocol(loadgen, proto, binding, rate_override=None, tag=None, soft=False):
+def run_quiet(binding):
+    """No traffic for `quiet_s`. The phase exists for what the DUT does when
+    nothing is asked of it: idle keepalives time out, slots return to the
+    table, the heartbeat's `act=` falls to 0 while `hw=` keeps the peak."""
+    quiet_s = binding_int(binding, "quiet_s", 20)
+    emit_line(f"[proto_load] phase=quiet start quiet_s={quiet_s}")
+    time.sleep(quiet_s)
+    emit_line(f"[proto_load] phase=quiet quiet_s={quiet_s} rc=0 OK")
+    return True
+
+
+def run_protocol(loadgen, proto, binding, rate_override=None, tag=None, soft=False,
+                 conns_override=None, extra_argv=None):
     """Drive one protocol; return True if the run completed cleanly.
 
     `rate_override` replaces the bound rate for one run and `tag` suffixes the
@@ -692,7 +717,8 @@ def run_protocol(loadgen, proto, binding, rate_override=None, tag=None, soft=Fal
         "--rate", str(rate_override if rate_override is not None
                       else binding_int(binding, "rate", 50)),
         "--duration", str(binding_int(binding, "duration", 10)),
-        "--conns", str(binding_int(binding, "conns", 4)),
+        "--conns", str(conns_override if conns_override is not None
+                       else binding_int(binding, "conns", 4)),
         "--path", path,
         "--payload", str(binding_int(binding, "payload", 0)),
         "--warmup", str(binding_int(binding, "warmup", 1)),
@@ -704,6 +730,8 @@ def run_protocol(loadgen, proto, binding, rate_override=None, tag=None, soft=Fal
         argv += ["--authority", authority]
     if binding_bool(binding, "tls"):
         argv.append("--tls")
+    if extra_argv:
+        argv += list(extra_argv)
 
     emit_line(f"[proto_load] phase={proto} start host={host} path={path} "
               f"tls={binding_bool(binding, 'tls')}")
@@ -751,14 +779,16 @@ def run_protocol(loadgen, proto, binding, rate_override=None, tag=None, soft=Fal
     failed = summary.get("failed", 0)
     rejected = summary.get("rejected", 0)
     connect_errors = summary.get("connect_errors", 0)
-    if soft and committed > 0 and not connect_errors:
-        # Ladder rung: shedding or a missed offered rate at altitude is the
-        # knee, reported as data. Only a rung that commits NOTHING or cannot
-        # connect is an error.
-        if failed or rejected:
+    if soft and committed > 0:
+        # Ladder rung: shedding, a missed offered rate, or connections
+        # refused past a ceiling are the knee — the thing the sweep exists to
+        # find — and report as data. Only a rung that commits NOTHING is an
+        # error.
+        if failed or rejected or connect_errors:
             emit_line(
                 f"[proto_load] phase={proto} committed={committed} "
-                f"failed={failed} rejected={rejected} SATURATED"
+                f"failed={failed} rejected={rejected} "
+                f"connect_errors={connect_errors} SATURATED"
             )
             return True
     if committed == 0 or failed or connect_errors:
@@ -868,12 +898,34 @@ def main():
         if proto == SIP_PROTOCOL:
             all_ok &= run_sip(binding)
             continue
+        if proto == QUIET_PROTOCOL:
+            all_ok &= run_quiet(binding)
+            continue
+        if proto == CHURN_PROTOCOL:
+            all_ok &= run_protocol(loadgen, "h1", binding, tag="churn",
+                                   extra_argv=["--churn"])
+            continue
+        if proto == H1_LADDER_PROTOCOL:
+            # One rung per connection count. A rung past a ceiling commits
+            # what the DUT admits and reports connect errors for the rest:
+            # that is the refusal being measured, reported SATURATED rather
+            # than ERR. Only a rung that commits nothing fails the run.
+            ladder = binding_str(binding, "h1_conns_ladder", "1,16,64")
+            for rung in ladder.split(","):
+                rung = rung.strip()
+                if not rung:
+                    continue
+                n = int(rung)
+                ok = run_protocol(loadgen, "h1", binding, tag=f"c{n}",
+                                  conns_override=n, soft=True)
+                if not ok:
+                    all_ok = False
+            continue
         if proto == H3_BENCH_PROTOCOL:
-            # wave-loadgen speaks h3 natively now; same driver, same
-            # accounting, compiled all the way down. `h3bench_ladder`
-            # ("50,200,800") runs one rung per offered rate so a single
-            # scenario measures the §7.3 sweep; without it, one run at the
-            # bound rate.
+            # wave-loadgen speaks h3 natively; same driver, same accounting,
+            # compiled all the way down. `h3bench_ladder` ("50,200,800") runs
+            # one rung per offered rate so a single scenario measures the
+            # saturation sweep; without it, one run at the bound rate.
             ladder = binding_str(binding, "h3bench_ladder", "")
             if ladder:
                 for rung in ladder.split(","):

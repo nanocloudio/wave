@@ -219,8 +219,8 @@ def _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, t
         # proves the DUT's RECEIVE path heard us. Counting packets alone is
         # blind to a dead receive path — the jitter adapter conceals losses at
         # cadence, so a DUT that never hears a single frame still transmits
-        # a full run of silence (found by the §4.3 media-path mutation, which
-        # a packet count did not detect).
+        # a full run of silence. The media-path mutation (rtp bound off the SDP
+        # port) is exactly what a packet count does not detect.
         nonlocal received, got_payload_bytes, tone_frames
         if len(pkt) >= 12 and (pkt[0] >> 6) == 2:
             received += 1

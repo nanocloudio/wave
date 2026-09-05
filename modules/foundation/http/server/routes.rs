@@ -398,7 +398,7 @@ pub struct DynRoute {
     pub(crate) path_len: u8,
     pub(crate) backend_count: u8,
     /// Weighted-round-robin cursor. u16 to keep modulo bias small; the
-    /// distribution is best-effort under churn (§3.2) and converges.
+    /// distribution is best-effort under churn and converges.
     pub(crate) rr_cursor: u16,
     /// 1 when this slot holds a live route.
     pub(crate) used: u8,
@@ -459,7 +459,7 @@ impl DynRoute {
     }
 }
 
-/// The dynamic-route arena plus its rebuild shadow (§2 rule 4). The
+/// The dynamic-route arena plus its rebuild shadow. The
 /// table_consumer helper fills `shadow` during a relist and
 /// `swap_shadow` promotes it atomically; live requests only ever see a
 /// whole, consistent `live` table.
@@ -468,8 +468,8 @@ pub struct DynRoutes {
     pub(crate) live: [DynRoute; MAX_DYN_ROUTES],
     pub(crate) shadow: [DynRoute; MAX_DYN_ROUTES],
     /// Cumulative rows/backends dropped on overflow — mirrored to the
-    /// `http.routes.dropped` telemetry counter (§2.5, §6: a reader
-    /// surfaces degradation through telemetry, never a store key).
+    /// `http.routes.dropped` telemetry counter: a reader surfaces
+    /// degradation through telemetry, never a store key.
     pub(crate) dropped: u32,
 }
 
@@ -596,7 +596,7 @@ impl TableSink for DynRoutes {
         let slot = match found.or(free) {
             Some(i) => i,
             None => {
-                // Arena full — serve what fits, count the drop (§2.5).
+                // Arena full — serve what fits, count the drop.
                 self.dropped = self.dropped.wrapping_add(1);
                 return;
             }
@@ -664,7 +664,7 @@ impl DynRoutes {
 /// Match a request `host`/`path` against the dynamic-route table: host
 /// must match exactly (byte-wise), then the longest path prefix wins
 /// (an empty route path matches any path). Returns the live index, or
-/// `-1` when none match. Consulted after the static arena (§3.2).
+/// `-1` when none match. Consulted after the static arena.
 pub fn match_dyn_route(dyn_routes: &DynRoutes, host: &[u8], path: &[u8]) -> i32 {
     let mut best: i32 = -1;
     let mut best_len: usize = 0;

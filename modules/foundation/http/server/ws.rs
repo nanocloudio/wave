@@ -80,8 +80,7 @@ pub(crate) unsafe fn begin_ws_upgrade(s: &mut HttpState) -> bool {
 /// Validate the upgrade request and compute its accept value.
 ///
 /// `None` when the request is not a well-formed upgrade; the caller's error
-/// response and phase have already been set, exactly as `begin_ws_upgrade`
-/// used to do inline.
+/// response and phase have already been set.
 pub(crate) unsafe fn ws_validate_upgrade(s: &mut HttpState) -> Option<[u8; 28]> {
     let buf = cur_recv_buf_ptr(s);
     let len = cur_recv_len(s) as usize;
@@ -388,8 +387,8 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
             None => {
                 // Either no fan-out slot is active, or several are and the
                 // sentinel cannot say which one this envelope is for. Both are
-                // a drop, and both are counted — the second case used to be a
-                // silent delivery to the wrong client.
+                // a drop, and both are counted — the second would otherwise be
+                // a silent delivery to the wrong client.
                 s.server.ws_envelopes_dropped = s.server.ws_envelopes_dropped.wrapping_add(1);
                 return false;
             }
@@ -1025,4 +1024,50 @@ pub(crate) unsafe fn ws_poll_admission(s: &mut HttpState, conn: u32) -> AdmitPol
         let status = if view.status == 0 { 403 } else { view.status };
         AdmitPoll::Reject(status, reason, take)
     }
+}
+
+// ── Idle policy ───────────────────────────────────────────────────────────
+
+/// Enforce `ws_idle_ms` on the current `WsActive` slot.
+///
+/// A WebSocket with no inbound frame for half the limit is sent a ping; one
+/// with none for the whole limit is closed 1001 (Going Away) and counted as
+/// an idle timeout. Any inbound frame — a pong included — restarts the clock,
+/// so a peer that answers pings is never closed. The clock is `inbound_ms`,
+/// not `progress_ms`: this end's own ping must not count as the peer being
+/// alive.
+///
+/// Returns the step result to use when the policy acted (a close queued, a
+/// ping queued), `None` when the phase should continue normally. A limit of 0
+/// disables the policy entirely: RFC 6455 places no obligation on a server
+/// to ping, and a quiet socket is the ordinary state of most of them.
+pub(crate) unsafe fn ws_idle_policy(s: &mut HttpState) -> Option<i32> {
+    let limit = s.server.ws_idle_ms as u64;
+    if limit == 0 {
+        return None;
+    }
+    let (progress, ping_ms, send_len) = match cur_slot(s) {
+        Some(c) => (c.inbound_ms, c.ws_ping_ms, c.send_len),
+        None => return None,
+    };
+    let elapsed = s.server.now_ms.saturating_sub(progress);
+    if elapsed >= limit {
+        super::count_deadline(s, super::DeadlineKind::Idle);
+        ws_begin_close(s, ws::CLOSE_GOING_AWAY);
+        return Some(2);
+    }
+    // One ping per silence: a ping newer than the last progress is still
+    // unanswered, so another would only add bytes to a socket that is not
+    // reading them.
+    if elapsed >= limit / 2 && ping_ms <= progress && send_len == 0 {
+        let now = s.server.now_ms;
+        // An empty payload still needs a readable (if zero-length) source.
+        let empty: [u8; 0] = [];
+        ws_queue_frame(s, ws::OP_PING, empty.as_ptr(), 0);
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.ws_ping_ms = now;
+        }
+        return Some(2);
+    }
+    None
 }

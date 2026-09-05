@@ -1,4 +1,4 @@
-//! RTCP — the control plane RTP does not have.
+//! RTCP (RFC 3550 §6) — the control plane RTP does not have.
 //!
 //! RTP carries media and says nothing about how it arrived. This module is the
 //! channel on which a receiver tells a sender what it actually got — how much

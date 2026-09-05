@@ -268,6 +268,9 @@ pub struct H1Client {
 }
 
 impl H1Client {
+    /// Always `Connection: keep-alive`, in churn mode too: the client closes
+    /// its own sockets, as a browser or a pooled client does, so the server's
+    /// accept path is measured rather than its close-state capacity.
     pub fn connect(host: &str, path: &str, authority: &str, tls: bool) -> std::io::Result<Self> {
         let conn = dial_opt(host, tls, "h1", "")?;
         let request = format!(
@@ -539,14 +542,13 @@ impl LoadClient for H2Client {
             // The definitive gRPC outcome is `grpc-status`, and its ABSENCE is
             // a failure, not an implied 0.
             //
-            // This previously read `grpc_status.unwrap_or(0)`, treating a
-            // missing trailer as OK. That makes the check unable to tell "the
-            // server spoke gRPC and succeeded" from "the server ignored gRPC
-            // entirely" — and the second case is exactly what a load generator
-            // meets when pointed at a route that isn't gRPC. Measured
-            // 2026-07-29 against the rig, whose only route returns static
-            // HTML: 1504/1504 reported OK, a pure false positive. An oracle
-            // must not report success it did not verify.
+            // Reading a missing trailer as 0 would make the check unable to
+            // tell "the server spoke gRPC and succeeded" from "the server
+            // ignored gRPC entirely" — and the second case is exactly what a
+            // load generator meets when pointed at a route that isn't gRPC:
+            // every request reported OK against a route returning static
+            // HTML, a pure false positive. An oracle must not report success
+            // it did not verify.
             return match grpc_status {
                 Some(0) => Outcome::Ok,
                 Some(_) => Outcome::Rejected,

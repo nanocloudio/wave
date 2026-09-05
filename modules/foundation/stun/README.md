@@ -102,7 +102,7 @@ mean a consumer that logs it has to undo the tidying.
 answered from the datagram it arrived in — but the client holds the RFC 5389
 §7.2.1 deadline, and a module attests once for everything it compiles.
 A schedule counted in scheduler passes would stretch with the cadence, which is
-the drift `adaptive_tick` §8 rule 2 forbids.
+the drift a module attested `agnostic` promises not to have.
 
 ## Scope — read this before wiring it
 

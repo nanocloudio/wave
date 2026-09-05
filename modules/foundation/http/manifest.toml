@@ -245,7 +245,7 @@ requires_contract = "channel"
 access = "read"
 
 # Read-only grant on the compiled route prefix. A table consumer holds
-# a storage.namespace READ grant and nothing else (§6): it SUBSCRIBEs +
+# a storage.namespace READ grant and nothing else: it SUBSCRIBEs +
 # CHANGES the `/dataplane/edge/` prefix and never writes the store —
 # degradation goes to telemetry (http.routes.dropped), not a store key.
 [[resources]]
@@ -266,14 +266,13 @@ access = "read"
 # (http.proxy.5xx): proxy-relay failover / terminal 5xx.
 #
 # ids 5-13 are the load-shedding surface. Every one of these paths refuses or
-# drops work under pressure, and before they were counted each presented to an
-# operator as the same symptom — a slow or reset client — while having a
-# different fix. They are positional and append-only, so ids 0-4 keep their
-# meanings.
+# drops work under pressure, and uncounted each would present to an operator
+# as the same symptom — a slow or reset client — while having a different fix.
+# They are positional and append-only, so ids 0-4 keep their meanings.
 #
 # id  5 = backpressure_steps (http.backpressure.steps): counted at every send
-#         seam. Previously read only by the idle heuristic, so a module
-#         shedding work looked busy to the scheduler and fine to the operator.
+#         seam. The idle heuristic reads the same count, so a module shedding
+#         work reads as busy to the scheduler and as shedding to the operator.
 # id  6 = conns_refused_slots, id 7 = conns_refused_arena: an accept refused
 #         because the slot table was full, versus because the arena could not
 #         supply the slot's buffers. Different constants, different fix; as one
@@ -338,6 +337,26 @@ metrics = [
   # the id-table — bounds are metadata, and the record carries counts alone.
   "requests_total",
   "request_latency_us",
+  # ids 20-23 are the connection-lifetime surface. Nothing else on the path
+  # closes an established connection that stops talking, so without these a
+  # silent peer holds a slot, its buffers and a TLS session indefinitely, and
+  # enough of them make a listener deaf with every counter above reading zero.
+  #   20 = conns_timeout_header: no complete request head within
+  #        `header_timeout_ms` of the wait for it beginning (a slow or hostile
+  #        client, a header trickled a byte at a time included).
+  #   21 = conns_timeout_idle: a keepalive, h2 or h3 connection with no
+  #        admitted work for `keepalive_idle_ms` (`pressure_idle_ms` once the
+  #        table is three quarters full), or a WebSocket past `ws_idle_ms`.
+  #   22 = conns_timeout_stall: bytes stopped moving mid-request for
+  #        `stall_ms` — a body that stopped arriving or a peer that stopped
+  #        reading.
+  #   23 = conns_evicted_idle: an accept found no free slot and took the
+  #        longest-idle keepalive connection's. Rising steadily means the
+  #        slot table is sized below the working set.
+  "conns_timeout_header",
+  "conns_timeout_idle",
+  "conns_timeout_stall",
+  "conns_evicted_idle",
 ]
 # Span 0: one `http.server.request` span per request (head parsed -> response
 # drained), SERVER kind. Minted only when a telemetry consumer is subscribed

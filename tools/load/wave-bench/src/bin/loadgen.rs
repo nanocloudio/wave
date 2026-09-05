@@ -48,13 +48,17 @@ struct Args {
     payload: usize,
     tls: bool,
     warmup_secs: u64,
+    /// One connection per request: dial, one round trip, close. Measures the
+    /// accept path — SYN admission, the slot table, TLS handshakes, slot
+    /// release — which keepalive never touches after the first request.
+    churn: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "wave-loadgen --host <addr:port> [--protocol h1|h2c|h3|ws|grpc] [--tls] [--rate N]\n\
          \x20  [--duration N] [--conns N] [--path P] [--authority H] [--payload B]\n\
-         \x20  [--warmup N]"
+         \x20  [--warmup N] [--churn]"
     );
     std::process::exit(2);
 }
@@ -71,6 +75,7 @@ fn parse_args() -> Args {
         payload: 64,
         tls: false,
         warmup_secs: 1,
+        churn: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -85,6 +90,7 @@ fn parse_args() -> Args {
             "--authority" => a.authority = next(),
             "--payload" => a.payload = next().parse().unwrap_or_else(|_| usage()),
             "--tls" => a.tls = true,
+            "--churn" => a.churn = true,
             "--warmup" => a.warmup_secs = next().parse().unwrap_or_else(|_| usage()),
             "-h" | "--help" => usage(),
             other => {
@@ -161,6 +167,13 @@ fn self_cpu_seconds() -> f64 {
 
 fn make_client(a: &Args, shard: u64) -> std::io::Result<Box<dyn LoadClient>> {
     Ok(match a.protocol.as_str() {
+        // Churn dials per request but asks for keep-alive and closes from
+        // the CLIENT side. A `Connection: close` would make the server
+        // initiate every close and hold every TIME_WAIT, which measures the
+        // transport's close-state capacity rather than its accept path, and
+        // shows up as a p50 shaped like the client's SYN retransmit ladder. A
+        // browser or a pooled client closes its own idle sockets; that is the
+        // churn worth measuring.
         "h1" => Box::new(H1Client::connect(&a.host, &a.path, &a.authority, a.tls)?),
         "h2c" => Box::new(H2Client::connect(
             &a.host,
@@ -212,15 +225,15 @@ fn run_shard(shard: u64, a: &Args, per_shard_rate: f64) -> ShardResult {
     // connection pays TCP/handshake/slow-start costs that would otherwise land
     // in the steady-state tail as a phantom outlier.
     //
-    // PACED AT `interval`, exactly like the measured loop below. It used to be
-    // an unthrottled `while` loop, which made warm-up the heaviest phase of the
-    // run — every shard hammering as fast as it could, ignoring `--rate`
-    // entirely. At 8 concurrent h2-over-TLS connections that burst pushed a Pi 5
-    // past saturation, and because a warm-up failure USED TO `return` (retiring
-    // the shard without the reconnect the measured loop performs) every shard
-    // died before the measured phase began. The run then reported
-    // `committed=0 failed=8` — a total DUT failure — for a DUT that serves the
-    // requested rate cleanly. Warm-up must not be a load test.
+    // PACED AT `interval`, exactly like the measured loop below. An
+    // unthrottled warm-up would be the heaviest phase of the run — every shard
+    // hammering as fast as it could, ignoring `--rate` entirely — and at 8
+    // concurrent h2-over-TLS connections that burst is enough to push a Pi 5
+    // past saturation. A warm-up failure reconnects rather than retiring the
+    // shard, for the same reason: a warm-up burst that killed every shard
+    // before the measured phase began would report `committed=0 failed=8` —
+    // a total DUT failure — for a DUT that serves the requested rate cleanly.
+    // Warm-up must not be a load test.
     let warmup_end = Instant::now() + Duration::from_secs(a.warmup_secs);
     let mut w: u64 = 0;
     let warmup_start = Instant::now();
@@ -231,7 +244,22 @@ fn run_shard(shard: u64, a: &Args, per_shard_rate: f64) -> ShardResult {
             std::thread::sleep(intended - now);
         }
         w += 1;
-        if client.round_trip() == Outcome::Failed {
+        let outcome = client.round_trip();
+        // Churn: the connection is spent after its one request, in warm-up
+        // as in the measured loop. Reusing it would read EOF and count a
+        // healthy server as a warm-up failure.
+        if a.churn && outcome != Outcome::Failed {
+            drop(client);
+            match make_client(a, shard) {
+                Ok(c) => client = c,
+                Err(_) => {
+                    r.connect_err += 1;
+                    return r;
+                }
+            }
+            continue;
+        }
+        if outcome == Outcome::Failed {
             // Reconnect rather than retire, matching the measured loop: one
             // reset must not silently remove a shard and leave the survivors
             // looking healthy. Counted apart from `n_failed` so an unmeasured
@@ -268,6 +296,32 @@ fn run_shard(shard: u64, a: &Args, per_shard_rate: f64) -> ShardResult {
 
         let outcome = client.round_trip();
         let done = Instant::now();
+        // Churn: this connection has done its one request. Dial the next
+        // before the schedule's next slot so the reconnect is not charged to
+        // the following request's latency — the round trip above already
+        // paid the handshake it was meant to measure.
+        if a.churn && outcome != Outcome::Failed {
+            drop(client);
+            match make_client(a, shard) {
+                Ok(c) => client = c,
+                Err(_) => {
+                    r.connect_err += 1;
+                    r.sent += 1;
+                    match outcome {
+                        Outcome::Ok => {
+                            r.ok.record(done.saturating_duration_since(intended).as_micros() as u64);
+                            r.n_ok += 1;
+                        }
+                        Outcome::Rejected => {
+                            r.rejected.record(done.saturating_duration_since(intended).as_micros() as u64);
+                            r.n_rejected += 1;
+                        }
+                        Outcome::Failed => {}
+                    }
+                    break;
+                }
+            }
+        }
         // Latency from `intended`, not from the actual send.
         let us = done.saturating_duration_since(intended).as_micros() as u64;
 
@@ -299,7 +353,45 @@ fn run_shard(shard: u64, a: &Args, per_shard_rate: f64) -> ShardResult {
     r
 }
 
+/// quiche reports its packet-level decisions through the `log` facade; with
+/// no logger installed they vanish. `RUST_LOG=<level>` installs this one,
+/// which writes each record to stderr, so a handshake that "timed out" can
+/// say which packet it discarded and why. Off unless the variable is set.
+struct StderrLog(log::LevelFilter);
+
+impl log::Log for StderrLog {
+    fn enabled(&self, m: &log::Metadata<'_>) -> bool {
+        m.level() <= self.0
+    }
+    fn log(&self, r: &log::Record<'_>) {
+        if self.enabled(r.metadata()) {
+            eprintln!("[{}] {}: {}", r.level(), r.target(), r.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn install_logger() {
+    let Ok(v) = std::env::var("RUST_LOG") else {
+        return;
+    };
+    let level = match v.to_ascii_lowercase().as_str() {
+        "trace" => log::LevelFilter::Trace,
+        "debug" => log::LevelFilter::Debug,
+        "info" => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => return,
+    };
+    static LOGGER: std::sync::OnceLock<StderrLog> = std::sync::OnceLock::new();
+    let l = LOGGER.get_or_init(|| StderrLog(level));
+    if log::set_logger(l).is_ok() {
+        log::set_max_level(level);
+    }
+}
+
 fn main() {
+    install_logger();
     let a = parse_args();
     let per_shard = a.rate as f64 / a.conns as f64;
 
@@ -377,6 +469,7 @@ fn main() {
         .num("offered_rate", a.rate)
         .num("achieved_rate", format!("{achieved:.1}"))
         .num("conns", a.conns)
+        .str("mode", if a.churn { "churn" } else { "keepalive" })
         .num("duration_s", a.duration_secs)
         .num("payload_bytes", a.payload)
         .num("offered", a.rate * a.duration_secs)

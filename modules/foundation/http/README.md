@@ -73,7 +73,9 @@ what its deployment uses, and an unwired port is silent rather than an error.
 `request_body`, `websocket`, `host_tcp`, `grpc`, then eight route blocks of
 `route_N_{path,body,handler,proxy_ip,proxy_port,source,content_type,fs_path,fs_list,fs_filter}`,
 and the high-tag set: `routes_prefix`, `listeners_prefix`, `max_body_kib`,
-`content_type`, `surface_status`.
+`content_type`, `surface_status`, then the connection-lifetime set
+`header_timeout_ms`, `keepalive_idle_ms`, `pressure_idle_ms`, `stall_ms`,
+`ws_idle_ms`.
 Tags are wire positions: append, never renumber.
 
 Two shape the client's requests and its answers:
@@ -87,6 +89,37 @@ Two shape the client's requests and its answers:
   Set, a status of 400 or above answers as a typed refusal carrying the code,
   so a producer can retry a 503 and discard a 404 without parsing a payload
   whose shape it does not know.
+
+## Connection lifetime
+
+Nothing else on the path closes an established connection that stops
+talking — not `tls`, and not `ip`, whose timers cover SYN retransmit and
+unacknowledged data only. So the server keeps one wall-clock stamp per
+connection, moved by every byte the peer sends, every byte the transport
+takes, and every response completed, and closes a connection whose stamp is
+older than the limit for its phase. The header limit is the exception: it is
+measured from the moment the wait for a head began, not from the last byte,
+so a head trickled one byte at a time is bounded in total. Milliseconds; 0
+disables a limit.
+
+| Waiting for | Limit | Default | Counter |
+|---|---|---|---|
+| a complete request head, from accept or from the first byte of the next request | `header_timeout_ms` | 10 000 | `conns_timeout_header` |
+| the next request on a keepalive | `keepalive_idle_ms`, or `pressure_idle_ms` once the slot table is three quarters full | 60 000 / 2 000 | `conns_timeout_idle` |
+| a body still arriving, a response still draining, a proxy relay, a cache stream to the client | `stall_ms` | 15 000 | `conns_timeout_stall` |
+| a WebSocket frame (ping at half, close 1001 at full) | `ws_idle_ms` | 0 (off) | `conns_timeout_idle` |
+| an HTTP/2 or HTTP/3 request on an open session | the keepalive limit; GOAWAY then close | | `conns_timeout_idle` |
+
+The application fan-out keeps its own 30 s deadline (`app_timeouts`), and a
+phase that is waiting on this server rather than on the peer — the file
+provider, the admission decision — is not measured.
+
+An accept that finds no free slot closes the longest-idle keepalive
+connection and takes its slot, counted as `conns_evicted_idle`; a new caller
+is never refused in favour of a silent one. That, and the pressure limit, are
+what let the table empty again when load falls. The `[http] state` heartbeat
+reports `act=` (slots allocated now) and `hw=` (the peak since boot), so a
+capture shows both.
 
 ## Timing
 
@@ -256,8 +289,8 @@ connection), and not a path that happens to work for exactly one concurrent
 request. `http.h3.handler_unavailable` counts it, so the mismatch is visible to
 whoever configured the route and not only to the client that hit it.
 
-There is no longer a second implementation to reconcile with: Fluxor's `quic`
-has shed its own `qpack.rs` and `h3.rs` responder, so QPACK exists once in the
+There is no second implementation to reconcile with: Fluxor's `quic` carries
+no QPACK and no HTTP/3 responder of its own, so QPACK exists once in the
 stack, here. See `docs/architecture/http3-ownership.md`.
 
 ## WebSocket admission

@@ -511,10 +511,20 @@ pub(crate) unsafe fn finish_response(s: &mut HttpState) {
         let buf = cur_recv_buf_mut_ptr(s);
         core::ptr::copy(buf.add(header_end_off), buf, leftover);
     }
+    let now = s.server.now_ms;
     if let Some(cur) = cur_slot_mut(s) {
         cur.recv_len = leftover as u16;
         cur.recv_parsed = 0;
         cur.req_path_len = 0;
+        // The keepalive clock starts here: the connection has served, and
+        // from this instant an empty request buffer is idleness rather than
+        // a head still arriving.
+        cur.served = 1;
+        cur.progress_ms = now;
+        // And the header clock for a pipelined next request, whose bytes
+        // are already in the buffer, starts here too; with nothing buffered
+        // it starts at the first byte to arrive.
+        cur.head_ms = now;
         // Per-REQUEST, not per-connection: a keep-alive connection serves
         // many, and a stale HEAD would suppress the body of the GET after it.
         cur.req_method = super::super::wire::method::METHOD_NONE;
@@ -686,8 +696,19 @@ pub(crate) unsafe fn step_send_file(s: &mut HttpState) -> i32 {
 /// ends the loop), so slow consumers see one-round pacing.
 pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
     const FS_SEND_ROUNDS: usize = 16;
+    // The round bound is the kernel's per-step grant for `net_out` in
+    // send-buffer units. This loop adopts the budget rather than the kernel's
+    // pump primitive because it interleaves Content-Length capping, EAGAIN/EOF
+    // and the keep-alive transition between rounds. Floored at 16, so an
+    // edge with no rate class keeps a fixed per-step bound.
+    let rounds = super::rounds_for_grant(
+        super::super::dev_flow_budget(&*s.syscalls, 0),
+        SEND_BUF_SIZE,
+        FS_SEND_ROUNDS,
+        64,
+    );
     let mut progressed = false;
-    for _ in 0..FS_SEND_ROUNDS {
+    for _ in 0..rounds {
         if cur_fs_fd(s) < 0 {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::CloseConn;

@@ -28,6 +28,10 @@ front door. This page indexes the doc set.
 
 ## Reference
 
+- [reference/envelope.md](reference/envelope.md) — the connection envelope:
+  every ceiling on the path per target, generated from the constants that
+  compile it, and the lifetime limits that close a connection which stops
+  talking.
 - [reference/protocol-surfaces.md](reference/protocol-surfaces.md) —
   the fluxor content surfaces Wave consumes, and which module
   declares which.

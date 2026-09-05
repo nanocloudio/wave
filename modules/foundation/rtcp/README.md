@@ -151,7 +151,7 @@ model. Counted, never silently folded into the first one's numbers.
 `timer_class = "wall_clock"`. The reporting interval and the arrival stamps
 that feed the jitter estimate are both real time. An interval counted in
 scheduler passes would stretch and compress with the cadence, which is the
-drift `adaptive_tick` §8 rule 2 forbids.
+drift a module attested `agnostic` promises not to have.
 
 ## Scope — read this before wiring it
 

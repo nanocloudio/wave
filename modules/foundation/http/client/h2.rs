@@ -897,7 +897,7 @@ unsafe fn build_request(s: &mut HttpState) {
             },
         );
         if is_grpc {
-            // gRPC-over-HTTP/2 (§ gRPC spec) requires `te: trailers` so the
+            // The gRPC HTTP/2 protocol requires `te: trailers` so the
             // server may send grpc-status/grpc-message in trailing HEADERS.
             // No content-length: gRPC bodies are DATA-framed and END_STREAM
             // delimited, and the framed body may exceed the initial buffer.

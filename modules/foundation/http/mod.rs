@@ -93,11 +93,26 @@
 //! |-------|-------------|------|---------|-----------------------------------------------------|
 //! | 0     | mode        | u8   | 0       | 0=server, 1=client                                  |
 //! | 1     | port        | u16  | 80      | TCP listen port (server) or target port (client)    |
-//! | 2     | body        | str  | (none)  | Legacy inline body (server, backward compat)        |
+//! | 2     | body        | str  | (none)  | Inline body for the default route (server)          |
 //! | 3     | path        | str  | "/"     | URL path (client mode)                              |
 //! | 4     | host_ip     | u32  | 0       | Target IP (client mode)                             |
-//! | 10-45 | route_N_*   | —    | —       | Route params (server mode)                          |
+//! | 5     | protocol    | u8   | 0       | Client: 0 = HTTP/1.1, 1 = HTTP/2                    |
+//! | 6     | request_body | str | (none)  | Client request body                                 |
+//! | 7     | websocket   | u8   | 0       | Client: upgrade to WebSocket                        |
+//! | 8     | host_tcp    | u8   | 0       | 1 = downstream is kernel TCP: send whole buffers, not one MSS |
+//! | 9     | grpc        | u8   | 0       | Client: frame the request as gRPC                   |
+//! | 10-89 | route_N_*   | —    | —       | Route params, eight blocks of ten (server mode)     |
+//! | 90    | routes_prefix | str | (none) | Store prefix for dynamic routes                     |
+//! | 91    | listeners_prefix | str | (none) | Store prefix for dynamic listeners               |
+//! | 100   | h3          | u8   | 0       | Serve HTTP/3 over the `mux` contract                |
 //! | 101   | max_body_kib | u16 | 0       | Request-body cap in KiB (0 = 64 KiB default)        |
+//! | 102   | content_type | str | (none)  | `Content-Type` of a composed client request         |
+//! | 103   | surface_status | u8 | 0      | Exchange: answer 400+ as a typed refusal            |
+//! | 104   | header_timeout_ms | u32 | 10000 | Close a connection with no complete head (0 = off) |
+//! | 105   | keepalive_idle_ms | u32 | 60000 | Close a keepalive with no next request (0 = off)   |
+//! | 106   | pressure_idle_ms | u32 | 2000  | Keepalive limit once the table is ¾ full (0 = off)  |
+//! | 107   | stall_ms    | u32  | 15000   | Close a connection whose bytes stopped moving (0 = off) |
+//! | 108   | ws_idle_ms  | u32  | 0       | WebSocket: ping at half, close at full (0 = off)    |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -315,8 +330,8 @@ mod params_def {
     // `10*(n+1) + field` up to 89, 90/91 are the routes/listeners prefixes, and
     // 92/93 must stay UNDEFINED — `bounds_saturation.rs` configures a 9th route
     // at 92/93 to prove the TLV walk skips unknown tags instead of writing past
-    // the table. Taking 92 turned that probe into `h3 = 1` and broke every h1
-    // route in the test, which is exactly what the test is for.
+    // the table, and a definition there would turn that probe into a live
+    // parameter.
     100, h3, u8, 0
         => |s, d, len| { s.h3_mode = p_u8(d, len, 0, 0); };
 
@@ -348,6 +363,30 @@ mod params_def {
     // carrying the code, rather than as a success carrying the error body.
     103, surface_status, u8, 0
         => |s, d, len| { s.client.surface_status = p_u8(d, len, 0, 0); };
+
+    // ── Connection lifetime (server) ──
+    //
+    // Milliseconds; 0 disables the deadline. Nothing else on the path closes
+    // an established connection that stops talking (see
+    // `server::ServerState::header_timeout_ms`), so these are the only thing
+    // between a silent peer and a slot held forever. Defaults chosen so an
+    // interactive client never meets them and a stalled one meets them
+    // before the table fills.
+    //
+    // Tags 104-108 follow 100-103 in the post-route block; 92/93 stay
+    // undefined for `bounds_saturation.rs`.
+    104, header_timeout_ms, u32, 10_000
+        => |s, d, len| { s.server.header_timeout_ms = p_u32(d, len, 0, 10_000); };
+    105, keepalive_idle_ms, u32, 60_000
+        => |s, d, len| { s.server.keepalive_idle_ms = p_u32(d, len, 0, 60_000); };
+    106, pressure_idle_ms, u32, 2_000
+        => |s, d, len| { s.server.pressure_idle_ms = p_u32(d, len, 0, 2_000); };
+    107, stall_ms, u32, 15_000
+        => |s, d, len| { s.server.stall_ms = p_u32(d, len, 0, 15_000); };
+    // Off by default: a server is not obliged to ping (RFC 6455 §5.5.2) and
+    // a quiet socket is the ordinary state of most WebSockets.
+    108, ws_idle_ms, u32, 0
+        => |s, d, len| { s.server.ws_idle_ms = p_u32(d, len, 0, 0); };
 
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };
@@ -788,6 +827,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // Server mode. With `h3 = 1` the module speaks HTTP/3 over the
             // `mux` contract instead of HTTP/1+2 over net_proto — same ports,
             // disjoint opcode ranges (../fluxor/modules/sdk/contracts/net/mux.rs).
+            //
+            // One clock read per pass, ahead of either path: every lifetime
+            // deadline and progress stamp in this step compares against it.
+            // A platform whose timer answers 0 leaves every deadline at zero
+            // elapsed — the failure mode of a missing clock is a connection
+            // kept, never one cut.
+            s.server.now_ms = dev_millis(&*s.syscalls);
             #[cfg(feature = "h3")]
             let r = if s.h3_mode != 0 {
                 server::h3::step_mux(s)
@@ -962,6 +1008,47 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     abi::contracts::telemetry::DIM_NONE,
                     &s.server.lat_hist,
                 );
+                // ids 20-23: connections closed by a lifetime deadline
+                // (header / idle / stall) and idle keepalives evicted to
+                // admit a new caller. Each names a different remedy — a
+                // rising header count is a slow or hostile client, a rising
+                // eviction count is a table sized below the working set.
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    20,
+                    s.server.conns_timeout_header as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    21,
+                    s.server.conns_timeout_idle as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    22,
+                    s.server.conns_timeout_stall as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    23,
+                    s.server.conns_evicted_idle as u64,
+                );
             }
         }
 
@@ -1032,6 +1119,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 t += 1;
             }
             q += fmt_u32_raw(p.add(q), server::active_slot_count(s) as u32);
+            // Peak occupancy since boot beside the live count: a scale-down
+            // capture reads `act=0 hw=N` and knows the table filled AND
+            // emptied, which neither number says alone.
+            let mhw = b" hw=";
+            let mut t = 0usize;
+            while t < mhw.len() {
+                *p.add(q) = mhw[t];
+                q += 1;
+                t += 1;
+            }
+            q += fmt_u32_raw(p.add(q), s.server.slots_high_water as u32);
             dev_log(sys, 3, p, q);
         }
         // Work signal for the pacer: if the request/response path

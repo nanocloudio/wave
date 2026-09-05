@@ -239,7 +239,7 @@ pub(crate) unsafe fn proxy_relay_step(s: &mut HttpState) {
         }
     }
     // Teardown: backend closed + its bytes fully flushed → close the
-    // client (`edge_anchored`: no session migration, §5).
+    // client (`edge_anchored`: no session migration).
     let (backend_closed, send_len2, send_off2) = match cur_slot(s) {
         Some(c) => (c.backend_closed, c.send_len, c.send_offset),
         None => return,
@@ -252,7 +252,7 @@ pub(crate) unsafe fn proxy_relay_step(s: &mut HttpState) {
 }
 
 /// Consult the dynamic-route table for a proxy match on the active
-/// slot's Host + path (§5: host exact, then longest path-prefix, then
+/// slot's Host + path (host exact, then longest path-prefix, then
 /// readiness-gated backend selection). Returns `true` when it took
 /// over dispatch (started a relay or emitted a 502); `false` when no
 /// dynamic route matched (caller falls back to its fixed surface).
@@ -284,7 +284,7 @@ pub(crate) unsafe fn try_begin_dyn_proxy(s: &mut HttpState) -> bool {
             true
         }
         None => {
-            // Matched a route but no `ready=1` backend (§5 readiness gate).
+            // Matched a route but no `ready=1` backend: the readiness gate.
             s.server.proxy_5xx = s.server.proxy_5xx.wrapping_add(1);
             build_error(s, b"502 Bad Gateway", b"No ready backend\n");
             if let Some(cur) = cur_slot_mut(s) {

@@ -39,7 +39,7 @@ use super::{
 pub(crate) const NET_MSG_BIND_REFUSED: u8 = 0x07;
 
 /// Additional listeners beyond the static `port`, bound from the
-/// pre-leased pool. Small: listener churn is operator-rate (§4.2).
+/// pre-leased pool. Small: listener churn is operator-rate.
 pub(crate) const MAX_DYN_LISTENERS: usize = 8;
 /// Input port index carrying the self-edged listener change sink (in[5]).
 pub(crate) const DYN_LISTENERS_PORT_INDEX: u8 = 5;
@@ -115,7 +115,7 @@ pub struct DynListeners {
     /// Runtime bind state — owned by `reconcile_listeners`, never by the
     /// TableSink swap.
     pub(crate) bound: [BoundListener; MAX_DYN_LISTENERS],
-    /// Rows dropped on overflow (mirrors §2.5 degradation-to-telemetry).
+    /// Rows dropped on overflow; degradation goes to telemetry, never a store key.
     pub(crate) dropped: u32,
 }
 

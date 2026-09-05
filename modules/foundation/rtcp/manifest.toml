@@ -5,8 +5,8 @@ hardware_targets = ["rp2350", "bcm2712"]
 # scales with the session so total RTCP traffic stays a fixed fraction of the
 # session bandwidth, and §6.3.1 randomises it over [0.5, 1.5] to stop every
 # participant reporting in lockstep. An interval counted in scheduler passes
-# would stretch and compress with the cadence, which is the drift RFC
-# adaptive_tick §8 rule 2 forbids. The arrival timestamps that feed the jitter
+# would stretch and compress with the cadence, which is the drift a module
+# attested `agnostic` promises not to have. The arrival timestamps that feed the jitter
 # estimate are wall-clock for the same reason.
 #
 # This is why RTCP is a module and not a role inside `rtp`: `rtp` attests

@@ -251,8 +251,8 @@ pub struct H3State {
     pub sessions: [H3Session; MAX_H3_SESSIONS],
     /// Sessions the table could not hold, owed an explicit transport close —
     /// a client whose session opened and then answers nothing is a hang,
-    /// which is the §7.5 failure shape. Bounded ring; a refusal that cannot
-    /// even queue is dropped counted.
+    /// which is the failure shape a ceiling must never have. Bounded ring; a
+    /// refusal that cannot even queue is dropped counted.
     pub refused_sessions: [u32; 4],
     pub refused_len: u8,
     /// Total sessions refused at the ceiling.
@@ -477,6 +477,16 @@ pub struct H3Session {
     /// difference between a client that re-issues its requests elsewhere
     /// and one that reports them failed.
     pub goaway_sent: bool,
+
+    /// `dev_millis` at the last frame the transport delivered for this
+    /// session — the session-level `progress_ms`. A session with no request
+    /// stream open and nothing arriving for the keepalive limit holds no
+    /// admitted work and is closed exactly as a drain would close it.
+    pub progress_ms: u64,
+    /// The idle deadline fired: this session drains (GOAWAY, then close) on
+    /// its own while the module carries on serving every other session. New
+    /// request streams on it are refused as they would be under a drain.
+    pub idle_close: bool,
 }
 
 impl H3Session {
@@ -502,7 +512,16 @@ impl H3Session {
             conn_error_pending: false,
             goaway_id: 0,
             goaway_sent: false,
+            progress_ms: 0,
+            idle_close: false,
         }
+    }
+
+    /// Whether this session is being wound down — by the module's drain or
+    /// by its own idle deadline. Either way it admits no new request and
+    /// owes GOAWAY then a close once nothing is in flight.
+    pub fn closing(&self, draining: bool) -> bool {
+        draining || self.idle_close
     }
 
     /// Whether a response may be ENCODED yet.
@@ -1857,8 +1876,10 @@ pub(crate) unsafe fn pump_stream_in(
     data: &[u8],
     _fin: bool,
 ) -> H3StreamOutcome {
+    let closing =
+        st.draining || session_slot(st, session_id).is_some_and(|i| st.sessions[i].idle_close);
     let Some(idx) = st.slot_for(session_id, stream_id) else {
-        return if st.draining {
+        return if closing {
             H3StreamOutcome::DrainRefused
         } else {
             H3StreamOutcome::SlotsExhausted
@@ -2196,6 +2217,10 @@ pub(crate) unsafe fn pump_mux_frame(
         return H3StreamOutcome::Ignored;
     }
     let session = mux::session_id(payload);
+    // Anything the transport delivers for a session is that session moving.
+    if let Some(i) = session_slot(st, session) {
+        st.sessions[i].progress_ms = s.server.now_ms;
+    }
 
     // ── session-scoped events ──────────────────────────────────────
     // Handled before the stream-prefix parse, because their bytes 4..8
@@ -2231,6 +2256,7 @@ pub(crate) unsafe fn pump_mux_frame(
             // transport. Deciding that these particular bytes select
             // HTTP/3 is this module's job, and this is where it happens.
             st.sessions[i].is_h3 = alpn == H3_ALPN_TOKEN;
+            st.sessions[i].progress_ms = s.server.now_ms;
             return H3StreamOutcome::SessionEvent;
         }
         mux::MSG_MUX_SESSION_CLOSED => {
@@ -2318,7 +2344,7 @@ pub(crate) unsafe fn pump_mux_frame(
                     }
                     H3StreamOutcome::Buffered
                 }
-                None if st.draining => H3StreamOutcome::DrainRefused,
+                None if st.sessions[si].closing(st.draining) => H3StreamOutcome::DrainRefused,
                 None => H3StreamOutcome::SlotsExhausted,
             }
         }
@@ -2651,12 +2677,13 @@ fn session_next_out(st: &H3State, out: &mut [u8]) -> Option<(usize, H3Commit)> {
         // SETTINGS ahead of any of them. A connection error outranks the
         // drain for the same reason it outranks everything else.
         let live = session_has_live_stream(st, si);
-        if !st.draining || live || sess.conn_error_pending {
+        let closing = sess.closing(st.draining);
+        if !closing || live || sess.conn_error_pending {
             if let Some((n, what)) = session_preamble_out(sess, out) {
                 return Some((n, H3Commit::Session(si, what)));
             }
         }
-        if st.draining && !live {
+        if closing && !live {
             if let Some((n, what)) = session_drain_out(sess, out) {
                 return Some((n, H3Commit::Session(si, what)));
             }
@@ -3110,6 +3137,38 @@ unsafe fn log_h3(s: &super::super::HttpState, msg: &[u8]) {
     super::super::dev_log(&*s.syscalls, 3, msg.as_ptr(), msg.len());
 }
 
+/// Fire the idle deadline on every session that has no request stream open
+/// and has received nothing for the keepalive limit.
+///
+/// The limit is the server's (`keepalive_limit_ms`, pressure-aware), so an
+/// HTTP/3 session is held to exactly what an h1 keepalive or an h2
+/// connection is. A session already closing, or carrying a stream, is left
+/// alone: a stream is admitted work, and the stall clock for it is the
+/// stream's own transport-level flow. Counted as `conns_timeout_idle`.
+unsafe fn sweep_idle_sessions(s: &mut super::super::HttpState) {
+    let limit = super::keepalive_limit_ms(s) as u64;
+    if limit == 0 {
+        return;
+    }
+    let now = s.server.now_ms;
+    let st = &mut *(&mut s.h3 as *mut H3State);
+    let mut si = 0;
+    while si < MAX_H3_SESSIONS {
+        let sess = &st.sessions[si];
+        if sess.allocated
+            && sess.is_h3
+            && !sess.idle_close
+            && !st.draining
+            && !session_has_live_stream(st, si)
+            && now.saturating_sub(sess.progress_ms) >= limit
+        {
+            st.sessions[si].idle_close = true;
+            super::count_deadline(s, super::DeadlineKind::Idle);
+        }
+        si += 1;
+    }
+}
+
 pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
     let sys = &*s.syscalls;
     let in_chan = s.net_in_chan;
@@ -3124,6 +3183,7 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
             begin_drain(st);
         }
     }
+    sweep_idle_sessions(s);
 
     // Ingress: drain everything available this step. A bounded loop, because
     // the channel is bounded — this cannot spin.

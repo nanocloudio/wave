@@ -729,7 +729,8 @@ unsafe fn step_sip(s: &mut SipModState) {
                     if let Some(ev) = classify_and_extract(s, data_len) {
                         // Bounded, payload-free: a stable class code for the
                         // classified event (1=INVITE, 2=ACK, 3=BYE, else the
-                        // response status), not the message bytes (§4.2/§10).
+                        // response status), not the message bytes: the event is a fact
+                        // about the dialogue, and the payload never leaves this module.
                         let code: u16 = match ev {
                             SipEvent::RxInvite { .. } => 1,
                             SipEvent::RxAck => 2,

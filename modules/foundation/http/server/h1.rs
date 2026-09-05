@@ -131,7 +131,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
     // the same channel directly with phase-specific semantics.
     // Inbound channel drain happens once per `step()` call via
     // `demux_inbound` (sibling of this function), which routes
-    // every frame to the right slot. Per-slot ticks no longer poll
+    // every frame to the right slot. Per-slot ticks do not poll
     // the channel themselves.
 
     // If MSG_CLOSED has fired for the current conn, any outbound-write
@@ -182,6 +182,13 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
             _ => {}
         }
+    }
+
+    // Lifetime deadlines. A slot that has outlived the limit for its phase
+    // is closed before the phase runs — the phase would only wait on the
+    // peer again. Re-step so `CloseConn` frees the slot this pass.
+    if super::enforce_slot_deadline(s) {
+        return 2;
     }
 
     match cur_phase(s) {
@@ -827,8 +834,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let ri = match_route(s);
             if ri < 0 {
                 // No static route — consult the dynamic-route proxy
-                // table (§3.2: after the static arena). An empty table
-                // falls through to the fixed 404 surface (§7).
+                // table, consulted after the static arena. An empty table
+                // falls through to the fixed 404 surface.
                 if try_begin_dyn_proxy(s) {
                     return 2;
                 }
@@ -2341,6 +2348,12 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     cur.phase = Phase::CloseConn;
                 }
                 return 0;
+            }
+
+            // Idle policy: ping at half the limit, close at the full one.
+            // Off unless `ws_idle_ms` is configured.
+            if let Some(r) = super::ws::ws_idle_policy(s) {
+                return r;
             }
 
             // Last-connection-wins self-check: if a newer fan-out
