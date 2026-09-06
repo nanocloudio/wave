@@ -56,7 +56,10 @@ pub(crate) const MAX_PATH_LEN: usize = 1024;
 /// chosen independently: `write_request_head` fails closed when the head does
 /// not fit, so a buffer too small for the longest admissible path would refuse
 /// requests this client had already accepted.
-pub(crate) const REQUEST_BUF_SIZE: usize = MAX_PATH_LEN + 256;
+/// Smallest default body-output ring declared in the module manifest.
+pub(crate) const OUTPUT_CHUNK: usize = 256;
+pub(crate) const AUTHORITY_MAX: usize = 128;
+pub(crate) const REQUEST_BUF_SIZE: usize = MAX_PATH_LEN + AUTHORITY_MAX + CONTENT_TYPE_MAX + 192;
 
 /// One-shot param client: a small body configured at build time.
 #[cfg(not(feature = "exchange"))]
@@ -143,6 +146,11 @@ pub(crate) struct ClientState {
     pub(crate) data_in_chan: i32,
 
     pub(crate) host_ip: u32,
+    pub(crate) authority: [u8; AUTHORITY_MAX],
+    pub(crate) authority_len: u16,
+    pub(crate) request_invalid: u8,
+    pub(crate) keep_alive: u8,
+    pub(crate) idle_since_ms: u64,
     pub(crate) port: u16,
     pub(crate) path_len: u16,
     /// Status code of the response in flight, parsed when its headers
@@ -200,9 +208,18 @@ pub(crate) struct ClientState {
     pub(crate) window_update_pending: u8,
 
     pub(crate) connect_start_ms: u64,
+    pub(crate) request_start_ms: u64,
+    pub(crate) response_start_ms: u64,
+    pub(crate) progress_ms: u64,
+    pub(crate) client_header_ms: u32,
+    pub(crate) client_stall_ms: u32,
+    pub(crate) client_total_ms: u32,
 
     pub(crate) pending_offset: u16,
     pub(crate) recv_len: u16,
+    pub(crate) response: wire::response::ResponseDecoder,
+    pub(crate) h1_input_len: u16,
+    pub(crate) h1_input_offset: u16,
 
     pub(crate) content_length: u32,
     pub(crate) bytes_received: u32,
@@ -240,6 +257,8 @@ pub(crate) struct ClientState {
     /// Correlation id of the request in flight; 0 when idle.
     #[cfg(feature = "exchange")]
     pub(crate) exchange_corr: u64,
+    #[cfg(feature = "exchange")]
+    pub(crate) exchange_pending: u16,
     /// The request's `msg_key`, echoed unchanged on the reply so a downstream
     /// stage can rejoin without holding state.
     #[cfg(feature = "exchange")]
@@ -270,6 +289,9 @@ pub(crate) struct ClientState {
 // ── Param parsers ─────────────────────────────────────────────────────────
 
 pub(crate) unsafe fn parse_request_body(s: &mut HttpState, d: *const u8, len: usize) {
+    if len > REQUEST_BODY_SIZE {
+        s.client.request_invalid = 1;
+    }
     let n = len.min(REQUEST_BODY_SIZE);
     let mut i = 0;
     while i < n {
@@ -285,11 +307,16 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.client.out_chan = -1;
     s.client.data_in_chan = -1;
     s.client.port = 80;
+    s.client.authority_len = 0;
+    s.client.request_invalid = 0;
     s.client.content_type = [0; CONTENT_TYPE_MAX];
     s.client.content_type_len = 0;
     s.client.last_status = 0;
     s.client.surface_status = 0;
     s.client.phase = Phase::Init;
+    s.client.client_header_ms = 15000;
+    s.client.client_stall_ms = 15000;
+    s.client.client_total_ms = 60000;
     // h2 connection-level recv window starts at the spec default.
     s.client.recv_window = 65535;
 }
@@ -334,9 +361,13 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
         s.client.path.as_ptr(),
         s.client.path_len as usize,
         s.client.host_ip,
-        s.client.request_body_len as usize,
-        s.client.content_type.as_ptr(),
-        s.client.content_type_len as usize,
+        &wire::h1::RequestOptions {
+            authority: &s.client.authority[..s.client.authority_len as usize],
+            body_len: s.client.request_body_len as usize,
+            content_type: &s.client.content_type[..s.client.content_type_len as usize],
+            http11: true,
+            keep_alive: s.client.keep_alive != 0,
+        },
     );
     s.client.request_len = len as u16;
     s.client.request_sent = 0;

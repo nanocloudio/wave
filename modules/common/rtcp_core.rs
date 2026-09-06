@@ -45,6 +45,12 @@ pub const RTCP_PT_SDES: u8 = 202;
 pub const RTCP_PT_BYE: u8 = 203;
 /// Application-defined; parsed as a length and skipped.
 pub const RTCP_PT_APP: u8 = 204;
+/// Transport-layer feedback (RFC 4585), used for Generic NACK.
+pub const RTCP_PT_RTPFB: u8 = 205;
+/// Payload-specific feedback (RFC 4585), used for PLI.
+pub const RTCP_PT_PSFB: u8 = 206;
+pub const RTCP_FMT_NACK: u8 = 1;
+pub const RTCP_FMT_PLI: u8 = 1;
 
 /// SDES item type for the canonical name (§6.5.1), the only one required.
 pub const RTCP_SDES_CNAME: u8 = 1;
@@ -331,6 +337,64 @@ pub fn rtcp_write_bye(ssrc: u32, out: &mut [u8]) -> Option<usize> {
     out[2..4].copy_from_slice(&1u16.to_be_bytes());
     out[4..8].copy_from_slice(&ssrc.to_be_bytes());
     Some(8)
+}
+
+/// Build one Generic NACK packet (RFC 4585 §6.2.1). `pid` is the first
+/// missing RTP sequence and `blp` marks up to the following 16 losses.
+pub fn rtcp_write_nack(
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    pid: u16,
+    blp: u16,
+    out: &mut [u8],
+) -> Option<usize> {
+    if out.len() < 16 {
+        return None;
+    }
+    out[0] = (RTCP_VERSION << 6) | RTCP_FMT_NACK;
+    out[1] = RTCP_PT_RTPFB;
+    out[2..4].copy_from_slice(&3u16.to_be_bytes());
+    out[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+    out[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+    out[12..14].copy_from_slice(&pid.to_be_bytes());
+    out[14..16].copy_from_slice(&blp.to_be_bytes());
+    Some(16)
+}
+
+/// Build a Picture Loss Indication (RFC 4585 §6.3.1).
+pub fn rtcp_write_pli(sender_ssrc: u32, media_ssrc: u32, out: &mut [u8]) -> Option<usize> {
+    if out.len() < 12 {
+        return None;
+    }
+    out[0] = (RTCP_VERSION << 6) | RTCP_FMT_PLI;
+    out[1] = RTCP_PT_PSFB;
+    out[2..4].copy_from_slice(&2u16.to_be_bytes());
+    out[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+    out[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+    Some(12)
+}
+
+pub fn rtcp_parse_nack(buf: &[u8], at: usize) -> Option<(u32, u32, u16, u16)> {
+    let p = buf.get(at..at + 16)?;
+    if p[1] != RTCP_PT_RTPFB
+        || p[0] & 0x1f != RTCP_FMT_NACK
+        || u16::from_be_bytes([p[2], p[3]]) != 3
+    {
+        return None;
+    }
+    Some((
+        u32::from_be_bytes(p[4..8].try_into().ok()?),
+        u32::from_be_bytes(p[8..12].try_into().ok()?),
+        u16::from_be_bytes([p[12], p[13]]),
+        u16::from_be_bytes([p[14], p[15]]),
+    ))
+}
+
+pub fn rtcp_packet_is_pli(buf: &[u8], at: usize) -> bool {
+    let Some(p) = buf.get(at..at + 12) else {
+        return false;
+    };
+    p[1] == RTCP_PT_PSFB && p[0] & 0x1f == RTCP_FMT_PLI && u16::from_be_bytes([p[2], p[3]]) == 2
 }
 
 /// Build a minimal SDES carrying one CNAME item (§6.5.1).

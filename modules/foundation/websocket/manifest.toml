@@ -10,6 +10,7 @@ buffer_size  = 2048
 
 [[ports]]
 name         = "request_in"
+max_record   = 504
 index        = 1
 direction    = "input"
 content_type = "OctetStream"

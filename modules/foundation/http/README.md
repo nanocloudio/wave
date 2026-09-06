@@ -212,10 +212,64 @@ non-zero on a listener configured for mutual TLS means callers are reaching the
 application anonymous, which nothing at request level shows — the request
 succeeds, and the application simply never learns who made it.
 
+## Exchange delivery
+
+A terminal reply and its correlation remain resident until `reply_out` accepts
+that exact frame. Backpressure prevents the next request from being admitted.
+Drain refuses an in-flight request, preserves an already completed reply, closes
+the transport, and reports quiescence only after the reply is delivered. An
+unread reply holds a bounded amount of state; the module does not report a
+successful drain while discarding it. Applications still need idempotency for
+retries after transport or process failure.
+
+## HTTP/1 client response framing
+
+Response heads are bounded to 2048 bytes. The client accepts up to 16
+informational responses before a final response, streams Content-Length and
+chunked bodies, and completes an unframed body only at EOF. Truncated bodies,
+malformed or conflicting framing, unsupported transfer codings and malformed
+trailers fail the exchange. HEAD, 204 and 304 complete at their bodyless framing
+boundary. A full output channel retains both decoded and unread transport bytes.
+
+The client uses separate wall-clock deadlines: `client_header_ms` (15000) is
+absolute from request transmission to a final response head, `client_stall_ms`
+(15000) bounds lack of byte progress, and `client_total_ms` (60000) bounds the
+whole request including connect and blocked output. Zero disables an individual
+limit. A trickled header does not restart its head deadline.
+
+## HTTP/1 client connections
+
+The client speaks HTTP/1.1. `authority` (parameter 112, up to 128 bytes,
+default `localhost`) selects the Host header, falling back to the configured
+IP. `method` (parameter 113) takes the same verb codes the request envelope
+carries, and defaults to GET.
+
+`client_keep_alive` (parameter 114, default 0) lets one connection to an origin
+serve exchanges in sequence. Only a complete, reusable response returns its
+connection to that bounded pool; a peer close, an idle expiry
+(`client_stall_ms`), a failure and a drain each retire it. A request is never
+replayed automatically, so a connection that dies mid-exchange fails that
+exchange rather than repeating a side effect. With keep-alive off, the client
+closes at completion.
+
+## HTTP/3 client requests
+
+An HTTP/3 request is composed from the same `path`, `body`, `content_type`,
+`authority` and `method` parameters, and the head/stall/total deadlines apply
+unchanged. A configured field too large for its buffer fails the request rather
+than being truncated.
+
+HEADERS and DATA are split to the mux provider's send bound and retained across
+a refusal, with FIN following the complete body. Response DATA streams through
+bounded staging independently of frame length, while a response header block
+stays capped at 1024 encoded bytes. Status, Content-Length, informational
+responses, trailers, stream identity, FIN, reset and session closure are all
+validated before an exchange completes. CONNECT is rejected: a tunnel needs an
+interface of its own, and answering it on the request path would give a caller
+a tunnel that silently is not one.
+
 ## Declared deviations
 
-- **The HTTP/1 client speaks HTTP/1.0**, with a `Host` header. Legal, and
-  deliberate, but it means no keep-alive: one connection per request.
 - **`bytes=500-499` returns 416** where RFC 7233 §3.1 says an unsatisfiable-looking
   range whose first-byte-pos exceeds last-byte-pos should be ignored (→ 200).
   Preserved from the origin rather than corrected.

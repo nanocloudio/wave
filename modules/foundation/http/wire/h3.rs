@@ -71,15 +71,10 @@ pub struct H3Frame<'a> {
 /// Parse one frame from `buf`. Returns `Some((frame, total_consumed))`
 /// or `None` on truncation (caller should buffer more bytes).
 pub fn parse_h3_frame(buf: &[u8]) -> Option<(H3Frame<'_>, usize)> {
-    // SAFETY: pointer/length pair derived from a Rust slice; varint_decode
-    // bounds-checks internally against the supplied length.
-    let (frame_type, type_len) = unsafe { varint_decode(buf.as_ptr(), buf.len()) }?;
-    let after_type = &buf[type_len..];
-    // SAFETY: as above; `after_type` is a sub-slice of `buf`.
-    let (length, len_len) = unsafe { varint_decode(after_type.as_ptr(), after_type.len()) }?;
-    let length = length as usize;
-    let payload_off = type_len + len_len;
-    if buf.len() < payload_off + length {
+    let (frame_type, length, payload_off) = parse_h3_frame_head(buf)?;
+    let length = usize::try_from(length).ok()?;
+    let end = payload_off.checked_add(length)?;
+    if buf.len() < end {
         return None;
     }
     Some((
@@ -89,6 +84,14 @@ pub fn parse_h3_frame(buf: &[u8]) -> Option<(H3Frame<'_>, usize)> {
         },
         payload_off + length,
     ))
+}
+
+/// Decode only the frame prefix, allowing DATA and unknown payloads to stream.
+pub fn parse_h3_frame_head(buf: &[u8]) -> Option<(u64, u64, usize)> {
+    let (kind, tn) = unsafe { varint_decode(buf.as_ptr(), buf.len()) }?;
+    let rest = &buf[tn..];
+    let (length, ln) = unsafe { varint_decode(rest.as_ptr(), rest.len()) }?;
+    Some((kind, length, tn + ln))
 }
 
 /// Build a SETTINGS frame body: a sequence of (varint id, varint value)

@@ -12,7 +12,7 @@ this module is the pump around them.
 
 ## Why a module and not a role inside `rtp`
 
-Three reasons, recorded with the admission decision in `.context/backlog.md`:
+Three reasons:
 
 - **Its own endpoint.** RFC 3550 §11 puts RTCP on the odd port one above RTP's.
   It is not the same socket, so it is not `rtp` wearing a second hat.

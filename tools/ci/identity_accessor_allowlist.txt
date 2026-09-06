@@ -15,7 +15,6 @@ modules/foundation/rtp/mod.rs|u32::from_le_bytes([s.ctrl_buf[4], s.ctrl_buf[5], 
 modules/foundation/rtp/mod.rs|let port_le = s.local_port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/rtp/mod.rs|let port = u16::from_le_bytes([s.ctrl_buf[2], s.ctrl_buf[3]]);|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/rtp/mod.rs|let addr = u32::from_le_bytes([|IP address — transport addressing, not a connection identity
-modules/foundation/rtp/mod.rs|let port_bytes = s.peer_port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/http/server/ws.rs|let len_bytes = (payload_len as u16).to_le_bytes();|TLV frame length field, not an identity
 modules/foundation/http/server/app.rs|buf[0..2].copy_from_slice(&conn_id.to_le_bytes());|owning parser/serialiser of the Wave fan-out envelope — this file defines the layout
 modules/foundation/http/server/app.rs|buf[2..4].copy_from_slice(&stream_id.to_le_bytes());|owning parser/serialiser of the Wave fan-out envelope — this file defines the layout
@@ -51,8 +50,6 @@ modules/foundation/http/server/h1.rs|let r_len = u16::from_le_bytes([*buf.add(2)
 modules/foundation/http/client/h2.rs|let ip = s.client.host_ip.to_le_bytes();|IP address — transport addressing, not a connection identity
 modules/foundation/http/client/h2.rs|let bytes = host.to_le_bytes();|IP address — transport addressing, not a connection identity
 modules/foundation/http/client/h3.rs|open[1..3].copy_from_slice(&(plen as u16).to_le_bytes());|TLV frame length field, not an identity
-modules/foundation/http/client/h3.rs|frame[1..3].copy_from_slice(&(body_len as u16).to_le_bytes());|TLV frame length field, not an identity
-modules/foundation/http/client/h3.rs|close[1..3].copy_from_slice(&(cplen as u16).to_le_bytes());|TLV frame length field, not an identity
 modules/foundation/http/client/h1.rs|let ip_bytes = s.client.host_ip.to_le_bytes();|IP address — transport addressing, not a connection identity
 modules/foundation/s3/mod.rs|s.port = u16::from_le_bytes([ep[4], ep[5]]);|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/s3/mod.rs|let bucket_len = u16::from_le_bytes([buf[5], buf[6]]) as u64;|Wave-local operation-record length field; this module owns the layout
@@ -64,7 +61,6 @@ modules/foundation/s3/mod.rs|let port = s.port.to_le_bytes();|TCP/UDP port — t
 modules/foundation/s3/mod.rs|let port = s.port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/stun/mod.rs|let port = s.port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/websocket/mod.rs|s.port = u16::from_le_bytes([ep[4], ep[5]]);|TCP/UDP port — transport addressing, not a connection identity
-modules/foundation/websocket/mod.rs|(x as u32).to_le_bytes()|PRNG mask bytes for RFC 6455 client masking, not an identity
 modules/foundation/websocket/mod.rs|let port = s.port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/smtp/mod.rs|s.port = u16::from_le_bytes([ep[4], ep[5]]);|TCP/UDP port — transport addressing, not a connection identity
 modules/foundation/smtp/mod.rs|let from_len = u16::from_le_bytes([buf[6], buf[7]]) as u64;|Wave-local operation-record length field; this module owns the layout
@@ -79,3 +75,11 @@ modules/foundation/http/client/exchange.rs|u16::from_le_bytes([p[3], p[4]]) as u
 modules/foundation/rtcp/mod.rs|let port = s.port.to_le_bytes();|UDP port in a CMD_DG_BIND payload — transport addressing, not a connection identity (same site and reason as stun/mod.rs)
 modules/foundation/http/server/app.rs|buf[off..off + 2].copy_from_slice(&(svid.len() as u16).to_le_bytes());|length prefix of the peer-identity TRAILER, not an identity — and this file is the owning serialiser of the Wave fan-out envelope. The identity bytes themselves are read through abi::contracts::net::peer_identity in server/mod.rs
 modules/foundation/http/client/exchange.rs|let code = s.client.last_status.to_le_bytes();|HTTP status code as a refusal payload — a protocol result, not a connection identity, and this file is the owning serialiser of the exchange reply
+modules/foundation/rtp/mod.rs|ssrc: u32::from_le_bytes([d[34], d[35], d[36], d[37]]),|SSRC of a negotiated route in rtp's own control record; this module owns the layout
+modules/foundation/rtp/mod.rs|u16::from_le_bytes([*buf.add(NET_FRAME_HDR + 6), *buf.add(NET_FRAME_HDR + 7)]);|source UDP port from the datagram prefix — transport addressing, not a connection identity
+modules/foundation/rtp/mod.rs|let port_bytes = dest_port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
+modules/foundation/http/server/h3.rs|headers[1..3].copy_from_slice(&(authority.len() as u16).to_le_bytes());|length prefix of a header in the Wave h3 application record; this file is the owning serialiser
+modules/foundation/http/client/h3.rs|frame[1..3].copy_from_slice(&plen.to_le_bytes());|TLV frame length field, not an identity
+modules/foundation/http/client/h3.rs|frame[FRAME_HDR + 5..].copy_from_slice(&0x10Cu64.to_le_bytes());|H3_REQUEST_CANCELLED close-reason code, not an identity
+modules/foundation/http/client/h3.rs|frame[1..3].copy_from_slice(&(plen as u16).to_le_bytes());|TLV frame length field, not an identity
+modules/foundation/http/client/h3.rs|close[1..3].copy_from_slice(&(plen as u16).to_le_bytes());|TLV frame length field, not an identity

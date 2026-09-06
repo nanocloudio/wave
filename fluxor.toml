@@ -17,13 +17,17 @@ fluxor = { abi = 1 }
 [ci]
 # Silicon targets `fluxor modules build --all` produces artefacts for. Which
 # modules build for which silicon is decided per module by `manifest.toml`'s
-# `hardware_targets` (`websocket`, `smtp` and `s3` are bcm2712-only, `ws_stream`
-# is portable, `http`/`rtp`/`sip` are rp2350 + bcm2712 — rtp gained bcm2712 on
-# 2026-08-03, see T3.6.5). The three bcm2712-only modules are all OUTBOUND
-# connectors, which is why rp2350 can serve WebSocket but not dial one; that is
-# an unexamined default rather than a requirement. `linux` is a *runtime* host,
-# not a silicon, so it is not listed here.
-targets = ["rp2350", "bcm2712", "wasm"]
+# `hardware_targets`: `websocket`, `smtp` and `s3` are bcm2712-only, `http` and
+# `ws_stream` reach down to rp2040, and the rest of the protocol set is
+# rp2350 + bcm2712. The three bcm2712-only modules are all OUTBOUND connectors,
+# which is why rp2350 can serve WebSocket but not dial one; that is an
+# unexamined default rather than a requirement.
+#
+# rp2040 is listed because `tools/ci/fmod_size_budget.sh` holds ceilings for its
+# artefacts, and a ceiling on a target CI never builds is a gate that reports
+# MISSING rather than a size. `linux` is a *runtime* host, not a silicon, so it
+# is not listed here.
+targets = ["rp2040", "rp2350", "bcm2712", "wasm"]
 
 # No `[ci.cargo]`. Wave has NO root cargo workspace: it was retired on
 # 2026-08-08 along with `crates/wave-cores`, because the shared cores are
@@ -36,46 +40,48 @@ targets = ["rp2350", "bcm2712", "wasm"]
 #
 # `host_tools_crate` would be the wrong tool for either of them:
 #   * `tests/harness` is already phase 4's job — `cargo-test (harness)` is
-#     built in and keys off the directory existing (ci.rs:308), so naming it here
-#     would run those ~27s of suites TWICE per CI run.
+#     built in and keys off the directory existing, so naming it here would run
+#     those suites TWICE per CI run.
 #   * `tools/load/wave-bench` holds no tests to run in phase 2; what it needs is to be
 #     BUILT and linted, which tools/ci/host_crates.sh does below.
 # With the key absent and no root manifest, phase 2 is omitted rather than
-# skipped (ci.rs:245) — the work it would have done is covered, not dropped.
+# skipped — the work it would have done is covered, not dropped.
 
 # No `[[ci.lints.exemption]]`: the opt-in audit it feeds matches exemptions
-# against workspace-member paths and is omitted entirely without a root manifest
-# (ci.rs:146). `tools/load/wave-bench` still inlines its relaxed `[lints]` mirror —
+# against workspace-member paths and is omitted entirely without a root
+# manifest. `tools/load/wave-bench` still inlines its relaxed `[lints]` mirror —
 # there is simply no workspace left for it to have opted out of.
 
 [ci.test]
-# Three project gates, run in order at CI phase 3.5 (after the strict module
+# Five project gates, run in order at CI phase 3.5 (after the strict module
 # build):
-#   1. ci-shadow-guard.sh — shadow-checkout hard-fail:
-#      tests/ is shadow-tracked in .git-shadow/, so a primary-only checkout has
-#      zero files there and the test phases would pass vacuously.
-#   2. host_crates.sh — phases 1.1/1.2 fmt-check and clippy the PIC module
-#      sources directly when there is no root manifest, which is new coverage —
-#      but it leaves the two host crates linted by nothing, and
+#
+#   1. shadow_guard.sh — tests/ is shadow-tracked in .git-shadow/, so a
+#      primary-only checkout has zero files there and the test phases would
+#      pass vacuously. It also fails when the primary repo TRACKS a path under
+#      a shadow tier: ignoring a tree does not untrack what is already in it,
+#      so a force-add reaches the shared remote with every ignore rule still
+#      reading as correct.
+#   2. host_crates.sh — the module build fmt-checks and clippies the PIC
+#      sources directly, which leaves the two host crates linted by nothing and
 #      `tools/load/wave-bench` built by nothing. This gate is that.
 #   3. fmod_size_budget.sh — the variant split's whole point is fitting smaller
 #      devices, which is a claim about BYTES; enforced here, after the module
 #      build, so a variant cannot quietly stop being smaller than its superset.
+#   4. identity_accessor_guard.sh — module pumps must decode contract
+#      identities through the owning accessors, never literal offsets. Every
+#      remaining byte-decode site carries an individual justification in
+#      tools/ci/identity_accessor_allowlist.txt, and a stale or unjustified
+#      entry fails the gate.
+#   5. envelope_table.sh — the connection envelope, generated from the
+#      constants that compile it (SDK profile + Wave sources) and diffed
+#      against docs/reference/envelope.md, so the ceiling a reader consults is
+#      the ceiling the module compiled.
 scripts = [
   "tools/ci/shadow_guard.sh",
   "tools/ci/host_crates.sh",
   "tools/ci/fmod_size_budget.sh",
-  #   4. identity_accessor_guard.sh — connection-identity accessor guard
-  #      module pumps must decode contract identities
-  #      through the owning accessors, never literal offsets; every remaining
-  #      byte-decode site carries an individual justification in
-  #      tools/ci/identity_accessor_allowlist.txt, and a stale or unjustified
-  #      entry fails the gate.
   "tools/ci/identity_accessor_guard.sh",
-  #   5. envelope_table.sh — the connection envelope, generated from the
-  #      constants that compile it (SDK profile + Wave sources) and diffed
-  #      against docs/reference/envelope.md, so the ceiling a reader consults
-  #      is the ceiling the module compiled.
   "tools/ci/envelope_table.sh",
 ]
 

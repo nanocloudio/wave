@@ -3,8 +3,8 @@
 #
 # Boots a Wave graph on the linux target, then runs `wave-loadgen` across every
 # protocol at an increasing offered rate, emitting one JSON line per cell plus a
-# human summary. Designed to be the L4 layer of `.context/planning/test-strategy.md`
-# and the linux-proxy gate every rig scenario must pass first (../standards/rig.md §7).
+# human summary. It is the linux-proxy gate every rig scenario must pass before
+# it is worth booting hardware for (../standards/rig.md §7).
 #
 # Usage:
 #   tools/load/suite.sh                       # full ladder, local graph
@@ -13,7 +13,7 @@
 #   tools/load/suite.sh --conns-ladder 1,16,64,128,240,256,288   # concurrency axis
 #   tools/load/suite.sh --duration 30 --out results.ndjson
 #
-# Measurement discipline (../standards/rig.md §6, ../lattice/.context/perf_budgets.md):
+# Measurement discipline (../standards/rig.md §6):
 #
 #  * Localhost numbers are a FLOOR, not a prediction. Loopback has no NIC, and
 #    the generator competes with the DUT for the same cores. A clean number

@@ -9,9 +9,9 @@
 //! itself.
 //!
 //! A module rather than a role inside `rtp` because RTCP has its own endpoint,
-//! its own clock and its own cost; the decision and its grounds are in
-//! `.context/backlog.md` and the README. This is the split `jitter` already
-//! uses — a separate realtime adapter over `rtp`'s validated records.
+//! its own clock and its own cost; the README sets out why each of those
+//! forces a split. It is the arrangement `jitter` already uses — a separate
+//! realtime adapter over `rtp`'s validated records.
 //!
 //! Protocol mechanics in the host-tested `modules/common/rtcp_core.rs`; this
 //! file is the pump: bind, account for what `rtp` received and sent, report on
@@ -73,14 +73,21 @@ mod rtcp_core;
 pub mod rtcp_core;
 use rtcp_core::{
     ms_to_ntp32, ms_to_ntp64, ms_to_rtp_units, ntp32_to_ms, ntp_middle_32, rtcp_first_block_at,
-    rtcp_is_plausible, rtcp_packet_ssrc, rtcp_parse_compound, rtcp_parse_report_block,
-    rtcp_parse_sender_info, rtcp_randomise_interval, rtcp_round_trip, rtcp_write_rr,
-    rtcp_write_sdes_cname, rtcp_write_sr, write_rtcp_report_record, RtcpPacket, RtcpReceiverStats,
-    RtcpReportBlock, RtcpSenderInfo, RTCP_PT_BYE, RTCP_PT_RR, RTCP_PT_SR,
+    rtcp_is_plausible, rtcp_packet_is_pli, rtcp_packet_ssrc, rtcp_parse_compound, rtcp_parse_nack,
+    rtcp_parse_report_block, rtcp_parse_sender_info, rtcp_randomise_interval, rtcp_round_trip,
+    rtcp_write_rr, rtcp_write_sdes_cname, rtcp_write_sr, write_rtcp_report_record, RtcpPacket,
+    RtcpReceiverStats, RtcpReportBlock, RtcpSenderInfo, RTCP_PT_BYE, RTCP_PT_RR, RTCP_PT_SR,
 };
 
+#[cfg(not(feature = "host-test"))]
+#[path = "../../common/srtp_core.rs"]
+mod srtp_core;
+#[cfg(feature = "host-test")]
+#[path = "../../common/srtp_core.rs"]
+pub mod srtp_core;
+
 const NET_BUF: usize = 1600;
-const MSG_BUF: usize = 1500;
+const MSG_BUF: usize = 1536;
 const CNAME_BUF: usize = 64;
 /// Packets located in one compound. §6.1 compounds are short by construction —
 /// a report, an SDES, maybe a BYE — and a datagram claiming more than this is
@@ -158,6 +165,20 @@ struct RtcpState {
     /// The report the peer sent about US, held until `reports_out` takes it.
     report: [u8; REPORT_REC],
     report_owed: u8,
+    pub(crate) nacks_received: u32,
+    pub(crate) plis_received: u32,
+
+    /// Optional SRTCP AES-128-GCM context. Keys are installed by the DTLS
+    /// owner through the same bounded parameter path as RTP; index and replay
+    /// state stay local to this RTCP association.
+    srtp_key: [u8; 16],
+    srtp_salt: [u8; 12],
+    srtp_set: u8,
+    dtls_export: [u8; 56],
+    dtls_export_set: u8,
+    dtls_role: u8,
+    srtcp_index: u32,
+    srtcp_replay: srtp_core::SrtpReplay,
 
     msg: [u8; MSG_BUF],
     net_buf: [u8; NET_BUF],
@@ -167,6 +188,26 @@ struct RtcpState {
     dropped: u32,
     byes: u32,
     draining: u8,
+}
+
+fn install_dtls_export(s: &mut RtcpState) {
+    if s.dtls_export_set == 0 {
+        return;
+    }
+    let (key_off, salt_off) = if s.dtls_role == 0 { (0, 32) } else { (16, 44) };
+    let mut master_key = [0u8; 16];
+    let mut master_salt = [0u8; 12];
+    master_key.copy_from_slice(&s.dtls_export[key_off..key_off + 16]);
+    master_salt.copy_from_slice(&s.dtls_export[salt_off..salt_off + 12]);
+    srtp_core::derive_aead_key_salt(
+        &master_key,
+        &master_salt,
+        3,
+        5,
+        &mut s.srtp_key,
+        &mut s.srtp_salt,
+    );
+    s.srtp_set = 1;
 }
 
 define_params! {
@@ -192,6 +233,23 @@ define_params! {
         => |s, d, len| { s.ntp_epoch_offset_s = p_u32(d, len, 0, 0); };
     8, clock_rate_hz, u32, 8000
         => |s, d, len| { s.clock_rate_hz = p_u32(d, len, 0, 8_000).max(1); };
+    9, srtp_key, u8, 0 => |s, d, len| {
+        if len == 16 { unsafe { core::ptr::copy_nonoverlapping(d, s.srtp_key.as_mut_ptr(), 16); } }
+    };
+    10, srtp_salt, u8, 0 => |s, d, len| {
+        if len == 12 { unsafe { core::ptr::copy_nonoverlapping(d, s.srtp_salt.as_mut_ptr(), 12); s.srtp_set = 1; } }
+    };
+    11, dtls_srtp_export, u8, 0 => |s, d, len| {
+        if len == 56 {
+            unsafe { core::ptr::copy_nonoverlapping(d, s.dtls_export.as_mut_ptr(), 56); }
+            s.dtls_export_set = 1;
+            install_dtls_export(s);
+        }
+    };
+    12, dtls_srtp_role, u8, 0 => |s, d, len| {
+        s.dtls_role = p_u8(d, len, 0, 0).min(1);
+        install_dtls_export(s);
+    };
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -249,6 +307,14 @@ pub extern "C" fn module_new(
         s.last_sr_ntp = 0;
         s.last_sr_at_ms = 0;
         s.report_owed = 0;
+        s.srtp_key = [0; 16];
+        s.srtp_salt = [0; 12];
+        s.srtp_set = 0;
+        s.dtls_export = [0; 56];
+        s.dtls_export_set = 0;
+        s.dtls_role = 0;
+        s.srtcp_index = 0;
+        s.srtcp_replay = srtp_core::SrtpReplay::new();
         s.reports_sent = 0;
         s.reports_received = 0;
         s.dropped = 0;
@@ -381,6 +447,16 @@ unsafe fn pump_stats(s: &mut RtcpState) {
                 s.stats.on_packet(seq, rtp_ts, arrival);
                 s.stats_seen = 1;
             }
+            Some(RtcpStat::RxMeta { seq, rtp_ts, ssrc }) => {
+                let arrival = ms_to_rtp_units(dev_millis(sys) as u32, s.clock_rate_hz);
+                if s.stats.ssrc == 0 {
+                    s.stats.ssrc = ssrc;
+                }
+                if s.stats.ssrc == ssrc {
+                    s.stats.on_packet(seq, rtp_ts, arrival);
+                    s.stats_seen = 1;
+                }
+            }
             Some(RtcpStat::Tx {
                 packets,
                 octets,
@@ -459,6 +535,22 @@ unsafe fn send_report(s: &mut RtcpState, now: u64) {
     };
     at += added;
 
+    let send_len = if s.srtp_set != 0 {
+        let Some(n) = srtp_core::protect_srtcp_aes128_gcm(
+            &s.srtp_key,
+            &s.srtp_salt,
+            &mut out,
+            at,
+            s.srtcp_index,
+        ) else {
+            return;
+        };
+        s.srtcp_index = s.srtcp_index.wrapping_add(1) & 0x7fff_ffff;
+        n
+    } else {
+        at
+    };
+
     let sent = dev_dg_send_to_v4(
         sys,
         s.net_out,
@@ -466,7 +558,7 @@ unsafe fn send_report(s: &mut RtcpState, now: u64) {
         s.peer_ip,
         s.peer_port,
         out.as_ptr(),
-        at,
+        send_len,
         s.net_buf.as_mut_ptr(),
         NET_BUF,
     );
@@ -509,6 +601,16 @@ unsafe fn on_compound(s: &mut RtcpState, len: usize, now: u64) {
             }
             RTCP_PT_RR => take_blocks_about_us(s, &copy[..len], p, now),
             RTCP_PT_BYE => s.byes = s.byes.wrapping_add(1),
+            rtcp_core::RTCP_PT_RTPFB => {
+                if rtcp_parse_nack(&copy[..len], p.at).is_some() {
+                    s.nacks_received = s.nacks_received.wrapping_add(1);
+                }
+            }
+            rtcp_core::RTCP_PT_PSFB => {
+                if rtcp_packet_is_pli(&copy[..len], p.at) {
+                    s.plis_received = s.plis_received.wrapping_add(1);
+                }
+            }
             _ => {}
         }
         // The first source we hear becomes the one we report on. A second
@@ -613,6 +715,23 @@ unsafe fn pump_net(s: &mut RtcpState, now: u64) {
     }
     let data_len = raw_len.min(MSG_BUF);
     core::ptr::copy_nonoverlapping(data_ptr, s.msg.as_mut_ptr(), data_len);
+    let data_len = if s.srtp_set != 0 {
+        let Some((plain_len, index)) = srtp_core::unprotect_srtcp_aes128_gcm(
+            &s.srtp_key,
+            &s.srtp_salt,
+            &mut s.msg[..data_len],
+        ) else {
+            s.dropped = s.dropped.wrapping_add(1);
+            return;
+        };
+        if !s.srtcp_replay.accept(index as u64) {
+            s.dropped = s.dropped.wrapping_add(1);
+            return;
+        }
+        plain_len
+    } else {
+        data_len
+    };
     if !rtcp_is_plausible(&s.msg[..data_len]) {
         s.dropped = s.dropped.wrapping_add(1);
         return;

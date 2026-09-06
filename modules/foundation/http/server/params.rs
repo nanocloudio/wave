@@ -262,7 +262,8 @@ pub(crate) unsafe fn set_route_fs_filter(s: &mut HttpState, idx: usize, d: *cons
 /// 256 KiB. Growth is therefore unreachable in production today and was
 /// consequently untested — which is how a host-harness allocator that
 /// dropped the old contents on `heap_realloc` went unnoticed in three
-/// repositories (`../fluxor/.context/abi_test_double_divergence.md`). The growth
+/// repositories at once — every one of them exercising the path only through
+/// the same test double. The growth
 /// code is real and becomes live the moment a body arrives from anything
 /// other than a one-byte-length TLV, so it is pinned here rather than
 /// left to be discovered.

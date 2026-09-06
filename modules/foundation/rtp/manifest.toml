@@ -1,4 +1,4 @@
-version = "1.0.1"
+version = "1.0.2"
 hardware_targets = ["rp2350", "bcm2712"]
 
 # timer_class: this module reads no clock at all — verified, it calls neither
@@ -26,13 +26,21 @@ direction = "input"
 content_type = "OctetStream"
 
 [[ports]]
+name = "encoded_media"
+index = 3
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
 
-# Validated receive records (out[1]): `[seq: u16 LE][payload…]`, one per
-# accepted packet — what a reorder buffer needs to see loss. Consumed by the
-# `jitter` adapter.
+# Validated receive records (out[1]): metadata-bearing `[seq,timestamp,ssrc,PT,
+# marker][payload…]`, with a MID extension variant when RFC 8285 supplies one.
+# Each record is tagged, so a consumer that reads only the fixed prefix and one
+# that needs the MID share the port without either having to know which the
+# sender chose. The `jitter` adapter accepts both.
 [[ports]]
 name = "packets"
 index = 1
@@ -71,4 +79,3 @@ access = "read"
 # Module-scope observability — exempt (see ../standards/observability.md §6).
 [observability]
 exempt = "application-layer demo — byte throughput is observed at the foundation transport (ip/quic/http) it rides"
-

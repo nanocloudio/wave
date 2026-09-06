@@ -50,7 +50,7 @@ const MAGIC_GUID_LEN: usize = 36;
 // RFC 6455 frame-header decode + validation, shared verbatim with the client
 // core in `modules/common/ws_core.rs`. Before this was split out the
 // rules below existed only here, so the client accepted RSV bits, reserved
-// opcodes and oversized control frames that this side rejected (T2.2.4).
+// opcodes and oversized control frames that this side rejected.
 include!("../../../common/ws_frame_core.rs");
 
 // The admission record layouts. Mounted here beside the frame core because

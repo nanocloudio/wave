@@ -62,7 +62,10 @@ mod rtp_wire;
 #[cfg(feature = "host-test")]
 #[path = "../../common/rtp_wire.rs"]
 pub mod rtp_wire;
-use rtp_wire::{rtp_rx_seq, REC_RTP_RX, RTP_RX_SEQ_LEN};
+use rtp_wire::{
+    parse_rtp_rx_meta, parse_rtp_rx_meta_mid, rtp_rx_seq, REC_RTP_RX, REC_RTP_RX_META,
+    REC_RTP_RX_META_MID, RTP_RX_META_LEN, RTP_RX_META_MID_LEN, RTP_RX_SEQ_LEN,
+};
 
 /// The shared media-control records (`sip.rtp_ctrl`, fanned here and to the
 /// transmitter). SET_ENDPOINT addresses the transmitter and is ignored.
@@ -243,7 +246,16 @@ unsafe fn step_rx(s: &mut JitterState) {
             return;
         }
         let (msg_type, plen) = net_read_frame(sys, s.rx_in, s.rx_buf.as_mut_ptr(), s.rx_buf.len());
-        if msg_type != REC_RTP_RX || plen < RTP_RX_SEQ_LEN {
+        let payload_offset = if msg_type == REC_RTP_RX_META {
+            RTP_RX_META_LEN
+        } else if msg_type == REC_RTP_RX_META_MID {
+            RTP_RX_META_MID_LEN
+        } else if msg_type == REC_RTP_RX {
+            RTP_RX_SEQ_LEN
+        } else {
+            0
+        };
+        if payload_offset == 0 || plen < payload_offset {
             // Unknown frame or a runt too short for a sequence: consumed
             // whole (the framing keeps the FIFO aligned) and dropped.
             if msg_type == 0 {
@@ -256,7 +268,29 @@ unsafe fn step_rx(s: &mut JitterState) {
         }
         let payload = &s.rx_buf[NET_FRAME_HDR..NET_FRAME_HDR + plen];
         let seq = rtp_rx_seq(payload);
-        s.jitter.insert(seq, &payload[RTP_RX_SEQ_LEN..]);
+        if msg_type == REC_RTP_RX_META || msg_type == REC_RTP_RX_META_MID {
+            let mid_meta = if msg_type == REC_RTP_RX_META_MID {
+                parse_rtp_rx_meta_mid(payload)
+            } else {
+                parse_rtp_rx_meta(payload).map(|meta| (meta, [0; 32], 0))
+            };
+            if let Some((meta, mid, mid_len)) = mid_meta {
+                let mid_slice = &mid[..mid_len as usize];
+                s.jitter.insert_meta_mid(
+                    seq,
+                    &payload[payload_offset..],
+                    jitter_core::JitterPacketMeta {
+                        timestamp: meta.timestamp,
+                        ssrc: meta.ssrc,
+                        payload_type: meta.payload_type,
+                        marker: meta.marker,
+                    },
+                    mid_slice,
+                );
+            }
+        } else {
+            s.jitter.insert(seq, &payload[payload_offset..]);
+        }
     }
 }
 

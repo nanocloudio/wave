@@ -1,7 +1,7 @@
 version = "1.0.1"
 # timer_class: ping/idle timers read wall-clock (dev_millis).
 timer_class = "wall_clock"
-hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
+hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux", "wasm"]
 
 # WsFrame ↔ OctetStream adapter.
 #

@@ -108,6 +108,12 @@ fn phase(s: &HttpState) -> H2Phase {
 #[inline]
 fn set_phase(s: &mut HttpState, p: H2Phase) {
     s.client.h2_phase = p as u8;
+    s.client.phase = match p {
+        H2Phase::Init => super::Phase::Init,
+        H2Phase::Done => super::Phase::Done,
+        H2Phase::Error => super::Phase::Error,
+        _ => super::Phase::SendRequest,
+    };
 }
 
 #[inline(always)]
@@ -513,7 +519,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     .as_ptr()
                     .add(h2w::FRAME_HEADER_LEN + pending);
                 let remaining = payload_len - pending;
-                let written = (sys.channel_write)(out_chan, src, remaining);
+                let written =
+                    (sys.channel_write)(out_chan, src, remaining.min(super::OUTPUT_CHUNK));
                 if written < 0 {
                     if written == E_AGAIN {
                         return 0;
@@ -626,6 +633,7 @@ unsafe fn process_one_frame(s: &mut HttpState) -> FrameAction {
                 log(s, b"[http] headers done (h2c)");
                 s.client.headers_done = 1;
                 s.client.content_length = status as u32;
+                s.client.last_status = status;
             }
 
             let end_stream = (hdr.flags & h2w::FLAG_END_STREAM) != 0;

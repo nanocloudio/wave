@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scripted Linux-graph runner (Conclave plan S3.4, T3.4.1).
+# Scripted Linux-graph runner.
 #
 # Boots Wave's `http` module inside a REAL Fluxor graph on the host — real
 # scheduler, real `linux_net` transport, real TCP socket — and asserts it end to

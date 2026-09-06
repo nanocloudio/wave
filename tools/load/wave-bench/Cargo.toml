@@ -33,8 +33,8 @@ description = "Off-DUT load harness for Wave: open-loop multi-protocol generator
 # actually rests on — HTTP/1.1, HPACK, h2 frames, RFC 6455, gRPC framing —
 # remain this crate's own. TLS is transport; a shared TLS bug surfaces as a
 # handshake failure, not as a codec defect that cancels out on both sides.
-# Without it the rig could only ever be driven in plaintext, which is not the
-# shape production runs in — see .context/perf_benchmarks.md §5 "No TLS".
+# Without it the rig could only ever be driven in plaintext, and a number
+# measured without TLS is not a number about the deployment being measured.
 
 [dependencies]
 # `quiche` (Cloudflare) passes the same scrutiny as rustls, on stronger terms:

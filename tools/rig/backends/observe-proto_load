@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """`observe.proto_load` rig backend — the protocol-agnostic load probe.
 
-Conclave plan T3.6.1. Successor to Fluxor's `observe-https_load`, which is
-HTTPS-only and lives in the Fluxor tree. The split here is deliberate:
+The protocol-aware counterpart to Fluxor's HTTPS-only `observe-https_load`,
+which stays in the Fluxor tree. The split here is deliberate:
 
   * FLUXOR owns the capability NAME (`observe.proto_load` in
     `tools/src/rig/vocab.rs`) and the byte-stream matcher path.

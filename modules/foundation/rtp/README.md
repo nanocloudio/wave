@@ -1,8 +1,13 @@
 # `rtp` — RFC 3550 transmitter and receiver
 
-A combined transmitter and receiver for PCMU/G.711 over a UDP `NetProto`
-binding. It builds for rp2350 and bcm2712 — the same targets as `sip`, which
-drives it over a control port.
+A combined transmitter and receiver for negotiated RTP over a UDP `NetProto`
+binding. The `g711` port carries raw PCMU for the smallest voice graph, and
+encoded access units arrive as bounded `rtp_media_wire` records that the
+mounted `rtp_media` boundary packetizes as H.264 or VP8. The shared media cores also provide
+route validation, pacing, congestion control, and RTP-to-wall-clock
+synchronization for higher-level media graphs.
+It builds for rp2350 and bcm2712 — the same targets as `sip`, which drives it
+over a control port.
 
 `timer_class = "agnostic"`: this module reads no clock at all. Packet cadence is
 the graph's, not its own.
@@ -21,7 +26,9 @@ all move that boundary.
 | `packets` | out (1) | `OctetStream` | µ-law audio recovered from received packets |
 | `endpoint` | ctrl in | `OctetStream` | peer address and start/stop control |
 
-Parameters: `local_port`, `peer_ip`, `peer_port`, `ptime`, `ssrc`.
+Parameters include `local_port`, `peer_ip`, `peer_port`, `ptime`, `ssrc`,
+negotiated payload/SSRC/MID routes, DTLS-SRTP exporter material, and TURN relay
+and ChannelData settings.
 
 ## Bounds
 
@@ -38,12 +45,19 @@ A packet too large to accept is refused and counted, never delivered as the
 fraction that happened to fit. Both directions interoperate with ffmpeg's RTP
 muxer, not only with Wave's own reading of the RFC.
 
-## Not implemented
+## Composition boundaries
 
-RTCP, SRTP, jitter buffering, payload formats other than PCMU, and multi-party
-session policy. Receive-side reorder and loss-concealing playout live in `sip`,
-which owns the media recovery for a call. Secure RTP requires an explicit future
-capability and is never implied by an RTP binding.
+RTCP report generation and jitter-buffer playout remain separate modules so a
+minimal voice graph does not pay for them. `rtp` emits bounded metadata records
+with sequence, timestamp, SSRC, payload type, marker, and MID; `rtcp` consumes
+those records for reports. SRTP/SRTCP are explicit profiles configured by
+parameters or DTLS-SRTP exporter material and are never enabled implicitly.
+
+Video codecs remain in shared zero-copy packetizers (`rtp_h264` and `rtp_vp8`)
+so Spectra or another source can choose the negotiated codec. The fixed record
+header carries codec, marker, and RTP timestamp; the higher-level media graph
+owns the bounded access-unit buffer and feeds packet plans into the transport
+and encryption seam.
 
 ## Observability
 

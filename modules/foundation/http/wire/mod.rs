@@ -61,3 +61,8 @@ pub mod hpack;
 pub(crate) mod qpack;
 #[cfg(all(feature = "h3", feature = "host-test"))]
 pub mod qpack;
+
+#[cfg(not(feature = "host-test"))]
+pub(crate) mod response;
+#[cfg(feature = "host-test")]
+pub mod response;

@@ -17,7 +17,7 @@ direct fixture in `tests/harness` and never presented as a deployable role.
 | `sip_core` | RFC 3261 PCMU-dialog message formatters + response/SDP parsers | `sip` |
 | `sip_dialog` | Bounded UAC/UAS dialog transaction machine — protocol-fact transitions | `sip` |
 | `sip_wire` | The `command_in` / `event_out` record layouts for driving a call | `sip` |
-| `jitter_core` | Bounded RTP reorder window + loss-concealing playout | `sip` (moving to the `jitter` adapter — see `.context/planning/sip-rtp-decomposition.md`) |
+| `jitter_core` | Bounded RTP reorder window + loss-concealing playout | `jitter` |
 | `rtp_core` | RFC 3550 header decode — fixed header, CSRC list, §5.3.1 extension, §5.1 padding — and therefore which bytes of a packet are payload | `rtp`, `sip` |
 | `smtp_core` | RFC 5321 reply-line parsing, dot-stuffed command builders, lockstep submission phase machine | `smtp` |
 | `smtp_wire` | The submission-record and result-record layouts (`SmtpRequest`/`SmtpResult`) | `smtp` |

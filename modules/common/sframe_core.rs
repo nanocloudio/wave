@@ -64,6 +64,76 @@ pub struct SframeHeader {
     pub header_len: usize,
 }
 
+/// Bounded anti-replay state for one SFrame key identifier.
+///
+/// The AEAD implementation owns authentication; this small state machine
+/// owns the receive-side counter policy. It accepts a new highest counter and
+/// the previous 63 counters once each, while rejecting duplicates and values
+/// older than the window. A caller must keep one window per active key/epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SframeReplayWindow {
+    highest: u64,
+    seen: u64,
+    initialized: bool,
+}
+
+impl Default for SframeReplayWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SframeReplayWindow {
+    pub const EMPTY: Self = Self {
+        highest: 0,
+        seen: 0,
+        initialized: false,
+    };
+
+    pub const fn new() -> Self {
+        Self::EMPTY
+    }
+
+    /// Observe a counter. `true` means it is inside the replay window and has
+    /// not been observed before; `false` means duplicate or too old.
+    pub fn accept(&mut self, counter: u64) -> bool {
+        if !self.initialized {
+            self.initialized = true;
+            self.highest = counter;
+            self.seen = 1;
+            return true;
+        }
+        if counter > self.highest {
+            let shift = counter - self.highest;
+            self.seen = if shift >= 64 {
+                1
+            } else {
+                (self.seen << shift) | 1
+            };
+            self.highest = counter;
+            return true;
+        }
+        let distance = self.highest - counter;
+        if distance >= 64 {
+            return false;
+        }
+        let bit = 1u64 << distance;
+        if self.seen & bit != 0 {
+            return false;
+        }
+        self.seen |= bit;
+        true
+    }
+
+    pub const fn highest(&self) -> Option<u64> {
+        if self.initialized {
+            Some(self.highest)
+        } else {
+            None
+        }
+    }
+}
+
 /// The number of bytes needed to hold `value`, at least one.
 ///
 /// At least one because a zero-length field would make a present value

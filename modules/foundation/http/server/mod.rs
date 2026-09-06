@@ -1035,6 +1035,8 @@ pub(crate) struct ServerState {
     /// tab must NOT auto-reconnect (the WS source built-in and the
     /// canonical runtime shell both have no reconnect logic).
     pub(crate) latest_fanout_slot: i32,
+    /// Explicit addressed-client mode: no displacement or cross-client retention replay.
+    pub(crate) ws_multi_client: u8,
 
     // ── Dynamic routes ─────────────────────────────────────────────
     //
@@ -1308,7 +1310,11 @@ pub(crate) unsafe fn find_sentinel_ws_fanout_slot(s: &HttpState) -> Option<usize
     };
     // The most recent fan-out upgrade, when it is still live: the connection a
     // producer-first bundle is for.
-    let latest = s.server.latest_fanout_slot;
+    let latest = if s.server.ws_multi_client == 0 {
+        s.server.latest_fanout_slot
+    } else {
+        -1
+    };
     if latest >= 0 && (latest as usize) < MAX_CONCURRENT_CONNS && is_live_fanout(latest as usize) {
         return Some(latest as usize);
     }

@@ -113,6 +113,12 @@
 //! | 106   | pressure_idle_ms | u32 | 2000  | Keepalive limit once the table is ¾ full (0 = off)  |
 //! | 107   | stall_ms    | u32  | 15000   | Close a connection whose bytes stopped moving (0 = off) |
 //! | 108   | ws_idle_ms  | u32  | 0       | WebSocket: ping at half, close at full (0 = off)    |
+//! | 109   | client_header_ms | u32 | 15000 | Client: request sent to final response head (0 = off) |
+//! | 110   | client_stall_ms | u32 | 15000 | Client: no byte progress (0 = off)                  |
+//! | 111   | client_total_ms | u32 | 60000 | Client: whole request, connect included (0 = off)   |
+//! | 112   | authority   | str  | localhost | Client: Host / `:authority` (falls back to host_ip) |
+//! | 113   | method      | u8   | 1 (GET) | Client: request verb                                |
+//! | 114   | client_keep_alive | u8 | 0   | Client: reuse one connection across exchanges       |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -136,9 +142,8 @@
     reason = "the fluxor module ABI entry points (module_init/module_new/module_step): the \
               runtime owns these pointers and their validity is the ABI's contract, and the \
               signature is fixed by that contract rather than chosen here. Same allow as \
-              chronicle's and lattice's PIC modules carry. Newly required because \
-              `fluxor ci` clippies modules/** directly now that Wave has no root manifest \
-              for it to lint instead."
+              chronicle's and lattice's PIC modules carry, and required here because \
+              `fluxor ci` clippies modules/** directly."
 )]
 
 use core::ffi::c_void;
@@ -271,6 +276,7 @@ mod params_def {
     use super::client;
     use super::client::MAX_PATH_LEN;
     use super::server;
+    use super::wire;
     use super::HttpState;
     use super::SCHEMA_MAX;
     use super::{p_u16, p_u32, p_u8};
@@ -293,6 +299,7 @@ mod params_def {
 
         3, path, str, 0
             => |s, d, len| {
+                if len > MAX_PATH_LEN { s.client.request_invalid = 1; }
                 let n = if len > MAX_PATH_LEN { MAX_PATH_LEN } else { len };
                 s.client.path_len = n as u16;
                 let mut i = 0;
@@ -387,6 +394,29 @@ mod params_def {
     // a quiet socket is the ordinary state of most WebSockets.
     108, ws_idle_ms, u32, 0
         => |s, d, len| { s.server.ws_idle_ms = p_u32(d, len, 0, 0); };
+
+    115, ws_multi_client, u8, 0
+        => |s, d, len| { s.server.ws_multi_client = u8::from(p_u8(d, len, 0, 0) != 0); };
+
+    109, client_header_ms, u32, 15_000
+        => |s, d, len| { s.client.client_header_ms = p_u32(d, len, 0, 15_000); };
+    110, client_stall_ms, u32, 15_000
+        => |s, d, len| { s.client.client_stall_ms = p_u32(d, len, 0, 15_000); };
+    111, client_total_ms, u32, 60_000
+        => |s, d, len| { s.client.client_total_ms = p_u32(d, len, 0, 60_000); };
+
+    112, authority, str, 0 => |s, d, len| {
+        if len > client::AUTHORITY_MAX { s.client.request_invalid = 1; }
+        let n = len.min(client::AUTHORITY_MAX);
+        core::ptr::copy_nonoverlapping(d, s.client.authority.as_mut_ptr(), n);
+        s.client.authority_len = n as u16;
+    };
+    113, method, u8, 1 => |s, d, len| {
+        let code = p_u8(d, len, 0, wire::method::METHOD_GET);
+        if wire::method::method_name(code).is_empty() { s.client.request_invalid = 1; }
+        s.client.method = code;
+    };
+    114, client_keep_alive, u8, 0 => |s, d, len| { s.client.keep_alive = p_u8(d, len, 0, 0); };
 
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };
@@ -754,7 +784,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // free rather than each having to carry one.
         if s.mode == MODE_CLIENT
             && s.client.conn_present != 0
-            && matches!(s.client.phase, client::Phase::Done | client::Phase::Error)
+            && (s.client.phase == client::Phase::Error
+                || (s.client.phase == client::Phase::Done
+                    && (s.client.keep_alive == 0 || !s.client.response.reusable)))
         {
             let _ = client::send_close_frame(s);
         }
@@ -765,7 +797,33 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // busy one is left alone until it has answered.
             #[cfg(feature = "exchange")]
             if client::exchange::armed(s) {
+                client::exchange::flush_reply(s);
+                if client::exchange::pending(s) {
+                    return 0;
+                }
+                if s.client.draining != 0 {
+                    client::exchange::fail(s);
+                    #[cfg(feature = "h3")]
+                    let closed = if s.h3_mode != 0 {
+                        client::h3::close_session(s)
+                    } else {
+                        client::send_close_frame(s)
+                    };
+                    #[cfg(not(feature = "h3"))]
+                    let closed = client::send_close_frame(s);
+                    return if closed && !client::exchange::busy(s) {
+                        1
+                    } else {
+                        0
+                    };
+                }
+                if s.h3_mode == 0 && s.client.protocol == 0 {
+                    client::h1::idle(s);
+                }
                 let _ = client::exchange::poll_request(s);
+                if client::exchange::pending(s) {
+                    return 0;
+                }
                 if !client::exchange::busy(s) {
                     tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
                     return 0;
@@ -795,6 +853,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 client::h1::step(s)
             };
+            #[cfg(feature = "exchange")]
+            let r = if client::exchange::armed(s) {
+                if r < 0 {
+                    s.client.phase = client::Phase::Error;
+                    client::exchange::fail(s);
+                }
+                0
+            } else {
+                r
+            };
+
             // Drain completion. The step above ran first, so an exchange that
             // was one frame from finishing has already finished.
             //
@@ -1165,11 +1234,14 @@ pub unsafe extern "C" fn module_drain(state: *mut u8) -> i32 {
             // remain, so no specific slot needs to be poked.
             s.server.draining = 1;
         } else {
-            // Client mode participates too. It is one-shot, so draining means
-            // "finish the exchange already admitted, then go" — abandoning it
-            // would leave a caller waiting on a response that was still coming,
-            // and ignoring drain entirely left the instance to be torn down by
-            // the scheduler's forced-drain timeout even when it was idle.
+            // Client mode participates too: draining means "finish the
+            // exchange already admitted, deliver its reply, then go". A client
+            // that abandoned it would leave a caller waiting on a response
+            // that was still coming, and one that ignored drain would be torn
+            // down by the scheduler's forced-drain timeout even while idle.
+            // No further request is admitted once this is set, so a
+            // keep-alive connection drains after the exchange in flight
+            // rather than serving another.
             s.client.draining = 1;
         }
     }

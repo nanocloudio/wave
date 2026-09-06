@@ -2366,7 +2366,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // we don't want a being-displaced slot to consume more
             // envelopes that the new slot should be receiving.
             let me_idx = s.server.cur_slot;
-            let displaced = cur_ws_fan_out(s) != 0
+            let displaced = s.server.ws_multi_client == 0
+                && cur_ws_fan_out(s) != 0
                 && s.server.latest_fanout_slot >= 0
                 && s.server.latest_fanout_slot != me_idx;
             if displaced {
@@ -2423,7 +2424,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // subsequent ticks fall through to the normal flow.
             let needs_replay = cur_slot(s)
                 .map(|c| {
-                    c.ws_fan_out != 0 && c.retained_replay_done == 0 && c.ws_frag_buf.is_null()
+                    s.server.ws_multi_client == 0
+                        && c.ws_fan_out != 0
+                        && c.retained_replay_done == 0
+                        && c.ws_frag_buf.is_null()
                 })
                 .unwrap_or(false);
             if needs_replay && cur_send_len(s) == 0 && !s.server.retained_buf.is_null() {

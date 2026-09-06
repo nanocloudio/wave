@@ -56,6 +56,7 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.client.exchange_in_chan = super::super::dev_channel_port(sys, 0, 8);
     s.client.exchange_out_chan = super::super::dev_channel_port(sys, 1, 9);
     s.client.exchange_corr = 0;
+    s.client.exchange_pending = 0;
 }
 
 /// Is this client driven by the graph rather than by params?
@@ -90,7 +91,14 @@ unsafe fn adopt(s: &mut HttpState, corr: u64, key: &[u8]) {
 /// refused: without a `corr` there is nobody to answer. A frame that decodes
 /// but asks for something unperformable IS answered, because by then there is.
 pub(crate) unsafe fn poll_request(s: &mut HttpState) -> bool {
-    if !armed(s) || busy(s) {
+    if !armed(s)
+        || busy(s)
+        || (s.client.conn_present != 0
+            && (s.client.keep_alive == 0
+                || s.client.phase != Phase::Done
+                || !s.client.response.reusable))
+        || s.client.draining != 0
+    {
         return false;
     }
     let sys = &*s.syscalls;
@@ -181,6 +189,11 @@ pub(crate) unsafe fn poll_request(s: &mut HttpState) -> bool {
     s.client.pending_offset = 0;
     s.client.headers_done = 0;
     s.client.phase = Phase::Init;
+    s.client.h2_phase = 0;
+    #[cfg(feature = "h3")]
+    if s.h3_mode != 0 {
+        super::h3::next_request(s);
+    }
     true
 }
 
@@ -212,6 +225,14 @@ pub(crate) unsafe fn accumulate(s: &mut HttpState, src: *const u8, len: usize) {
 /// Answer the request in flight and go idle.
 pub(crate) unsafe fn complete(s: &mut HttpState) {
     if !busy(s) {
+        return;
+    }
+    if pending(s) {
+        flush_reply(s);
+        return;
+    }
+    if s.client.last_status == 0 {
+        fail(s);
         return;
     }
     if s.client.exchange_oversize != 0 {
@@ -250,12 +271,13 @@ pub(crate) unsafe fn fail(s: &mut HttpState) {
 /// a copy of it, on the stack, on the way to a channel, would be the largest
 /// allocation in the module for no purpose.
 ///
-/// Idle is set even when the write fails. Holding the corr would wedge the
-/// client on a full ring with nobody to retry it, and the contract's answer to
-/// a lost answer is the producer's timeout, not an unbounded wait here.
+/// Once framed, a reply is immutable until the channel accepts it. The
+/// correlation stays occupied, preventing a retry from executing another request.
 unsafe fn send_reply(s: &mut HttpState, status: u8, payload_len: usize) {
-    let sys = &*s.syscalls;
-    let chan = s.client.exchange_out_chan;
+    if pending(s) {
+        flush_reply(s);
+        return;
+    }
     let key_len = s.client.exchange_key_len as usize;
     let plen = payload_len.min(EXCHANGE_REPLY_MAX);
 
@@ -280,9 +302,30 @@ unsafe fn send_reply(s: &mut HttpState, status: u8, payload_len: usize) {
         // frame.
         s.client.exchange_stage[0] = MSG_REPLY;
         s.client.exchange_stage[1..ENVELOPE].copy_from_slice(&(n as u16).to_le_bytes());
-        let _ = (sys.channel_write)(chan, s.client.exchange_stage.as_ptr(), ENVELOPE + n);
+        s.client.exchange_pending = (ENVELOPE + n) as u16;
     }
 
+    flush_reply(s);
+}
+
+pub(crate) fn pending(s: &HttpState) -> bool {
+    s.client.exchange_pending != 0
+}
+
+pub(crate) unsafe fn flush_reply(s: &mut HttpState) {
+    let n = s.client.exchange_pending as usize;
+    if n == 0 {
+        return;
+    }
+    if ((*s.syscalls).channel_write)(
+        s.client.exchange_out_chan,
+        s.client.exchange_stage.as_ptr(),
+        n,
+    ) != n as i32
+    {
+        return;
+    }
+    s.client.exchange_pending = 0;
     s.client.exchange_corr = 0;
     s.client.exchange_reply_len = 0;
     s.client.exchange_oversize = 0;

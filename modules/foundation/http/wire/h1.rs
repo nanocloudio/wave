@@ -726,10 +726,28 @@ pub fn parse_range_header(value: &[u8], size: u32) -> RangeParse {
     }
 }
 
-/// Write an HTTP/1.0 request head into `dst`: request line, `Host:` (the
-/// peer's dotted-quad IP), a `Content-Length` when `body_len` is non-zero,
-/// and the `Connection: close` terminator. Returns the head's length, or
-/// **0 if it does not fit**.
+/// Everything about a request head except where it is written and what it
+/// asks for — grouped so the writer takes the destination, the request line
+/// and one options record rather than a run of positional arguments in which
+/// two adjacent lengths can be swapped without the compiler noticing.
+#[derive(Default)]
+pub struct RequestOptions<'a> {
+    /// `Host` value. Empty selects the peer's dotted-quad IP.
+    pub authority: &'a [u8],
+    /// Length of the body that follows this head. Non-zero writes a
+    /// `Content-Length`.
+    pub body_len: usize,
+    /// `Content-Type` for that body. Empty omits the header.
+    pub content_type: &'a [u8],
+    /// HTTP/1.1 rather than HTTP/1.0 on the request line.
+    pub http11: bool,
+    /// `Connection: keep-alive` rather than `close`.
+    pub keep_alive: bool,
+}
+
+/// Write a request head into `dst`: request line, `Host:`, a
+/// `Content-Length` when the body is non-empty, and the `Connection`
+/// terminator. Returns the head's length, or **0 if it does not fit**.
 ///
 /// Fails closed rather than truncating. A head cut off at `dst_cap` is not a
 /// short request, it is a malformed one — the version token, the `Host:`, or
@@ -744,16 +762,13 @@ pub fn parse_range_header(value: &[u8], size: u32) -> RangeParse {
 /// meant is the worst direction to guess in.
 ///
 /// The body itself is NOT written here — it is sent after this head, from
-/// wherever the caller holds it — but `body_len` must be declared here,
+/// wherever the caller holds it — but its length must be declared here,
 /// because `Content-Length` belongs to the head and a body without one is
 /// unreadable on a `Connection: close` request.
 ///
 /// # Safety
-/// `dst` must be valid for writes of `dst_cap` bytes.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a request head is a flat record; the callers' fields map 1:1"
-)]
+/// `dst` must be valid for writes of `dst_cap` bytes, and `path` for reads of
+/// `path_len`; the two must not overlap.
 pub unsafe fn write_request_head(
     dst: *mut u8,
     dst_cap: usize,
@@ -761,10 +776,21 @@ pub unsafe fn write_request_head(
     path: *const u8,
     path_len: usize,
     host_ip_be: u32,
-    body_len: usize,
-    content_type: *const u8,
-    content_type_len: usize,
+    options: &RequestOptions<'_>,
 ) -> usize {
+    if path_len == 0 {
+        return 0;
+    }
+    let path_bytes = core::slice::from_raw_parts(path, path_len);
+    let type_bytes = options.content_type;
+    if !path_bytes.starts_with(b"/")
+        || path_bytes.iter().any(|b| *b <= 32 || *b == 127)
+        || options.authority.iter().any(|b| *b <= 32 || *b == 127)
+        || type_bytes.iter().any(|b| *b < 32 || *b == 127)
+        || method == method::METHOD_CONNECT
+    {
+        return 0;
+    }
     let verb = method::method_name(method);
     if verb.is_empty() {
         return 0;
@@ -794,42 +820,45 @@ pub unsafe fn write_request_head(
     }
     core::ptr::copy_nonoverlapping(path, dst.add(off), path_len);
     off += path_len;
-    put!(b" HTTP/1.0\r\nHost: ");
-
-    // host IP, big-endian dotted-quad
-    let ip = host_ip_be.to_be_bytes();
-    let mut o = 0;
-    while o < 4 {
-        let b = ip[o];
-        if b >= 100 {
-            put!(&[b'0' + (b / 100)]);
+    if options.http11 {
+        put!(b" HTTP/1.1\r\nHost: ");
+    } else {
+        put!(b" HTTP/1.0\r\nHost: ");
+    }
+    if !options.authority.is_empty() {
+        put!(options.authority);
+    } else {
+        // host IP, big-endian dotted-quad
+        let ip = host_ip_be.to_be_bytes();
+        let mut o = 0;
+        while o < 4 {
+            let b = ip[o];
+            if b >= 100 {
+                put!(&[b'0' + (b / 100)]);
+            }
+            if b >= 10 {
+                put!(&[b'0' + ((b / 10) % 10)]);
+            }
+            put!(&[b'0' + (b % 10)]);
+            if o < 3 {
+                put!(b".");
+            }
+            o += 1;
         }
-        if b >= 10 {
-            put!(&[b'0' + ((b / 10) % 10)]);
-        }
-        put!(&[b'0' + (b % 10)]);
-        if o < 3 {
-            put!(b".");
-        }
-        o += 1;
     }
 
     // `Content-Type` precedes `Content-Length`, so a typed body reads as one
     // description of what follows. Omitted entirely when unset: a header with
     // an empty value is a different claim from no header at all.
-    if content_type_len > 0 {
+    if !type_bytes.is_empty() {
         put!(b"\r\nContent-Type: ");
-        if off + content_type_len > dst_cap {
-            return 0;
-        }
-        core::ptr::copy_nonoverlapping(content_type, dst.add(off), content_type_len);
-        off += content_type_len;
+        put!(type_bytes);
     }
 
-    if body_len > 0 {
+    if options.body_len > 0 {
         put!(b"\r\nContent-Length: ");
         let mut digits = [0u8; 20];
-        let mut n = body_len;
+        let mut n = options.body_len;
         let mut d = digits.len();
         while {
             d -= 1;
@@ -840,7 +869,11 @@ pub unsafe fn write_request_head(
         put!(&digits[d..]);
     }
 
-    put!(b"\r\nConnection: close\r\n\r\n");
+    if options.keep_alive {
+        put!(b"\r\nConnection: keep-alive\r\n\r\n");
+    } else {
+        put!(b"\r\nConnection: close\r\n\r\n");
+    }
 
     off
 }

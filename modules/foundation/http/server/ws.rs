@@ -523,7 +523,10 @@ pub(crate) unsafe fn retain_capture_envelope(
     payload: *const u8,
     payload_len: usize,
 ) {
-    if s.server.retained_buf.is_null() || s.server.retained_cap == 0 {
+    if s.server.ws_multi_client != 0
+        || s.server.retained_buf.is_null()
+        || s.server.retained_cap == 0
+    {
         return;
     }
     if payload_len > u16::MAX as usize {

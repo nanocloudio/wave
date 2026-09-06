@@ -43,6 +43,13 @@ pub fn ws_upgrade_request(
     key_b64: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
+    if !path.starts_with(b"/")
+        || path.iter().any(|b| *b <= 32 || *b == 127)
+        || host.is_empty()
+        || host.iter().any(|b| *b <= 32 || *b == 127)
+    {
+        return None;
+    }
     let mut p = 0;
     wput(out, &mut p, b"GET ")?;
     wput(out, &mut p, path)?;
@@ -75,42 +82,46 @@ pub fn ws_verify_upgrade(buf: &[u8], expected_accept: &[u8]) -> Option<bool> {
     let hdr_end = end?;
     let hdr = &buf[..hdr_end];
     // status 101 on the first line
-    let is101 = hdr.len() >= 12 && &hdr[9..12] == b"101";
+    let is101 = hdr.starts_with(b"HTTP/1.1 101 ");
     // find the accept header value (case-insensitive header name)
     let accept_ok = find_header_value(hdr, b"sec-websocket-accept")
         .map(|v| v == expected_accept)
         .unwrap_or(false);
-    Some(is101 && accept_ok)
+    let upgrade =
+        find_header_value(hdr, b"upgrade").is_some_and(|v| v.eq_ignore_ascii_case(b"websocket"));
+    let connection = find_header_value(hdr, b"connection").is_some_and(|v| {
+        v.split(|b| *b == b',')
+            .any(|t| trim_ws(t).eq_ignore_ascii_case(b"upgrade"))
+    });
+    let unsolicited = find_header_value(hdr, b"sec-websocket-extensions").is_some()
+        || find_header_value(hdr, b"sec-websocket-protocol").is_some();
+    Some(is101 && accept_ok && upgrade && connection && !unsolicited)
 }
 
-fn find_header_value<'a>(hdr: &'a [u8], name_lower: &[u8]) -> Option<&'a [u8]> {
-    let mut ls = 0;
-    while ls < hdr.len() {
-        // line end
-        let mut le = ls;
-        while le + 1 < hdr.len() && !(hdr[le] == b'\r' && hdr[le + 1] == b'\n') {
-            le += 1;
-        }
-        let line = &hdr[ls..le];
-        if let Some(colon) = line.iter().position(|&c| c == b':') {
-            let (nm, val) = line.split_at(colon);
-            if nm.len() == name_lower.len()
-                && nm
-                    .iter()
-                    .zip(name_lower)
-                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
-            {
-                // trim leading space after ':'
-                let mut v = &val[1..];
-                while !v.is_empty() && v[0] == b' ' {
-                    v = &v[1..];
+fn trim_ws(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn find_header_value<'a>(hdr: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut found = None;
+    for line in hdr.split(|b| *b == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(colon) = line.iter().position(|b| *b == b':') {
+            if line[..colon].eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    return None;
                 }
-                return Some(v);
+                found = Some(trim_ws(&line[colon + 1..]));
             }
         }
-        ls = le + 2;
     }
-    None
+    found
 }
 
 /// WebSocket opcodes.

@@ -12,11 +12,13 @@
 // which bytes of a packet are payload at all — and getting that wrong is
 // inaudible in a test and audible on a call.
 //
-// Both sides previously read the CSRC count and ignored the X and P bits, so a
-// conforming sender using either put non-audio bytes into the µ-law stream:
-// four-plus bytes of extension header at the front of every packet (RFC 6464
-// audio level indication is the common case), or padding at the end. ffmpeg
-// sets neither by default, which is why the interop suite never saw it.
+// A reader that honours the CSRC count but ignores the X and P bits admits
+// non-audio bytes into the µ-law stream from a perfectly conforming sender:
+// four or more bytes of extension header at the front of every packet (RFC
+// 6464 audio level indication is the common case), or padding at the end.
+// ffmpeg sets neither by default, so an interop suite built around it does not
+// exercise either — which is why both are decoded here rather than assumed
+// absent.
 
 /// §5.1: the only version this decoder accepts.
 pub const RTP_VERSION: u8 = 2;
@@ -37,6 +39,49 @@ pub struct RtpHeader {
     pub ssrc: u32,
     pub payload_start: usize,
     pub payload_end: usize,
+}
+
+/// Extract the RFC 8285 MID extension (one-byte profile, element id 10) from
+/// a packet already accepted by [`rtp_parse`]. The returned slice borrows the
+/// packet and is empty when the extension is absent or uses an unsupported
+/// profile; no allocation or unbounded scan is possible.
+pub fn rtp_mid<'a>(pkt: &'a [u8], header: &RtpHeader) -> &'a [u8] {
+    if pkt.len() < RTP_HEADER_SIZE || header.payload_start > pkt.len() {
+        return &[];
+    }
+    let cc = (pkt[0] & 0x0f) as usize;
+    let ext = RTP_HEADER_SIZE + cc * 4;
+    if pkt[0] & 0x10 == 0 || ext + 4 > header.payload_start {
+        return &[];
+    }
+    let profile = u16::from_be_bytes([pkt[ext], pkt[ext + 1]]);
+    let bytes = usize::from(u16::from_be_bytes([pkt[ext + 2], pkt[ext + 3]])) * 4;
+    let start = ext + 4;
+    if profile != 0xBEDE || start.checked_add(bytes).is_none() || start + bytes > pkt.len() {
+        return &[];
+    }
+    let end = start + bytes;
+    let mut at = start;
+    while at < end {
+        let descriptor = pkt[at];
+        at += 1;
+        if descriptor == 0 {
+            continue;
+        }
+        let id = descriptor >> 4;
+        if id == 15 {
+            break;
+        }
+        let len = (descriptor & 0x0f) as usize + 1;
+        if at + len > end {
+            return &[];
+        }
+        if id == 10 {
+            return &pkt[at..at + len];
+        }
+        at += len;
+    }
+    &[]
 }
 
 impl RtpHeader {

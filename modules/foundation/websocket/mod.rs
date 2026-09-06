@@ -7,13 +7,17 @@
 //! a per-frame key). A protocol that mutates from HTTP into a masked frame stream
 //! and verifies the switch is a stateful session, not request/reply.
 //!
-//! On boot it upgrades, sends a masked text `message`, and emits every server
-//! frame's payload on `message_out` (answering PING with PONG). Protocol +
-//! crypto in Wave's shared cores: `b64_core.rs` (Base64), `sha1_core.rs`
-//! (SHA-1), `ws_core.rs`.
+//! On boot it upgrades and sends a masked `message`. Thereafter it sends what
+//! arrives on `request_in`, one message per chunk, and emits what the server
+//! sends on `message_out` as COMPLETE messages — continuation frames are
+//! reassembled here, so a consumer never sees half of one. PING is answered
+//! with PONG. Protocol + crypto in Wave's shared cores: `b64_core.rs` (Base64),
+//! `sha1_core.rs` (SHA-1), `ws_core.rs`.
 //!
-//! Ports:  net_in/net_out (transport), message_out (received frame payloads).
-//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `host`, `path`, `message`.
+//! Ports:  net_in/net_out (transport), request_in (messages to send),
+//!         message_out (reassembled messages received).
+//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `host`, `path`, `message`,
+//!         `request_opcode` (1 = text, the default; 2 = binary).
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -26,9 +30,8 @@
     reason = "the fluxor module ABI entry points (module_init/module_new/module_step): the \
               runtime owns these pointers and their validity is the ABI's contract, and the \
               signature is fixed by that contract rather than chosen here. Same allow as \
-              chronicle's and lattice's PIC modules carry. Newly required because \
-              `fluxor ci` clippies modules/** directly now that Wave has no root manifest \
-              for it to lint instead."
+              chronicle's and lattice's PIC modules carry, and required here because \
+              `fluxor ci` clippies modules/** directly."
 )]
 
 use core::ffi::c_void;
@@ -51,6 +54,7 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs"); // b64_encode
 include!("../../common/hex_core.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs"); // sha1
 include!("../../common/ws_frame_core.rs");
+include!("../../common/utf8_core.rs");
 include!("../../common/ws_core.rs");
 
 // The NetProto opcodes and identity accessors come from the owning contract,
@@ -66,6 +70,8 @@ const NET_BUF: usize = 2048;
 const REQ_BUF: usize = 512;
 const ACC_BUF: usize = 8192;
 const NAME_BUF: usize = 128;
+const MESSAGE_MAX: usize = 2048;
+const CLOSE_TIMEOUT_MS: u64 = 5000;
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const REPLY_TIMEOUT_MS: u64 = 15_000;
 
@@ -100,8 +106,8 @@ struct WsState {
     tag: u8,
     started_ms: u64,
     draining: u8,
-    mask_ctr: u32,
     sent_msg: u8,
+    request_opcode: u8,
 
     // The expected Sec-WebSocket-Accept for the key we sent.
     accept: [u8; 32],
@@ -112,6 +118,13 @@ struct WsState {
     req_sent: u16,
     acc: [u8; ACC_BUF],
     acc_len: u32,
+    assembled: [u8; MESSAGE_MAX],
+    assembled_len: u16,
+    assembled_opcode: u8,
+    assembled_ready: u8,
+    /// 1 closes after sending (peer close/protocol error); 2 awaits peer close.
+    closing: u8,
+    close_started_ms: u64,
 
     nbuf: [u8; NET_BUF],
     frames: u32,
@@ -144,6 +157,9 @@ define_params! {
         while i < len && (s.message_len as usize) < NAME_BUF {
             s.message[s.message_len as usize] = *d.add(i); s.message_len += 1; i += 1;
         }
+    };
+    5, request_opcode, u8, 1 => |s, d, len| {
+        s.request_opcode = p_u8(d, len, 0, ws_op::TEXT);
     };
 }
 
@@ -204,15 +220,23 @@ pub extern "C" fn module_new(
         s.tag = dev_requester_tag(sys);
         s.started_ms = 0;
         s.draining = 0;
-        s.mask_ctr = 0;
         s.sent_msg = 0;
+        s.request_opcode = ws_op::TEXT;
         s.accept_len = 0;
         s.req_len = 0;
         s.req_sent = 0;
         s.acc_len = 0;
+        s.assembled_len = 0;
+        s.assembled_opcode = 0;
+        s.assembled_ready = 0;
+        s.closing = 0;
+        s.close_started_ms = 0;
         s.frames = 0;
         s.errors = 0;
         parse_tlv(s, params, params_len);
+        if !matches!(s.request_opcode, ws_op::TEXT | ws_op::BINARY) {
+            return -22;
+        }
         let mut ep = [0u8; 8];
         if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
             if n >= 6 {
@@ -233,45 +257,52 @@ pub extern "C" fn module_new(
     }
 }
 
-/// Derive a 4-byte frame mask from time/tag/counter.
-unsafe fn next_mask(s: &mut WsState, now: u64) -> [u8; 4] {
-    s.mask_ctr = s.mask_ctr.wrapping_add(1);
-    let mut x = now ^ ((s.tag as u64) << 40) ^ ((s.mask_ctr as u64).wrapping_mul(0x9E37_79B9));
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    (x as u32).to_le_bytes()
+/// Entropy failure never falls back to predictable masks.
+unsafe fn next_mask(s: &WsState) -> Option<[u8; 4]> {
+    let mut key = [0u8; 4];
+    (dev_csprng_fill(&*s.syscalls, key.as_mut_ptr(), key.len()) == 0).then_some(key)
 }
 
-/// Hand one received application message to `message_out`.
-///
-/// Returns whether the caller may consume the frame that carried it. `false`
-/// means `message_out` refused the write, and the frame must stay in `acc` so
-/// the identical bytes are offered again next step — a message the peer sent
-/// successfully is not ours to drop because a downstream reader is briefly
-/// behind.
-///
-/// An unwired `message_out` returns `true`: nobody asked for the data, so
-/// there is nothing to deliver and nothing to retry.
-#[must_use]
-unsafe fn emit_message(s: &mut WsState, start: usize, end: usize) -> bool {
-    if s.message_out < 0 {
-        s.frames = s.frames.wrapping_add(1);
+/// Keep the connection identity until the transport accepted its close.
+unsafe fn close_transport(s: &mut WsState) -> bool {
+    if s.conn_present == 0 {
         return true;
     }
-    if end > s.acc_len as usize || end < start {
-        return true;
-    }
-    let sys = &*s.syscalls;
-    let poll = (sys.channel_poll)(s.message_out, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    let mut close = [0u8; 2];
+    net_proto::put_conn_id(&mut close, s.conn_id);
+    if net_write_frame(
+        &*s.syscalls,
+        s.net_out,
+        NET_CMD_CLOSE,
+        close.as_ptr(),
+        close.len(),
+        s.nbuf.as_mut_ptr(),
+        NET_BUF,
+    ) == 0
+    {
         return false;
     }
-    let len = end - start;
-    if (sys.channel_write)(s.message_out, s.acc.as_ptr().add(start), len) != len as i32 {
+    s.conn_present = 0;
+    s.conn_id = 0;
+    true
+}
+
+/// Application output is a complete bounded message, retained on refusal.
+unsafe fn emit_message(s: &mut WsState) -> bool {
+    if s.assembled_ready == 0 {
+        return true;
+    }
+    let len = s.assembled_len as usize;
+    if s.message_out >= 0
+        && len > 0
+        && ((*s.syscalls).channel_write)(s.message_out, s.assembled.as_ptr(), len) != len as i32
+    {
         return false;
     }
     s.frames = s.frames.wrapping_add(1);
+    s.assembled_ready = 0;
+    s.assembled_len = 0;
+    s.assembled_opcode = 0;
     true
 }
 
@@ -280,51 +311,124 @@ unsafe fn stage(s: &mut WsState, n: usize) {
     s.req_sent = 0;
 }
 
-/// Drive one FSM transition.
-///
-/// The phase advances only when the action it carries actually reached the
-/// transport. `net_write_frame` returns 0 on backpressure precisely so a caller
-/// can retry rather than treat a dropped frame as committed; advancing anyway
-/// left this client waiting in `Connecting` for a reply to a CONNECT the
-/// channel had refused, until the connect deadline failed the exchange.
-/// Parse and deliver whatever complete frames the accumulator holds.
-///
-/// Called once per step rather than only when new bytes arrive: a frame the
-/// consumer refused stays in `acc`, and if this ran only on fresh input it
-/// would sit there until the peer happened to send something else — which,
-/// for a peer waiting on a reply, is never.
+unsafe fn control(s: &mut WsState, opcode: u8, payload: &[u8], now: u64) -> bool {
+    if s.req_sent < s.req_len {
+        return false;
+    }
+    let Some(mask) = next_mask(s) else {
+        feed(s, &*s.syscalls, WsEv::NetError, now);
+        return false;
+    };
+    let Some(n) = ws_frame(opcode, payload, mask, &mut s.req) else {
+        return false;
+    };
+    stage(s, n);
+    true
+}
+
+unsafe fn protocol_close(s: &mut WsState, code: u16, now: u64) {
+    if control(s, ws_op::CLOSE, &code.to_be_bytes(), now) {
+        s.closing = 1;
+        s.close_started_ms = now;
+        s.errors = s.errors.wrapping_add(1);
+        s.acc_len = 0;
+    }
+}
+
+fn valid_close(payload: &[u8]) -> Result<(), u16> {
+    if payload.len() == 1 {
+        return Err(1002);
+    }
+    if payload.len() >= 2 {
+        let code = u16::from_be_bytes([payload[0], payload[1]]);
+        if !matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999) {
+            return Err(1002);
+        }
+        if !valid_utf8(&payload[2..]) {
+            return Err(1007);
+        }
+    }
+    Ok(())
+}
+
 unsafe fn drain_messages(s: &mut WsState, now: u64) {
-    if s.phase != WsPhase::Ready {
+    if s.phase != WsPhase::Ready || s.closing == 1 || !emit_message(s) {
         return;
     }
-    while let Some(f) = ws_parse_frame(&s.acc[..s.acc_len as usize]) {
-        if f.opcode == ws_op::TEXT || f.opcode == ws_op::BINARY {
-            // Refused downstream: leave the frame in `acc` and stop draining.
-            // It is re-parsed and re-offered next step.
-            if !emit_message(s, f.payload_start, f.payload_end) {
+    // Fixed work budget even when a peer pipelines zero-length control frames.
+    for _ in 0..16 {
+        let h = match ws_decode_header(&s.acc[..s.acc_len as usize]) {
+            WsHeaderParse::Incomplete => return,
+            WsHeaderParse::Invalid => {
+                protocol_close(s, 1002, now);
                 return;
             }
-        } else if f.opcode == ws_op::PING {
-            // answer with a masked PONG
-            let mask = next_mask(s, now);
-            let mut out = [0u8; 128];
-            let pl2 = (f.payload_end - f.payload_start).min(120);
-            let mut body = [0u8; 120];
-            body[..pl2].copy_from_slice(&s.acc[f.payload_start..f.payload_start + pl2]);
-            if let Some(n) = ws_frame(ws_op::PONG, &body[..pl2], mask, &mut out) {
-                s.req[..n].copy_from_slice(&out[..n]);
-                stage(s, n);
+            WsHeaderParse::Header(h) => h,
+        };
+        if h.masked {
+            protocol_close(s, 1002, now);
+            return;
+        }
+        if h.payload_len > MESSAGE_MAX as u64 {
+            protocol_close(s, 1009, now);
+            return;
+        }
+        let total = h.header_len + h.payload_len as usize;
+        if total > s.acc_len as usize {
+            return;
+        }
+        if h.opcode == ws_op::CLOSE {
+            let mut payload = [0u8; 125];
+            let n = h.payload_len as usize;
+            payload[..n].copy_from_slice(&s.acc[h.header_len..total]);
+            if let Err(code) = valid_close(&payload[..n]) {
+                protocol_close(s, code, now);
+                return;
+            }
+            if s.closing == 2 {
+                s.closing = 1;
+            } else if control(s, ws_op::CLOSE, &payload[..n], now) {
+                s.closing = 1;
+                s.close_started_ms = now;
+            } else {
+                return;
+            }
+        } else if h.opcode == ws_op::PING {
+            if s.closing == 0 {
+                let mut payload = [0u8; 125];
+                let n = h.payload_len as usize;
+                payload[..n].copy_from_slice(&s.acc[h.header_len..total]);
+                if !control(s, ws_op::PONG, &payload[..n], now) {
+                    return;
+                }
+            }
+        } else if matches!(h.opcode, ws_op::TEXT | ws_op::BINARY | ws_op::CONT) && s.closing == 0 {
+            if (h.opcode == ws_op::CONT) != (s.assembled_opcode != 0) {
+                protocol_close(s, 1002, now);
+                return;
+            }
+            if h.opcode != ws_op::CONT {
+                s.assembled_opcode = h.opcode;
+            }
+            let have = s.assembled_len as usize;
+            let n = h.payload_len as usize;
+            if have + n > MESSAGE_MAX {
+                protocol_close(s, 1009, now);
+                return;
+            }
+            s.assembled[have..have + n].copy_from_slice(&s.acc[h.header_len..total]);
+            s.assembled_len = (have + n) as u16;
+            if h.fin {
+                if s.assembled_opcode == ws_op::TEXT && !valid_utf8(&s.assembled[..have + n]) {
+                    protocol_close(s, 1007, now);
+                    return;
+                }
+                s.assembled_ready = 1;
             }
         }
-        let total = f.total;
-        let rem = s.acc_len as usize - total;
-        let mut k = 0;
-        while k < rem {
-            s.acc[k] = s.acc[total + k];
-            k += 1;
-        }
-        s.acc_len = rem as u32;
-        if s.acc_len == 0 {
+        s.acc.copy_within(total..s.acc_len as usize, 0);
+        s.acc_len -= total as u32;
+        if s.closing != 0 || !emit_message(s) {
             return;
         }
     }
@@ -334,6 +438,10 @@ unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
     let (action, next) = ws_transition(s.phase, ev);
     match action {
         WsAct::Connect => {
+            s.assembled_len = 0;
+            s.assembled_opcode = 0;
+            s.assembled_ready = 0;
+            s.closing = 0;
             let mut payload = [0u8; 8];
             payload[0] = SOCK_TYPE_STREAM;
             payload[1] = s.ip[3];
@@ -362,14 +470,11 @@ unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
             s.started_ms = now;
         }
         WsAct::SendUpgrade => {
-            // Random 16-byte key -> base64; remember the expected accept.
-            let mask = next_mask(s, now);
-            let mask2 = next_mask(s, now ^ 0x5555);
             let mut raw = [0u8; 16];
-            raw[..4].copy_from_slice(&mask);
-            raw[4..8].copy_from_slice(&mask2);
-            raw[8..12].copy_from_slice(&next_mask(s, now ^ 0xAAAA));
-            raw[12..16].copy_from_slice(&next_mask(s, now ^ 0x1234));
+            if dev_csprng_fill(sys, raw.as_mut_ptr(), raw.len()) != 0 {
+                feed(s, sys, WsEv::NetError, now);
+                return;
+            }
             let mut key_b64 = [0u8; 24];
             let kn = b64_encode(&raw, &mut key_b64).unwrap_or(0);
             if let Some(an) = ws_accept(&key_b64[..kn], &mut s.accept) {
@@ -388,24 +493,13 @@ unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
                 stage(s, n);
                 s.started_ms = now;
                 s.acc_len = 0;
+            } else {
+                feed(s, sys, WsEv::NetError, now);
+                return;
             }
         }
         WsAct::Fail => {
-            if s.conn_present != 0 {
-                let mut close = [0u8; 2];
-                net_proto::put_conn_id(&mut close, s.conn_id);
-                net_write_frame(
-                    sys,
-                    s.net_out,
-                    NET_CMD_CLOSE,
-                    close.as_ptr(),
-                    2,
-                    s.nbuf.as_mut_ptr(),
-                    NET_BUF,
-                );
-            }
-            s.conn_id = 0;
-            s.conn_present = 0;
+            let _ = close_transport(s);
             s.acc_len = 0;
             s.req_len = 0;
             s.req_sent = 0;
@@ -418,14 +512,18 @@ unsafe fn feed(s: &mut WsState, sys: &SyscallTable, ev: WsEv, now: u64) {
         let ml = s.message_len as usize;
         let mut msg = [0u8; NAME_BUF];
         msg[..ml].copy_from_slice(&s.message[..ml]);
-        let mask = next_mask(s, now);
+        let Some(mask) = next_mask(s) else {
+            feed(s, &*s.syscalls, WsEv::NetError, now);
+            return;
+        };
         let mut out = [0u8; REQ_BUF];
         if let Some(n) = ws_frame(ws_op::TEXT, &msg[..ml], mask, &mut out) {
             s.req[..n].copy_from_slice(&out[..n]);
             stage(s, n);
             s.sent_msg = 1;
         }
-        s.acc_len = 0;
+        // The upgrade reader retained any coalesced WebSocket bytes.
+        // They belong to the new session and must survive this transition.
     }
     s.phase = next;
 }
@@ -438,12 +536,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
 
+        if s.phase == WsPhase::Disconnected && !close_transport(s) {
+            return 0;
+        }
         if s.phase == WsPhase::Disconnected && s.draining == 0 && s.ep_hex_len > 0 {
             feed(s, sys, WsEv::Start, now);
         }
 
         if s.net_in >= 0 {
-            loop {
+            for _ in 0..8 {
+                drain_messages(s, now);
+                // Leave the next transport event in its channel until there is
+                // room for it. Accepted frames are never truncated under pressure.
+                if s.closing == 1 || ACC_BUF - (s.acc_len as usize) < NET_BUF {
+                    break;
+                }
                 let poll = (sys.channel_poll)(s.net_in, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
@@ -551,8 +658,36 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // waiting for the peer to send more.
         drain_messages(s, now);
 
+        // A channel is an octet stream: each bounded read becomes one message.
+        // Do not consume another chunk until the transport accepts this frame.
+        if s.phase == WsPhase::Ready
+            && s.draining == 0
+            && s.closing == 0
+            && s.req_sent == s.req_len
+            && s.request_in >= 0
+            && (sys.channel_poll)(s.request_in, 1) & 1 != 0
+        {
+            let Some(mask) = next_mask(s) else {
+                feed(s, sys, WsEv::NetError, now);
+                return 0;
+            };
+            let mut payload = [0u8; REQ_BUF - 8];
+            let n = (sys.channel_read)(s.request_in, payload.as_mut_ptr(), payload.len());
+            if n > 0 {
+                if s.request_opcode == ws_op::TEXT && !valid_utf8(&payload[..n as usize]) {
+                    protocol_close(s, 1007, now);
+                    return 0;
+                }
+                if let Some(len) =
+                    ws_frame(s.request_opcode, &payload[..n as usize], mask, &mut s.req)
+                {
+                    stage(s, len);
+                }
+            }
+        }
+
         if s.conn_present != 0 && s.req_sent < s.req_len {
-            let max_chunk = NET_BUF - NET_FRAME_HDR - 1;
+            let max_chunk = 1600 - NET_FRAME_HDR - 2;
             while s.req_sent < s.req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
                 if poll <= 0 || (poll as u32 & 0x02) == 0 {
@@ -597,32 +732,27 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // Drain reports finished only once the CLOSE has actually been taken
-        // by the transport. Reporting on an unconfirmed write drops the
-        // connection locally while the peer's socket stays open: the instance
-        // is torn down, the CLOSE never goes out, and the far end waits on a
-        // half of a connection nobody owns any more. A refused CLOSE simply
-        // retries next step.
-        if s.draining == 1 && matches!(s.phase, WsPhase::Disconnected | WsPhase::Ready) {
-            if s.conn_present != 0 {
-                let mut close = [0u8; 2];
-                net_proto::put_conn_id(&mut close, s.conn_id);
-                if net_write_frame(
-                    sys,
-                    s.net_out,
-                    NET_CMD_CLOSE,
-                    close.as_ptr(),
-                    2,
-                    s.nbuf.as_mut_ptr(),
-                    NET_BUF,
-                ) == 0
-                {
-                    return 0;
-                }
-                s.conn_id = 0;
-                s.conn_present = 0;
+        if s.draining != 0
+            && s.phase == WsPhase::Ready
+            && s.closing == 0
+            && s.req_sent == s.req_len
+            && control(s, ws_op::CLOSE, &1000u16.to_be_bytes(), now)
+        {
+            s.closing = 2;
+            s.close_started_ms = now;
+        }
+        if s.closing != 0
+            && s.req_sent == s.req_len
+            && (s.closing == 1 || now.wrapping_sub(s.close_started_ms) >= CLOSE_TIMEOUT_MS)
+        {
+            if !close_transport(s) {
+                return 0;
             }
-            return 1;
+            s.phase = WsPhase::Disconnected;
+            s.draining = 1;
+        }
+        if s.draining != 0 && s.phase == WsPhase::Disconnected {
+            return if close_transport(s) { 1 } else { 0 };
         }
         0
     }

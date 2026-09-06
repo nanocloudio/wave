@@ -1,5 +1,9 @@
 version = "2.0.1"
-hardware_targets = ["rp2350", "bcm2712"]
+# rp2040 is in `[ci].targets`, so every variant below is built for it on each
+# run and carries a flash ceiling in `tools/ci/fmod_size_budget.sh`. A variant
+# that cannot fit is meant to fail admission there rather than drop out of the
+# matrix unremarked, which is the failure a per-target opt-out invites.
+hardware_targets = ["rp2040", "rp2350", "bcm2712"]
 
 # timer_class: every deadline this module holds is read from wall-clock
 # `dev_millis` — the client connect timeout (client.rs / client_h2.rs
@@ -19,15 +23,9 @@ timer_class = "wall_clock"
 # on the tls module in front. `.secure` is an orthogonal child, so the
 # cleartext http anchor declares the base `transport.anchor.stream`.
 #
-# `stream.ordered_ack.exchange` is the graph-driven client (see the exchange
-# ports below). One manifest describes every variant this module builds, so
-# this list is the UNION: the surface is compiled only under the `exchange`
-# feature, and the other artefacts wire the ports but have no code behind
-# them. That is the same arrangement the `app` fan-out ports at index 6
-# already have, and it is a property of the variant split rather than of this
-# surface — a graph names `http`, and which .fmod satisfies it is a
-# deployment choice. A deployment that wires publish_in/reply_out must ship
-# http-exchange.fmod.
+# The source declares the union; selected variants remove capabilities and
+# ports they do not implement. Graph admission and embedded port metadata
+# both use that specialization, preserving numeric indices across omissions.
 capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 
 # Feature-set variants. `full` (default) emits the
@@ -46,6 +44,8 @@ capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 [[variant]]
 name = "web"
 features = ["h1", "ws"]
+omit_ports = ["req_out", "resp_in", "publish_in", "reply_out"]
+omit_capabilities = ["stream.ordered_ack.exchange"]
 
 # h1 + the HANDLER_APP request/response fan-out, nothing else — the ingress
 # for graphs whose application IS downstream modules (chronicle's reverser
@@ -54,6 +54,8 @@ features = ["h1", "ws"]
 [[variant]]
 name = "app"
 features = ["h1", "app"]
+omit_ports = ["publish_in", "reply_out"]
+omit_capabilities = ["stream.ordered_ack.exchange"]
 
 # h1 + h2 + ws — everything but HTTP/3.
 #
@@ -67,6 +69,8 @@ features = ["h1", "app"]
 [[variant]]
 name = "h2"
 features = ["h1", "h2", "ws", "app"]
+omit_ports = ["publish_in", "reply_out"]
+omit_capabilities = ["stream.ordered_ack.exchange"]
 
 
 # Every protocol generation plus the graph-driven client exchange: requests
@@ -77,12 +81,19 @@ features = ["h1", "h2", "ws", "app"]
 # are ~26 KiB of state, and the wider path and request bodies that come with
 # them are real cost an embedded one-shot client should not carry.
 [[variant]]
+name = "h1_exchange"
+features = ["h1", "exchange"]
+omit_ports = ["req_out", "resp_in"]
+
+[[variant]]
 name = "exchange"
 features = ["h1", "h2", "h3", "ws", "app", "exchange"]
 
 [[variant]]
 name = "full"
 features = ["h1", "h2", "ws", "h3", "app"]
+omit_ports = ["publish_in", "reply_out"]
+omit_capabilities = ["stream.ordered_ack.exchange"]
 default = true
 
 [[ports]]
@@ -492,4 +503,3 @@ buffer_size = 4096
 # authenticated client is silently anonymous, and the undelivered bytes desync
 # whatever follows.
 max_record = 195
-

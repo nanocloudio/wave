@@ -29,7 +29,7 @@ use super::super::server::h3::{
     preamble_open_outstanding, session_preamble_out, uni_ingest, H3Session, H3_ALPN_TOKEN,
 };
 use super::super::wire::h3::{
-    build_h3_frame_header, parse_h3_frame, H3Frame, H3_FRAME_DATA, H3_FRAME_HEADERS,
+    build_h3_frame_header, parse_h3_frame_head, H3Frame, H3_FRAME_DATA, H3_FRAME_HEADERS,
 };
 use super::super::wire::qpack;
 
@@ -92,11 +92,20 @@ pub struct H3Client {
     pub body_len: usize,
     /// The response body has been handed to the app port.
     pub body_emitted: bool,
+    pub expected_len: Option<u64>,
+    pub trailers: bool,
+    pub informational: u8,
+    pub head_only: bool,
+    pub total_body: u64,
+    pub frame_remaining: u64,
+    pub frame_kind: u64,
+    pub reading_frame: bool,
     /// The request head has been taken by the transport in full. Until it
     /// has, the identical frame is offered again: a request the channel
     /// refused is one the server never sees, and the exchange would sit
     /// awaiting a response to something never sent.
     pub request_sent: bool,
+    pub request_offset: usize,
     /// The FIN closing the request half has been taken. A server waits for
     /// it before responding, so a refused close is retried rather than
     /// dropped.
@@ -116,7 +125,16 @@ impl H3Client {
             body: [0; H3_CLIENT_BODY_BUF],
             body_len: 0,
             body_emitted: false,
+            expected_len: None,
+            trailers: false,
+            informational: 0,
+            head_only: false,
+            total_body: 0,
+            frame_remaining: 0,
+            frame_kind: 0,
+            reading_frame: false,
             request_sent: false,
+            request_offset: 0,
             fin_sent: false,
         }
     }
@@ -196,28 +214,79 @@ pub fn build_request(
 /// Returns the status, or None if the section did not decode or carried no
 /// `:status` — which RFC 9114 §4.3.2 requires of every response.
 pub fn decode_response_status(block: &[u8]) -> Option<u16> {
+    response_fields(block, false)?.0
+}
+
+fn response_fields(block: &[u8], trailers: bool) -> Option<(Option<u16>, Option<u64>)> {
     let mut off = qpack::qpack_decode_block_prefix(block)?;
     let mut scratch = [0u8; H3_FIELD_SCRATCH];
+    let mut status = None;
+    let mut length = None;
+    let mut regular = false;
     while off < block.len() {
         let r = qpack::qpack_decode_field_into(&block[off..], &mut scratch)?;
         if r.consumed == 0 {
             return None;
         }
         let name = &scratch[r.name.0..r.name.1];
-        if name == b":status" {
-            let value = &scratch[r.value.0..r.value.1];
-            let mut code: u16 = 0;
-            for b in value {
-                if !b.is_ascii_digit() {
+        let value = &scratch[r.value.0..r.value.1];
+        if name.is_empty()
+            || name
+                .iter()
+                .any(|b| b.is_ascii_uppercase() || *b <= 32 || *b >= 127)
+            || value.iter().any(|b| *b == 0 || *b == 10 || *b == 13)
+        {
+            return None;
+        }
+        if name.starts_with(b":") {
+            if trailers
+                || regular
+                || name != b":status"
+                || status.is_some()
+                || value.len() != 3
+                || !value.iter().all(u8::is_ascii_digit)
+            {
+                return None;
+            }
+            let code = u16::from(value[0] - b'0') * 100
+                + u16::from(value[1] - b'0') * 10
+                + u16::from(value[2] - b'0');
+            if !(100..600).contains(&code) || code == 101 {
+                return None;
+            }
+            status = Some(code);
+        } else {
+            regular = true;
+            if matches!(
+                name,
+                b"connection"
+                    | b"transfer-encoding"
+                    | b"upgrade"
+                    | b"keep-alive"
+                    | b"proxy-connection"
+            ) {
+                return None;
+            }
+            if name == b"content-length" {
+                if trailers || length.is_some() || value.is_empty() {
                     return None;
                 }
-                code = code.checked_mul(10)?.checked_add((b - b'0') as u16)?;
+                let mut n = 0u64;
+                for b in value {
+                    if !b.is_ascii_digit() {
+                        return None;
+                    }
+                    n = n.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+                }
+                length = Some(n);
             }
-            return Some(code);
         }
         off += r.consumed;
     }
-    None
+    if !trailers && status.is_none() {
+        return None;
+    }
+    Some((status, length))
 }
 
 /// Feed one `mux` frame to the client.
@@ -231,6 +300,9 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
     // handle, and reading them as one would address a stream that does not
     // exist.
     if msg_type == mux::MSG_MUX_SESSION_OPENED {
+        if c.session.allocated || c.state != H3ClientState::Idle {
+            return c.state;
+        }
         if payload.len() < mux::SESSION_ID_BYTES + mux::SESSION_OPENED_BODY_MIN {
             return c.state;
         }
@@ -258,8 +330,12 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
         }
         return c.state;
     }
+    if session != c.session_id {
+        return c.state;
+    }
     if msg_type == mux::MSG_MUX_SESSION_CLOSED {
-        if c.state == H3ClientState::AwaitingResponse {
+        c.session.allocated = false;
+        if !matches!(c.state, H3ClientState::Complete | H3ClientState::Failed) {
             c.state = H3ClientState::Failed;
         }
         return c.state;
@@ -293,6 +369,12 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
             // unambiguous.
             if preamble_open_outstanding(&c.session) {
                 local_uni_opened(&mut c.session, handle, status);
+                if status != mux::STATUS_OK {
+                    c.state = H3ClientState::Failed;
+                }
+                return c.state;
+            }
+            if c.state != H3ClientState::Opening {
                 return c.state;
             }
             if status != mux::STATUS_OK {
@@ -317,21 +399,17 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
                 }
                 return c.state;
             }
-            let body = &payload[mux::STREAM_DATA_PREFIX..];
-            let room = H3_CLIENT_RECV_BUF - c.recv_len;
-            if body.len() > room {
-                c.state = H3ClientState::Failed;
+            if handle != c.stream_id || c.state != H3ClientState::AwaitingResponse {
                 return c.state;
             }
-            c.recv_buf[c.recv_len..c.recv_len + body.len()].copy_from_slice(body);
-            c.recv_len += body.len();
-            client_drain(c);
+            let body = &payload[mux::STREAM_DATA_PREFIX..];
+            client_ingest(c, body);
         }
         mux::MSG_MUX_STREAM_RESET => {
             // The server abandoned the exchange. Whatever arrived is a
             // fragment of a response it withdrew, so reporting Complete
             // would present a truncated body as a whole one.
-            if c.state == H3ClientState::AwaitingResponse {
+            if handle == c.stream_id && c.state == H3ClientState::AwaitingResponse {
                 c.state = H3ClientState::Failed;
             }
         }
@@ -342,10 +420,16 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
                 c.state = H3ClientState::Failed;
                 return c.state;
             }
-            if c.state == H3ClientState::AwaitingResponse {
+            if handle == c.stream_id && c.state == H3ClientState::AwaitingResponse {
                 // The peer finished. A response without a `:status` never
                 // arrived, and reporting Complete would invent one.
-                c.state = if c.status > 0 {
+                c.state = if c.status >= 200
+                    && c.recv_len == 0
+                    && !c.reading_frame
+                    && (c.head_only
+                        || c.status == 304
+                        || c.expected_len.is_none_or(|n| n == c.total_body))
+                {
                     H3ClientState::Complete
                 } else {
                     H3ClientState::Failed
@@ -357,46 +441,136 @@ pub fn client_mux_frame(c: &mut H3Client, msg_type: u8, payload: &[u8]) -> H3Cli
     c.state
 }
 
-/// Walk complete h3 frames out of the client's accumulator.
-fn client_drain(c: &mut H3Client) {
-    let mut consumed = 0usize;
-    loop {
-        let (kind, range, total) = {
-            let buf = &c.recv_buf[consumed..c.recv_len];
-            match parse_h3_frame(buf) {
-                Some((f, n)) => {
-                    let start = consumed + (n - f.payload.len());
-                    (f.frame_type, (start, start + f.payload.len()), n)
-                }
-                None => break,
+/// Feed a response without buffering whole DATA frames. Metadata has its own
+/// bound; unknown extension payloads are skipped without allocating for length.
+fn client_ingest(c: &mut H3Client, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        if !c.reading_frame {
+            if c.recv_len == 16 {
+                c.state = H3ClientState::Failed;
+                return;
             }
-        };
-        if kind == H3_FRAME_HEADERS {
-            match decode_response_status(&c.recv_buf[range.0..range.1]) {
-                Some(code) => c.status = code,
-                None => {
-                    c.state = H3ClientState::Failed;
-                    return;
-                }
+            c.recv_buf[c.recv_len] = bytes[0];
+            c.recv_len += 1;
+            bytes = &bytes[1..];
+            let Some((kind, len, _)) = parse_h3_frame_head(&c.recv_buf[..c.recv_len]) else {
+                continue;
+            };
+            c.recv_len = 0;
+            c.frame_kind = kind;
+            c.frame_remaining = len;
+            c.reading_frame = true;
+            if matches!(kind, 2..=5 | 7 | 13)
+                || (kind == H3_FRAME_HEADERS && len > H3_CLIENT_RECV_BUF as u64)
+                || (kind == H3_FRAME_DATA
+                    && (c.status < 200
+                        || c.trailers
+                        || c.head_only
+                        || matches!(c.status, 204 | 304)))
+            {
+                c.state = H3ClientState::Failed;
+                return;
             }
-        } else if kind == H3_FRAME_DATA {
-            let n = (range.1 - range.0).min(H3_CLIENT_BODY_BUF - c.body_len);
-            let (a, b) = (range.0, range.0 + n);
-            c.body.copy_within(0..0, 0); // no-op, keeps the borrow shape obvious
-            let mut tmp = [0u8; H3_CLIENT_BODY_BUF];
-            tmp[..n].copy_from_slice(&c.recv_buf[a..b]);
-            c.body[c.body_len..c.body_len + n].copy_from_slice(&tmp[..n]);
+        }
+        let n = c.frame_remaining.min(bytes.len() as u64) as usize;
+        if c.frame_kind == H3_FRAME_HEADERS {
+            c.recv_buf[c.recv_len..c.recv_len + n].copy_from_slice(&bytes[..n]);
+            c.recv_len += n;
+        } else if c.frame_kind == H3_FRAME_DATA {
+            if n > H3_CLIENT_BODY_BUF - c.body_len
+                || c.total_body.checked_add(n as u64).is_none()
+                || c.expected_len
+                    .is_some_and(|len| c.total_body + n as u64 > len)
+            {
+                c.state = H3ClientState::Failed;
+                return;
+            }
+            c.body[c.body_len..c.body_len + n].copy_from_slice(&bytes[..n]);
             c.body_len += n;
+            c.total_body += n as u64;
         }
-        consumed += total;
-        if consumed >= c.recv_len {
-            break;
+        bytes = &bytes[n..];
+        c.frame_remaining -= n as u64;
+        if c.frame_remaining == 0 {
+            c.reading_frame = false;
+            if c.frame_kind == H3_FRAME_HEADERS {
+                let trailer = c.status >= 200;
+                match response_fields(&c.recv_buf[..c.recv_len], trailer) {
+                    Some((code, length)) if !c.trailers => {
+                        if trailer {
+                            c.trailers = true;
+                        } else if let Some(code) = code {
+                            if code < 200 {
+                                c.informational += 1;
+                                if c.informational > 16 {
+                                    c.state = H3ClientState::Failed;
+                                    return;
+                                }
+                            } else {
+                                c.status = code;
+                                c.expected_len = length;
+                                if code == 204 && length.is_some() {
+                                    c.state = H3ClientState::Failed;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        c.state = H3ClientState::Failed;
+                        return;
+                    }
+                }
+            }
+            c.recv_len = 0;
         }
     }
-    if consumed > 0 {
-        c.recv_buf.copy_within(consumed..c.recv_len, 0);
-        c.recv_len -= consumed;
+}
+
+/// Retain the session identity until the transport accepts cancellation.
+pub(crate) unsafe fn close_session(s: &mut super::super::HttpState) -> bool {
+    if !s.h3_client.session.allocated {
+        return true;
     }
+    let mut frame = [0u8; FRAME_HDR + mux::SESSION_ID_BYTES + 1 + mux::APP_ERROR_BYTES];
+    frame[0] = mux::CMD_MUX_SESSION_CLOSE;
+    let plen = (frame.len() - FRAME_HDR) as u16;
+    frame[1..3].copy_from_slice(&plen.to_le_bytes());
+    mux::put_session_id(&mut frame[FRAME_HDR..], s.h3_client.session_id);
+    frame[FRAME_HDR + 4] = mux::STATUS_OK;
+    frame[FRAME_HDR + 5..].copy_from_slice(&0x10Cu64.to_le_bytes());
+    if ((*s.syscalls).channel_write)(s.net_out_chan, frame.as_ptr(), frame.len())
+        != frame.len() as i32
+    {
+        return false;
+    }
+    s.h3_client.session.allocated = false;
+    true
+}
+
+/// Reset exchange-local state while preserving the negotiated connection.
+pub(crate) fn next_request(s: &mut super::super::HttpState) {
+    let c = &mut s.h3_client;
+    c.state = if c.session.allocated {
+        H3ClientState::Preamble
+    } else {
+        H3ClientState::Idle
+    };
+    c.stream_id = 0;
+    c.status = 0;
+    c.recv_len = 0;
+    c.body_len = 0;
+    c.total_body = 0;
+    c.frame_remaining = 0;
+    c.reading_frame = false;
+    c.body_emitted = false;
+    c.expected_len = None;
+    c.trailers = false;
+    c.informational = 0;
+    c.head_only = s.client.method == super::super::wire::method::METHOD_HEAD;
+    c.request_sent = false;
+    c.request_offset = 0;
+    c.fin_sent = false;
 }
 
 /// One step of the HTTP/3 client: ask for a stream, send the request, collect
@@ -410,6 +584,63 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
     let (in_chan, out_chan) = (s.net_in_chan, s.net_out_chan);
     if in_chan < 0 || out_chan < 0 {
         return 0;
+    }
+
+    let now = super::super::dev_millis(sys);
+    if s.client.phase == super::Phase::Init {
+        s.client.phase = super::Phase::SendRequest;
+        s.client.request_start_ms = now;
+        s.client.progress_ms = now;
+        s.h3_client.head_only = s.client.method == super::super::wire::method::METHOD_HEAD;
+    }
+    let expired = |start, budget: u32| budget != 0 && now.wrapping_sub(start) >= u64::from(budget);
+    if s.client.draining != 0
+        || s.client.request_invalid != 0
+        || (!s.h3_client.body_emitted
+            && (expired(s.client.request_start_ms, s.client.client_total_ms)
+                || expired(s.client.progress_ms, s.client.client_stall_ms)
+                || (s.h3_client.fin_sent
+                    && s.h3_client.status == 0
+                    && expired(s.client.response_start_ms, s.client.client_header_ms))))
+    {
+        s.h3_client.state = H3ClientState::Failed;
+    }
+    if s.h3_client.state == H3ClientState::Failed {
+        if !close_session(s) {
+            return 0;
+        }
+        #[cfg(feature = "exchange")]
+        if super::exchange::armed(s) {
+            super::exchange::fail(s);
+            return 0;
+        }
+        return if s.client.draining != 0 { 1 } else { -1 };
+    }
+
+    #[cfg(feature = "exchange")]
+    let streaming = !super::exchange::armed(s);
+    #[cfg(not(feature = "exchange"))]
+    let streaming = true;
+    if streaming && s.h3_client.body_len != 0 {
+        let c = &mut s.h3_client;
+        if s.client.out_chan < 0 {
+            c.body_len = 0;
+        } else {
+            let written = (sys.channel_write)(
+                s.client.out_chan,
+                c.body.as_ptr(),
+                c.body_len.min(super::OUTPUT_CHUNK),
+            );
+            if written > 0 && written as usize <= c.body_len {
+                let n = written as usize;
+                c.body.copy_within(n..c.body_len, 0);
+                c.body_len -= n;
+                s.client.progress_ms = now;
+            }
+        }
+        if c.body_len != 0 {
+            return 0;
+        }
     }
 
     // Idle means the transport has not announced a session yet. There is
@@ -430,7 +661,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             // rather than skipping a critical stream.
             if poll > 0
                 && (poll as u32) & super::super::POLL_OUT != 0
-                && (sys.channel_write)(out_chan, frame.as_ptr(), n) > 0
+                && (sys.channel_write)(out_chan, frame.as_ptr(), n) == n as i32
             {
                 commit_session(&mut s.h3_client.session, what);
             }
@@ -446,7 +677,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             let poll = (sys.channel_poll)(out_chan, super::super::POLL_OUT);
             if poll > 0
                 && (poll as u32) & super::super::POLL_OUT != 0
-                && (sys.channel_write)(out_chan, open.as_ptr(), open.len()) > 0
+                && (sys.channel_write)(out_chan, open.as_ptr(), open.len()) == open.len() as i32
             {
                 s.h3_client.state = H3ClientState::Opening;
             }
@@ -455,8 +686,8 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
         // arrives on the ingress drain below.
     }
 
-    // Drain inbound mux frames.
-    loop {
+    // Bound input work per scheduler step.
+    for _ in 0..8 {
         let poll = (sys.channel_poll)(in_chan, super::super::POLL_IN);
         if poll <= 0 || (poll as u32) & super::super::POLL_IN == 0 {
             break;
@@ -484,7 +715,24 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             frame.as_mut_ptr(),
             n,
         );
+        let before = (
+            s.h3_client.state,
+            s.h3_client.recv_len,
+            s.h3_client.body_len,
+        );
         client_mux_frame(&mut s.h3_client, msg_type, &frame[..n]);
+        if before
+            != (
+                s.h3_client.state,
+                s.h3_client.recv_len,
+                s.h3_client.body_len,
+            )
+        {
+            s.client.progress_ms = now;
+        }
+        if s.h3_client.state == H3ClientState::Failed || (streaming && s.h3_client.body_len != 0) {
+            break;
+        }
     }
 
     // The stream is granted: send the request on it, then FIN the request
@@ -527,6 +775,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
         // the whole body, so there is nothing to re-assemble here.
         #[cfg(feature = "exchange")]
         if super::exchange::busy(s) {
+            s.client.last_status = s.h3_client.status;
             let n = s.h3_client.body_len;
             let src = s.h3_client.body.as_ptr();
             super::exchange::accumulate(s, src, n);
@@ -535,87 +784,163 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             return 0;
         }
 
-        let chan = s.client.out_chan;
-        if chan >= 0 && s.h3_client.body_len > 0 {
-            let poll = (sys.channel_poll)(chan, super::super::POLL_OUT);
-            if poll > 0 && (poll as u32) & super::super::POLL_OUT != 0 {
-                let mut body = [0u8; H3_CLIENT_BODY_BUF];
-                let n = s.h3_client.body_len;
-                body[..n].copy_from_slice(&s.h3_client.body[..n]);
-                if (sys.channel_write)(chan, body.as_ptr(), n) > 0 {
-                    s.h3_client.body_emitted = true;
-                }
-            }
-        } else {
+        if s.h3_client.body_len == 0 {
             s.h3_client.body_emitted = true;
         }
     }
     0
 }
 
-/// Build and send the configured request, then FIN the stream — a GET carries
-/// no body, so the request is complete the moment its headers are sent.
-///
-/// Both writes are all-or-nothing and are only recorded once accepted, so a
-/// step that finds the channel full re-offers the identical bytes on the
-/// next one. Called every step while the exchange awaits its response; it
-/// returns immediately once both have gone out.
+/// Fields supplied by the application, before encoding the request head.
+pub struct RequestHead<'a> {
+    pub method: &'a [u8],
+    pub authority: &'a [u8],
+    pub path: &'a [u8],
+    pub content_type: &'a [u8],
+    pub body_len: usize,
+}
+
+/// Encode a configured request without truncating any field.
+pub fn configured_request(head: &RequestHead<'_>, out: &mut [u8]) -> usize {
+    if head.method.is_empty()
+        || head.method.iter().any(|b| !b.is_ascii_uppercase())
+        || head.method == b"CONNECT"
+        || !head.path.starts_with(b"/")
+        || head.path.iter().any(|b| *b <= 32 || *b == 127)
+        || head.authority.is_empty()
+        || head.authority.iter().any(|b| *b <= 32 || *b == 127)
+        || head.content_type.iter().any(|b| *b < 32 || *b == 127)
+    {
+        return 0;
+    }
+    let mut block = [0u8; super::REQUEST_BUF_SIZE];
+    let mut scheme = [0u8; 5];
+    scheme.copy_from_slice(b"https");
+    let mut n = encode_request_headers(head.method, &scheme, head.authority, head.path, &mut block);
+    if n == 0 {
+        return 0;
+    }
+    if !head.content_type.is_empty() {
+        let mut name = [0u8; 12];
+        name.copy_from_slice(b"content-type");
+        let added = qpack::qpack_encode_field(&name, head.content_type, &mut block[n..]);
+        if added == 0 {
+            return 0;
+        }
+        n += added;
+    }
+    if head.body_len > 0 {
+        let mut digits = [0u8; 20];
+        let mut start = digits.len();
+        let mut value = head.body_len;
+        while value > 0 {
+            start -= 1;
+            digits[start] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        let mut name = [0u8; 14];
+        name.copy_from_slice(b"content-length");
+        let added = qpack::qpack_encode_field(&name, &digits[start..], &mut block[n..]);
+        if added == 0 {
+            return 0;
+        }
+        n += added;
+    }
+    let mut frame_head = [0u8; 16];
+    let hn = build_h3_frame_header(H3_FRAME_HEADERS, n, &mut frame_head);
+    if hn == 0 || hn + n > out.len() {
+        return 0;
+    }
+    out[..hn].copy_from_slice(&frame_head[..hn]);
+    out[hn..hn + n].copy_from_slice(&block[..n]);
+    hn + n
+}
+
+unsafe fn send_stream_bytes(s: &mut super::super::HttpState, bytes: &[u8]) -> bool {
+    if bytes.len() > mux::MUX_QUIC_STREAM_SEND_MAX {
+        return false;
+    }
+    let mut frame = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + mux::MUX_QUIC_STREAM_SEND_MAX];
+    let plen = mux::STREAM_DATA_PREFIX + bytes.len();
+    frame[0] = mux::CMD_MUX_STREAM_SEND;
+    frame[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
+    mux::put_session_id(&mut frame[FRAME_HDR..], s.h3_client.session_id);
+    mux::put_stream_id(&mut frame[FRAME_HDR..], s.h3_client.stream_id);
+    frame[FRAME_HDR + mux::STREAM_DATA_PREFIX..FRAME_HDR + plen].copy_from_slice(bytes);
+    ((*s.syscalls).channel_write)(s.net_out_chan, frame.as_ptr(), FRAME_HDR + plen)
+        == (FRAME_HDR + plen) as i32
+}
+
+/// Bound each send to the transport's maximum. Offsets advance only when the
+/// complete mux record was accepted, including headers larger than one record.
 unsafe fn client_send_request(s: &mut super::super::HttpState) {
     if s.h3_client.fin_sent {
         return;
     }
-    let sys = &*s.syscalls;
-    let out_chan = s.net_out_chan;
-
-    let plen = s.client.path_len as usize;
-    let mut path = [0u8; 128];
-    let plen = plen.min(path.len());
-    path[..plen].copy_from_slice(&s.client.path[..plen]);
-    let path: &[u8] = if plen == 0 { b"/" } else { &path[..plen] };
-
-    // `:authority` is not configurable yet. Virtual hosting needs it to be, and
-    // that is a parameter away — but inventing one here would be a surface
-    // nobody asked for.
-    let mut authority = [0u8; 9];
-    authority.copy_from_slice(b"localhost");
-    let mut method = [0u8; 3];
-    method.copy_from_slice(b"GET");
-    let mut scheme = [0u8; 5];
-    scheme.copy_from_slice(b"https");
-
-    let mut req = [0u8; 512];
-    let n = build_request(&method, &scheme, &authority, path, &mut req);
-    if n == 0 {
+    if s.client.request_invalid != 0 {
         s.h3_client.state = H3ClientState::Failed;
         return;
     }
-
-    let (session, stream) = (s.h3_client.session_id, s.h3_client.stream_id);
     if !s.h3_client.request_sent {
-        let body_len = mux::STREAM_DATA_PREFIX + n;
-        let mut frame = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 512];
-        frame[0] = mux::CMD_MUX_STREAM_SEND;
-        frame[1..3].copy_from_slice(&(body_len as u16).to_le_bytes());
-        mux::put_session_id(&mut frame[FRAME_HDR..], session);
-        mux::put_stream_id(&mut frame[FRAME_HDR..], stream);
-        frame[FRAME_HDR + mux::STREAM_DATA_PREFIX..FRAME_HDR + mux::STREAM_DATA_PREFIX + n]
-            .copy_from_slice(&req[..n]);
-        let total = FRAME_HDR + body_len;
-        if (sys.channel_write)(out_chan, frame.as_ptr(), total) <= 0 {
+        let method = super::super::wire::method::method_name(s.client.method);
+        let mut fallback = [0u8; 9];
+        fallback.copy_from_slice(b"localhost");
+        let authority = if s.client.authority_len == 0 {
+            &fallback[..]
+        } else {
+            &s.client.authority[..s.client.authority_len as usize]
+        };
+        let head = RequestHead {
+            method,
+            authority,
+            path: &s.client.path[..s.client.path_len as usize],
+            content_type: &s.client.content_type[..s.client.content_type_len as usize],
+            body_len: s.client.request_body_len as usize,
+        };
+        let mut req = [0u8; super::REQUEST_BUF_SIZE];
+        let len = configured_request(&head, &mut req);
+        if len == 0 {
+            s.h3_client.state = H3ClientState::Failed;
+            return;
+        }
+        let at = s.h3_client.request_offset;
+        let end = (at + mux::MUX_QUIC_STREAM_SEND_MAX).min(len);
+        if !send_stream_bytes(s, &req[at..end]) {
+            return;
+        }
+        s.client.progress_ms = super::super::dev_millis(&*s.syscalls);
+        s.h3_client.request_offset = end;
+        if end < len {
             return;
         }
         s.h3_client.request_sent = true;
     }
-
-    // FIN the request half: a server waits for it before responding.
-    let cplen = mux::STREAM_DATA_PREFIX + 1;
+    if s.client.request_body_sent < s.client.request_body_len {
+        let at = s.client.request_body_sent as usize;
+        let n = (s.client.request_body_len as usize - at).min(mux::MUX_QUIC_STREAM_SEND_MAX - 16);
+        let mut frame = [0u8; mux::MUX_QUIC_STREAM_SEND_MAX];
+        let hn = build_h3_frame_header(H3_FRAME_DATA, n, &mut frame);
+        frame[hn..hn + n].copy_from_slice(&s.client.request_body[at..at + n]);
+        if !send_stream_bytes(s, &frame[..hn + n]) {
+            return;
+        }
+        s.client.progress_ms = super::super::dev_millis(&*s.syscalls);
+        s.client.request_body_sent += n as u16;
+        if s.client.request_body_sent < s.client.request_body_len {
+            return;
+        }
+    }
+    let plen = mux::STREAM_DATA_PREFIX + 1;
     let mut close = [0u8; FRAME_HDR + mux::STREAM_DATA_PREFIX + 1];
     close[0] = mux::CMD_MUX_STREAM_CLOSE;
-    close[1..3].copy_from_slice(&(cplen as u16).to_le_bytes());
-    mux::put_session_id(&mut close[FRAME_HDR..], session);
-    mux::put_stream_id(&mut close[FRAME_HDR..], stream);
-    close[FRAME_HDR + 8] = mux::STATUS_OK;
-    if (sys.channel_write)(out_chan, close.as_ptr(), close.len()) > 0 {
+    close[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
+    mux::put_session_id(&mut close[FRAME_HDR..], s.h3_client.session_id);
+    mux::put_stream_id(&mut close[FRAME_HDR..], s.h3_client.stream_id);
+    close[FRAME_HDR + mux::STREAM_DATA_PREFIX] = mux::STATUS_OK;
+    if ((*s.syscalls).channel_write)(s.net_out_chan, close.as_ptr(), close.len())
+        == close.len() as i32
+    {
         s.h3_client.fin_sent = true;
+        s.client.response_start_ms = super::super::dev_millis(&*s.syscalls);
     }
 }

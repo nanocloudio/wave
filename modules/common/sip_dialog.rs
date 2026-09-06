@@ -11,9 +11,9 @@
 // formats bytes, touches a socket, reads a clock, or decides call *policy*
 // (whether to answer is the caller's `answer` input, kept out of the machine).
 //
-// The single implementation of the `SipPhase` dialog transitions.
-// under Conclave plan S4.3 (T4.3.4). Transitions are behaviour-exact with those
-// handlers; the coverage lives in `tests/harness/tests/sip_dialog_vectors.rs`.
+// The single implementation of the `SipPhase` dialog transitions, so the
+// state a call is in is decided in exactly one place no matter which module
+// is driving it.
 
 /// Maximum retransmissions before a transaction gives up and returns to idle
 /// (origin `MAX_RETRANSMIT`). The exponential backoff schedule that paces them

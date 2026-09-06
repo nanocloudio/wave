@@ -13,8 +13,22 @@ random `Sec-WebSocket-Key` and **cryptographically verifies** the server's
 101, both sides exchange frames; client frames are masked (payload XOR a
 per-frame key). PING is answered with PONG.
 
-On boot it upgrades, sends a masked text `message`, and emits every server
-frame's payload on `message_out`.
+On boot it upgrades and sends a masked text `message`. It then reads
+`request_in` in chunks of at most 504 bytes and sends each chunk as one message.
+`request_opcode` selects text (1, default) or binary (2). This port is an octet
+stream: producers needing application record boundaries must frame their own
+records inside it. Pending frames survive network backpressure, and drain sends
+already staged bytes before sending CLOSE. Drain waits up to five seconds for
+its peer's close before releasing the transport. Received payloads leave on
+`message_out` as complete messages, reassembled across continuation frames, up
+to 2048 bytes. Invalid UTF-8, masking direction, control framing and continuation
+ordering close the session; oversized messages close with 1009. PING payloads up
+to 125 bytes are echoed exactly. Transport and application backpressure retain
+accepted bytes rather than truncating them.
+
+The nonce and every mask use Fluxor's CSPRNG. An entropy error fails the session;
+there is no predictable fallback. Input text chunks must contain valid UTF-8;
+use binary for arbitrary octet streams.
 
 `Ready` is reachable only through a verified upgrade — see
 `ws_transition` in `modules/common/ws_core.rs`.
@@ -55,6 +69,6 @@ repository README gives for `https://`.
 
 ## Not claimed
 
-Permessage-deflate, continuation-fragment reassembly above the frame codec,
-subprotocol negotiation, reconnect policy, and multi-connection session routing
-are future features, not migration claims.
+Permessage-deflate, subprotocol negotiation, application reconnect policy and
+multi-connection session routing are outside this connector profile. An
+unsolicited extension or subprotocol in the upgrade response is refused.

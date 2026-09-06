@@ -11,6 +11,19 @@ if [ -z "$(ls -A tests 2>/dev/null)" ]; then
   echo "is not materialised on this machine (../standards/test-tracking.md §7)." >&2
   exit 1
 fi
+# A tier being gitignored does not untrack what is already committed, so a
+# force-add puts shadow-tracked sources into the primary history — where they
+# reach the shared remote — while every ignore rule still reads as correct.
+# The lint checks the exclusion; only the index says whether it held.
+leaked="$(git ls-files tests examples)"
+if [ -n "$leaked" ]; then
+  echo "ci-shadow-guard: the primary repo tracks shadow-tracked paths:" >&2
+  echo "$leaked" | sed 's/^/  /' >&2
+  echo "Untrack them with 'git rm -r --cached <path>' — the files stay on" >&2
+  echo "disk — then stage and commit them in the shadow repo:" >&2
+  echo "  git shadow add -f -- tests examples ':(exclude)**/target/**'" >&2
+  exit 1
+fi
 if [ ! -f tests/harness/Cargo.toml ]; then
   echo "ci-shadow-guard: tests/harness/Cargo.toml missing — the protocol harness" >&2
   echo "would silently not build and every host test would not run — it is the" >&2

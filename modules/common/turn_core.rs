@@ -271,6 +271,25 @@ pub fn append_data(payload: &[u8], out: &mut [u8], at: usize) -> Option<usize> {
     append_attribute(ATTR_DATA, payload, out, at)
 }
 
+/// Build a TURN Send Indication carrying one UDP datagram to a permitted peer.
+/// Indications are deliberately unauthenticated per RFC 5766: permission
+/// state on the relay is the authorization boundary. The fingerprint remains
+/// present so demultiplexers can reject corruption before dispatch.
+pub fn write_send_indication(
+    txn: &[u8; STUN_TXN_LEN],
+    peer_addr: [u8; 4],
+    peer_port: u16,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut at = write_stun_header(STUN_CLASS_INDICATION, TURN_METHOD_SEND, txn, out)?;
+    at = append_xor_peer_address_v4(peer_addr, peer_port, out, at)?;
+    at = append_data(payload, out, at)?;
+    at = append_fingerprint(out, at)?;
+    stun_set_length(out, at)?;
+    Some(at)
+}
+
 /// Read an XOR-RELAYED-ADDRESS. This is the address that becomes a relay
 /// candidate.
 pub fn parse_xor_relayed_address(

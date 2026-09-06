@@ -7,12 +7,13 @@
 //! Signalling ONLY: it owns the SIP datagram endpoint
 //! and drives the media path — the separate `rtp` module and the `jitter`
 //! reorder/playout adapter — over shared control records on `rtp_ctrl`. It
-//! holds no media socket, no jitter state and no playout clock; those moved
-//! to `rtp` and `jitter` (see .context/planning/sip-rtp-decomposition.md).
+//! holds no media socket, no jitter state and no playout clock: the media path
+//! is `rtp`'s and the reorder ring is `jitter`'s, so a graph that needs
+//! signalling without media pays for neither.
 //!
-//! Assembled from `fluxor/modules/app/voip` under Conclave plan S4.3.
-//! Byte/behaviour parity lives in the shared-core vectors; this module is the
-//! endpoint/orchestration wrapper.
+//! This module is the endpoint and orchestration wrapper. The message and
+//! dialog mechanics it drives are the shared cores, which is where their
+//! behaviour is pinned.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -26,9 +27,8 @@
     reason = "the fluxor module ABI entry points (module_init/module_new/module_step): the \
               runtime owns these pointers and their validity is the ABI's contract, and the \
               signature is fixed by that contract rather than chosen here. Same allow as \
-              chronicle's and lattice's PIC modules carry. Newly required because \
-              `fluxor ci` clippies modules/** directly now that Wave has no root manifest \
-              for it to lint instead."
+              chronicle's and lattice's PIC modules carry, and required here because \
+              `fluxor ci` clippies modules/** directly."
 )]
 
 use core::ffi::c_void;

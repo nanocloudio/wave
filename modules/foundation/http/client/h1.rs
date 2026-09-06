@@ -4,11 +4,6 @@
 //! connection: connect, send the request, parse the status line and headers,
 //! stream the body out to the module's data port, close.
 //!
-//! Symmetric with `super::super::server::h1`: the connection lifecycle lives
-//! with the generation whose model it is, and `super::h2` is the other front end
-//! onto the same `ClientState`. There is no `h3.rs` — Fluxor's `quic` owns the
-//! h3 client (`docs/architecture/http3-ownership.md`), and that absence is
-//! deliberate rather than pending.
 
 use super::super::connection::{
     net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED,
@@ -45,9 +40,46 @@ pub fn parse_status_line(head: &[u8]) -> u16 {
 }
 
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
+    let now = dev_millis(&*s.syscalls);
+    if !matches!(s.client.phase, Phase::Init | Phase::Done | Phase::Error) {
+        let expired =
+            |start, budget: u32| budget != 0 && now.wrapping_sub(start) >= u64::from(budget);
+        let waiting_head = matches!(s.client.phase, Phase::RecvHeaders | Phase::RecvBody)
+            && !s.client.response.has_head();
+        let moving = matches!(
+            s.client.phase,
+            Phase::SendRequest | Phase::RecvHeaders | Phase::RecvBody | Phase::Writing
+        );
+        if expired(s.client.request_start_ms, s.client.client_total_ms)
+            || (waiting_head && expired(s.client.response_start_ms, s.client.client_header_ms))
+            || (moving && expired(s.client.progress_ms, s.client.client_stall_ms))
+        {
+            s.client.phase = Phase::Error;
+        }
+    }
     loop {
         match s.client.phase {
             Phase::Init => {
+                if s.client.request_invalid != 0 {
+                    s.client.phase = Phase::Error;
+                    continue;
+                }
+                s.client.request_start_ms = now;
+                s.client.progress_ms = now;
+                s.client.response = super::super::wire::response::ResponseDecoder::new(
+                    s.client.method == super::super::wire::method::METHOD_HEAD,
+                    s.client.method == super::super::wire::method::METHOD_CONNECT,
+                );
+                s.client.h1_input_len = 0;
+                s.client.h1_input_offset = 0;
+                if s.client.conn_present != 0 {
+                    s.client.phase = if build_request(s) {
+                        Phase::SendRequest
+                    } else {
+                        Phase::Error
+                    };
+                    continue;
+                }
                 log(s, b"[http] connecting");
                 s.client.phase = Phase::Connecting;
                 continue;
@@ -105,9 +137,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
                         // Claim only our own outbound connection: MSG_CONNECTED
                         // is `[conn_id][requester_tag]`; the tag echoes our
-                        // CMD_CONNECT index. Untagged (legacy/sole-consumer) or
-                        // our tag → ours; any other tag belongs to a co-wired
-                        // consumer sharing this fanned queue, so ignore it.
+                        // CMD_CONNECT index. Untagged — which is what a sole
+                        // consumer sees — or our tag → ours; any other tag
+                        // belongs to a co-wired consumer sharing this fanned
+                        // queue, so ignore it.
                         let (_, tag) = net_proto::connected_parts(core::slice::from_raw_parts(
                             buf.add(NET_FRAME_HDR),
                             payload_len,
@@ -121,6 +154,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             payload_len,
                         ));
                         s.client.conn_present = 1;
+                        s.client.progress_ms = now;
                         log(s, b"[http] connected");
                         if !build_request(s) {
                             // The head does not fit or names no verb. Failing
@@ -207,6 +241,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     return 0;
                 }
 
+                s.client.progress_ms = now;
                 if head_left > 0 {
                     s.client.request_sent += to_send as u16;
                 } else {
@@ -218,158 +253,87 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     log(s, b"[http] request sent");
                     s.client.headers_done = 0;
                     s.client.recv_len = 0;
+                    s.client.response_start_ms = now;
                     s.client.phase = Phase::RecvHeaders;
                 }
                 return 0;
             }
 
-            Phase::RecvHeaders => {
-                if s.net_in_chan < 0 {
-                    return 0;
-                }
-                let sys = &*s.syscalls;
-                let chan = s.net_in_chan;
-                let poll = (sys.channel_poll)(chan, POLL_IN);
-                if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
-                    return 0;
-                }
-
-                let nbuf = s.net_buf.as_mut_ptr();
-                let (msg_type, payload_len, _full) =
-                    net_read_frame_aligned(sys, chan, nbuf, NET_BUF_SIZE);
-
-                // Established-stream isolation: ip.net_out may be fanned to other
-                // stream consumers (e.g. an OTLP exporter); ignore any DATA/CLOSED
-                // /ERROR frame that isn't for our own connection.
-                if is_foreign_frame(s, msg_type, payload_len, nbuf) {
-                    return 0;
-                }
-
-                if msg_type == NET_MSG_CLOSED {
-                    log(s, b"[http] premature close");
+            Phase::RecvHeaders | Phase::RecvBody => {
+                if s.client.response.done() {
                     s.client.phase = Phase::Done;
-                    // Emitted HERE, not in the `Phase::Done` arm: this path
-                    // returns straight to the caller and never falls through
-                    // to it, so a hook there answers nothing.
-                    #[cfg(feature = "exchange")]
-                    {
-                        super::exchange::complete(s);
-                        if super::exchange::armed(s) {
-                            // A graph-driven client is RESIDENT: this ends one
-                            // exchange, not the module.
-                            return 0;
-                        }
-                    }
-                    return 1;
-                }
-
-                if msg_type == NET_MSG_DATA && payload_len > 1 {
-                    let data_ptr = nbuf.add(NET_FRAME_HDR + 2) as *const u8;
-                    let data_len = payload_len - 2;
-
-                    let cur = s.client.recv_len as usize;
-                    let space = RECV_BUF_SIZE - cur;
-                    let to_copy = data_len.min(space);
-                    if to_copy > 0 {
-                        core::ptr::copy_nonoverlapping(
-                            data_ptr,
-                            s.client.recv_buf.as_mut_ptr().add(cur),
-                            to_copy,
-                        );
-                        s.client.recv_len += to_copy as u16;
-                    }
-
-                    if let Some(body_start) =
-                        h1::find_header_end(&s.client.recv_buf, s.client.recv_len as usize)
-                    {
-                        // Capture the status BEFORE the body memmove below
-                        // overwrites the head in place.
-                        s.client.last_status = parse_status_line(&s.client.recv_buf[..body_start]);
-                        let body_len = (s.client.recv_len as usize) - body_start;
-                        if body_len > 0 {
-                            let buf_ptr = s.client.recv_buf.as_mut_ptr();
-                            let mut i = 0;
-                            while i < body_len {
-                                *buf_ptr.add(i) = *buf_ptr.add(body_start + i);
-                                i += 1;
-                            }
-                            s.client.recv_len = body_len as u16;
-                            s.client.pending_offset = 0;
-                            s.client.phase = Phase::Writing;
-                        } else {
-                            s.client.recv_len = 0;
-                            s.client.phase = Phase::RecvBody;
-                        }
-                        log(s, b"[http] headers done");
-                        continue;
-                    }
-                }
-
-                return 0;
-            }
-
-            Phase::RecvBody => {
-                let sys = &*s.syscalls;
-                if s.client.out_chan >= 0 {
-                    let poll = (sys.channel_poll)(s.client.out_chan, POLL_OUT);
-                    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
-                        return 0;
-                    }
-                }
-
-                if s.net_in_chan < 0 {
-                    return 0;
-                }
-                let chan = s.net_in_chan;
-                let poll = (sys.channel_poll)(chan, POLL_IN);
-                if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
-                    return 0;
-                }
-
-                let nbuf = s.net_buf.as_mut_ptr();
-                let (msg_type, payload_len, _full) =
-                    net_read_frame_aligned(sys, chan, nbuf, NET_BUF_SIZE);
-
-                if is_foreign_frame(s, msg_type, payload_len, nbuf) {
-                    return 0;
-                }
-
-                if msg_type == NET_MSG_CLOSED {
-                    log(s, b"[http] transfer done");
-                    s.client.phase = Phase::Done;
-                    // Emitted HERE, not in the `Phase::Done` arm: this path
-                    // returns straight to the caller and never falls through
-                    // to it, so a hook there answers nothing.
-                    #[cfg(feature = "exchange")]
-                    {
-                        super::exchange::complete(s);
-                        if super::exchange::armed(s) {
-                            // A graph-driven client is RESIDENT: this ends one
-                            // exchange, not the module.
-                            return 0;
-                        }
-                    }
-                    return 1;
-                }
-
-                if msg_type == NET_MSG_DATA && payload_len > 1 {
-                    let data_ptr = nbuf.add(NET_FRAME_HDR + 2) as *const u8;
-                    let data_len = payload_len - 2;
-
-                    let to_copy = data_len.min(RECV_BUF_SIZE);
-                    core::ptr::copy_nonoverlapping(
-                        data_ptr,
-                        s.client.recv_buf.as_mut_ptr(),
-                        to_copy,
-                    );
-                    s.client.recv_len = to_copy as u16;
-                    s.client.pending_offset = 0;
-                    s.client.bytes_received += to_copy as u32;
-                    s.client.phase = Phase::Writing;
                     continue;
                 }
-
-                return 0;
+                let sys = &*s.syscalls;
+                if s.client.h1_input_offset == s.client.h1_input_len {
+                    if s.net_in_chan < 0 {
+                        return 0;
+                    }
+                    let nbuf = s.net_buf.as_mut_ptr();
+                    let (kind, len, declared) =
+                        net_read_frame_aligned(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
+                    if kind == 0 {
+                        return 0;
+                    }
+                    if len < 2 || len != declared {
+                        s.client.phase = Phase::Error;
+                        continue;
+                    }
+                    if is_foreign_frame(s, kind, len, nbuf) {
+                        return 0;
+                    }
+                    if kind == NET_MSG_ERROR {
+                        s.client.phase = Phase::Error;
+                        continue;
+                    }
+                    if kind == NET_MSG_CLOSED {
+                        s.client.phase = if s.client.response.eof().is_ok() {
+                            Phase::Done
+                        } else {
+                            Phase::Error
+                        };
+                        continue;
+                    }
+                    if kind != NET_MSG_DATA {
+                        return 0;
+                    }
+                    s.client.h1_input_offset = (NET_FRAME_HDR + 2) as u16;
+                    s.client.h1_input_len = (NET_FRAME_HDR + len) as u16;
+                }
+                let input =
+                    &s.net_buf[s.client.h1_input_offset as usize..s.client.h1_input_len as usize];
+                match s.client.response.consume(input, &mut s.client.recv_buf) {
+                    Ok((used, produced)) => {
+                        if used > 0 {
+                            s.client.progress_ms = now;
+                        }
+                        s.client.h1_input_offset += used as u16;
+                        s.client.last_status = s.client.response.status;
+                        s.client.bytes_received =
+                            s.client.bytes_received.saturating_add(produced as u32);
+                        // One request is outstanding: unsolicited bytes after its
+                        // framing boundary are not a second successful response.
+                        if s.client.response.done()
+                            && s.client.h1_input_offset != s.client.h1_input_len
+                        {
+                            s.client.phase = Phase::Error;
+                            continue;
+                        }
+                        if produced > 0 {
+                            s.client.recv_len = produced as u16;
+                            s.client.pending_offset = 0;
+                            s.client.phase = Phase::Writing;
+                        } else if s.client.response.done() {
+                            s.client.phase = Phase::Done;
+                        } else {
+                            return 0;
+                        }
+                    }
+                    Err(_) => {
+                        s.client.phase = Phase::Error;
+                    }
+                }
+                continue;
             }
 
             Phase::Writing => {
@@ -399,7 +363,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let written = (sys.channel_write)(
                     out_chan,
                     s.client.recv_buf.as_ptr().add(offset),
-                    remaining,
+                    remaining.min(super::OUTPUT_CHUNK),
                 );
 
                 if written < 0 {
@@ -411,6 +375,9 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     return E_WRITE_FAILED;
                 }
 
+                if written > 0 {
+                    s.client.progress_ms = now;
+                }
                 s.client.pending_offset += written as u16;
                 if s.client.pending_offset >= s.client.recv_len {
                     s.client.phase = Phase::RecvBody;
@@ -419,11 +386,21 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             Phase::Done => {
-                let _ = send_close_frame(s);
+                #[cfg(not(feature = "exchange"))]
+                let reuse = false;
+                #[cfg(feature = "exchange")]
+                let reuse = super::exchange::armed(s)
+                    && s.client.keep_alive != 0
+                    && s.client.response.reusable
+                    && s.client.draining == 0;
+                if !reuse && !send_close_frame(s) {
+                    return 0;
+                }
                 // Answer the request that produced this response, then go
                 // idle so the next one on `publish_in` can be taken.
                 #[cfg(feature = "exchange")]
                 {
+                    s.client.idle_since_ms = now;
                     super::exchange::complete(s);
                     if super::exchange::armed(s) {
                         // A graph-driven client is RESIDENT: `Done` ends one
@@ -439,7 +416,9 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             Phase::Error => {
-                let _ = send_close_frame(s);
+                if !send_close_frame(s) {
+                    return 0;
+                }
                 // A failed exchange is still an answer: the contract admits
                 // no silent drops, so the producer gets a typed refusal
                 // rather than waiting out its own timeout.
@@ -457,6 +436,35 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             _ => return -1,
+        }
+    }
+}
+
+/// Clear an idle connection on peer EOF, unsolicited bytes, or idle expiry.
+/// A closed idle socket is never automatically replayed after a request write.
+pub(crate) unsafe fn idle(s: &mut HttpState) {
+    if s.client.conn_present == 0 || s.client.phase != Phase::Done {
+        return;
+    }
+    let sys = &*s.syscalls;
+    if s.client.client_stall_ms != 0
+        && dev_millis(sys).wrapping_sub(s.client.idle_since_ms)
+            >= u64::from(s.client.client_stall_ms)
+    {
+        let _ = send_close_frame(s);
+        return;
+    }
+    for _ in 0..8 {
+        let (kind, n) = net_read_frame(sys, s.net_in_chan, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
+        if kind == 0 {
+            break;
+        }
+        if n >= 2
+            && net_proto::conn_id(&s.net_buf[NET_FRAME_HDR..NET_FRAME_HDR + n]) == s.client.conn_id
+        {
+            s.client.response.reusable = false;
+            let _ = send_close_frame(s);
+            break;
         }
     }
 }

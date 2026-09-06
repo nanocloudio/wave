@@ -146,7 +146,11 @@ pub fn ws_decode_header(buf: &[u8]) -> WsHeaderParse {
             if buf.len() < 4 {
                 return WsHeaderParse::Incomplete;
             }
-            (4, u64::from(u16::from_be_bytes([buf[2], buf[3]])))
+            let n = u16::from_be_bytes([buf[2], buf[3]]);
+            if n < 126 {
+                return WsHeaderParse::Invalid;
+            }
+            (4, u64::from(n))
         }
         127 => {
             if buf.len() < 10 {
@@ -156,7 +160,7 @@ pub fn ws_decode_header(buf: &[u8]) -> WsHeaderParse {
                 buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
             ]);
             // §5.2: "the most significant bit MUST be 0".
-            if v & (1 << 63) != 0 {
+            if v & (1 << 63) != 0 || v <= u16::MAX as u64 {
                 return WsHeaderParse::Invalid;
             }
             (10, v)

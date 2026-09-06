@@ -47,10 +47,10 @@ and add no second ABI.
 
 | Module | Role | Targets |
 | --- | --- | --- |
-| `http` | HTTP/1.1, HTTP/2 and HTTP/3 server and client; WebSocket upgrade; gRPC-over-HTTP/2 | rp2350, bcm2712 |
+| `http` | HTTP/1.1, HTTP/2 and HTTP/3 server and client; WebSocket upgrade; gRPC-over-HTTP/2 | rp2040 (H1 variants), rp2350, bcm2712 |
 | `websocket` | RFC 6455 HTTP/1.1 client: upgrade, verified accept, masked frames | bcm2712 |
 | `ws_stream` | `WsFrame` ⇄ `OctetStream` adapter for the server fan-out path | rp2350, bcm2712, linux, wasm |
-| `rtp` | RFC 3550 media endpoint, transmit and receive on one symmetric port, PCMU/G.711 | rp2350, bcm2712 |
+| `rtp` | RFC 3550 media endpoint, transmit and receive on one symmetric port; PCMU/G.711, H.264 and VP8 payloads, SRTP profiles, and a TURN relay path | rp2350, bcm2712 |
 | `sip` | RFC 3261 subset UAC/UAS for two-party PCMU voice — signalling only | rp2350, bcm2712 |
 | `jitter` | RTP reorder and loss-concealing playout adapter | rp2350, bcm2712 |
 | `smtp` | RFC 5321 mail submission client: lockstep ESMTP, optional SASL PLAIN on a confidential channel | bcm2712 |
@@ -67,15 +67,17 @@ WebSocket without being able to dial one.
 
 The TURN, SFrame and WebRTC session-description capabilities are
 codec cores, not modules: `turn_core` spells TURN messages and
-ChannelData without any relay existing, `sframe_core` is framing
-with nothing yet encrypting, and `webrtc_sdp` carries bounded
+ChannelData without any relay existing, `sframe_core` provides framing and
+a bounded anti-replay window (the AEAD remains an owned security-layer
+concern), and `webrtc_sdp` carries bounded
 session-description facts, not a WebRTC stack. Each is
 conformance-tested directly; none is deployable on its own.
 
-`http` ships as four variants selected in its manifest: `web`
+`http` ships as five variants selected in its manifest: `web`
 (HTTP/1.1 + WebSocket), `app` (HTTP/1.1 + the application fan-out,
-nothing else), `h2` (adds HTTP/2) and `full` (the default, adds
-HTTP/3). The split is about flash: a target takes only the protocol
+nothing else), `h2` (adds HTTP/2), `h1_exchange` (a minimal HTTP/1.1
+ordered exchange client), and `full` (the default, adds HTTP/3 and the
+application server). The split is about flash: a target takes only the protocol
 generations it serves. The variants form a lattice, not a chain
 (`web` and `app` are not subsets of each other).
 
@@ -128,7 +130,7 @@ make -C ../fluxor publish    # publish SDK, module palette, runtime into the sto
 Then, in this checkout:
 
 ```sh
-fluxor modules build --all   # build every module for rp2350, bcm2712, wasm
+fluxor modules build --all   # build every module for rp2040/rp2350/bcm2712, wasm
 ```
 
 [docs/guides/running.md](docs/guides/running.md) carries the smallest

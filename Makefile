@@ -14,8 +14,9 @@
 #
 # Shadow-tracked `tests/` and `examples/` (../standards/test-tracking.md) are
 # not targets either — `git shadow status` / `git shadow log` are one command
-# each, and the staging incantation lives in README.md where a reader without
-# the CLI installed can still find it.
+# each, and the staging incantation is printed by `tools/ci/shadow_guard.sh`
+# at the moment it is needed. It is not in README.md: a public document naming
+# shadow-tracked paths is what ../standards/documentation.md rules out.
 
 SHELL       := /bin/bash
 .SHELLFLAGS := -euo pipefail -c

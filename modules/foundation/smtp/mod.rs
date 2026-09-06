@@ -64,9 +64,8 @@
     reason = "the fluxor module ABI entry points (module_init/module_new/module_step): the \
               runtime owns these pointers and their validity is the ABI's contract, and the \
               signature is fixed by that contract rather than chosen here. Same allow as \
-              chronicle's and lattice's PIC modules carry. Newly required because \
-              `fluxor ci` clippies modules/** directly now that Wave has no root manifest \
-              for it to lint instead."
+              chronicle's and lattice's PIC modules carry, and required here because \
+              `fluxor ci` clippies modules/** directly."
 )]
 
 use core::ffi::c_void;

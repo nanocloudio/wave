@@ -12,13 +12,13 @@
 // and the ptime→byte-length policy are all the caller's, never this file's.
 //
 // The single implementation of the receive-side reorder and playout ring.
-// (`Complete Wave voice protocol ownership`, T4.3.7). Presentation-clock
-// adaptation is intentionally excluded — pacing lives in the composing module,
-// not hidden in the buffer. Behaviour is parity-exact with the origin ring;
-// the vectors live in `tests/harness/tests/sip_jitter_vectors.rs`.
+// Presentation-clock adaptation is deliberately excluded: pacing belongs to the
+// composing module, where it is visible and configurable, rather than hidden
+// inside a buffer that would then silently decide when audio is heard.
 
 /// Payload bytes held per slot — 20 ms of 8 kHz G.711 (`8000 * 0.02`).
 pub const JITTER_SLOT_SIZE: usize = 160;
+pub const JITTER_MID_MAX: usize = 32;
 
 /// Ring depth in packets — up to 320 ms of reorder tolerance at 20 ms ptime.
 pub const JITTER_MAX_SLOTS: usize = 16;
@@ -36,11 +36,22 @@ pub enum Playout {
     Silence,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct JitterPacketMeta {
+    pub timestamp: u32,
+    pub ssrc: u32,
+    pub payload_type: u8,
+    pub marker: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Slot {
     data: [u8; JITTER_SLOT_SIZE],
     seq: u16,
     len: u16,
+    meta: JitterPacketMeta,
+    mid: [u8; JITTER_MID_MAX],
+    mid_len: u8,
 }
 
 impl Slot {
@@ -49,6 +60,14 @@ impl Slot {
             data: [0u8; JITTER_SLOT_SIZE],
             seq: 0,
             len: 0,
+            meta: JitterPacketMeta {
+                timestamp: 0,
+                ssrc: 0,
+                payload_type: 0,
+                marker: false,
+            },
+            mid: [0; JITTER_MID_MAX],
+            mid_len: 0,
         }
     }
 }
@@ -61,6 +80,8 @@ pub struct JitterBuffer {
     fill_count: u16,
     packets_received: u32,
     packets_lost: u32,
+    last_meta: Option<JitterPacketMeta>,
+    last_mid: Option<([u8; JITTER_MID_MAX], u8)>,
 }
 
 impl Default for JitterBuffer {
@@ -79,6 +100,8 @@ impl JitterBuffer {
             fill_count: 0,
             packets_received: 0,
             packets_lost: 0,
+            last_meta: None,
+            last_mid: None,
         }
     }
 
@@ -92,6 +115,8 @@ impl JitterBuffer {
         self.fill_count = 0;
         self.packets_received = 0;
         self.packets_lost = 0;
+        self.last_meta = None;
+        self.last_mid = None;
     }
 
     /// Number of filled slots not yet played out — the caller's buffering gauge
@@ -119,6 +144,23 @@ impl JitterBuffer {
     /// holding this exact sequence is not overwritten. Returns `true` when the
     /// payload was stored.
     pub fn insert(&mut self, seq: u16, payload: &[u8]) -> bool {
+        self.insert_meta(seq, payload, JitterPacketMeta::default())
+    }
+
+    pub fn insert_meta(&mut self, seq: u16, payload: &[u8], meta: JitterPacketMeta) -> bool {
+        self.insert_meta_mid(seq, payload, meta, &[])
+    }
+
+    pub fn insert_meta_mid(
+        &mut self,
+        seq: u16,
+        payload: &[u8],
+        meta: JitterPacketMeta,
+        mid: &[u8],
+    ) -> bool {
+        if mid.len() > JITTER_MID_MAX {
+            return false;
+        }
         self.packets_received = self.packets_received.wrapping_add(1);
         if self.packets_received == 1 {
             self.play_seq = seq;
@@ -137,6 +179,10 @@ impl JitterBuffer {
             slot.data[..n].copy_from_slice(&payload[..n]);
             slot.seq = seq;
             slot.len = n as u16;
+            slot.meta = meta;
+            slot.mid = [0; JITTER_MID_MAX];
+            slot.mid[..mid.len()].copy_from_slice(mid);
+            slot.mid_len = mid.len() as u8;
             self.fill_count = self.fill_count.wrapping_add(1);
             true
         } else {
@@ -157,6 +203,8 @@ impl JitterBuffer {
 
         let slot = &mut self.slots[self.play_seq as usize % JITTER_MAX_SLOTS];
         let result = if slot.seq == self.play_seq && slot.len > 0 {
+            self.last_meta = Some(slot.meta);
+            self.last_mid = Some((slot.mid, slot.mid_len));
             let n = (slot.len as usize).min(output_len);
             dst[..n].copy_from_slice(&slot.data[..n]);
             if n < output_len {
@@ -165,6 +213,8 @@ impl JitterBuffer {
             slot.len = 0;
             Playout::Packet
         } else {
+            self.last_meta = None;
+            self.last_mid = None;
             dst.fill(ULAW_SILENCE);
             self.packets_lost = self.packets_lost.wrapping_add(1);
             Playout::Silence
@@ -175,5 +225,12 @@ impl JitterBuffer {
             self.fill_count -= 1;
         }
         Some(result)
+    }
+
+    pub const fn last_meta(&self) -> Option<JitterPacketMeta> {
+        self.last_meta
+    }
+    pub const fn last_mid(&self) -> Option<([u8; JITTER_MID_MAX], u8)> {
+        self.last_mid
     }
 }
