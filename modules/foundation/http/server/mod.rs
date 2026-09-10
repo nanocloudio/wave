@@ -60,8 +60,89 @@ server_mod!(
     reqbody,
     response,
     routes,
+    // The session anchor is server-class: the embedded variants omit it
+    // (`manifest.toml` `[[variant]]`), and a stub below keeps every call site
+    // in the fan-out path identical either way.
+    #[cfg(feature = "session")]
+    session,
     ws,
 );
+
+/// The anchor's surface with the feature off: a fan-out connection is never
+/// a session, worker 0's data pair is the only one, and every hook is a
+/// no-op. Same names, same shapes, so the fan-out path calls them
+/// unconditionally — `ws.rs` and `h1.rs`, and `h2.rs` and `h3.rs` where those
+/// are built.
+#[cfg(not(feature = "session"))]
+pub(crate) mod session {
+    use super::{ConnSlot, HttpState};
+
+    pub(crate) const SC_WORKERS: usize = 1;
+    pub(crate) const NO_WORKER: u8 = 0xFF;
+    pub const SP_NONE: u8 = 0;
+    pub(crate) const WS_CLOSE_SESSION_FAILED: u16 = 1011;
+
+    #[repr(C)]
+    pub(crate) struct SessionAnchor {
+        pub(crate) data_in: [i32; SC_WORKERS],
+    }
+    impl SessionAnchor {
+        pub(crate) fn init(&mut self) {
+            self.data_in = [-1; SC_WORKERS];
+        }
+        #[inline]
+        pub(crate) fn anchored(&self) -> bool {
+            false
+        }
+    }
+
+    pub(crate) unsafe fn resolve_ports(s: &mut HttpState) {
+        s.server.sc.data_in[0] = s.server.ws_in_chan;
+    }
+    pub(crate) unsafe fn validate(_s: &mut HttpState) -> i32 {
+        0
+    }
+    pub(crate) unsafe fn set_anchor_id(_s: &mut HttpState, _d: *const u8, _len: usize) {}
+    pub(crate) unsafe fn set_sessions_prefix(_s: &mut HttpState, _d: *const u8, _len: usize) {}
+    pub(crate) fn set_drain_ms(_s: &mut HttpState, _v: u32) {}
+    pub(crate) fn set_handoff_after_frames(_s: &mut HttpState, _v: u32) {}
+    /// `[attached, moved, swaps_completed, swaps_refused, misowned]`.
+    pub(crate) fn metrics(_s: &HttpState) -> [u32; 5] {
+        [0; 5]
+    }
+    #[inline]
+    pub(crate) unsafe fn cur_may_forward(_s: &HttpState) -> bool {
+        true
+    }
+    #[inline]
+    pub(crate) unsafe fn cur_data_out(s: &HttpState) -> i32 {
+        s.server.ws_out_chan
+    }
+    #[inline]
+    pub(crate) unsafe fn cur_note_forwarded(_s: &mut HttpState, _total: usize) {}
+    #[inline]
+    pub(crate) unsafe fn envelope_admitted(_s: &mut HttpState, _idx: usize, w: usize) -> bool {
+        w == 0
+    }
+    #[inline]
+    pub(crate) unsafe fn note_relayed(_s: &mut HttpState, _idx: usize, _total: usize) {}
+    #[inline]
+    pub(crate) unsafe fn cur_is_held(_s: &HttpState) -> bool {
+        false
+    }
+    #[inline]
+    pub(crate) unsafe fn cur_failed(_s: &HttpState) -> bool {
+        false
+    }
+    pub(crate) unsafe fn on_ws_open(_s: &mut HttpState) {}
+    pub(crate) unsafe fn on_slot_close(_s: &mut HttpState, _idx: usize) {}
+    pub(crate) unsafe fn on_ws_end(_s: &mut HttpState) {}
+    pub(crate) unsafe fn pump(_s: &mut HttpState) {}
+    pub(crate) fn slot_init(slot: &mut ConnSlot) {
+        slot.sc_phase = SP_NONE;
+        slot.sc_worker = NO_WORKER;
+    }
+}
 
 // What the core itself needs back from them. Short by design: everything else
 // flows the other way, from a subsystem reaching into the slot helpers below.
@@ -241,6 +322,14 @@ pub(crate) enum Phase {
     /// past the poll-timeout (`DrainSend` 504). No response bytes
     /// hit the wire until the outcome is known.
     AwaitFsStat = 22,
+
+    /// An HTTP/3 WebSocket tunnel's seat at the fan-out seam. In h3 mode the
+    /// connection table is otherwise unused, so each RFC 9220 tunnel on a
+    /// fan-out route takes a slot: its `conn_id` is the tunnel's H3 stream
+    /// slot index (the identity `WsFrame` envelopes name), `h3_stream` points
+    /// back, and the session anchor treats it exactly as an h1 upgrade. Never
+    /// stepped by the h1 phase machine; `h3::step_mux` drives it.
+    H3Tunnel = 26,
 
     Error = 255,
 }
@@ -519,6 +608,30 @@ pub(crate) struct ConnSlot {
     pub(crate) retained_replay_started: u8,
     _slot_pad2: [u8; 2],
 
+    // ── Session anchor (see `session.rs`) ──────────────────────────
+    //
+    // Present only on an anchored fan-out connection (`sc_phase != SP_NONE`).
+    /// The identity this anchor minted: `[anchor_id:8][conn_id:4][gen:4]`.
+    pub(crate) sc_session_id: [u8; 16],
+    /// Envelope bytes accepted onto the owning worker's channel — the
+    /// inbound delivery cursor.
+    pub(crate) sc_forwarded: u64,
+    /// Envelope bytes from the owning worker queued onto this connection's
+    /// send path — the outbound delivery cursor.
+    pub(crate) sc_relayed: u64,
+    /// `now_ms` when the current hold began; 0 outside a swap window.
+    pub(crate) sc_hold_start_ms: u64,
+    pub(crate) sc_epoch: u32,
+    /// `session::SP_*`.
+    pub(crate) sc_phase: u8,
+    /// Index of the worker serving this session; `session::NO_WORKER` when
+    /// none.
+    pub(crate) sc_worker: u8,
+    _sc_pad: u8,
+    /// `Phase::H3Tunnel` only: the `H3State.slots` index this slot fronts;
+    /// `-1` otherwise.
+    pub(crate) h3_stream: i16,
+
     /// Observability: monotonic-micros start of this request's
     /// `http.server.request` span, latched when the request head is parsed and
     /// the telemetry port is wired (`0` = no span). Keepalive reuses the slot,
@@ -600,6 +713,8 @@ unsafe fn slot_init_zero(slot: &mut ConnSlot) {
     // a *valid* conn id / route index, so they must be re-set to -1.
     slot.backend_conn_id = -1;
     slot.proxy_dyn_idx = -1;
+    slot.h3_stream = -1;
+    session::slot_init(slot);
 }
 
 /// Drain every pending `peer_identity` record onto its connection.
@@ -739,6 +854,9 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
             forget_peer(s, cid);
         }
     }
+    // An anchored session owes its workers a detach, for the same reason
+    // the closure below is reported here: every close path converges.
+    session::on_slot_close(s, idx);
     // A connection that opened owes a committed closure. Reported here, where
     // every path that ends a connection converges, so it is reported once and
     // for exactly the connections that opened — not where a close was
@@ -1096,6 +1214,9 @@ pub(crate) struct ServerState {
     /// this envelope can carry, and the request it would collide with has long
     /// since timed out.
     pub(crate) app_gen_next: u16,
+
+    /// The session anchor: SessionCtrlV1 to the fan-out workers.
+    pub(crate) sc: session::SessionAnchor,
 
     // ── Load-shedding counters ─────────────────────────────────────
     //
@@ -1840,6 +1961,7 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     // the table, shadow, bind records, and TableConsumer are zero-init.
     s.server.listeners_sink = -1;
     s.server.proxy_connect_owner = -1;
+    s.server.sc.init();
     s.server.port = 80;
     if let Some(cur) = cur_slot_mut(s) {
         cur.fs_fd = -1;
@@ -1924,6 +2046,10 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
         s.server.app_in_chan = dev_channel_port(sys, 0, 6);
         s.server.app_out_chan = dev_channel_port(sys, 1, 6);
     }
+    //   in[10]/out[3]  = ctrl_in / ctrl_out    (SessionCtrlV1, worker 0)
+    //   in[11]/out[10] = ctrl2_in / ctrl2_out  (SessionCtrlV1, standby)
+    //   in[12]/out[11] = ws2_in / ws2_out      (WsFrame, standby data)
+    session::resolve_ports(s);
 
     if s.server.route_count == 0 {
         let r0 = &mut *s.server.routes.as_mut_ptr().add(0);
@@ -2644,6 +2770,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // the drain check below, so a closure reported on the last connection is
     // handed over rather than stranded by the instance reporting itself done.
     ws::ws_flush_events(s);
+    // The session anchor's control plane: worker replies, the swap trigger
+    // and its deadline. Before the slot loop so a RESUMED lifts a hold in the
+    // same tick the slot is served.
+    session::pump(s);
 
     // Graceful-drain check, run before any per-slot work. Drain is
     // complete once `module_drain` has set the flag, the listener

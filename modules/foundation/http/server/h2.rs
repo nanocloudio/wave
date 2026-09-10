@@ -43,6 +43,7 @@ use super::super::connection::{net_proto, NET_BUF_SIZE, NET_CMD_SEND};
 use super::routes::HANDLER_APP;
 use super::routes::{
     HANDLER_FILE, HANDLER_GRPC, HANDLER_STATIC, HANDLER_TEMPLATE, HANDLER_WEBSOCKET,
+    HANDLER_WEBSOCKET_ADMIT, HANDLER_WEBSOCKET_FANOUT, HANDLER_WEBSOCKET_SESSION,
 };
 use super::{
     cur_conn_id, cur_h2, cur_h2_mut, cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_recv_len,
@@ -220,6 +221,11 @@ pub(crate) struct H2State {
     pub(crate) file_owner: i8,
     pub(crate) last_stream_id: u32,
     pub(crate) ws_active: u8, // 1 when any slot is WsActive (capped at one)
+    /// 1 when the last DATA frame for a fan-out tunnel was left unconsumed in
+    /// `recv_buf` because `ws_buf` already holds bytes it cannot take on top
+    /// of — which is what a held session looks like from here. The frame is
+    /// re-offered next tick rather than closed 1009. See `handle_data`.
+    pub(crate) ws_defer: u8,
     /// 1 if a WINDOW_UPDATE frame should be queued as soon as
     /// `send_buf` is free again. See `recv_window` below.
     pub(crate) window_update_pending: u8,
@@ -254,6 +260,7 @@ impl H2State {
             file_owner: -1,
             last_stream_id: 0,
             ws_active: 0,
+            ws_defer: 0,
             window_update_pending: 0,
             ws_buf_len: 0,
             ws_stream_id: 0,
@@ -904,13 +911,40 @@ unsafe fn active(s: &mut HttpState) -> i32 {
         }
     }
 
+    // No worker will serve this tunnel's session — the attach was refused,
+    // or a refused swap could not give it back. Close the tunnel `1011`
+    // rather than leave the peer holding a stream that answers nothing.
+    if cur_h2(s).ws_active != 0
+        && super::cur_ws_fan_out(s) != 0
+        && cur_send_len(s) == 0
+        && super::session::cur_failed(s)
+    {
+        queue_ws_close(s, super::session::WS_CLOSE_SESSION_FAILED);
+        return 2;
+    }
+
     // If we left a partial WS frame queue from a previous tick, try to
-    // drain another frame now that send_buf is free again.
-    if cur_h2(s).ws_active != 0 && cur_send_len(s) == 0 && cur_h2(s).ws_buf_len > 0 {
+    // drain another frame now that send_buf is free again. A fan-out tunnel
+    // drains to the seam and needs no send_buf.
+    if cur_h2(s).ws_active != 0
+        && cur_h2(s).ws_buf_len > 0
+        && (cur_send_len(s) == 0 || super::cur_ws_fan_out(s) != 0)
+    {
         ws_drain_buf(s);
         if cur_send_len(s) > 0 {
             return 2;
         }
+    }
+    // The worker's envelopes for this tunnel — and, since the drain routes by
+    // the envelope's own address, for any other fan-out connection. Each one
+    // is queued the way its target takes it: DATA frames on a tunnel, wire
+    // bytes in an h1 slot's `send_buf`.
+    if cur_h2(s).ws_active != 0
+        && super::cur_ws_fan_out(s) != 0
+        && cur_send_len(s) == 0
+        && super::ws::ws_drain_fanout_input(s)
+    {
+        return 2;
     }
 
     // If recv_buf doesn't yet hold a full frame, yield this tick.
@@ -971,9 +1005,14 @@ unsafe fn peek_frame_complete(s: &HttpState) -> FrameStatus {
     }
 }
 
-/// Process exactly one complete frame from the head of `recv_buf` and
-/// shift the remainder. Returns 0 normally, -1 if a connection-level
-/// error has been queued (caller should drain and close).
+/// Process exactly one complete frame from the head of `recv_buf` and shift
+/// the remainder.
+///
+/// Returns 0 normally; -1 if a connection-level error has been queued, so the
+/// caller should drain and close; -2 if the frame was left where it is for a
+/// tunnel that cannot take it yet, in which case nothing is shifted and the
+/// same frame is offered again next tick. Callers that only test for a
+/// negative result stop the loop either way, which is what both cases want.
 unsafe fn process_one_frame(s: &mut HttpState) -> i32 {
     let len = cur_recv_len(s) as usize;
     let hdr = match h2w::parse_header(cur_recv_buf_ptr(s), len) {
@@ -1003,11 +1042,10 @@ unsafe fn process_one_frame(s: &mut HttpState) -> i32 {
                     super::release_file_chan_external(s);
                 }
                 if slot_state == SlotState::WsActive {
-                    cur_h2_mut(s).ws_active = 0;
-                    cur_h2_mut(s).ws_buf_len = 0;
-                    cur_h2_mut(s).ws_stream_id = 0;
+                    end_tunnel(s);
+                } else {
+                    free_slot(s, idx);
                 }
-                free_slot(s, idx);
                 // If no Sending or Fetching slots remain, fall back
                 // to Active so the loop picks up Pending or new
                 // inbound work. A surviving Fetching slot keeps us in
@@ -1028,6 +1066,13 @@ unsafe fn process_one_frame(s: &mut HttpState) -> i32 {
         h2w::FRAME_CONTINUATION => Err(h2w::ERR_PROTOCOL_ERROR), // we cap headers at one frame
         _ => Ok(()), // unknown frame types are ignored per §5.5
     };
+
+    // A deferred tunnel frame stays at the head of `recv_buf`, unshifted,
+    // and the active loop yields until the seam takes frames again.
+    if cur_h2(s).ws_defer != 0 {
+        cur_h2_mut(s).ws_defer = 0;
+        return -2;
+    }
 
     // Shift consumed bytes off the front of recv_buf.
     let leftover = len - total;
@@ -1375,11 +1420,20 @@ unsafe fn handle_data(s: &mut HttpState, hdr: &h2w::Header, payload: *const u8) 
         return Err(h2w::ERR_PROTOCOL_ERROR);
     }
 
+    let idx = slot_for_id(s, hdr.stream_id);
+    // A tunnel frame the fan-out cannot take yet is deferred BEFORE the
+    // windows are charged, because it will be offered again.
+    if idx >= 0 && (*cur_h2(s).streams.as_ptr().add(idx as usize)).state == SlotState::WsActive {
+        let cur = cur_h2(s).ws_buf_len as usize;
+        if cur + hdr.length as usize > WS_BUF_SIZE && super::cur_ws_fan_out(s) != 0 && cur > 0 {
+            cur_h2_mut(s).ws_defer = 1;
+            return Ok(());
+        }
+    }
     // Account for the bytes against connection-level + stream-level
     // recv windows. The window doesn't care whether we kept the
     // payload or discarded it.
     consume_recv_window(s, hdr.length);
-    let idx = slot_for_id(s, hdr.stream_id);
     if idx >= 0 {
         consume_slot_recv_window(s, idx, hdr.length);
     }
@@ -1559,19 +1613,32 @@ unsafe fn accept_ws_upgrade(s: &mut HttpState, slot_idx: i8) {
         return;
     }
     let route = &*s.server.routes.as_ptr().add(matched as usize);
-    if route.handler != HANDLER_WEBSOCKET {
-        emit_response(
-            s,
-            stream_id,
-            b"404",
-            b"text/plain",
-            b"Not a WebSocket route\n",
-        );
+    let handler = route.handler;
+    let fan_out = handler == HANDLER_WEBSOCKET_FANOUT || handler == HANDLER_WEBSOCKET_SESSION;
+    if handler != HANDLER_WEBSOCKET && !fan_out {
+        // Admission-gated routes are not served over h2: the admission
+        // exchange is an h1 upgrade's, and answering the CONNECT before the
+        // application decided would open a socket nobody admitted.
+        let (status, body): (&[u8], &[u8]) = if handler == HANDLER_WEBSOCKET_ADMIT {
+            (
+                b"501",
+                b"Admission-gated WebSocket routes are served over HTTP/1.1\n",
+            )
+        } else {
+            (b"404", b"Not a WebSocket route\n")
+        };
+        emit_response(s, stream_id, status, b"text/plain", body);
         free_slot(s, slot_idx);
         return;
     }
     if let Some(cur) = super::cur_slot_mut(s) {
         cur.matched_route = matched;
+        // The tunnel rides the same `WsFrame` seam as an h1 upgrade, and
+        // is a session on an anchored instance in exactly the same way.
+        // Retention replay is an h1 loop's; an h2 tunnel never replays.
+        cur.ws_fan_out = u8::from(fan_out);
+        cur.retained_replay_started = 1;
+        cur.retained_replay_done = 1;
     }
 
     // 200 HEADERS, no END_STREAM (DATA frames will follow with WS
@@ -1591,14 +1658,22 @@ unsafe fn accept_ws_upgrade(s: &mut HttpState, slot_idx: i8) {
     }
 
     cur_h2_mut(s).ws_active = 1;
+    cur_h2_mut(s).ws_defer = 0;
     cur_h2_mut(s).ws_stream_id = stream_id;
     (*cur_h2_mut(s).streams.as_mut_ptr().add(slot_idx as usize)).state = SlotState::WsActive;
     log(s, b"[http] websocket upgraded (h2)");
+    if fan_out {
+        super::session::on_ws_open(s);
+    }
 }
 
 unsafe fn ws_handle_data(s: &mut HttpState, hdr: &h2w::Header, payload: *const u8) {
     let plen = hdr.length as usize;
     let cur = cur_h2(s).ws_buf_len as usize;
+    // A frame that would overflow an accumulator holding something is
+    // deferred by `handle_data` before it reaches here, so what is left is
+    // the frame that cannot fit an empty accumulator: too big to ever
+    // deliver, whoever is on the far side.
     if cur + plen > WS_BUF_SIZE {
         queue_ws_close(s, ws::CLOSE_MESSAGE_TOO_BIG);
         return;
@@ -1610,12 +1685,17 @@ unsafe fn ws_handle_data(s: &mut HttpState, hdr: &h2w::Header, payload: *const u
     ws_drain_buf(s);
 }
 
-/// Pop and echo as many complete RFC 6455 frames as possible from
-/// `ws_buf`. Stops when (a) the buffer holds only an incomplete frame
-/// or (b) `send_buf` is busy with a queued echo (next tick will retry
-/// after the wire drains).
+/// Pop as many complete RFC 6455 frames as possible from `ws_buf`: echoed
+/// here on a plain tunnel, handed across the seam on a fan-out one.
+///
+/// Stops when the buffer holds only an incomplete frame, when the seam
+/// refuses one (the session is held, and the frame is put back masked), or —
+/// on a plain tunnel only — when `send_buf` is busy with a queued echo. A
+/// fan-out tunnel does not touch `send_buf`, so it keeps going.
 pub(crate) unsafe fn ws_drain_buf(s: &mut HttpState) {
-    while cur_h2(s).ws_active != 0 && cur_send_len(s) == 0 && cur_h2(s).ws_buf_len > 0 {
+    let fan_out = super::cur_ws_fan_out(s) != 0;
+    while cur_h2(s).ws_active != 0 && (cur_send_len(s) == 0 || fan_out) && cur_h2(s).ws_buf_len > 0
+    {
         let buflen = cur_h2(s).ws_buf_len as usize;
         let frame = match ws::parse_frame(cur_h2(s).ws_buf.as_ptr(), buflen) {
             Ok(Some(f)) => f,
@@ -1645,22 +1725,43 @@ pub(crate) unsafe fn ws_drain_buf(s: &mut HttpState) {
         let mut consume_only = false;
         match frame.opcode {
             ws::OP_CLOSE => {
-                queue_ws_frame(s, ws::OP_CLOSE, pl_ptr, frame.payload_len as usize, true);
-                let ws_idx = slot_for_id(s, cur_h2(s).ws_stream_id);
-                if ws_idx >= 0 {
-                    free_slot(s, ws_idx);
+                if cur_send_len(s) != 0 {
+                    // The echo needs send_buf; try again once it drains.
+                    ws::unmask(pl_ptr, frame.payload_len, &frame.mask_key);
+                    return;
                 }
-                cur_h2_mut(s).ws_active = 0;
-                cur_h2_mut(s).ws_stream_id = 0;
-                cur_h2_mut(s).ws_buf_len = 0;
+                queue_ws_frame(s, ws::OP_CLOSE, pl_ptr, frame.payload_len as usize, true);
+                end_tunnel(s);
                 return;
             }
             ws::OP_PING => {
+                if cur_send_len(s) != 0 {
+                    ws::unmask(pl_ptr, frame.payload_len, &frame.mask_key);
+                    return;
+                }
                 queue_ws_frame(s, ws::OP_PONG, pl_ptr, frame.payload_len as usize, false);
             }
             ws::OP_PONG => consume_only = true, // drop silently
             ws::OP_TEXT | ws::OP_BINARY | ws::OP_CONTINUATION => {
-                queue_ws_frame(s, frame.opcode, pl_ptr, frame.payload_len as usize, false);
+                if fan_out {
+                    // Across the seam, exactly as an h1 upgrade's frames go.
+                    // A refusal — the session is held, or `ws_out` is full —
+                    // leaves the frame here to be offered again; the mask
+                    // goes back on because the retry unmasks it again.
+                    if !super::ws::ws_emit_fanout_frame(
+                        s,
+                        frame.opcode,
+                        u8::from(frame.fin),
+                        pl_ptr,
+                        frame.payload_len as usize,
+                    ) {
+                        ws::unmask(pl_ptr, frame.payload_len, &frame.mask_key);
+                        return;
+                    }
+                    consume_only = true;
+                } else {
+                    queue_ws_frame(s, frame.opcode, pl_ptr, frame.payload_len as usize, false);
+                }
             }
             _ => {
                 queue_ws_close(s, ws::CLOSE_PROTOCOL_ERROR);
@@ -1713,12 +1814,27 @@ unsafe fn queue_ws_frame(
 unsafe fn queue_ws_close(s: &mut HttpState, code: u16) {
     let payload = [(code >> 8) as u8, (code & 0xFF) as u8];
     queue_ws_frame(s, ws::OP_CLOSE, payload.as_ptr(), 2, true);
+    end_tunnel(s);
+}
+
+/// The tunnel is over (a CLOSE either way, or a reset): release its stream
+/// and, on an anchored instance, detach the session it was — the
+/// connection itself stays.
+unsafe fn end_tunnel(s: &mut HttpState) {
     let ws_idx = slot_for_id(s, cur_h2(s).ws_stream_id);
     if ws_idx >= 0 {
         free_slot(s, ws_idx);
     }
     cur_h2_mut(s).ws_active = 0;
+    cur_h2_mut(s).ws_defer = 0;
     cur_h2_mut(s).ws_stream_id = 0;
+    cur_h2_mut(s).ws_buf_len = 0;
+    if super::cur_ws_fan_out(s) != 0 {
+        super::session::on_ws_end(s);
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.ws_fan_out = 0;
+        }
+    }
 }
 
 // ── Request dispatch ──────────────────────────────────────────────────────

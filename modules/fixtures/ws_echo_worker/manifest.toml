@@ -1,0 +1,65 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+
+# CONFORMANCE FIXTURE for `foundation/http`'s session anchor — the far side
+# of the `WsFrame` seam that a swap moves. Not a product module, which is why
+# it lives in `modules/fixtures/`: `docs/specification.md` places the
+# application that owns a WebSocket's state outside Wave. What Wave does own is
+# the contract an anchored worker answers — SessionCtrlV1 attach / drain /
+# export / import / resume, the delivery cursors, the message-boundary rule —
+# and a contract with nothing on the far side of it is untested by
+# construction. `modules/common/ws_session_worker.rs` is the reusable half a
+# real worker mounts; this module is that core wrapped around the smallest
+# state that makes a swap OBSERVABLE: a per-session message count and the
+# partial message being accumulated.
+#
+# Each complete message is answered as `<tag>:<count>:<message>`, so a client
+# watching one connection sees which worker answered and that the count carried
+# across the swap.
+#
+# Continuity roles (capability_surface.md §Continuity Role): a movable session
+# worker with opaque export/import handoff. Consumed by the `continuity` config
+# block validator (class edge_anchored, `session.handoff` required on every
+# worker when two are declared).
+capabilities = ["session.worker", "session.handoff"]
+
+# SessionCtrlV1 commands from the anchor. `max_record` matches the anchor's
+# `CTRL_FRAME_MAX` plus the 3-byte header.
+[[ports]]
+name = "ctrl_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+# `WsFrame` envelopes from the anchor (client frames). Mailbox mode is REQUIRED
+# on this edge, as on every `WsFrame` edge: a write is one envelope.
+[[ports]]
+name = "data_in"
+index = 1
+direction = "input"
+content_type = "WsFrame"
+buffer_size = { default = 65600, bcm2712 = 131072 }
+max_record = 8192
+
+# SessionCtrlV1 replies to the anchor.
+[[ports]]
+name = "ctrl_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+# `WsFrame` envelopes toward the anchor (this worker's replies).
+[[ports]]
+name = "data_out"
+index = 1
+direction = "output"
+content_type = "WsFrame"
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "conformance fixture: observed through the MON_SESSION lines it emits and the replies the gates assert on"

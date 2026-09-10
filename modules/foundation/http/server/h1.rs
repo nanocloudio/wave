@@ -2309,6 +2309,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 // takes over.
                 if cur_ws_fan_out(s) != 0 {
                     s.server.latest_fanout_slot = s.server.cur_slot;
+                    // On an anchored instance the connection is now a
+                    // session: mint its identity and attach it to a worker.
+                    super::session::on_ws_open(s);
                 }
                 return 2;
             }
@@ -2398,6 +2401,18 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                 }
                 return 0;
+            }
+
+            // A session no worker will serve: the worker refused the attach,
+            // or would not take the session back after a refused swap. The
+            // connection is closed 1011 rather than left open and silent.
+            if super::session::cur_failed(s) {
+                let send_empty = cur_send_len(s) == 0;
+                let no_frag = cur_slot(s).map(|c| c.ws_frag_buf.is_null()).unwrap_or(true);
+                if send_empty && no_frag {
+                    ws_begin_close(s, super::session::WS_CLOSE_SESSION_FAILED);
+                    return 2;
+                }
             }
 
             // Draining: a tunnel is long-lived by construction, so waiting for
@@ -2626,6 +2641,12 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
                 return 0;
             }
+        }
+
+        Phase::H3Tunnel => {
+            // Owned by `h3::step_mux`; the h1 machine never steps it. Reached
+            // only if a tunnel slot were ever marked ready, which it is not.
+            return 0;
         }
 
         #[cfg(not(feature = "h2"))]

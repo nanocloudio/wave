@@ -7,16 +7,27 @@
 //! Like our HPACK implementation (`hpack.rs`), this module stores the
 //! QPACK static table (RFC 9204 Appendix A — 99 entries) inline as a
 //! `match` statement to avoid PIC relocation issues with const arrays.
-//! The dynamic table is intentionally not implemented; we plan to
-//! advertise `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` so the peer must
-//! not send dynamic-table references.
+//! The dynamic table is intentionally not implemented, and the module
+//! advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` and
+//! `SETTINGS_QPACK_BLOCKED_STREAMS = 0` (`modules/foundation/http/server/h3.rs`), so a peer must
+//! not send dynamic-table references and this decoder refuses any it sees.
 //!
-//! Status: static table, integer codec, block prefix, and field-line
-//! encode/decode — including Huffman-coded names and values, which
-//! RFC 9204 §4.1.2 takes unchanged from RFC 7541 Appendix B (shared with
-//! HPACK via `super::huffman`). `h3.rs` consumes all of it for its request
-//! decoder and response encoder; what is still missing above them is the
-//! pump loop and the QUIC transport binding, not header coding.
+//! # Continuity invariant
+//!
+//! As for HPACK (`hpack.rs`): with no dynamic table there is no
+//! compression context to carry between hosts, so an HTTP/3 connection's
+//! header state is nothing and the rest of its state is a record of
+//! integers a checkpoint can hold. Required Insert Count is pinned at
+//! zero on every block this module emits. Introducing a dynamic table
+//! here breaks connection continuity, not merely compression ratios
+//! (`docs/architecture/session_continuity.md` §HPACK and QPACK);
+//! `tests/harness/tests/header_compression_invariant.rs` holds it.
+//!
+//! The module covers the static table, the integer codec, the block
+//! prefix, and field-line encode/decode — including Huffman-coded names
+//! and values, which RFC 9204 §4.1.2 takes unchanged from RFC 7541
+//! Appendix B (shared with HPACK via `super::huffman`). `h3.rs` consumes
+//! all of it for its request decoder and response encoder.
 
 #[path = "../../../../target/fluxor/fluxor-abi/sdk/wire/varint.rs"]
 #[allow(

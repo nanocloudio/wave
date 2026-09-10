@@ -167,6 +167,7 @@ directly against each `mod.rs`. Wave has no root cargo workspace.
 - [docs/guides/running.md](docs/guides/running.md) — validated bring-up on a Linux host
 - [docs/specification.md](docs/specification.md) — the ownership boundary, per-module scope and declared limits
 - [docs/architecture/http3-ownership.md](docs/architecture/http3-ownership.md) — the HTTP/3 boundary and the stream-record seam with fluxor's `quic`
+- [docs/architecture/session_continuity.md](docs/architecture/session_continuity.md) — `http` as a Fluxor session anchor: the SessionCtrlV1 half of the WebSocket fan-out, the delivery cursors, the hold, and the h2/h3 tunnels on the same seam
 
 ## Licence
 

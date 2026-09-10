@@ -15,6 +15,21 @@
 //! (the wire encoding works regardless of dynamic table size); we
 //! treat those bytes as literal-without-indexing equivalents from a
 //! semantic standpoint, ignoring the indexing instruction.
+//!
+//! # Continuity invariant
+//!
+//! The absence of a dynamic table is load-bearing beyond flash and RAM:
+//! it is what keeps an HTTP/2 connection's state checkpointable. A
+//! dynamic table is a mutable compression context both endpoints evolve
+//! with every header block, and it cannot be reconstructed on another
+//! host without replaying the connection — so a connection carrying one
+//! can never be migrated (`docs/architecture/session_continuity.md` §HPACK and QPACK). With
+//! the encoder emitting static-table and literal forms only, and the
+//! decoder holding no state between blocks, the connection's header state
+//! is nothing, and its stream table and windows are a record of integers.
+//! A change that introduces a dynamic table here is therefore a change to
+//! connection continuity, not merely to compression ratios, and
+//! `tests/harness/tests/header_compression_invariant.rs` holds it.
 
 // ── Static table (RFC 7541 Appendix A) ────────────────────────────────────
 //
@@ -237,7 +252,7 @@ pub(crate) unsafe fn encode_string(
 /// connection setup. Dynamic-table-size-update directives (§6.3) are
 /// still parsed and discarded so non-conforming peers see a clean
 /// accept.
-pub(crate) unsafe fn decode_block<F>(buf: *const u8, len: usize, mut sink: F) -> Result<(), ()>
+pub unsafe fn decode_block<F>(buf: *const u8, len: usize, mut sink: F) -> Result<(), ()>
 where
     F: FnMut(&[u8], &[u8]),
 {
@@ -347,12 +362,7 @@ where
 /// is emitted as a literal string. The value is always literal.
 ///
 /// Returns the number of bytes written, or 0 on insufficient capacity.
-pub(crate) unsafe fn encode_header(
-    dst: *mut u8,
-    dst_cap: usize,
-    name: &[u8],
-    value: &[u8],
-) -> usize {
+pub unsafe fn encode_header(dst: *mut u8, dst_cap: usize, name: &[u8], value: &[u8]) -> usize {
     let idx = static_name_index(name);
     let o = if idx > 0 {
         let n = encode_integer(dst, dst_cap, 0x00, 4, idx);

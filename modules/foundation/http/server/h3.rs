@@ -187,6 +187,16 @@ pub struct H3StreamSlot {
     pub app_pending: bool,
     /// The application response is chunked and another envelope may follow.
     pub app_more: bool,
+    /// The tunnel's frames cross the `WsFrame` seam (a fan-out route) rather
+    /// than being echoed here. See `ws_stream_in`.
+    pub ws_fan_out: bool,
+    /// The connection-table slot fronting a fan-out tunnel at the seam
+    /// (`Phase::H3Tunnel`), or -1 until `step_mux` seats it.
+    pub conn_slot: i16,
+    /// Offset into the head h3 DATA frame's payload of the first RFC 6455
+    /// frame not yet taken: a fan-out refusal leaves the rest for the next
+    /// step rather than dropping it.
+    pub ws_pos: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +249,9 @@ impl H3StreamSlot {
             tmpl_pos: 0,
             app_pending: false,
             app_more: false,
+            ws_fan_out: false,
+            conn_slot: -1,
+            ws_pos: 0,
         }
     }
 
@@ -268,6 +281,9 @@ impl H3StreamSlot {
         self.tmpl_pos = 0;
         self.app_pending = false;
         self.app_more = false;
+        self.ws_fan_out = false;
+        self.conn_slot = -1;
+        self.ws_pos = 0;
     }
 
     pub fn pending_out(&self) -> usize {
@@ -1573,7 +1589,18 @@ pub(crate) unsafe fn dispatch_request_bounded(
     // meaning here (RFC 8441 §5.1, inherited by RFC 9220). The 200 alone is the
     // upgrade.
     if req.method_kind == H3_METHOD_CONNECT && (req.protocol_ws || req.protocol_webtransport) {
-        if handler != super::HANDLER_WEBSOCKET && handler != super::routes::HANDLER_APP {
+        // A WebSocket tunnel may also be a fan-out route: its frames then
+        // cross the `WsFrame` seam like an h1 upgrade's. WebTransport has no
+        // seam here and stays an application route.
+        let fan_out_ws = req.protocol_ws
+            && matches!(
+                handler,
+                super::routes::HANDLER_WEBSOCKET_FANOUT | super::routes::HANDLER_WEBSOCKET_SESSION
+            );
+        if handler != super::HANDLER_WEBSOCKET
+            && handler != super::routes::HANDLER_APP
+            && !fan_out_ws
+        {
             return not_implemented(peer_limit, handler, out);
         }
         let mut status = [0u8; 3];
@@ -2283,6 +2310,12 @@ pub(crate) unsafe fn pump_stream_in(
         }
     };
 
+    let fan_out = upgraded
+        && matched >= 0
+        && matches!(
+            (*s.server.routes.as_ptr().add(matched as usize)).handler,
+            super::routes::HANDLER_WEBSOCKET_FANOUT | super::routes::HANDLER_WEBSOCKET_SESSION
+        );
     let slot = &mut st.slots[idx];
     slot.send_buf[..n].copy_from_slice(&rendered[..n]);
     slot.send_len = n;
@@ -2291,7 +2324,10 @@ pub(crate) unsafe fn pump_stream_in(
     slot.recv_hdr_len = 0;
     if upgraded {
         slot.ws_active = true;
+        slot.ws_fan_out = fan_out;
+        slot.conn_slot = -1;
         slot.ws_buf_len = 0;
+        slot.ws_pos = 0;
         return H3StreamOutcome::WebSocketUpgraded(n);
     }
     if let Some(h) = not_shared_handler {
@@ -2313,15 +2349,37 @@ unsafe fn ws_stream_in(st: &mut H3State, idx: usize, data: &[u8]) -> H3StreamOut
         let room = H3_RECV_BUF - slot.ws_buf_len;
         if data.len() > room {
             // A frame larger than the accumulator can never complete. Close
-            // rather than buffer forever.
+            // rather than buffer forever. (For a fan-out tunnel on hold this
+            // is also the bound on the hold: the accumulator is the whole of
+            // what a held tunnel can absorb.)
             return ws_queue_close(st, idx, super::super::wire::ws::CLOSE_MESSAGE_TOO_BIG);
         }
         slot.ws_buf_len += data.len();
         let at = slot.ws_buf_len - data.len();
         slot.recv_hdr_buf[at..at + data.len()].copy_from_slice(data);
     }
+    // A fan-out tunnel's frames cross the seam from `tunnel_pump`, where the
+    // module state is held mutably; this pump is I/O-free and only holds the
+    // bytes. A plain tunnel is answered here.
+    if st.slots[idx].ws_fan_out {
+        return H3StreamOutcome::Buffered;
+    }
+    ws_stream_drain(st, None, idx)
+}
 
-    // Walk the h3 DATA frames, then the RFC 6455 frames inside them.
+/// Walk the h3 DATA frames held for a tunnel, and the RFC 6455 frames inside
+/// them, from where the last walk stopped.
+///
+/// `ws_pos` is the cursor into the HEAD frame's payload. A fan-out refusal
+/// (the session is held, `ws_out` is full) stops the walk with the cursor
+/// on the frame refused, and the h3 frame is kept whole until every RFC
+/// 6455 frame in it has been taken — so a refusal costs a retry, never a
+/// frame.
+unsafe fn ws_stream_drain(
+    st: &mut H3State,
+    mut seam: Option<&mut super::super::HttpState>,
+    idx: usize,
+) -> H3StreamOutcome {
     let mut consumed = 0usize;
     loop {
         let (frame_type, payload_range, total) = {
@@ -2335,12 +2393,22 @@ unsafe fn ws_stream_in(st: &mut H3State, idx: usize, data: &[u8]) -> H3StreamOut
                 None => break,
             }
         };
-        consumed += total;
         if frame_type != H3_FRAME_DATA {
-            continue; // grease or a frame with no meaning in a tunnel
+            consumed += total; // grease or a frame with no meaning in a tunnel
+            st.slots[idx].ws_pos = 0;
+            continue;
         }
-        if let Some(err) = ws_drain_payload(st, idx, payload_range) {
-            return err;
+        let from = payload_range.0 + st.slots[idx].ws_pos.min(payload_range.1 - payload_range.0);
+        match ws_drain_payload(st, seam.as_deref_mut(), idx, (from, payload_range.1)) {
+            WsDrain::Done => {
+                consumed += total;
+                st.slots[idx].ws_pos = 0;
+            }
+            WsDrain::Held(at) => {
+                st.slots[idx].ws_pos = at - payload_range.0;
+                break;
+            }
+            WsDrain::Ended(outcome) => return outcome,
         }
     }
 
@@ -2357,16 +2425,31 @@ unsafe fn ws_stream_in(st: &mut H3State, idx: usize, data: &[u8]) -> H3StreamOut
     }
 }
 
+/// The result of walking one h3 DATA payload's RFC 6455 frames.
+enum WsDrain {
+    /// Every frame in the payload was taken.
+    Done,
+    /// The walk stopped at this offset: the frame there is incomplete, or
+    /// the fan-out seam refused it. Offered again next step.
+    Held(usize),
+    /// The tunnel ended (a CLOSE, a protocol error).
+    Ended(H3StreamOutcome),
+}
+
 /// Parse and answer the RFC 6455 frames in one h3 DATA payload.
 ///
-/// Echo semantics, matching what `HANDLER_WEBSOCKET` already means for HTTP/1
-/// and HTTP/2 in this module — a route behaves the same way whichever
-/// generation reached it, which is the point of sharing the handler id.
+/// Echo semantics on a plain WebSocket route, matching what
+/// `HANDLER_WEBSOCKET` already means for HTTP/1 and HTTP/2 in this module —
+/// a route behaves the same way whichever generation reached it. On a
+/// fan-out route the data frames cross the `WsFrame` seam instead, through
+/// the tunnel's seat in the connection table, exactly as an h1 upgrade's do;
+/// control frames are answered here on either.
 unsafe fn ws_drain_payload(
     st: &mut H3State,
+    mut seam: Option<&mut super::super::HttpState>,
     idx: usize,
     range: (usize, usize),
-) -> Option<H3StreamOutcome> {
+) -> WsDrain {
     use super::super::wire::ws;
     let mut pos = range.0;
     while pos < range.1 {
@@ -2375,23 +2458,25 @@ unsafe fn ws_drain_payload(
             let slot = &st.slots[idx];
             match ws::parse_frame(slot.recv_hdr_buf.as_ptr().add(pos), avail) {
                 Ok(Some(f)) => f,
-                Ok(None) => break, // incomplete: wait for more DATA
-                Err(()) => return Some(ws_queue_close(st, idx, ws::CLOSE_PROTOCOL_ERROR)),
+                Ok(None) => return WsDrain::Held(pos), // incomplete: wait for more DATA
+                Err(()) => {
+                    return WsDrain::Ended(ws_queue_close(st, idx, ws::CLOSE_PROTOCOL_ERROR))
+                }
             }
         };
         let hdr = frame.header_len as usize;
         let plen = frame.payload_len as usize;
         if hdr + plen > avail {
-            break;
+            return WsDrain::Held(pos);
         }
         // RFC 6455 §5.3 / RFC 8441 §5.1: client-to-server frames are masked.
         if !frame.masked {
-            return Some(ws_queue_close(st, idx, ws::CLOSE_PROTOCOL_ERROR));
+            return WsDrain::Ended(ws_queue_close(st, idx, ws::CLOSE_PROTOCOL_ERROR));
         }
 
         let mut payload = [0u8; H3_WS_PAYLOAD_MAX];
         if plen > payload.len() {
-            return Some(ws_queue_close(st, idx, ws::CLOSE_MESSAGE_TOO_BIG));
+            return WsDrain::Ended(ws_queue_close(st, idx, ws::CLOSE_MESSAGE_TOO_BIG));
         }
         {
             let slot = &mut st.slots[idx];
@@ -2401,19 +2486,44 @@ unsafe fn ws_drain_payload(
 
         match frame.opcode {
             ws::OP_CLOSE => {
-                return Some(ws_queue_close(st, idx, ws::CLOSE_NORMAL));
+                return WsDrain::Ended(ws_queue_close(st, idx, ws::CLOSE_NORMAL));
             }
             ws::OP_PING => {
                 ws_queue_frame(st, idx, ws::OP_PONG, &payload[..plen]);
             }
             ws::OP_PONG => {}
+            _ if st.slots[idx].ws_fan_out => {
+                // Across the seam through the tunnel's seat. Without the
+                // module state (the I/O-free pump) or a seat (the upgrade's
+                // outcome seats it in the same step), the frame waits here.
+                let seat = st.slots[idx].conn_slot;
+                let Some(sm) = seam.as_deref_mut() else {
+                    return WsDrain::Held(pos);
+                };
+                if seat < 0 {
+                    return WsDrain::Held(pos);
+                }
+                let saved = sm.server.cur_slot;
+                sm.server.cur_slot = i32::from(seat);
+                let taken = super::ws::ws_emit_fanout_frame(
+                    sm,
+                    frame.opcode,
+                    u8::from(frame.fin),
+                    payload.as_ptr(),
+                    plen,
+                );
+                sm.server.cur_slot = saved;
+                if !taken {
+                    return WsDrain::Held(pos);
+                }
+            }
             _ => {
                 ws_queue_frame(st, idx, frame.opcode, &payload[..plen]);
             }
         }
         pos += hdr + plen;
     }
-    None
+    WsDrain::Done
 }
 
 /// Queue one server-to-client WebSocket frame, wrapped in an h3 DATA frame.
@@ -2445,6 +2555,145 @@ unsafe fn ws_queue_frame(st: &mut H3State, idx: usize, opcode: u8, payload: &[u8
     }
     slot.send_buf[slot.send_len..slot.send_len + total].copy_from_slice(&framed[..total]);
     slot.send_len += total;
+}
+
+/// The largest RFC 6455 payload one fan-out envelope may put on a tunnel
+/// stream at once: the stream's send buffer less the h3 DATA and WebSocket
+/// headers. Larger envelopes are fragmented by the fan-out
+/// (`ws::ws_queue_envelope_on_active`).
+pub(crate) const TUNNEL_FRAME_MAX: usize = H3_SEND_BUF - 24;
+
+/// Queue one server-to-client WebSocket frame on a fan-out tunnel's stream,
+/// with the caller's FIN — the fan-out's fragmentation path. Appends behind
+/// anything the stream still owes; a frame that does not fit is dropped,
+/// which `tunnel_busy` prevents by gating the caller on an empty stream.
+///
+/// # Safety
+/// `s` must be a live `HttpState`; `idx` an allocated tunnel slot.
+pub(crate) unsafe fn tunnel_queue_frame(
+    s: &mut super::super::HttpState,
+    idx: usize,
+    opcode: u8,
+    fin: bool,
+    payload: *const u8,
+    payload_len: usize,
+) {
+    if idx >= MAX_H3_STREAMS || payload_len > TUNNEL_FRAME_MAX {
+        return;
+    }
+    let mut ws_buf = [0u8; H3_SEND_BUF];
+    let n = super::super::wire::ws::write_frame(
+        ws_buf.as_mut_ptr(),
+        ws_buf.len(),
+        fin,
+        opcode,
+        payload,
+        payload_len,
+    );
+    if n == 0 {
+        return;
+    }
+    let mut hdr_buf = [0u8; 16];
+    let hdr = build_h3_frame_header(H3_FRAME_DATA, n, &mut hdr_buf);
+    let st = &mut *(&mut s.h3 as *mut H3State);
+    let slot = &mut st.slots[idx];
+    if hdr == 0 || slot.send_len + hdr + n > H3_SEND_BUF {
+        return;
+    }
+    slot.send_buf[slot.send_len..slot.send_len + hdr].copy_from_slice(&hdr_buf[..hdr]);
+    slot.send_buf[slot.send_len + hdr..slot.send_len + hdr + n].copy_from_slice(&ws_buf[..n]);
+    slot.send_len += hdr + n;
+}
+
+/// A tunnel stream still owes bytes to the transport: the fan-out waits
+/// before queueing another envelope on it.
+pub(crate) unsafe fn tunnel_busy(s: &super::super::HttpState, idx: usize) -> bool {
+    idx >= MAX_H3_STREAMS || s.h3.slots[idx].pending_out() > 0
+}
+
+/// Seat a freshly upgraded fan-out tunnel at the seam: a connection-table
+/// slot whose `conn_id` is the tunnel's stream slot index, attached as a
+/// session on an anchored instance.
+unsafe fn tunnel_seat(s: &mut super::super::HttpState, session: u32, stream: u64) {
+    let st = &mut *(&mut s.h3 as *mut H3State);
+    let Some(idx) = st.slots.iter().position(|sl| {
+        sl.allocated && sl.session_id == session && sl.stream_id == stream && sl.ws_active
+    }) else {
+        return;
+    };
+    if !st.slots[idx].ws_fan_out || st.slots[idx].conn_slot >= 0 {
+        return;
+    }
+    let Some(ci) = super::alloc_free_slot(s, idx as u16) else {
+        // No seat: the tunnel cannot reach the seam and is closed rather
+        // than left open and silent.
+        let _ = ws_queue_close(st, idx, super::super::wire::ws::CLOSE_GOING_AWAY);
+        return;
+    };
+    {
+        let slot = &mut *s.server.slots.as_mut_ptr().add(ci);
+        slot.phase = super::Phase::H3Tunnel;
+        slot.h3_stream = idx as i16;
+        slot.ws_fan_out = 1;
+        slot.retained_replay_started = 1;
+        slot.retained_replay_done = 1;
+    }
+    // Never stepped by the h1 machine.
+    super::ready_clear(s, ci);
+    st.slots[idx].conn_slot = ci as i16;
+    let saved = s.server.cur_slot;
+    s.server.cur_slot = ci as i32;
+    super::session::on_ws_open(s);
+    s.server.cur_slot = saved;
+}
+
+/// Drive the fan-out for every seated tunnel: release the seats of tunnels
+/// that have ended (detaching their sessions), continue any fragmentation in
+/// flight, and queue the workers' envelopes onto their streams.
+unsafe fn tunnel_pump(s: &mut super::super::HttpState) {
+    let saved = s.server.cur_slot;
+    let mut ci = 0;
+    while ci < super::MAX_CONCURRENT_CONNS {
+        let (phase, h3_idx) = {
+            let slot = &*s.server.slots.as_ptr().add(ci);
+            (slot.phase, slot.h3_stream)
+        };
+        if !matches!(phase, super::Phase::H3Tunnel) {
+            ci += 1;
+            continue;
+        }
+        let live = h3_idx >= 0 && {
+            let sl = &s.h3.slots[h3_idx as usize];
+            sl.allocated && sl.ws_active && sl.ws_fan_out && sl.conn_slot == ci as i16
+        };
+        if !live {
+            super::free_slot(s, ci);
+            ci += 1;
+            continue;
+        }
+        // Inbound: the frames this tunnel holds cross the seam now, with the
+        // module state in hand. `st` aliases `s.h3`, as the stream pump's own
+        // callers arrange; the seam touches nothing under it.
+        {
+            let st = &mut *(&mut s.h3 as *mut H3State);
+            let _ = ws_stream_drain(st, Some(&mut *s), h3_idx as usize);
+        }
+        s.server.cur_slot = ci as i32;
+        // No worker will serve this tunnel's session. Close it `1011`; the
+        // next pass sees a tunnel that is no longer live and frees the seat,
+        // which detaches.
+        if super::session::cur_failed(s) {
+            let st = &mut *(&mut s.h3 as *mut H3State);
+            let _ = ws_queue_close(st, h3_idx as usize, super::session::WS_CLOSE_SESSION_FAILED);
+            ci += 1;
+            continue;
+        }
+        // Outbound: one envelope per seated tunnel per step; the drain routes
+        // by the envelope's own address, so any tunnel's step serves them all.
+        let _ = super::ws::ws_drain_fanout_input(s);
+        ci += 1;
+    }
+    s.server.cur_slot = saved;
 }
 
 /// Queue a CLOSE frame and end the tunnel.
@@ -3612,6 +3861,14 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
                 outcome = o;
             }
         }
+        if matches!(outcome, H3StreamOutcome::WebSocketUpgraded(_))
+            && msg_type == mux::MSG_MUX_STREAM_RX
+            && n >= mux::STREAM_DATA_PREFIX
+        {
+            let session = mux::session_id(&frame[..n]);
+            let stream = u64::from(mux::stream_id(&frame[..n]));
+            tunnel_seat(s, session, stream);
+        }
         match outcome {
             H3StreamOutcome::StreamError(e) => {
                 // Reset the stream with the RFC 9114 §8.1 code. The peer
@@ -3643,6 +3900,13 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
             _ => {}
         }
     }
+
+    // The session anchor's control plane runs from here in h3 mode — the h1
+    // server step, which pumps it otherwise, never runs — then the fan-out
+    // tunnels: seats released, frames across the seam, envelopes queued
+    // onto streams.
+    super::session::pump(s);
+    tunnel_pump(s);
 
     // Egress: hand back as much as the channel will take, all-or-nothing per
     // frame (a partial mux frame would desync the transport's reader).

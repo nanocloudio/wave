@@ -25,6 +25,11 @@ front door. This page indexes the doc set.
   how one `http` instance serves many concurrent HTTP/1, HTTP/2 and
   WebSocket connections: slot table, step iterator, demux,
   backpressure, and the WebSocket and application fan-outs.
+- [architecture/session_continuity.md](architecture/session_continuity.md)
+  — `http` as a Fluxor session anchor: the SessionCtrlV1 control plane
+  behind the WebSocket fan-out, the delivery cursors, the hold that
+  covers a worker swap, and the HTTP/2 and HTTP/3 tunnels on the same
+  seam.
 
 ## Reference
 

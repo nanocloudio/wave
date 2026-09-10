@@ -189,6 +189,40 @@ pub(crate) unsafe fn ws_queue_frame_fin(
     payload: *const u8,
     payload_len: usize,
 ) {
+    // An HTTP/3 tunnel's frames ride h3 DATA frames on its stream, appended
+    // behind whatever the stream still owes; the slot's own `send_buf` is
+    // never used for a tunnel.
+    #[cfg(feature = "h3")]
+    if matches!(super::cur_phase(s), Phase::H3Tunnel) {
+        let idx = cur_slot(s).map_or(-1, |c| c.h3_stream);
+        if idx >= 0 {
+            super::h3::tunnel_queue_frame(s, idx as usize, opcode, fin, payload, payload_len);
+        }
+        return;
+    }
+    // An h2 tunnel's frames ride DATA frames on the tunnel stream; the RFC
+    // 6455 bytes are the same, which is what lets the fan-out and its
+    // fragmentation serve both generations from one place.
+    #[cfg(feature = "h2")]
+    if matches!(super::cur_phase(s), Phase::H2Active) {
+        use super::super::wire::h2 as h2w;
+        let buf = cur_send_buf_mut_ptr(s);
+        let written = ws::write_frame(
+            buf.add(h2w::FRAME_HEADER_LEN),
+            SEND_BUF_SIZE - h2w::FRAME_HEADER_LEN,
+            fin,
+            opcode,
+            payload,
+            payload_len,
+        );
+        let stream_id = super::cur_h2(s).ws_stream_id;
+        h2w::write_data_frame_header(buf, written, stream_id, false);
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+            cur.send_len = (h2w::FRAME_HEADER_LEN + written) as u16;
+        }
+        return;
+    }
     let written = ws::write_frame(
         cur_send_buf_mut_ptr(s),
         SEND_BUF_SIZE,
@@ -203,6 +237,42 @@ pub(crate) unsafe fn ws_queue_frame_fin(
     if let Some(cur) = cur_slot_mut(s) {
         cur.send_len = written as u16;
     }
+}
+
+/// The largest payload one wire fragment may carry on the current slot.
+///
+/// An h1 connection is bounded by `send_buf` less the frame header reserve;
+/// an h2 tunnel by the same, less the DATA frame header it is wrapped in; an
+/// h3 tunnel by its own stream send buffer (`h3::TUNNEL_FRAME_MAX`), which is
+/// not `send_buf` at all.
+pub(crate) unsafe fn ws_frag_max_chunk(s: &HttpState) -> usize {
+    let base = SEND_BUF_SIZE.saturating_sub(WS_FRAG_HDR_RESERVE);
+    #[cfg(feature = "h3")]
+    if matches!(super::cur_phase(s), Phase::H3Tunnel) {
+        return super::h3::TUNNEL_FRAME_MAX;
+    }
+    #[cfg(feature = "h2")]
+    if matches!(super::cur_phase(s), Phase::H2Active) {
+        return base.saturating_sub(super::super::wire::h2::FRAME_HEADER_LEN);
+    }
+    #[cfg(not(any(feature = "h2", feature = "h3")))]
+    let _ = s;
+    base
+}
+
+/// Whether slot `idx` is too busy to take another envelope onto its send
+/// path: its own `send_buf` still owes bytes, a fragmentation is in flight,
+/// or — for an HTTP/3 tunnel — its stream still owes bytes to the transport.
+unsafe fn target_send_busy(s: &HttpState, idx: usize) -> bool {
+    let slot = &*s.server.slots.as_ptr().add(idx);
+    if slot.send_len > slot.send_offset || !slot.ws_frag_buf.is_null() {
+        return true;
+    }
+    #[cfg(feature = "h3")]
+    if matches!(slot.phase, Phase::H3Tunnel) && slot.h3_stream >= 0 {
+        return super::h3::tunnel_busy(s, slot.h3_stream as usize);
+    }
+    false
 }
 
 /// Build a CLOSE frame carrying `code` (network-byte-order u16) and
@@ -244,11 +314,15 @@ pub(crate) use ws_frame::FRAME_HDR as WS_FRAME_HDR;
 /// fragments via the continuation path.
 pub(crate) const WS_FRAG_HDR_RESERVE: usize = 4;
 
-/// Emit a single inbound WS data frame on the `ws_out` port.
+/// Emit a single inbound WS data frame on the current session's data port —
+/// `ws_out` for worker 0, `ws2_out` for the standby.
 ///
 /// Returns whether the caller may now consume the source frame. `false` means
-/// only one thing — `ws_out` refused the write — and the caller must leave the
-/// frame buffered so the identical bytes are offered again next step.
+/// the frame was not taken, either because the channel refused the write or
+/// because the session is held mid-swap, and in both cases the caller must
+/// leave the frame buffered so the identical bytes are offered again. The two
+/// are the same instruction to the caller and differ only in how long they
+/// last: a full channel clears within a step or two, a hold within a window.
 ///
 /// The two `true`-with-no-delivery cases are deliberate and different from
 /// backpressure: an unwired port means nobody asked for the data, and an
@@ -263,12 +337,19 @@ pub(crate) unsafe fn ws_emit_fanout_frame(
     payload: *const u8,
     payload_len: usize,
 ) -> bool {
-    if s.server.ws_out_chan < 0 {
+    let out_chan = super::session::cur_data_out(s);
+    if out_chan < 0 {
         return true;
     }
     if WS_FRAME_HDR + payload_len > super::super::abi::CHANNEL_BUFFER_SIZE {
         s.server.ws_envelopes_dropped = s.server.ws_envelopes_dropped.wrapping_add(1);
         return true;
+    }
+    // An anchored session that is attaching or being swapped forwards
+    // nothing: the frame stays in `recv_buf` and is offered again once the
+    // session is serving (`session.rs` §The hold).
+    if !super::session::cur_may_forward(s) {
+        return false;
     }
     let mut frame_buf = [0u8; super::super::abi::CHANNEL_BUFFER_SIZE];
     ws_frame::put_header(
@@ -287,27 +368,33 @@ pub(crate) unsafe fn ws_emit_fanout_frame(
     }
     let total = WS_FRAME_HDR + payload_len;
     let sys = &*s.syscalls;
-    let poll = (sys.channel_poll)(s.server.ws_out_chan, super::super::POLL_OUT);
+    let poll = (sys.channel_poll)(out_chan, super::super::POLL_OUT);
     if poll <= 0 || (poll as u32 & super::super::POLL_OUT) == 0 {
         s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
         return false;
     }
-    if (sys.channel_write)(s.server.ws_out_chan, frame_buf.as_ptr(), total) <= 0 {
+    if (sys.channel_write)(out_chan, frame_buf.as_ptr(), total) <= 0 {
         s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
         return false;
     }
+    super::session::cur_note_forwarded(s, total);
     true
 }
 
-/// Try to read one outbound WsFrame from `ws_in` and queue it as a WS
-/// wire frame in `send_buf`. Returns true if a wire frame was queued,
-/// false if no data was available or the frame couldn't fit.
+/// Try to read one outbound WsFrame from a worker's data port and queue it
+/// toward the connection the envelope names. Returns true if a wire frame was
+/// queued, false if no data was available or the frame couldn't fit.
 ///
-/// Caller must guarantee `send_buf` is empty before calling — this
-/// function unconditionally overwrites it.
+/// Every worker's port is polled, not just worker 0's, and the envelope's own
+/// address picks the target slot — so any connection's step can serve any
+/// other's envelope. How the frame is queued is the target's business: an h1
+/// slot takes wire bytes in `send_buf`, an h2 tunnel a DATA frame, an h3
+/// tunnel a frame on its stream. `target_send_busy` is what holds an envelope
+/// back for a target that still owes bytes; a busy target's envelope is
+/// written back rather than dropped.
 ///
 /// **Fragmentation**: when the source envelope's payload exceeds
-/// `SEND_BUF_SIZE - WS_FRAG_HDR_RESERVE`, the message is split across
+/// `ws_frag_max_chunk` for the target, the message is split across
 /// multiple wire frames per RFC 6455 §5.4. The first fragment carries
 /// the original opcode (BINARY/TEXT) with `fin=0`; subsequent
 /// fragments carry `OP_CONTINUATION` with `fin=0`; the last carries
@@ -317,10 +404,6 @@ pub(crate) unsafe fn ws_emit_fanout_frame(
 /// from `ws_in` — preserving the message ordering guarantee that no
 /// other frame interleaves with the fragmented one on the wire.
 pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
-    if s.server.ws_in_chan < 0 {
-        return false;
-    }
-
     // If a fragmentation is in flight on the active slot, emit the
     // next continuation chunk — do not read a new frame from ws_in.
     let frag_in_flight = cur_slot(s)
@@ -330,8 +413,25 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
         return ws_emit_next_fragment(s);
     }
 
+    // Worker 0's channel is `ws_in`; a standby's is `ws2_in`. Each is
+    // offered in turn, and the first envelope that queues ends the call.
+    for w in 0..super::session::SC_WORKERS {
+        let chan = if w == 0 {
+            s.server.ws_in_chan
+        } else {
+            s.server.sc.data_in[w]
+        };
+        if chan >= 0 && ws_drain_fanout_from(s, w, chan) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read one envelope from worker `w`'s data channel `chan` and queue it on
+/// its target slot. See [`ws_drain_fanout_input`].
+unsafe fn ws_drain_fanout_from(s: &mut HttpState, w: usize, chan: i32) -> bool {
     let sys = &*s.syscalls;
-    let chan = s.server.ws_in_chan;
     let poll = (sys.channel_poll)(chan, POLL_IN);
     if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
         return false;
@@ -408,6 +508,13 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
         }
     };
 
+    // A session is spoken for by exactly one worker at a time. An envelope
+    // from any other — a detached worker still writing, a standby that has
+    // not been resumed — is not the session's and is dropped, counted.
+    if !super::session::envelope_admitted(s, target_idx, w) {
+        return false;
+    }
+
     // The target slot's send_buf must be empty before we overwrite
     // it. The active caller's own send_buf is empty by contract,
     // but the target's may not be. We've already consumed the
@@ -424,11 +531,7 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
     //
     // The hold is bounded by the target's send_buf drain time —
     // typically a handful of ticks.
-    let target_send_busy = {
-        let slot = &*s.server.slots.as_ptr().add(target_idx);
-        slot.send_len > slot.send_offset || !slot.ws_frag_buf.is_null()
-    };
-    if target_send_busy {
+    if target_send_busy(s, target_idx) {
         let _ = (sys.channel_write)(chan, frame_buf.as_ptr(), total);
         return false;
     }
@@ -451,6 +554,10 @@ pub(crate) unsafe fn ws_drain_fanout_input(s: &mut HttpState) -> bool {
     if !queued {
         return false;
     }
+    // Counted on queue, never on read: the write-back above means an
+    // envelope can be read more than once, and only the queue is the
+    // moment the client's prefix grows (`session.rs` §Delivery cursors).
+    super::session::note_relayed(s, target_idx, total);
 
     // Capture: append this envelope to the retention buffer so a
     // future fan-out connect can replay the producer's snapshot
@@ -488,7 +595,7 @@ pub(crate) unsafe fn ws_queue_envelope_on_active(
     payload: *const u8,
     payload_len: usize,
 ) -> bool {
-    let max_chunk = SEND_BUF_SIZE.saturating_sub(WS_FRAG_HDR_RESERVE);
+    let max_chunk = ws_frag_max_chunk(s);
     if payload_len <= max_chunk {
         ws_queue_frame_fin(s, opcode, fin, payload, payload_len);
         return true;
@@ -579,7 +686,7 @@ pub(crate) unsafe fn retain_capture_envelope(
 /// in-flight fragmentation. Frees `ws_frag_buf` and clears state on
 /// the final fragment (which carries the original `fin` bit).
 pub(crate) unsafe fn ws_emit_next_fragment(s: &mut HttpState) -> bool {
-    let max_chunk = SEND_BUF_SIZE.saturating_sub(WS_FRAG_HDR_RESERVE);
+    let max_chunk = ws_frag_max_chunk(s);
     let (buf, total, offset, orig_fin) = {
         let Some(cur) = cur_slot(s) else {
             return false;
@@ -694,6 +801,11 @@ pub(crate) unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
                     payload_ptr,
                     frame.payload_len as usize,
                 ) {
+                    // The payload was unmasked in place above; the retry
+                    // parses these same bytes and unmasks them again, so
+                    // put the mask back or a frame refused twice reaches
+                    // the worker scrambled.
+                    ws::unmask(payload_ptr, frame.payload_len, &frame.mask_key);
                     return false;
                 }
             } else {
@@ -1047,6 +1159,14 @@ pub(crate) unsafe fn ws_poll_admission(s: &mut HttpState, conn: u32) -> AdmitPol
 pub(crate) unsafe fn ws_idle_policy(s: &mut HttpState) -> Option<i32> {
     let limit = s.server.ws_idle_ms as u64;
     if limit == 0 {
+        return None;
+    }
+    // A session held mid-swap is silent because this end is not forwarding,
+    // not because the peer went away; the hold is charged to the clock when it
+    // lifts (`session::release_hold`). A session still waiting to attach is
+    // not exempt: nothing has been promised to the client yet, and the idle
+    // limit is the only thing that ends a wait on a worker that never answers.
+    if super::session::cur_is_held(s) {
         return None;
     }
     let (progress, ping_ms, send_len) = match cur_slot(s) {

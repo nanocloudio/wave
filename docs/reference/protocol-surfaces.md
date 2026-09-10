@@ -9,7 +9,7 @@ surface as a port content type.
 | --- | --- | --- |
 | `NetProto` | Network endpoint and framed transport commands/events | `http` (`net_in`/`net_out`), `rtp`, `websocket`, `s3` |
 | `OctetStream` | Unstructured application bytes | every module — HTTP bodies, `ws_stream` payloads, RTP PCMU audio, SIP datagrams, SMTP session bytes, S3 operation records |
-| `WsFrame` | Connection-addressed WebSocket frame envelope | `http` (`ws_in`/`ws_out`), `ws_stream` |
+| `WsFrame` | Connection-addressed WebSocket frame envelope | `http` (`ws_in`/`ws_out`, and `ws2_in`/`ws2_out` for a standby session worker), `ws_stream`, `ws_echo_worker` (fixture) |
 | `FmpMessage` | Structured control records | `http` (`variables`), `sip` (`call`) |
 | `Telemetry` | Observability records | `ws_stream` |
 | `AudioEncoded` | Codec-domain audio access units | not consumed — see below |
@@ -69,6 +69,17 @@ HTTP status rather than a socket that opens and goes quiet. The event
 port carries what happened rather than what was asked for: `opened`
 once the upgrade is on the wire, `closed` once the connection has
 actually ended, with its origin and close code.
+
+`http`'s `ctrl_out` / `ctrl_in` (and `ctrl2_out` / `ctrl2_in` for a
+standby) carry Fluxor's SessionCtrlV1 control plane on `OctetStream`,
+not a Wave-local layout: the same `[msg_type][len u16 LE][payload]`
+frames `echo_anchor` and `echo_worker` speak, decoded and encoded
+through the contract's accessors. They are how a fan-out WebSocket
+becomes a session a worker can be swapped behind
+(`docs/architecture/session_continuity.md`). `sessions_changes` /
+`sessions_sink` is the store subscription self-edge that carries the
+operator's swap trigger, in the same shape as `routes_changes` and
+`listeners_changes`.
 
 The admission request carries no transport facts. The accept event
 below carries a connection id and a local port and no peer address, and

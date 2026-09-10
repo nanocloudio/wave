@@ -119,6 +119,11 @@
 //! | 112   | authority   | str  | localhost | Client: Host / `:authority` (falls back to host_ip) |
 //! | 113   | method      | u8   | 1 (GET) | Client: request verb                                |
 //! | 114   | client_keep_alive | u8 | 0   | Client: reuse one connection across exchanges       |
+//! | 115   | ws_multi_client | u8 | 0     | WebSocket fan-out: addressed clients, no displacement |
+//! | 116   | anchor_id   | str  | WAVEHTTP | Session anchor: 16 hex chars naming this anchor   |
+//! | 117   | session_drain_ms | u32 | 500 | Session anchor: the swap window and DRAIN deadline |
+//! | 118   | handoff_after_frames | u32 | 0 | Session anchor: swap workers every N envelopes (0 = never) |
+//! | 119   | sessions_prefix | str | (none) | Session anchor: store prefix whose `active` row picks the worker |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -417,6 +422,17 @@ mod params_def {
         s.client.method = code;
     };
     114, client_keep_alive, u8, 0 => |s, d, len| { s.client.keep_alive = p_u8(d, len, 0, 0); };
+
+    // Session anchor (server/session.rs). All inert unless the anchor
+    // control ports are wired.
+    116, anchor_id, str, 0
+        => |s, d, len| { server::session::set_anchor_id(s, d, len); };
+    117, session_drain_ms, u32, 500
+        => |s, d, len| { server::session::set_drain_ms(s, p_u32(d, len, 0, 500)); };
+    118, handoff_after_frames, u32, 0
+        => |s, d, len| { server::session::set_handoff_after_frames(s, p_u32(d, len, 0, 0)); };
+    119, sessions_prefix, str, 0
+        => |s, d, len| { server::session::set_sessions_prefix(s, d, len); };
 
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };
@@ -732,6 +748,12 @@ pub unsafe extern "C" fn module_new(
             client::post_params(s);
         } else {
             server::post_params(s);
+            // An anchored instance that cannot move its sessions must not
+            // load: the refusal is a construction error, not a runtime one.
+            let rc = server::session::validate(s);
+            if rc != 0 {
+                return rc;
+            }
         }
 
         0
@@ -1118,6 +1140,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     23,
                     s.server.conns_evicted_idle as u64,
                 );
+                // ids 24-28: the session anchor. `sessions_moved` is the
+                // count continuity delivered; `swaps_refused` the count it
+                // declined to risk. All zero on a variant without `session`.
+                let sm = server::session::metrics(s);
+                for (k, v) in sm.iter().enumerate() {
+                    dev_telemetry_metric(sys, -1, midx, t, counter, 24 + k as u16, *v as u64);
+                }
             }
         }
 

@@ -41,10 +41,16 @@ capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 # small: the ws-attributable NAMED symbols in http-web.elf total ~1.2 KiB of its
 # 66 KiB, the rest being inlined into the shared request path. Worth doing only
 # against a specific flash target that the `web` variant misses.
+# `session` is the SessionCtrlV1 anchor (`server/session.rs`): the control
+# plane that lets a fan-out WebSocket's worker be swapped with the client's
+# connection open. Carried by the server-class shapes (`full`, `h2`,
+# `exchange`) and omitted from the embedded ones, where a transport anchor is
+# not the role a constrained device plays (protocol_surfaces.md §Target-Class
+# Fit) and its flash is. The ports it answers on are omitted with it.
 [[variant]]
 name = "web"
 features = ["h1", "ws"]
-omit_ports = ["req_out", "resp_in", "publish_in", "reply_out"]
+omit_ports = ["req_out", "resp_in", "publish_in", "reply_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 
 # h1 + the HANDLER_APP request/response fan-out, nothing else — the ingress
@@ -54,21 +60,20 @@ omit_capabilities = ["stream.ordered_ack.exchange"]
 [[variant]]
 name = "app"
 features = ["h1", "app"]
-omit_ports = ["publish_in", "reply_out"]
+omit_ports = ["publish_in", "reply_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 
 # h1 + h2 + ws — everything but HTTP/3.
 #
-# This variant was added, measured out BYTE-IDENTICAL to `full`, removed, and is
-# now back — because the fact underneath it changed. While h3 had no transport
-# nothing called it, `--gc-sections` dropped the whole layer, and excluding it
-# saved zero bytes. Now that `h3.rs` is reachable from `module_step` (the mux
-# pump), it is real code in the artefact and excluding it is a real saving.
-# The measured delta is in the module README, and `tools/ci/fmod_size_budget.sh`
-# holds both sizes.
+# The saving is real because `h3.rs` is reachable from `module_step` through the
+# mux pump: it is live code in `full`, so leaving it out is bytes off the
+# artefact rather than bytes `--gc-sections` would have dropped anyway. An
+# unreachable layer would make this variant byte-identical to `full` and not
+# worth carrying. The measured delta is in the module README, and
+# `tools/ci/fmod_size_budget.sh` holds both sizes.
 [[variant]]
 name = "h2"
-features = ["h1", "h2", "ws", "app"]
+features = ["h1", "h2", "ws", "app", "session"]
 omit_ports = ["publish_in", "reply_out"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 
@@ -83,15 +88,15 @@ omit_capabilities = ["stream.ordered_ack.exchange"]
 [[variant]]
 name = "h1_exchange"
 features = ["h1", "exchange"]
-omit_ports = ["req_out", "resp_in"]
+omit_ports = ["req_out", "resp_in", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
 
 [[variant]]
 name = "exchange"
-features = ["h1", "h2", "h3", "ws", "app", "exchange"]
+features = ["h1", "h2", "h3", "ws", "app", "exchange", "session"]
 
 [[variant]]
 name = "full"
-features = ["h1", "h2", "ws", "h3", "app"]
+features = ["h1", "h2", "ws", "h3", "app", "session"]
 omit_ports = ["publish_in", "reply_out"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 default = true
@@ -368,6 +373,22 @@ metrics = [
   "conns_timeout_idle",
   "conns_timeout_stall",
   "conns_evicted_idle",
+  # ids 24-28 are the session anchor (`server/session.rs`). All zero on an
+  # instance whose anchor ports are unwired.
+  #   24 = sessions_attached: fan-out connections a worker accepted.
+  #   25 = sessions_moved: sessions that changed worker with the client's
+  #        connection open — the number continuity delivered.
+  #   26 = swaps_completed: worker swaps that ran to the end.
+  #   27 = swaps_refused: sessions a swap left on the old worker (cursors
+  #        disagreed, the import failed, or the window closed).
+  #   28 = ws_envelopes_misowned: envelopes from a worker that does not own
+  #        the session they name, dropped. Non-zero means a worker wrote
+  #        after it was detached, which is a worker fault, not a load one.
+  "sessions_attached",
+  "sessions_moved",
+  "swaps_completed",
+  "swaps_refused",
+  "ws_envelopes_misowned",
 ]
 # Span 0: one `http.server.request` span per request (head parsed -> response
 # drained), SERVER kind. Minted only when a telemetry consumer is subscribed
@@ -503,3 +524,88 @@ buffer_size = 4096
 # authenticated client is silently anonymous, and the undelivered bytes desync
 # whatever follows.
 max_record = 195
+
+# ── Session anchor (SessionCtrlV1 to the fan-out workers) ──────────────
+#
+# The control plane that makes a fan-out WebSocket a Fluxor session
+# (`server/session.rs`, `docs/architecture/session_continuity.md`). Worker 0's
+# data plane IS `ws_out` / `ws_in`; its control pair is `ctrl_out` /
+# `ctrl_in`. A standby worker gets its own control AND data pairs
+# (`ctrl2_*`, `ws2_*`), following the `ctrl2` / `data2` shape of fluxor's
+# `echo_anchor`, because channels are static and the anchor's forwarding
+# flip is the activation. Every port here is inert until wired: an
+# instance with `ctrl_out` unwired anchors nothing and serves a plain
+# fan-out. The `web`, `app` and `h1_exchange` variants omit the `session`
+# feature and these ports with it.
+#
+# Control frames are SessionCtrlV1 TLVs; an export chunk is the largest.
+# `max_record` is the anchor's `CTRL_FRAME_MAX` plus the 3-byte header.
+[[ports]]
+name = "ctrl_in"
+index = 10
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "ctrl_out"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "ctrl2_in"
+index = 11
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "ctrl2_out"
+index = 10
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+# The standby's data plane: the same `WsFrame` envelopes as `ws_out` /
+# `ws_in`, with the same mailbox requirement and the same per-envelope
+# ceiling (see `ws_in` above for why `max_record` is what it is).
+[[ports]]
+name = "ws2_out"
+index = 11
+direction = "output"
+content_type = "WsFrame"
+
+[[ports]]
+name = "ws2_in"
+index = 12
+direction = "input"
+content_type = "WsFrame"
+buffer_size = { default = 65600, bcm2712 = 131072 }
+max_record  = 8192
+
+# Swap-trigger subscription self-edge. The graph self-wires `sessions_sink`
+# (out[12]) -> `sessions_changes` (in[13]) so the store's namespace.change
+# SUBSCRIBE for `sessions_prefix` has a module-owned sink; the row
+# `<prefix>active = <0|1>` names the worker new sessions attach to, and a
+# change away from the current one requests a swap. The operator's trigger,
+# following the `listeners_changes` precedent; `handoff_after_frames` is the
+# gates'. Both inert unless `sessions_prefix` is configured.
+[[ports]]
+name = "sessions_changes"
+index = 13
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "sessions_sink"
+index = 12
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096

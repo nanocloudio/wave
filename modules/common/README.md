@@ -1,7 +1,11 @@
 # `modules/common` — shared protocol cores
 
-Pure, `no_std`, I/O-free codecs mounted by Wave's `.fmod` modules. They are
-domain-neutral by construction: framing only, no session, no I/O, no allocation.
+Pure, `no_std`, I/O-free cores mounted by Wave's `.fmod` modules. They are
+domain-neutral by construction: no I/O, no allocation, and no knowledge of the
+module that mounts them. Most are framing only. A core that keeps state keeps
+it in the caller's storage and touches nothing else — `ws_session_worker` holds
+one array of sessions and moves bytes between them, which is why it can be the
+worker half of a handoff without owning a channel.
 
 Each file carries no inner attributes and no test module, so the PIC module
 build can `include!` it verbatim — every consumer compiles the same bytes. A
@@ -13,6 +17,7 @@ direct fixture in `tests/harness` and never presented as a deployable role.
 | `ws_frame_core` | RFC 6455 frame-header decode + validation | `websocket`, `http` (`wire::ws`) |
 | `ws_core` | RFC 6455 upgrade request/verify and the masked frame codec | `websocket` |
 | `ws_admit` | The server-side WS admission records (upgrade report, decision, events) | `http` |
+| `ws_session_worker` | The worker's half of session continuity for a `WsFrame` consumer: SessionCtrlV1 attach/drain/export/import/resume, the connection-to-session map, the delivery cursors, export gated on a message boundary | `ws_echo_worker` (fixture); a product worker outside Wave mounts it the same way |
 | `huffman_core` | RFC 7541 Appendix B Huffman table + decoder. RFC 9204 §4.1.2 specifies the SAME table for QPACK, so h2 and h3 share one transcription | `http` (`wire::hpack`, `wire::qpack`) |
 | `sip_core` | RFC 3261 PCMU-dialog message formatters + response/SDP parsers | `sip` |
 | `sip_dialog` | Bounded UAC/UAS dialog transaction machine — protocol-fact transitions | `sip` |
@@ -38,3 +43,5 @@ does not carry its own copy.
 
 Mount order matters where cores call each other: `ws_core` needs `sha1` and
 `b64_encode` in scope, so the SDK crypto sources are `include!`d before it.
+`ws_session_worker` needs the SDK's `../fluxor/modules/sdk/cores/session_handoff.rs`
+(the chunk walk and the cursors) before it, and the `session_ctrl` contract reachable as `sc`.
