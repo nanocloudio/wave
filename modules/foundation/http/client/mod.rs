@@ -52,14 +52,26 @@ pub(crate) const MAX_PATH_LEN: usize = 128;
 #[cfg(feature = "exchange")]
 pub(crate) const MAX_PATH_LEN: usize = 1024;
 
-/// Scratch for the composed request HEAD. Derived from `MAX_PATH_LEN`, never
-/// chosen independently: `write_request_head` fails closed when the head does
-/// not fit, so a buffer too small for the longest admissible path would refuse
-/// requests this client had already accepted.
 /// Smallest default body-output ring declared in the module manifest.
 pub(crate) const OUTPUT_CHUNK: usize = 256;
 pub(crate) const AUTHORITY_MAX: usize = 128;
-pub(crate) const REQUEST_BUF_SIZE: usize = MAX_PATH_LEN + AUTHORITY_MAX + CONTENT_TYPE_MAX + 192;
+
+/// Headers a graph-driven request may carry. Bounded like everything else on
+/// this path: a caller that needs more than this is composing a different
+/// request, not a longer one. The block a RESPONSE is answered with is a
+/// separate bound, `wire::response::RESPONSE_HEAD_MAX`.
+#[cfg(feature = "exchange")]
+pub(crate) const REQUEST_HEADERS_MAX: usize = 1024;
+#[cfg(not(feature = "exchange"))]
+pub(crate) const REQUEST_HEADERS_MAX: usize = 0;
+
+/// Scratch for the composed request HEAD. Derived from the bounds it has to
+/// hold — the path, the authority, the content type and a caller's own header
+/// block — never chosen independently: `write_request_head` fails closed when
+/// the head does not fit, so a buffer too small for the longest admissible
+/// request would refuse one this client had already accepted.
+pub(crate) const REQUEST_BUF_SIZE: usize =
+    MAX_PATH_LEN + AUTHORITY_MAX + CONTENT_TYPE_MAX + REQUEST_HEADERS_MAX + 192;
 
 /// One-shot param client: a small body configured at build time.
 #[cfg(not(feature = "exchange"))]
@@ -241,6 +253,13 @@ pub(crate) struct ClientState {
     pub(crate) recv_buf: [u8; RECV_BUF_SIZE],
     pub(crate) request_buf: [u8; REQUEST_BUF_SIZE],
     pub(crate) request_body: [u8; REQUEST_BODY_SIZE],
+    /// Headers a graph-driven request asked for, as the block they go on the
+    /// wire as. Empty for a request composed from params.
+    pub(crate) request_headers: [u8; REQUEST_HEADERS_MAX],
+    pub(crate) request_headers_len: u16,
+    /// Whether the request in flight asked to be answered with the whole
+    /// response -- its status and headers -- rather than with its body alone.
+    pub(crate) exchange_extended: u8,
 
     // ── Exchange mode (`stream.ordered_ack` with `reply = "yes"`) ──
     //
@@ -354,7 +373,7 @@ pub(crate) unsafe fn log(s: &HttpState, msg: &[u8]) {
 /// not know — a request that cannot be composed is not one to send in part.
 #[must_use]
 pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
-    let len = wire::h1::write_request_head(
+    let mut len = wire::h1::write_request_head(
         s.client.request_buf.as_mut_ptr(),
         REQUEST_BUF_SIZE,
         s.client.method,
@@ -369,6 +388,27 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
             keep_alive: s.client.keep_alive != 0,
         },
     );
+    // A caller's own headers go in ahead of the blank line that ends the
+    // head, which is the only place they can go and still be headers. Their
+    // bytes therefore decide where the head ends and what the origin reads as
+    // framing, so a block is admitted only after `exchange::header_block_ok`
+    // has read it as field lines naming nothing this module writes itself.
+    // The param client sets no block, so its length here is structurally 0.
+    let extra = s.client.request_headers_len as usize;
+    if len > 0 && extra > 0 {
+        if len + extra > REQUEST_BUF_SIZE {
+            return false;
+        }
+        let at = len - 2;
+        core::ptr::copy_nonoverlapping(
+            s.client.request_headers.as_ptr(),
+            s.client.request_buf.as_mut_ptr().add(at),
+            extra,
+        );
+        s.client.request_buf[at + extra] = b'\r';
+        s.client.request_buf[at + extra + 1] = b'\n';
+        len = at + extra + 2;
+    }
     s.client.request_len = len as u16;
     s.client.request_sent = 0;
     s.client.request_body_sent = 0;

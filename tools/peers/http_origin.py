@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """An HTTP/1.1 origin for the exchange-client E2E.
 
-Answers every request with a body that ECHOES THE PATH, and records each
-request line to <outfile>. Echoing the path is what makes the assertion
-meaningful: a reply carrying the path the graph built proves the request
-reached the origin, not merely that some response came back.
+Answers every request with a body that ECHOES THE PATH, and records the whole
+request head -- every line of it -- to <outfile>. Echoing the path is what
+makes the assertion meaningful: a reply carrying the path the graph built
+proves the request reached the origin, not merely that some response came
+back. Recording every line, not just the request line, is what lets a test
+assert on a header the graph sent.
 
 Binds the port it is given and serves until killed, so a graph that dials it
 more than once — a retry, a second publish — is answered every time rather
@@ -29,13 +31,17 @@ def serve(conn, out):
             if not chunk:
                 return
             data += chunk
-        head = data.split(b"\r\n", 1)[0]
+        # The whole head, so a test can assert on a header the graph sent
+        # and not only on the request line.
+        head = data.split(b"\r\n\r\n", 1)[0]
         out.write_bytes(head)
+        head = head.split(b"\r\n", 1)[0]
         parts = head.split(b" ")
         path = parts[1] if len(parts) > 1 else b"/"
         body = b"echo:" + path
         conn.sendall(
             b"HTTP/1.1 200 OK\r\n"
+            b"X-Origin-Note: seen\r\n"
             b"Content-Type: text/plain\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"Connection: close\r\n"

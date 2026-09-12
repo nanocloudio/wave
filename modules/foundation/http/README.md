@@ -88,7 +88,8 @@ Two shape the client's requests and its answers:
   status, and an error body is the answer — which is what most consumers want.
   Set, a status of 400 or above answers as a typed refusal carrying the code,
   so a producer can retry a 503 and discard a 404 without parsing a payload
-  whose shape it does not know.
+  whose shape it does not know. A record that asked for the whole response
+  carries its own status, so it is answered with the response either way.
 
 ## Connection lifetime
 

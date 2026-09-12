@@ -454,6 +454,14 @@ buffer_size = 8192
 # as a `Reply` carrying the body and echoing the request's `msg_key`, so a
 # downstream stage rejoins without holding state.
 #
+# The verb's high bit marks an extended record, which carries a header block
+# of its own and is answered with the status and the response's headers ahead
+# of the body (`client/exchange.rs`). Both forms ride the same ports and the
+# same payload ceiling; the headers come out of that budget rather than adding
+# to it. The caller's block is checked before the record is accepted — field
+# lines only, and none naming a field this client frames the request with —
+# because those bytes land in the request head and decide where it ends.
+#
 # Both are optional: a graph using the one-shot param client wires neither and
 # nothing changes for it.
 #

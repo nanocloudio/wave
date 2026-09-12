@@ -23,9 +23,24 @@ pub enum ResponseError {
     Unsupported,
 }
 
+/// The response header block the decoder keeps for a caller that asked for
+/// the whole response. Zero without the `exchange` feature, which is the only
+/// one that reads it.
+///
+/// Sized to the scratch a head arrives in, so a block that reached the
+/// decoder at all fits here: a longer head is refused as
+/// [`ResponseError::Oversize`] before it is ever parsed.
+#[cfg(feature = "exchange")]
+pub const RESPONSE_HEAD_MAX: usize = HEAD_SCRATCH;
+#[cfg(not(feature = "exchange"))]
+pub const RESPONSE_HEAD_MAX: usize = 0;
+
+/// Bytes of response head the decoder will accumulate before refusing it.
+const HEAD_SCRATCH: usize = 2048;
+
 pub struct ResponseDecoder {
     phase: Phase,
-    scratch: [u8; 2048],
+    scratch: [u8; HEAD_SCRATCH],
     len: usize,
     metadata: usize,
     remaining: u64,
@@ -34,6 +49,22 @@ pub struct ResponseDecoder {
     connect_request: bool,
     pub status: u16,
     pub reusable: bool,
+    /// The response's header block as it arrived, without the status line and
+    /// without the blank line that ends it.
+    ///
+    /// The decoder reads the headers it needs for framing and discards the
+    /// rest, which is all a body-only consumer wants. A consumer answering a
+    /// caller who asked for the response — not just its body — needs the ones
+    /// it did not parse: a content type, a location, an entity tag. Kept as
+    /// the bytes that arrived rather than a parse, because whichever field is
+    /// wanted is the caller's business and not this decoder's.
+    ///
+    /// Sized to nothing without the `exchange` feature: the graph-driven
+    /// client is the only caller that asks for the block, and a variant built
+    /// for a flash-constrained target should not carry the buffer for it.
+    /// Zero-length there, so nothing is kept and `head_len` stays 0.
+    pub head_bytes: [u8; RESPONSE_HEAD_MAX],
+    pub head_len: u16,
 }
 
 impl Default for ResponseDecoder {
@@ -46,7 +77,9 @@ impl ResponseDecoder {
     pub const fn new(head_request: bool, connect_request: bool) -> Self {
         Self {
             phase: Phase::Head,
-            scratch: [0; 2048],
+            scratch: [0; HEAD_SCRATCH],
+            head_bytes: [0; RESPONSE_HEAD_MAX],
+            head_len: 0,
             len: 0,
             metadata: 0,
             remaining: 0,
@@ -201,6 +234,21 @@ impl ResponseDecoder {
             + (status_line[11] - b'0') as u16;
         if !(100..=599).contains(&status) {
             return Err(ResponseError::Malformed);
+        }
+        // Keep the block before reading it: `at` walks the fields below and
+        // the scratch is reused for the body's framing afterwards.
+        let block_start = end + 2;
+        let block_end = self.len.saturating_sub(2).max(block_start);
+        let block = block_end - block_start;
+        if block <= self.head_bytes.len() {
+            self.head_bytes[..block].copy_from_slice(&self.scratch[block_start..block_end]);
+            self.head_len = block as u16;
+        } else {
+            // Only the zero-length build reaches this: `head_bytes` is sized
+            // to the scratch the head arrived in, so a block that got here
+            // fits. Kept whole or not at all — a block clipped to fit still
+            // parses as a block.
+            self.head_len = 0;
         }
         let mut length = None;
         let mut chunked = false;

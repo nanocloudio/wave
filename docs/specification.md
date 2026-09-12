@@ -247,6 +247,27 @@ ANSWERS, as opposed to a sink that only accepts. A request record is
 `corr` and echoing the publish's `msg_key` so a downstream stage
 rejoins it without holding state.
 
+The verb's high bit marks an extended record, which carries a header
+block of its own — `[method|0x80][path_len:u16 LE][body_len:u16 LE]
+[hdr_len:u16 LE][path…][headers…][body…]` — and is answered with the
+whole response rather than its body alone:
+`[status:u16 LE][hdr_len:u16 LE][headers…][body…]`. A caller answering
+somebody else needs both halves of that: a status tells a 204 from a
+200, and the headers carry the content type, the location, the entity
+tag.
+
+The caller's block is spliced into the request head, so its bytes decide
+where that head ends and what the origin reads as framing, and it is
+checked before the record is accepted: each line a field ending CRLF,
+none empty, none holding a stray CR or LF, each naming a field in token
+characters and carrying a value of printable ones. A block naming
+`Content-Length`, `Transfer-Encoding`, `Host` or `Connection` is refused
+with the rest — those are the fields this client frames the request
+with, and a second reading of where a request ends is how one request
+becomes two. An extended record is an HTTP/1.1 arrangement, and a client
+configured for h2c or HTTP/3 refuses one rather than perform a lesser
+request under its name.
+
 What Wave owns here is only the mapping between that surface and an
 HTTP request: the verb vocabulary, the head, and which reply status a
 failure earns. The surface itself, its frames and its correlation
