@@ -353,20 +353,39 @@ fn parse_status(path: &[u8]) -> Option<u16> {
     Some(v)
 }
 
-/// `wire::method::METHOD_*` → token. Duplicated from the http module rather
-/// than shared: a fixture that `include!`d the gateway's own table could not
-/// detect the gateway encoding a method wrongly, because both sides would be
-/// wrong together.
+/// Every token this fixture knows, end to end. Written independently of the
+/// http module's own literal rather than shared: a fixture that `include!`d
+/// the gateway's table could not detect the gateway encoding a method
+/// wrongly, because both sides would be wrong together.
+const TOKENS: &[u8] = b"GETCONNECTPOSTHEADPUTPATCHDELETEOPTIONSNONE";
+
+/// `(offset, length)` into [`TOKENS`] per `wire::method::METHOD_*` value,
+/// indexed by the value. Index 0 and anything past the table read as `NONE`.
+const TOKEN_SPAN: [(u8, u8); 9] = [
+    (39, 4), // METHOD_NONE
+    (0, 3),  // GET
+    (3, 7),  // CONNECT
+    (10, 4), // POST
+    (14, 4), // HEAD
+    (18, 3), // PUT
+    (21, 5), // PATCH
+    (26, 6), // DELETE
+    (32, 7), // OPTIONS
+];
+
+/// `wire::method::METHOD_*` → token.
+///
+/// Spans of one literal rather than a match returning eight different
+/// `&'static [u8]`, for the reason the http module's own table states: that
+/// match compiles to a table of pointers the flat `.fmod` image has no way to
+/// relocate (`tools/ci/fmod_pic_relocs.sh`).
 fn method_name(m: u8) -> &'static [u8] {
-    match m {
-        1 => b"GET",
-        2 => b"CONNECT",
-        3 => b"POST",
-        4 => b"HEAD",
-        5 => b"PUT",
-        6 => b"PATCH",
-        7 => b"DELETE",
-        8 => b"OPTIONS",
-        _ => b"NONE",
+    let (off, len) = match TOKEN_SPAN.get(m as usize) {
+        Some(&(off, len)) => (off as usize, len as usize),
+        None => (39, 4),
+    };
+    match TOKENS.get(off..off + len) {
+        Some(tok) => tok,
+        None => &[],
     }
 }

@@ -77,12 +77,26 @@ targets = ["rp2040", "rp2350", "bcm2712", "wasm"]
 #      constants that compile it (SDK profile + Wave sources) and diffed
 #      against docs/reference/envelope.md, so the ceiling a reader consults is
 #      the ceiling the module compiled.
+#   6. fmod_pic_relocs.sh — no module may store an address of its own image in
+#      its data. A `.fmod` is mapped at an arbitrary base with no relocations
+#      applied, so such an address is wrong at every read, and the shape that
+#      produces one is ordinary Rust a reviewer cannot see.
+#   7. http_exchange.sh — the exchange client against a real origin. It is here
+#      rather than under a manual E2E because the fault it guards lands between
+#      the connection opening and the first byte going out, where every
+#      HTTP-level check sees silence rather than an error.
+#   8. http_app_reply.sh — the application fan-out's reply half. A forwarded
+#      request whose answer is never composed leaves the connection open and
+#      silent, which reaches a client as a timeout and names no component.
 scripts = [
   "tools/ci/shadow_guard.sh",
   "tools/ci/host_crates.sh",
   "tools/ci/fmod_size_budget.sh",
   "tools/ci/identity_accessor_guard.sh",
   "tools/ci/envelope_table.sh",
+  "tools/ci/fmod_pic_relocs.sh",
+  "tools/e2e/http_exchange.sh",
+  "tools/e2e/http_app_reply.sh",
 ]
 
 [ci.hygiene]

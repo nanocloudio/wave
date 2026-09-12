@@ -67,19 +67,48 @@ pub fn method_from_token(tok: &[u8]) -> u8 {
     }
 }
 
+/// Every token end to end, so the one below can be a span of this rather than
+/// eight separate literals. Order is arbitrary; [`TOKEN_SPAN`] holds the
+/// offsets.
+const TOKENS: &[u8] = b"GETCONNECTPOSTHEADPUTPATCHDELETEOPTIONS";
+
+/// `(offset, length)` into [`TOKENS`] per method constant, indexed by the
+/// constant itself. [`METHOD_NONE`] and anything past the table is `(0, 0)`,
+/// which spans no bytes.
+const TOKEN_SPAN: [(u8, u8); 9] = [
+    (0, 0),  // METHOD_NONE
+    (0, 3),  // GET
+    (3, 7),  // CONNECT
+    (10, 4), // POST
+    (14, 4), // HEAD
+    (18, 3), // PUT
+    (21, 5), // PATCH
+    (26, 6), // DELETE
+    (32, 7), // OPTIONS
+];
+
 /// The token for a method constant — for logging, and for the `method` field
 /// an application module echoes back. Empty slice for [`METHOD_NONE`].
+///
+/// The span table holds integers, not string references, and that is
+/// load-bearing rather than a style choice. A `match` returning a different
+/// `&'static [u8]` per arm compiles to a table of `{pointer, length}` pairs
+/// that the linker fills with link-time absolute addresses and marks for
+/// relocation. A `.fmod` is a flat image mapped at whatever base the loader
+/// picks, with no relocations applied, so every pointer in such a table is
+/// wrong by the load address — and the first read of one walks off into
+/// unmapped memory. Offsets into a single literal need no relocation, and the
+/// one reference to `TOKENS` is materialised PC-relative like any other
+/// code-adjacent constant. `tools/ci/fmod_pic_relocs.sh` holds the rule for
+/// every module, because the same shape compiles the same way anywhere.
 pub fn method_name(m: u8) -> &'static [u8] {
-    match m {
-        METHOD_GET => b"GET",
-        METHOD_HEAD => b"HEAD",
-        METHOD_POST => b"POST",
-        METHOD_PUT => b"PUT",
-        METHOD_PATCH => b"PATCH",
-        METHOD_DELETE => b"DELETE",
-        METHOD_OPTIONS => b"OPTIONS",
-        METHOD_CONNECT => b"CONNECT",
-        _ => b"",
+    let (off, len) = match TOKEN_SPAN.get(m as usize) {
+        Some(&(off, len)) => (off as usize, len as usize),
+        None => return &[],
+    };
+    match TOKENS.get(off..off + len) {
+        Some(tok) => tok,
+        None => &[],
     }
 }
 

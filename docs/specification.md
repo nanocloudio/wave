@@ -186,6 +186,17 @@ bounded channels, explicit backpressure, target capability matching,
 declared timers, normal graph activation. They must not add a second
 socket, scheduler, module, or provider ABI.
 
+Position-independent here is stronger than the usual sense. A `.fmod`
+is the linked sections copied out as one flat image and mapped at
+whatever base the loader picks, with no relocations applied, so no
+address of the image may be stored in the image: code reaches its own
+constants PC-relatively, and data holds offsets rather than pointers.
+The shape that breaks this is ordinary Rust — a match over dense
+integers returning a different `&'static [u8]` per arm compiles to a
+table of pointers the linker expects to relocate — so
+`tools/ci/fmod_pic_relocs.sh` holds the rule across every module
+rather than leaving it to review.
+
 `http`, `rtp` and `s3` reach transports through `NetProto` and never
 call a host socket API. WebSocket protocol logic consumes an HTTP
 upgrade and exposes `WsFrame`; `ws_stream` adapts between `WsFrame`
