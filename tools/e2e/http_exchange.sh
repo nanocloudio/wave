@@ -194,10 +194,34 @@ headers = payload[4:4 + hdr_len]
 body = payload[4 + hdr_len:]
 assert headers.endswith(b"\r\n"), f"block does not end CRLF: {headers!r}"
 assert b"X-Origin-Note: seen\r\n" in headers, f"headers {headers!r}"
-assert body == b"echo:/typed", f"body {body!r}"
+# The body is not here. A reply is one record on a surface whose ceiling
+# every provider sizes its buffers from, so a response of any length cannot
+# be one: the head comes back on this frame and the body on its own stream.
+assert body == b"", f"body in the reply {body!r}"
 INNER
 )" || fail "extended: the reply did not decode"
-echo "   ok  reply leads with status 200 and the header block it describes, then the body"
+echo "   ok  reply is the status and the header block it describes, and no body"
+
+# And the body arrived on `file_ctrl`, in length-framed chunks ended by a
+# zero-length one. This is what makes the response unbounded: nothing about it
+# has to fit a record, and the head went first so a consumer can read the body
+# as it comes rather than after all of it has.
+python3 - "$WORK/runtime.log" <<'INNER' || fail "extended: the body did not stream whole"
+import sys
+raw = open(sys.argv[1], "rb").read()
+at = raw.find(b"\x0b\x00echo:/typed")
+assert at >= 0, f"no framed chunk carrying the body: {raw[-200:]!r}"
+body, at = b"", at
+while True:
+    n = int.from_bytes(raw[at:at + 2], "little")
+    at += 2
+    if n == 0:
+        break
+    body += raw[at:at + n]
+    at += n
+assert body == b"echo:/typed", f"body {body!r}"
+INNER
+echo "   ok  the body streamed in framed chunks, ended by a zero-length one"
 
 # Every way a block can reach into the request head. Each is refused
 # UNROUTABLE — the record is not one this provider will perform, as against

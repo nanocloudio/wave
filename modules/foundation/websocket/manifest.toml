@@ -30,6 +30,46 @@ direction    = "output"
 content_type = "OctetStream"
 buffer_size  = 2048
 
+# The addressed surface. `message_out`/`request_in` above serve a graph that
+# named one endpoint and one path and wants what comes back; these serve a
+# consumer holding several links, which needs to say which one it means. The
+# frame ports carry `WsFrame`, whose envelope Fluxor owns, so the link
+# identity, the opcode and the fin bit come from the contract rather than from
+# anything restated here.
+[[ports]]
+name         = "ws_in"
+index        = 2
+direction    = "input"
+content_type = "WsFrame"
+buffer_size  = 8192
+
+# `[conn: u8][path…]` — open that link on that resource. The endpoint stays
+# the graph's to name: a consumer chooses what to open, never where.
+[[ports]]
+name         = "open_in"
+index        = 3
+direction    = "input"
+content_type = "OctetStream"
+max_record   = 129
+buffer_size  = 1024
+
+[[ports]]
+name         = "ws_out"
+index        = 2
+direction    = "output"
+content_type = "WsFrame"
+buffer_size  = 8192
+
+# `[conn: u8][event: u8][code: u16 LE]` — a link opened, ended, or never
+# opened. What a frame has no room to say.
+[[ports]]
+name         = "event_out"
+index        = 3
+direction    = "output"
+content_type = "OctetStream"
+max_record   = 4
+buffer_size  = 256
+
 [[resources]]
 requires_contract = "channel"
 access            = "read"

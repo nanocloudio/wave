@@ -81,7 +81,7 @@ bcm2712|http-app.fmod|212000|196158 (2026-09-05, +9.1K since the 2026-08-16 row:
 bcm2712|http-exchange.fmod|367000|349111 (2026-09-10: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
 bcm2712|s3.fmod|22000|19647 (2026-08-16, first row; SigV4 signing connector)
 bcm2712|smtp.fmod|14000|13231 (2026-08-26, +3.7K: SASL PLAIN submission — base64 encoder, EHLO capability parsing, the AUTH phase, its credential buffers, and the volatile zeroing of every stack copy of a credential)
-bcm2712|websocket.fmod|16500|14934 (2026-09-07, current ABI and readiness hardening)
+bcm2712|websocket.fmod|18000|16518 (2026-09-14, per-link state and the addressed surface)
 '
 
 # subset|superset|target — the subset must be strictly smaller.

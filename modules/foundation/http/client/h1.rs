@@ -39,6 +39,55 @@ pub fn parse_status_line(head: &[u8]) -> u16 {
     }
 }
 
+/// Write the zero-length chunk that ends an extended body, if one is owed.
+///
+/// Answers whether the body is ended — `false` when the channel took only part
+/// of the chunk, and the caller must come back rather than move on. Owed means
+/// the head has gone and the closing chunk has not: before the head there is
+/// no stream for a consumer to be reading, and an unwired `file_ctrl` carries
+/// nothing to end.
+///
+/// The flags stay set afterwards until `complete` has seen them: clearing them
+/// here would leave it looking at an ordinary exchange and answering a second
+/// time, with an empty reply, for a correlation already spent.
+#[cfg(feature = "exchange")]
+unsafe fn end_extended_body(s: &mut HttpState) -> bool {
+    if s.client.exchange_extended == 0
+        || s.client.exchange_head_sent == 0
+        || s.client.exchange_terminated != 0
+    {
+        return true;
+    }
+    if s.client.out_chan >= 0 {
+        let sys = &*s.syscalls;
+        if s.client.ext_len == 0 {
+            let Some(framed) = super::exchange::write_chunk(&[], &mut s.client.ext_frame) else {
+                return false;
+            };
+            s.client.ext_len = framed as u16;
+            s.client.ext_sent = 0;
+        }
+        let sent = s.client.ext_sent as usize;
+        let left = s.client.ext_len as usize - sent;
+        let wrote = (sys.channel_write)(
+            s.client.out_chan,
+            s.client.ext_frame.as_ptr().add(sent),
+            left,
+        );
+        if wrote <= 0 {
+            return false;
+        }
+        s.client.ext_sent += wrote as u16;
+        if s.client.ext_sent < s.client.ext_len {
+            return false;
+        }
+        s.client.ext_len = 0;
+        s.client.ext_sent = 0;
+    }
+    s.client.exchange_terminated = 1;
+    true
+}
+
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     let now = dev_millis(&*s.syscalls);
     if !matches!(s.client.phase, Phase::Init | Phase::Done | Phase::Error) {
@@ -309,6 +358,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         }
                         s.client.h1_input_offset += used as u16;
                         s.client.last_status = s.client.response.status;
+                        // An extended exchange is answered as soon as there
+                        // is a head to answer with, so a consumer can read
+                        // the body as it arrives rather than after all of it
+                        // has.
+                        #[cfg(feature = "exchange")]
+                        if s.client.exchange_extended != 0 {
+                            super::exchange::send_head(s);
+                        }
                         s.client.bytes_received =
                             s.client.bytes_received.saturating_add(produced as u32);
                         // One request is outstanding: unsolicited bytes after its
@@ -337,10 +394,16 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             Phase::Writing => {
-                // Graph-driven: a reply is ONE frame, so the body is
-                // accumulated here rather than streamed to `file_ctrl`.
+                // Graph-driven, answering with the body alone: a reply is ONE
+                // frame, so the body is accumulated here rather than streamed.
+                //
+                // A caller that asked for the whole response takes the other
+                // path. Its body streams to `file_ctrl` as it arrives and its
+                // reply carries the head, because a response is not bounded by
+                // what one record may hold and this surface says a reply is
+                // exactly one of them.
                 #[cfg(feature = "exchange")]
-                if super::exchange::busy(s) {
+                if super::exchange::busy(s) && s.client.exchange_extended == 0 {
                     let off = s.client.pending_offset as usize;
                     let end = (s.client.recv_len as usize).max(off);
                     let src = s.client.recv_buf.as_ptr().add(off);
@@ -359,6 +422,57 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let out_chan = s.client.out_chan;
                 let offset = s.client.pending_offset as usize;
                 let remaining = (s.client.recv_len as usize) - offset;
+
+                // An extended body is written in length-framed chunks, and a
+                // zero-length one ends it. The reply has already gone, so
+                // nothing else says where the body stops: without a frame a
+                // consumer could not tell a pause from an ending.
+                #[cfg(feature = "exchange")]
+                if s.client.exchange_extended != 0 {
+                    // Compose the next chunk once, then send it from wherever
+                    // the last write got to.
+                    if s.client.ext_len == 0 {
+                        let take = remaining.min(super::EXT_CHUNK - super::exchange::CHUNK_HEAD);
+                        let bytes = core::slice::from_raw_parts(
+                            s.client.recv_buf.as_ptr().add(offset),
+                            take,
+                        );
+                        let Some(framed) =
+                            super::exchange::write_chunk(bytes, &mut s.client.ext_frame)
+                        else {
+                            s.client.phase = Phase::Error;
+                            return E_WRITE_FAILED;
+                        };
+                        s.client.ext_len = framed as u16;
+                        s.client.ext_sent = 0;
+                        s.client.pending_offset += take as u16;
+                    }
+                    let sent = s.client.ext_sent as usize;
+                    let left = s.client.ext_len as usize - sent;
+                    let wrote =
+                        (sys.channel_write)(out_chan, s.client.ext_frame.as_ptr().add(sent), left);
+                    if wrote < 0 {
+                        if wrote == E_AGAIN {
+                            return 0;
+                        }
+                        log(s, b"[http] write failed");
+                        s.client.phase = Phase::Error;
+                        return E_WRITE_FAILED;
+                    }
+                    if wrote > 0 {
+                        s.client.progress_ms = now;
+                    }
+                    s.client.ext_sent += wrote as u16;
+                    if s.client.ext_sent < s.client.ext_len {
+                        return 0;
+                    }
+                    s.client.ext_len = 0;
+                    s.client.ext_sent = 0;
+                    if s.client.pending_offset >= s.client.recv_len {
+                        s.client.phase = Phase::RecvBody;
+                    }
+                    return 0;
+                }
 
                 let written = (sys.channel_write)(
                     out_chan,
@@ -386,6 +500,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             Phase::Done => {
+                // The chunk that ends an extended body, before anything else
+                // here: a consumer reading the stream has no other way to
+                // learn the response is whole.
+                #[cfg(feature = "exchange")]
+                if !end_extended_body(s) {
+                    return 0;
+                }
                 #[cfg(not(feature = "exchange"))]
                 let reuse = false;
                 #[cfg(feature = "exchange")]
@@ -422,8 +543,17 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // A failed exchange is still an answer: the contract admits
                 // no silent drops, so the producer gets a typed refusal
                 // rather than waiting out its own timeout.
+                //
+                // A body that started has to end the same way a whole one
+                // does. Without the closing chunk a consumer cannot tell a
+                // response that failed from one still arriving, and it is the
+                // only thing left to tell it with — the one reply this
+                // exchange had was spent on the head.
                 #[cfg(feature = "exchange")]
                 {
+                    if !end_extended_body(s) {
+                        return 0;
+                    }
                     super::exchange::fail(s);
                     if super::exchange::armed(s) {
                         // The same rule on the failure path: the refusal

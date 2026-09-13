@@ -54,6 +54,11 @@ pub(crate) const MAX_PATH_LEN: usize = 1024;
 
 /// Smallest default body-output ring declared in the module manifest.
 pub(crate) const OUTPUT_CHUNK: usize = 256;
+
+/// One framed chunk of an extended body. Larger than `OUTPUT_CHUNK`, which
+/// bounds the raw stream of the one-shot client, because a framed chunk
+/// carries its own length and the port it goes to was sized for it.
+pub(crate) const EXT_CHUNK: usize = 1024;
 pub(crate) const AUTHORITY_MAX: usize = 128;
 
 /// Headers a graph-driven request may carry. Bounded like everything else on
@@ -260,6 +265,26 @@ pub(crate) struct ClientState {
     /// Whether the request in flight asked to be answered with the whole
     /// response -- its status and headers -- rather than with its body alone.
     pub(crate) exchange_extended: u8,
+    /// Whether the head of that response has already been answered.
+    ///
+    /// An extended exchange answers as soon as the head is known, not when
+    /// the body ends: a consumer building a response needs the status before
+    /// it can decide what to do with the bytes, and one that waits for the
+    /// body before learning the status cannot stream at all -- it must hold
+    /// the whole of it first, which is the bound this exists to remove.
+    pub(crate) exchange_head_sent: u8,
+    /// Whether the zero-length chunk that ends the body has been written.
+    pub(crate) exchange_terminated: u8,
+    /// One framed chunk of an extended body, and how much of it has left.
+    ///
+    /// A channel may take part of a write, and the raw stream handles that by
+    /// advancing. A framed chunk cannot: rewriting it from the start after a
+    /// short write puts its prefix on the wire twice, and a reader counting
+    /// lengths then reads everything after it wrong. So the frame is composed
+    /// once and sent from where it got to.
+    pub(crate) ext_frame: [u8; EXT_CHUNK],
+    pub(crate) ext_len: u16,
+    pub(crate) ext_sent: u16,
 
     // ── Exchange mode (`stream.ordered_ack` with `reply = "yes"`) ──
     //
@@ -391,9 +416,10 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
     // A caller's own headers go in ahead of the blank line that ends the
     // head, which is the only place they can go and still be headers. Their
     // bytes therefore decide where the head ends and what the origin reads as
-    // framing, so a block is admitted only after `exchange::header_block_ok`
-    // has read it as field lines naming nothing this module writes itself.
-    // The param client sets no block, so its length here is structurally 0.
+    // framing, so a block is admitted only after the record parser
+    // (`modules/common/http_exchange_wire.rs`) has read it as field lines naming
+    // nothing this module writes itself. The param client sets no block, so
+    // its length here is structurally 0.
     let extra = s.client.request_headers_len as usize;
     if len > 0 && extra > 0 {
         if len + extra > REQUEST_BUF_SIZE {

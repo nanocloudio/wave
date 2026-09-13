@@ -32,6 +32,8 @@ direct fixture in `tests/harness` and never presented as a deployable role.
 | `hex_core` | ASCII hex, for byte-valued module parameters and bounded evidence lines | `websocket`, `smtp`, `s3`, `rtp` |
 | `s3_core` | AWS SigV4 request signing for S3-compatible endpoints — canonical-form construction and key derivation over SDK-owned SHA-256/HMAC | `s3` |
 | `s3_wire` | The connector's request/response records (`S3Request`/`S3Response`) — the client-side mirror of `http`'s application fan-out | `s3` |
+| `http_exchange_wire` | The HTTP client's exchange records: the request, the reply head, and one streamed body chunk. Mounted by the client AND by the producer composing them, so the layouts are written once | `http` (`client::exchange`); consumers outside Wave |
+| `ws_control_wire` | What a `WsFrame` has no room to say: which resource to open, what became of a link, and how many links a connector carries | `websocket`; consumers outside Wave |
 | `stun_core` | RFC 5389 message mechanics: header, attribute walk, MESSAGE-INTEGRITY, FINGERPRINT, long-term credential key. RFC 5769-pinned | `stun` |
 | `turn_core` | TURN's relay extension to STUN: allocate/refresh/permission/channel methods, relay attributes, ChannelData framing | — (direct fixture only; no module presents relay mechanics it does not have) |
 | `sframe_core` | RFC 9605 SFrame framing: clear header, sealed payload boundary, what a cipher must authenticate. All 289 published header vectors. Framing, not encryption | — (direct fixture only) |

@@ -12,30 +12,22 @@
 //!
 //! # The request record
 //!
-//! `Publish.payload` carries:
-//!
-//! ```text
-//! [method:u8][path_len:u16 LE][body_len:u16 LE][path…][body…]
-//! ```
+//! The records themselves are `modules/common/http_exchange_wire.rs`, which
+//! this module mounts and a producer outside Wave mounts too -- so the
+//! layouts are written once and the two ends cannot drift. What is here is
+//! what this client DOES with them.
 //!
 //! # Asking for the whole response
 //!
-//! The verb's high bit marks an extended record. Verb codes are small, so the
-//! bit is free, and a producer that leaves it clear composes and reads the
-//! plain record above.
+//! The verb's high bit marks an extended record: answer me with the response
+//! and not its body alone. The reply carries the head and goes first; the
+//! BODY streams on `file_ctrl` as it arrives and ends with a zero-length
+//! chunk.
 //!
-//! ```text
-//! [method|0x80][path_len:u16 LE][body_len:u16 LE][hdr_len:u16 LE]
-//! [path…][headers…][body…]
-//! ```
-//!
-//! `headers` is the caller's own block as it goes on the wire, each line
-//! ending CRLF. The reply to such a record carries the response rather than
-//! its body alone:
-//!
-//! ```text
-//! [status:u16 LE][hdr_len:u16 LE][headers…][body…]
-//! ```
+//! A reply is one record on a surface whose ceiling every provider
+//! sizes its buffers from (`exchange::PAYLOAD_MAX`), so a response of any
+//! length cannot be one: streaming the body is what keeps the reply inside
+//! that ceiling and leaves the response unbounded.
 //!
 //! Both are what a caller answering somebody else needs and a body cannot
 //! supply: a status tells a 204 from a 200 and a redirect from either, and
@@ -83,136 +75,14 @@ use super::super::exchange::{
 use super::super::HttpState;
 use super::{Phase, EXCHANGE_KEY_MAX, EXCHANGE_REPLY_MAX};
 
-/// Fixed head of a request record: `method` + the two lengths.
-const REQ_HEAD: usize = 1 + 2 + 2;
-
-/// The bit on the verb that marks an extended record: one carrying a header
-/// block, and asking to be answered with the whole response.
-pub(crate) const EXTENDED: u8 = 0x80;
-
-/// Fixed head of an extended reply: the status, and the length of the header
-/// block that follows it.
-///
-/// ```text
-/// [status:u16 LE][hdr_len:u16 LE][headers…][body…]
-/// ```
-pub(crate) const RESP_HEAD: usize = 2 + 2;
+// The records this module reads and writes. Mounted rather than restated:
+// a producer outside Wave mounts the same file, so an offset written here
+// would be an offset that could disagree with one written there.
+include!("../../../common/http_exchange_wire.rs");
 
 /// The 3-byte channel envelope (`[msg_type][len:u16 LE]`) every frame on this
 /// pair rides, as `net_read_frame`/`net_write_frame` compose it elsewhere.
 const ENVELOPE: usize = 3;
-
-/// ASCII case-insensitive comparison against an already-lower-case name.
-fn eq_name(name: &[u8], lower: &[u8]) -> bool {
-    if name.len() != lower.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < name.len() {
-        if name[i].to_ascii_lowercase() != lower[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-/// Whether a field name may appear in a caller's block.
-///
-/// Token characters only — no space, tab, control or DEL. Space is the one
-/// that matters: `Host : x` reads as the name `Host` to a peer that trims and
-/// as `Host ` to one that does not, and a rule keyed on the name has to agree
-/// with whoever reads it next.
-///
-/// Then the four this module frames the request with. A second
-/// `Content-Length`, or a `Transfer-Encoding` beside the one computed from
-/// the record's body, leaves two readings of where the request ends, and a
-/// pair of peers that disagree take the next request off the connection as
-/// this one's body. `Host` is the origin's routing key and `Connection` is
-/// what this client's own keep-alive state is read from. `Content-Type` is
-/// deliberately not among them: naming the body it is sending is the main
-/// thing a caller wants the block for.
-///
-/// Each name is compared against its own literal rather than looked up in a
-/// table of references: a table of `&[u8]` is the shape that compiles to
-/// pointers a flat module image cannot relocate
-/// (`tools/ci/fmod_pic_relocs.sh`).
-fn field_name_ok(name: &[u8]) -> bool {
-    let mut i = 0;
-    while i < name.len() {
-        if name[i] <= 0x20 || name[i] == 0x7F {
-            return false;
-        }
-        i += 1;
-    }
-    !eq_name(name, b"content-length")
-        && !eq_name(name, b"transfer-encoding")
-        && !eq_name(name, b"host")
-        && !eq_name(name, b"connection")
-}
-
-/// Whether a caller's header block may be spliced into a request head.
-///
-/// The block goes onto the wire between this module's own fields and the
-/// blank line that ends the head, so its bytes decide where the head ends. A
-/// block carrying a blank line of its own ends it early and everything after
-/// that becomes a second request the origin will answer — the producer names
-/// one request and two arrive. A bare CR or LF does the same to any peer that
-/// splits on one.
-///
-/// So a block is a sequence of field lines: each ends CRLF, none is empty,
-/// none holds a stray CR or LF, and each is a name this module will emit
-/// ([`field_name_ok`]) followed by a colon and a value of printable bytes. A
-/// smuggled request line fails on the name: `GET http://elsewhere/ HTTP/1.1`
-/// carries a colon, so the colon alone would admit it, but no field name
-/// holds a space.
-///
-/// The value rule is the counterpart of the module's own inbound parser,
-/// which refuses a control byte in a field it reads (`wire::response`): a
-/// block this client would not accept from a peer is not one it should put on
-/// the wire toward one.
-fn header_block_ok(b: &[u8]) -> bool {
-    if b.is_empty() {
-        return true;
-    }
-    if b.len() < 2 || &b[b.len() - 2..] != b"\r\n" {
-        return false;
-    }
-    let mut line_start = 0usize;
-    let mut colon = false;
-    let mut i = 0usize;
-    while i + 1 < b.len() {
-        match b[i] {
-            b'\r' => {
-                // A CRLF with nothing before it is the blank line that ends a
-                // head; a CR without its LF splits a line on some peers and
-                // not others, which is the same ambiguity by a shorter route.
-                if b[i + 1] != b'\n' || i == line_start || !colon {
-                    return false;
-                }
-                line_start = i + 2;
-                colon = false;
-                i += 2;
-            }
-            b'\n' => return false,
-            b':' if !colon => {
-                // The first colon on the line ends the name, and a name must
-                // precede it.
-                if i == line_start || !field_name_ok(&b[line_start..i]) {
-                    return false;
-                }
-                colon = true;
-                i += 1;
-            }
-            // Inside a value: horizontal tab is legal there, nothing else
-            // below a space is.
-            c if colon && c < 0x20 && c != b'\t' => return false,
-            c if colon && c == 0x7F => return false,
-            _ => i += 1,
-        }
-    }
-    line_start == b.len()
-}
 
 /// Wire the exchange ports. Both are optional: a graph using the client in
 /// its one-shot param form wires neither, and `armed()` stays false.
@@ -247,6 +117,8 @@ unsafe fn adopt(s: &mut HttpState, corr: u64, key: &[u8]) {
     // otherwise be answered with the code the PREVIOUS exchange saw, and a
     // producer would retry or discard on a status this peer never sent.
     s.client.last_status = 0;
+    s.client.exchange_head_sent = 0;
+    s.client.exchange_terminated = 0;
 }
 
 /// Take one request off `publish_in` and arm the phase machine for it.
@@ -308,33 +180,36 @@ pub(crate) unsafe fn poll_request(s: &mut HttpState) -> bool {
     // happen.
     let broadcast = flags & FLAG_BROADCAST != 0;
 
-    // The verb's high bit asks to be answered with the whole response rather
-    // than with its body alone, and says the record carries a header block of
-    // its own. Verb codes are small, so the bit is free, and a producer that
-    // leaves it clear composes and reads the plain record.
-    let (raw, path_len, body_len) = if p.len() >= REQ_HEAD {
-        (
-            p[0],
-            u16::from_le_bytes([p[1], p[2]]) as usize,
-            u16::from_le_bytes([p[3], p[4]]) as usize,
-        )
-    } else {
-        (super::super::wire::method::METHOD_NONE, 0, 0)
-    };
-    let extended = raw & EXTENDED != 0;
-    let method = raw & !EXTENDED;
-    let head = if extended { REQ_HEAD + 2 } else { REQ_HEAD };
-    let headers_len = if extended && p.len() >= head {
-        u16::from_le_bytes([p[REQ_HEAD], p[REQ_HEAD + 1]]) as usize
-    } else {
-        0
-    };
-
+    // The record itself is read by the core that owns its layout, which the
+    // producer composing it mounts too. What is left here is what this client
+    // does about the answer: which refusal, and where the fields go.
+    let parsed = parse_request(
+        p,
+        &Limits {
+            path: super::MAX_PATH_LEN,
+            headers: super::REQUEST_HEADERS_MAX,
+            body: super::REQUEST_BODY_SIZE,
+        },
+    );
     // A path or body past this client's bounds is OVERSIZE, not UNROUTABLE:
     // the request is well formed and this provider is simply too small for it,
     // which is the distinction that tells a producer whether to shrink the
     // record or change the graph.
-    let headers_at_check = head + path_len;
+    let request = match parsed {
+        RequestParse::Ok(request) => request,
+        RequestParse::Oversize => {
+            adopt(s, corr, key);
+            send_reply(s, REFUSE_OVERSIZE, 0);
+            return false;
+        }
+        RequestParse::Malformed => {
+            adopt(s, corr, key);
+            send_reply(s, REFUSE_UNROUTABLE, 0);
+            return false;
+        }
+    };
+    let method = request.method;
+    let extended = request.extended;
     // The caller's headers are spliced into an HTTP/1.1 request head and the
     // answer is composed from the HTTP/1.1 response decoder, so an extended
     // record is refused on the other generations rather than performed as a
@@ -342,37 +217,33 @@ pub(crate) unsafe fn poll_request(s: &mut HttpState) -> bool {
     // and silently got a header-less one cannot tell that from an origin that
     // sent no headers.
     let wrong_generation = extended && (s.h3_mode != 0 || s.client.protocol != 0);
-    let malformed = broadcast
+    // The body of an extended response goes out on `file_ctrl`. Unwired, there
+    // is nowhere to put it, and performing the request anyway would answer a
+    // caller with a head and a status while dropping every byte the response
+    // carried.
+    let no_body_port = extended && s.client.out_chan < 0;
+    if broadcast
         || wrong_generation
-        || p.len() < head
-        || head + path_len + headers_len + body_len != p.len()
-        || path_len == 0
+        || no_body_port
         || super::super::wire::method::method_name(method).is_empty()
-        || !header_block_ok(&p[headers_at_check..headers_at_check + headers_len]);
-    let oversize = path_len > super::MAX_PATH_LEN
-        || body_len > super::REQUEST_BODY_SIZE
-        || headers_len > super::REQUEST_HEADERS_MAX;
-    if malformed || oversize {
-        let status = if malformed {
-            REFUSE_UNROUTABLE
-        } else {
-            REFUSE_OVERSIZE
-        };
+    {
         adopt(s, corr, key);
-        send_reply(s, status, 0);
+        send_reply(s, REFUSE_UNROUTABLE, 0);
         return false;
     }
+    let (path_len, headers_len, body_len) = (
+        request.path.len(),
+        request.headers.len(),
+        request.body.len(),
+    );
 
     s.client.method = method;
     s.client.exchange_extended = u8::from(extended);
-    let path_at = head;
-    let headers_at = path_at + path_len;
-    let body_at = headers_at + headers_len;
-    s.client.path[..path_len].copy_from_slice(&p[path_at..headers_at]);
+    s.client.path[..path_len].copy_from_slice(request.path);
     s.client.path_len = path_len as u16;
-    s.client.request_headers[..headers_len].copy_from_slice(&p[headers_at..body_at]);
+    s.client.request_headers[..headers_len].copy_from_slice(request.headers);
     s.client.request_headers_len = headers_len as u16;
-    s.client.request_body[..body_len].copy_from_slice(&p[body_at..body_at + body_len]);
+    s.client.request_body[..body_len].copy_from_slice(request.body);
     s.client.request_body_len = body_len as u16;
     s.client.request_body_sent = 0;
 
@@ -457,47 +328,91 @@ pub(crate) unsafe fn complete(s: &mut HttpState) {
     // cannot tell a 204 from a 200, cannot read a content type, and cannot
     // follow a redirect -- it has the body and no idea what the body is.
     if s.client.exchange_extended != 0 {
-        let body_len = s.client.exchange_reply_len as usize;
-        let head_len = s.client.response.head_len as usize;
-        // Whole or not at all, as for the body. A block clipped to fit still
-        // parses as a block, so a consumer cannot tell that the field it
-        // wanted is the one that did not fit.
-        if RESP_HEAD + head_len + body_len <= super::super::exchange::PAYLOAD_MAX {
-            // The body is already at the front of the buffer, so it moves up
-            // to make room for the head it is being described by.
-            core::ptr::copy(
-                s.client.exchange_reply.as_ptr(),
-                s.client
-                    .exchange_reply
-                    .as_mut_ptr()
-                    .add(RESP_HEAD + head_len),
-                body_len,
-            );
-            let status = s.client.last_status.to_le_bytes();
-            s.client.exchange_reply[0] = status[0];
-            s.client.exchange_reply[1] = status[1];
-            let hl = (head_len as u16).to_le_bytes();
-            s.client.exchange_reply[2] = hl[0];
-            s.client.exchange_reply[3] = hl[1];
-            core::ptr::copy_nonoverlapping(
-                s.client.response.head_bytes.as_ptr(),
-                s.client.exchange_reply.as_mut_ptr().add(RESP_HEAD),
-                head_len,
-            );
-            send_reply(s, STATUS_OK, RESP_HEAD + head_len + body_len);
-            return;
-        }
-        send_reply(s, REFUSE_OVERSIZE, 0);
+        // Already answered, when the head was known. Nothing is owed here:
+        // the body's own stream carried the rest and its terminator said
+        // where it ended.
+        s.client.exchange_corr = 0;
+        s.client.exchange_key_len = 0;
+        s.client.exchange_extended = 0;
+        s.client.exchange_head_sent = 0;
+        s.client.exchange_terminated = 0;
         return;
     }
     send_reply(s, STATUS_OK, s.client.exchange_reply_len as usize);
 }
 
+/// Answer an extended exchange with the head, as soon as there is one.
+///
+/// The body has not arrived and is not waited for: it streams on `file_ctrl`
+/// and ends with a zero-length chunk. Answering here is what lets a consumer
+/// read the body as it comes rather than after it is all in, which is the
+/// whole reason the body is not in this frame.
+pub(crate) unsafe fn send_head(s: &mut HttpState) {
+    if !busy(s) || s.client.exchange_head_sent != 0 {
+        return;
+    }
+    // There has to be a head to answer with. The decoder is fed every byte as
+    // it arrives and a status line and its block can span several reads, so a
+    // status below 200 means either nothing has parsed yet or what has is
+    // informational — and an interim response is not the answer. Answering
+    // either would spend the one reply this exchange has on a status the peer
+    // never finished sending.
+    if s.client.last_status < 200 {
+        return;
+    }
+    let head_len = s.client.response.head_len as usize;
+    // Whole or not at all. A block clipped to fit still parses as a block, so
+    // a consumer cannot tell that the field it wanted is the one that did not
+    // fit.
+    if RESP_HEAD + head_len > super::super::exchange::PAYLOAD_MAX {
+        s.client.exchange_head_sent = 1;
+        send_reply(s, REFUSE_OVERSIZE, 0);
+        return;
+    }
+    // Composed by the core that owns the layout: the status, the block's
+    // length, and the block itself, into the reply buffer in one go.
+    let Some(_) = write_reply_head(
+        s.client.last_status,
+        core::slice::from_raw_parts(s.client.response.head_bytes.as_ptr(), head_len),
+        &mut s.client.exchange_reply,
+    ) else {
+        s.client.exchange_head_sent = 1;
+        send_reply(s, REFUSE_OVERSIZE, 0);
+        return;
+    };
+    s.client.exchange_head_sent = 1;
+    // The reply is spent, but the exchange is not over: the body is still
+    // arriving and the client is stepped only while an exchange is in
+    // flight. So the correlation is put back after the frame is composed --
+    // `busy` means "a response is still coming", and the reply owed against
+    // it has simply already gone.
+    let corr = s.client.exchange_corr;
+    send_reply(s, STATUS_OK, RESP_HEAD + head_len);
+    s.client.exchange_corr = corr;
+}
+
 /// Answer with a typed refusal because the exchange itself failed.
 pub(crate) unsafe fn fail(s: &mut HttpState) {
-    if busy(s) {
-        send_reply(s, REFUSE_UNROUTABLE, 0);
+    if !busy(s) {
+        return;
     }
+    if s.client.exchange_head_sent == 0 {
+        send_reply(s, REFUSE_UNROUTABLE, 0);
+        return;
+    }
+    // An extended exchange whose head was already answered cannot be answered
+    // again: the reply is exactly one record and it has been spent. What a
+    // consumer sees is the body ending early, which is what a failed response
+    // is — and the closing chunk the caller writes before reaching here is
+    // what makes that an ending rather than a pause.
+    //
+    // The correlation is released here because nothing else will release it.
+    // Held, it would mean "a response is still coming" for ever: no later
+    // request would be taken off `publish_in`, and this instance would answer
+    // nobody again.
+    s.client.exchange_corr = 0;
+    s.client.exchange_reply_len = 0;
+    s.client.exchange_oversize = 0;
 }
 
 /// Emit one `[MSG_REPLY][len:u16][Reply…]` envelope and go idle.

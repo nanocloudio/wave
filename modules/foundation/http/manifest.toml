@@ -135,7 +135,7 @@ name = "file_ctrl"
 index = 1
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 256
+buffer_size = 2048
 
 # WebSocket fan-out — populated only when a route uses
 # HANDLER_WEBSOCKET_FANOUT (handler value 5). On such routes the upgraded
