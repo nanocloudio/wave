@@ -57,7 +57,7 @@ include!("../../common/ws_frame_core.rs");
 // The records that drive this connector from outside it, and the number of
 // links it carries. Mounted rather than restated: a consumer mounts the same
 // file, so neither end can believe in a link the other does not have.
-include!("../../common/ws_control_wire.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/contracts/net/ws_control.rs");
 include!("../../common/utf8_core.rs");
 include!("../../common/ws_core.rs");
 

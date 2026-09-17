@@ -12,7 +12,7 @@
 //!
 //! # The request record
 //!
-//! The records themselves are `modules/common/http_exchange_wire.rs`, which
+//! The records themselves are fluxor's `http_exchange` contract, which
 //! this module mounts and a producer outside Wave mounts too -- so the
 //! layouts are written once and the two ends cannot drift. What is here is
 //! what this client DOES with them.
@@ -78,7 +78,10 @@ use super::{Phase, EXCHANGE_KEY_MAX, EXCHANGE_REPLY_MAX};
 // The records this module reads and writes. Mounted rather than restated:
 // a producer outside Wave mounts the same file, so an offset written here
 // would be an offset that could disagree with one written there.
-include!("../../../common/http_exchange_wire.rs");
+// The record layouts are the `http_exchange` contract, mounted once in
+// `http/mod.rs`. Re-exported rather than imported so `h1.rs` reaches
+// `super::exchange::CHUNK_HEAD` through this module as it always has.
+pub(crate) use super::super::http_exchange::*;
 
 /// The 3-byte channel envelope (`[msg_type][len:u16 LE]`) every frame on this
 /// pair rides, as `net_read_frame`/`net_write_frame` compose it elsewhere.

@@ -305,7 +305,7 @@ define_params! {
             s.rcpt_to[s.rcpt_to_len as usize] = *d.add(i); s.rcpt_to_len += 1; i += 1;
         }
     };
-    5, body, str, 0 => |s, d, len| {
+    5, body, str_chunked, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.chunk_len as usize) < CHUNK_BUF {
             s.chunk[s.chunk_len as usize] = *d.add(i); s.chunk_len += 1; i += 1;

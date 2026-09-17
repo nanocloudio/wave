@@ -1,35 +1,27 @@
 //! HTTP request methods — one vocabulary, shared by every generation.
 //!
-//! h1, h2 and h3 all resolve a method against this table, so a request means
-//! the same thing whichever generation carried it. A per-generation table is
-//! how the same request comes to succeed on one and fail on another, which
-//! `http_interop.rs` asserts against from both sides.
+//! h1, h2 and h3 all resolve a method against one table, so a request means
+//! the same thing whichever generation carried it. That table is the
+//! `http_exchange` contract's: a request record carries its method as one
+//! byte, and every reader of that byte — this server, an application module
+//! decoding `HttpRequest`, and each connector that performs a request — must
+//! decode it identically. The values are STABLE and PUBLIC; appending a
+//! method is safe, renumbering one is a wire-format break.
 //!
-//! The values are STABLE and PUBLIC: `HttpRequest` envelopes on the `req_out`
-//! port carry `method` as one byte, so a downstream application module decodes
-//! them with this table. Appending a method is safe; renumbering one is a
-//! wire-format break, exactly as for Fluxor's content-type table.
-//!
-//! `GET`/`CONNECT`/`POST` keep the values 1/2/3 that h2 and h3 already used, so
-//! widening the vocabulary did not renumber the three values already in
-//! service. The rest are appended.
+//! What stays here is what only a server needs: how far a request-line
+//! parser scans for a method token, and which methods carry a body it must
+//! be prepared to read.
 //!
 //! Deliberately NOT a Rust enum: the value crosses a channel as a byte, and a
 //! `#[repr(u8)]` enum would make every decode a fallible transmute at the
 //! receiver for no gain over a `u8` plus these constants.
 
-/// No method parsed yet, or an unrecognised token.
-pub const METHOD_NONE: u8 = 0;
-pub const METHOD_GET: u8 = 1;
-/// Kept at 2 because h2 tests `method_kind == 2` for the RFC 8441 extended
-/// CONNECT that carries a WebSocket upgrade, and h3 does the same for RFC 9220.
-pub const METHOD_CONNECT: u8 = 2;
-pub const METHOD_POST: u8 = 3;
-pub const METHOD_HEAD: u8 = 4;
-pub const METHOD_PUT: u8 = 5;
-pub const METHOD_PATCH: u8 = 6;
-pub const METHOD_DELETE: u8 = 7;
-pub const METHOD_OPTIONS: u8 = 8;
+/// The method vocabulary and its lookups are the `http_exchange` contract's,
+/// re-exported here so every generation resolves a method through one name.
+pub use super::super::http_exchange::{
+    method_from_token, method_name, METHOD_CONNECT, METHOD_DELETE, METHOD_GET, METHOD_HEAD,
+    METHOD_NONE, METHOD_OPTIONS, METHOD_PATCH, METHOD_POST, METHOD_PUT,
+};
 
 /// How far a request-line parser scans for the space that ends the method
 /// token before giving up and calling the line malformed.
@@ -47,70 +39,6 @@ pub const METHOD_OPTIONS: u8 = 8;
 /// keeping the scan bounded — without a cap, a line containing no space walks
 /// the entire receive buffer on every parse attempt.
 pub const MAX_METHOD_SCAN: usize = 24;
-
-/// Map a method token to its constant. Case-SENSITIVE, per RFC 9110 §9.1:
-/// method names are case-sensitive tokens, and `get` is not `GET`. Returns
-/// [`METHOD_NONE`] for anything unrecognised — the caller decides whether that
-/// is a 400 (malformed request line) or a 501 (well-formed, unimplemented),
-/// which is a distinction the parser has no standing to make.
-pub fn method_from_token(tok: &[u8]) -> u8 {
-    match tok {
-        b"GET" => METHOD_GET,
-        b"HEAD" => METHOD_HEAD,
-        b"POST" => METHOD_POST,
-        b"PUT" => METHOD_PUT,
-        b"PATCH" => METHOD_PATCH,
-        b"DELETE" => METHOD_DELETE,
-        b"OPTIONS" => METHOD_OPTIONS,
-        b"CONNECT" => METHOD_CONNECT,
-        _ => METHOD_NONE,
-    }
-}
-
-/// Every token end to end, so the one below can be a span of this rather than
-/// eight separate literals. Order is arbitrary; [`TOKEN_SPAN`] holds the
-/// offsets.
-const TOKENS: &[u8] = b"GETCONNECTPOSTHEADPUTPATCHDELETEOPTIONS";
-
-/// `(offset, length)` into [`TOKENS`] per method constant, indexed by the
-/// constant itself. [`METHOD_NONE`] and anything past the table is `(0, 0)`,
-/// which spans no bytes.
-const TOKEN_SPAN: [(u8, u8); 9] = [
-    (0, 0),  // METHOD_NONE
-    (0, 3),  // GET
-    (3, 7),  // CONNECT
-    (10, 4), // POST
-    (14, 4), // HEAD
-    (18, 3), // PUT
-    (21, 5), // PATCH
-    (26, 6), // DELETE
-    (32, 7), // OPTIONS
-];
-
-/// The token for a method constant — for logging, and for the `method` field
-/// an application module echoes back. Empty slice for [`METHOD_NONE`].
-///
-/// The span table holds integers, not string references, and that is
-/// load-bearing rather than a style choice. A `match` returning a different
-/// `&'static [u8]` per arm compiles to a table of `{pointer, length}` pairs
-/// that the linker fills with link-time absolute addresses and marks for
-/// relocation. A `.fmod` is a flat image mapped at whatever base the loader
-/// picks, with no relocations applied, so every pointer in such a table is
-/// wrong by the load address — and the first read of one walks off into
-/// unmapped memory. Offsets into a single literal need no relocation, and the
-/// one reference to `TOKENS` is materialised PC-relative like any other
-/// code-adjacent constant. `tools/ci/fmod_pic_relocs.sh` holds the rule for
-/// every module, because the same shape compiles the same way anywhere.
-pub fn method_name(m: u8) -> &'static [u8] {
-    let (off, len) = match TOKEN_SPAN.get(m as usize) {
-        Some(&(off, len)) => (off as usize, len as usize),
-        None => return &[],
-    };
-    match TOKENS.get(off..off + len) {
-        Some(tok) => tok,
-        None => &[],
-    }
-}
 
 /// Whether a request with this method may carry a body that the server should
 /// read before dispatching.

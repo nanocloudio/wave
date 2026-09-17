@@ -69,8 +69,10 @@ disagree. Do not edit the tables by hand.
 
 The effective envelope is the SMALLEST ceiling on the path, which is rarely
 the layer being asked about. On aarch64 the HTTP slot and arena tables bound
-HTTPS concurrency, far below the transport underneath them; on rp2350 the TLS
-session, HTTP slot and arena tables all hold four.
+HTTPS concurrency, far below the transport underneath them. On rp2350 the TLS
+session table bounds it alone, at one: the HTTP tables there hold four, so a
+plaintext listener serves four connections while an HTTPS one serves a single
+connection at a time.
 
 ## Per target
 

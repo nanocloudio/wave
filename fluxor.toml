@@ -29,6 +29,15 @@ fluxor = { abi = 1 }
 # is not listed here.
 targets = ["rp2040", "rp2350", "bcm2712", "wasm"]
 
+# An unregistered ceiling in a file `docs/architecture/limit_register.md`
+# names FAILS rather than warns. The register's coverage list is empty, and
+# this is what stops it growing again: the report exists to be worked to zero
+# once, and a zero nothing holds is a zero that does not stay.
+#
+# It binds only the files the register names, so it is not a tax on the whole
+# tree — adding a file to the register is what opts its ceilings in.
+limit_register_coverage = "fail"
+
 # No `[ci.cargo]`. Wave has NO root cargo workspace: it was retired on
 # 2026-08-08 along with `crates/wave-cores`, because the shared cores are
 # `include!`d by the modules rather than linked, so the crate around them bought

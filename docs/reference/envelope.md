@@ -6,15 +6,17 @@ disagree. Do not edit the tables by hand.
 
 The effective envelope is the SMALLEST ceiling on the path, which is rarely
 the layer being asked about. On aarch64 the HTTP slot and arena tables bound
-HTTPS concurrency, far below the transport underneath them; on rp2350 the TLS
-session, HTTP slot and arena tables all hold four.
+HTTPS concurrency, far below the transport underneath them. On rp2350 the TLS
+session table bounds it alone, at one: the HTTP tables there hold four, so a
+plaintext listener serves four connections while an HTTPS one serves a single
+connection at a time.
 
 ## Per target
 
 | Layer | Constant | aarch64 (Pi 5, Linux host) | rp2350 | Owner | One past it |
 |---|---|---|---|---|---|
 | TCP connections | `ip::MAX_TCP_CONNS` | 65536 | 16 | Fluxor profile constant | SYN unanswered |
-| TLS sessions | `tls::MAX_SESSIONS` | 512 | 4 | Fluxor profile constant | accepted conn closed, `[tls] no session slot` |
+| TLS sessions | `tls::MAX_SESSIONS` | 512 | 1 | Fluxor profile constant | accepted conn closed, `[tls] no session slot` |
 | HTTP slots | `http::MAX_CONCURRENT_CONNS` | 256 | 4 | Fluxor profile constant | idle keepalive evicted, else accept closed (`conns_refused_slots`) |
 | HTTP arena working set | `http::ARENA_WORKING_SET_CONNS` | 256 | 4 | Fluxor profile constant | accept closed (`conns_refused_arena`) |
 | HTTP receive buffer / conn | `http::RECV_BUF_SIZE` | 8192 | 2048 | Fluxor profile constant | demux stalls (`demux_stalls`) |

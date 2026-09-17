@@ -176,6 +176,15 @@ mod exchange {
     include!("../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs");
 }
 
+// What goes inside that surface's payload when the destination is this
+// connector: the request and reply records and the method vocabulary.
+// Mounted once here and re-exported where it is used, so the client and
+// the wire layer read one definition.
+#[allow(dead_code, reason = "each variant consumes a subset of the surface")]
+mod http_exchange {
+    include!("../../../target/fluxor/fluxor-abi/sdk/contracts/net/http_exchange.rs");
+}
+
 // `pub` under host-test only, matching how `server` is exposed: the suites are
 // separate crates and need real `pub` to reach in, while the firmware links one
 // crate and keeps its symbol surface unchanged.
@@ -299,7 +308,7 @@ mod params_def {
                 s.client.port = v;
             };
 
-        2, body, str, 0
+        2, body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 0, d, len); };
 
         3, path, str, 0
@@ -439,7 +448,7 @@ mod params_def {
 
         10, route_0_path, str, 0
             => |s, d, len| { server::params::parse_route_path(s, 0, d, len); };
-        11, route_0_body, str, 0
+        11, route_0_body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 0, d, len); };
         12, route_0_handler, u8, 0
             => |s, d, len| { server::params::set_route_handler(s, 0, d, len); };
@@ -460,7 +469,7 @@ mod params_def {
 
         20, route_1_path, str, 0
             => |s, d, len| { server::params::parse_route_path(s, 1, d, len); };
-        21, route_1_body, str, 0
+        21, route_1_body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 1, d, len); };
         22, route_1_handler, u8, 0
             => |s, d, len| { server::params::set_route_handler(s, 1, d, len); };
@@ -481,7 +490,7 @@ mod params_def {
 
         30, route_2_path, str, 0
             => |s, d, len| { server::params::parse_route_path(s, 2, d, len); };
-        31, route_2_body, str, 0
+        31, route_2_body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 2, d, len); };
         32, route_2_handler, u8, 0
             => |s, d, len| { server::params::set_route_handler(s, 2, d, len); };
@@ -502,7 +511,7 @@ mod params_def {
 
         40, route_3_path, str, 0
             => |s, d, len| { server::params::parse_route_path(s, 3, d, len); };
-        41, route_3_body, str, 0
+        41, route_3_body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 3, d, len); };
         42, route_3_handler, u8, 0
             => |s, d, len| { server::params::set_route_handler(s, 3, d, len); };
@@ -523,7 +532,7 @@ mod params_def {
 
         50, route_4_path, str, 0
             => |s, d, len| { server::params::parse_route_path(s, 4, d, len); };
-        51, route_4_body, str, 0
+        51, route_4_body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 4, d, len); };
         52, route_4_handler, u8, 0
             => |s, d, len| { server::params::set_route_handler(s, 4, d, len); };
@@ -544,7 +553,7 @@ mod params_def {
 
         60, route_5_path, str, 0
             => |s, d, len| { server::params::parse_route_path(s, 5, d, len); };
-        61, route_5_body, str, 0
+        61, route_5_body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 5, d, len); };
         62, route_5_handler, u8, 0
             => |s, d, len| { server::params::set_route_handler(s, 5, d, len); };
@@ -565,7 +574,7 @@ mod params_def {
 
         70, route_6_path, str, 0
             => |s, d, len| { server::params::parse_route_path(s, 6, d, len); };
-        71, route_6_body, str, 0
+        71, route_6_body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 6, d, len); };
         72, route_6_handler, u8, 0
             => |s, d, len| { server::params::set_route_handler(s, 6, d, len); };
@@ -586,7 +595,7 @@ mod params_def {
 
         80, route_7_path, str, 0
             => |s, d, len| { server::params::parse_route_path(s, 7, d, len); };
-        81, route_7_body, str, 0
+        81, route_7_body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 7, d, len); };
         82, route_7_handler, u8, 0
             => |s, d, len| { server::params::set_route_handler(s, 7, d, len); };

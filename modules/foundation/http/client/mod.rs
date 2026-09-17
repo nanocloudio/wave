@@ -417,7 +417,7 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
     // head, which is the only place they can go and still be headers. Their
     // bytes therefore decide where the head ends and what the origin reads as
     // framing, so a block is admitted only after the record parser
-    // (`modules/common/http_exchange_wire.rs`) has read it as field lines naming
+    // (the `http_exchange` contract) has read it as field lines naming
     // nothing this module writes itself. The param client sets no block, so
     // its length here is structurally 0.
     let extra = s.client.request_headers_len as usize;
