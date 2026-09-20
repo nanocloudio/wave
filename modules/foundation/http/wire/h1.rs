@@ -732,7 +732,8 @@ pub fn parse_range_header(value: &[u8], size: u32) -> RangeParse {
 /// two adjacent lengths can be swapped without the compiler noticing.
 #[derive(Default)]
 pub struct RequestOptions<'a> {
-    /// `Host` value. Empty selects the peer's dotted-quad IP.
+    /// `Host` value, verbatim. A request names its authority, so an empty
+    /// one composes no head.
     pub authority: &'a [u8],
     /// Length of the body that follows this head. Non-zero writes a
     /// `Content-Length`.
@@ -775,10 +776,9 @@ pub unsafe fn write_request_head(
     method: u8,
     path: *const u8,
     path_len: usize,
-    host_ip_be: u32,
     options: &RequestOptions<'_>,
 ) -> usize {
-    if path_len == 0 {
+    if path_len == 0 || options.authority.is_empty() {
         return 0;
     }
     let path_bytes = core::slice::from_raw_parts(path, path_len);
@@ -825,27 +825,7 @@ pub unsafe fn write_request_head(
     } else {
         put!(b" HTTP/1.0\r\nHost: ");
     }
-    if !options.authority.is_empty() {
-        put!(options.authority);
-    } else {
-        // host IP, big-endian dotted-quad
-        let ip = host_ip_be.to_be_bytes();
-        let mut o = 0;
-        while o < 4 {
-            let b = ip[o];
-            if b >= 100 {
-                put!(&[b'0' + (b / 100)]);
-            }
-            if b >= 10 {
-                put!(&[b'0' + ((b / 10) % 10)]);
-            }
-            put!(&[b'0' + (b % 10)]);
-            if o < 3 {
-                put!(b".");
-            }
-            o += 1;
-        }
-    }
+    put!(options.authority);
 
     // `Content-Type` precedes `Content-Length`, so a typed body reads as one
     // description of what follows. Omitted entirely when unset: a header with

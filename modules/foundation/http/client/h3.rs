@@ -883,13 +883,10 @@ unsafe fn client_send_request(s: &mut super::super::HttpState) {
     }
     if !s.h3_client.request_sent {
         let method = super::super::wire::method::method_name(s.client.method);
-        let mut fallback = [0u8; 9];
-        fallback.copy_from_slice(b"localhost");
-        let authority = if s.client.authority_len == 0 {
-            &fallback[..]
-        } else {
-            &s.client.authority[..s.client.authority_len as usize]
-        };
+        // The authority of the connection in hand: the module's, or the
+        // record's on an open client. `configured_request` refuses an empty
+        // one, so a client with nothing to name fails the request here.
+        let authority = &s.client.conn_authority[..s.client.conn_authority_len as usize];
         let head = RequestHead {
             method,
             authority,

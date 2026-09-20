@@ -60,14 +60,14 @@ rp2350|http-h2.fmod|157000|149495 (2026-09-10, +14.0K since the 2026-09-07 row: 
 rp2350|http-web.fmod|98000|90020 (2026-09-07, current ABI and readiness hardening)
 rp2350|http-app.fmod|103000|95004 (2026-09-07, current ABI and readiness hardening)
 rp2350|http-exchange.fmod|207000|196791 (2026-09-10, +19.7K since the 2026-09-07 row: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
-rp2350|rtp.fmod|20700|19109 (2026-09-08, +14.1K: negotiated media — the SRTP profiles and their key derivation, the H.264/VP8 packetizers and Annex-B scanner, the MID/PT/SSRC route table, the pacer, the congestion controller, the RTP-to-wall-clock map and the TURN relay path)
+rp2350|rtp.fmod|23900|22080 (2026-09-19, +3.0K over the media baseline: the peer is an authority — the media destination, the TURN relay and the permitted peer are each one host[:port], parsed at construction, and a named peer is sent to by name over the datagram surface)
 rp2350|rtcp.fmod|14600|13501 (2026-09-08, +7.0K: SRTCP protection over the RFC 3550 §6 control plane (see `rtcp_core.rs`) — AES-GCM, the 31-bit SRTCP index and its replay window, plus RFC 4585 NACK and PLI feedback)
 bcm2712|rtp.fmod|29600|27394 (2026-09-08, +22.2K: negotiated media — the SRTP profiles, the video packetizers, the route table, pacing, congestion control, clock sync and the TURN relay path)
 bcm2712|rtcp.fmod|15700|14485 (2026-09-08, +7.1K: SRTCP protection over the RFC 3550 §6 control plane, both report directions, plus RFC 4585 NACK and PLI feedback)
 bcm2712|sip.fmod|22300|20651 (2026-09-08, first row)
 rp2350|sip.fmod|17000|16295 (2026-08-23, +2.7K: the application command/event contract — a call is offered and decided rather than auto-answered, and every terminal outcome is reported)
-rp2350|stun.fmod|8000|7353 (2026-08-29, +2.5K: the Binding CLIENT role — RFC 5389 transaction schedule, response matching, and the result record)
-bcm2712|stun.fmod|9100|8337 (2026-08-29, +3.5K: the Binding CLIENT role — RFC 5389 transaction schedule, response matching, and the result record)
+rp2350|stun.fmod|9300|8542 (2026-09-19, +1.2K over the client baseline: the server is an authority — one host[:port], parsed at construction, and a named server is asked by name over the datagram surface)
+bcm2712|stun.fmod|10200|9382 (2026-09-19, +1.0K over the client baseline: the server is an authority, asked by name when it is named)
 bcm2712|mail.fmod|24000|21081 (2026-08-23, first row; RFC 5322 + MIME assembly over the smtp connector)
 rp2350|ws_stream.fmod|3000|2717 (2026-08-07)
 rp2040|ws_stream.fmod|2800|2589 (2026-09-08, first row)
@@ -80,8 +80,8 @@ bcm2712|http-web.fmod|207000|191646 (2026-09-05, +9.1K since the 2026-08-16 row:
 bcm2712|http-app.fmod|212000|196158 (2026-09-05, +9.1K since the 2026-08-16 row: request metrics and the connection lifetime deadlines)
 bcm2712|http-exchange.fmod|367000|349111 (2026-09-10: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
 bcm2712|s3.fmod|22000|19647 (2026-08-16, first row; SigV4 signing connector)
-bcm2712|smtp.fmod|14000|13231 (2026-08-26, +3.7K: SASL PLAIN submission — base64 encoder, EHLO capability parsing, the AUTH phase, its credential buffers, and the volatile zeroing of every stack copy of a credential)
-bcm2712|websocket.fmod|18000|16518 (2026-09-14, per-link state and the addressed surface)
+bcm2712|smtp.fmod|16400|15208 (2026-09-19, +1208B over the previous ceiling; authority replaces the hex endpoint: Target::parse, write_connect_to and the 128-byte authority buffer)
+bcm2712|websocket.fmod|20700|19139 (2026-09-19, +1139B over the previous ceiling; authority replaces the hex endpoint and the separate Host parameter)
 '
 
 # subset|superset|target — the subset must be strictly smaller.

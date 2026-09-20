@@ -16,8 +16,9 @@
 //!
 //! Ports:  net_in/net_out (transport), request_in (messages to send),
 //!         message_out (reassembled messages received).
-//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `host`, `path`, `message`,
-//!         `request_opcode` (1 = text, the default; 2 = binary).
+//! Params: `authority` (`host[:port]`, port 80 when it names none: where the
+//!         connector dials and, verbatim, its `Host:` header), `path`,
+//!         `message`, `request_opcode` (1 = text, the default; 2 = binary).
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -51,7 +52,6 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 // Shared Wave codecs — `include!`d verbatim so the device and the host test
 // harness compile identical bytes.
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs"); // b64_encode
-include!("../../common/hex_core.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs"); // sha1
 include!("../../common/ws_frame_core.rs");
 // The records that drive this connector from outside it, and the number of
@@ -65,11 +65,14 @@ include!("../../common/ws_core.rs");
 // never redeclared locally, so a change to the wire is a compile error here
 // rather than a wrong answer.
 use abi::contracts::net::net_proto::{
-    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT, CMD_SEND as NET_CMD_SEND,
-    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
-    MSG_ERROR as NET_MSG_ERROR,
+    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO,
+    CMD_SEND as NET_CMD_SEND, MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED,
+    MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
 use abi::contracts::net::ws_frame as wsf;
+
+/// The port a dial takes when `authority` names none.
+const DEFAULT_PORT: u16 = 80;
 
 const NET_BUF: usize = 2048;
 const REQ_BUF: usize = 512;
@@ -104,12 +107,13 @@ struct WsState {
     open_in: i32,
     event_out: i32,
 
-    ip: [u8; 4],
+    /// `host[:port]`: where every link is dialled and what its upgrade
+    /// request carries as `Host:`, one value. Parsed at construction, so a
+    /// dial never meets an authority it cannot carry.
+    authority: [u8; NAME_BUF],
+    authority_len: u16,
+    /// The authority's port, or [`DEFAULT_PORT`] when it names none.
     port: u16,
-    ep_hex: [u8; 16],
-    ep_hex_len: u16,
-    host: [u8; NAME_BUF],
-    host_len: u16,
     message: [u8; NAME_BUF],
     message_len: u16,
 
@@ -214,18 +218,7 @@ impl Link {
 define_params! {
     WsState;
 
-    1, endpoint, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ep_hex_len as usize) < 16 {
-            s.ep_hex[s.ep_hex_len as usize] = *d.add(i); s.ep_hex_len += 1; i += 1;
-        }
-    };
-    2, host, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.host_len as usize) < NAME_BUF {
-            s.host[s.host_len as usize] = *d.add(i); s.host_len += 1; i += 1;
-        }
-    };
+    // 1: endpoint — retired. 2: host — retired. `authority` (6) is both.
     3, path, str, 0 => |s, d, len| {
         // A path named by the graph belongs to the link the graph opens, which
         // is the first one. A consumer that opens its own names it then.
@@ -244,6 +237,20 @@ define_params! {
     };
     5, request_opcode, u8, 1 => |s, d, len| {
         s.request_opcode = p_u8(d, len, 0, ws_op::TEXT);
+    };
+    6, authority, str, 0 => |s, d, len| {
+        // Held whole or not at all: a prefix of an authority is a
+        // different host, and construction refuses an instance whose
+        // authority does not parse.
+        let room = NAME_BUF - (s.authority_len as usize);
+        if len > room {
+            s.authority_len = 0;
+        } else {
+            let mut i = 0usize;
+            while i < len {
+                s.authority[s.authority_len as usize] = *d.add(i); s.authority_len += 1; i += 1;
+            }
+        }
     };
 }
 
@@ -296,10 +303,8 @@ pub extern "C" fn module_new(
         s.open_in = dev_channel_port(sys, 0, 3);
         s.ws_out = dev_channel_port(sys, 1, 2);
         s.event_out = dev_channel_port(sys, 1, 3);
-        s.ip = [0u8; 4];
+        s.authority_len = 0;
         s.port = 0;
-        s.ep_hex_len = 0;
-        s.host_len = 0;
         s.message_len = 0;
         s.links = [Link::EMPTY; WS_LINKS];
         s.tag = dev_requester_tag(sys);
@@ -312,22 +317,25 @@ pub extern "C" fn module_new(
         if !matches!(s.request_opcode, ws_op::TEXT | ws_op::BINARY) {
             return -22;
         }
-        let mut ep = [0u8; 8];
-        if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
-            if n >= 6 {
-                s.ip = [ep[0], ep[1], ep[2], ep[3]];
-                s.port = u16::from_le_bytes([ep[4], ep[5]]);
+        // The one address this connector has. Refused here rather than at
+        // the dial: a link opened to nowhere would time out and name the
+        // peer for a fault in the graph.
+        match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
+            Some((_, port)) => s.port = port.unwrap_or(DEFAULT_PORT),
+            None => {
+                dev_log(sys, 2, b"[ws] authority is not host[:port]".as_ptr(), 33);
+                return -22;
             }
         }
         // Who opens a link is settled by the wiring, not by a parameter. A
         // graph that wired `open_in` has a consumer that will say what it
         // wants opened and when, so nothing is opened until it does -- which
         // is what lets one connector serve a program that decides at run time
-        // whether it wants a socket at all. A graph that did not wire it is
-        // the older shape: it named an endpoint because it wants that link,
-        // so the first one is opened on its own, to the path it named or to
-        // the root, carrying the message it named.
-        if s.open_in < 0 && s.ep_hex_len > 0 {
+        // whether it wants a socket at all. A graph that did not wire it
+        // named an authority because it wants that link, so the first one is
+        // opened on its own, to the path it named or to the root, carrying
+        // the message it named.
+        if s.open_in < 0 {
             if s.links[0].path_len == 0 {
                 s.links[0].path[0] = b'/';
                 s.links[0].path_len = 1;
@@ -575,6 +583,18 @@ unsafe fn drain_messages(s: &mut WsState, i: usize, now: u64) {
     }
 }
 
+/// Compose the `CMD_CONNECT_TO` for this connector's authority into
+/// `payload`, tagged with its requester tag, answering the length. Zero only
+/// for an authority no dial carries, which construction already refused.
+fn connect_payload(s: &WsState, payload: &mut [u8]) -> usize {
+    match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
+        Some((target, _)) => {
+            net_proto::write_connect_to(payload, SOCK_TYPE_STREAM, s.port, &target, Some(s.tag))
+        }
+        None => 0,
+    }
+}
+
 unsafe fn feed(s: &mut WsState, i: usize, sys: &SyscallTable, ev: WsEv, now: u64) {
     let (action, next) = ws_transition(s.links[i].phase, ev);
     match action {
@@ -583,22 +603,18 @@ unsafe fn feed(s: &mut WsState, i: usize, sys: &SyscallTable, ev: WsEv, now: u64
             s.links[i].assembled_opcode = 0;
             s.links[i].assembled_ready = 0;
             s.links[i].closing = 0;
-            let mut payload = [0u8; 8];
-            payload[0] = SOCK_TYPE_STREAM;
-            payload[1] = s.ip[3];
-            payload[2] = s.ip[2];
-            payload[3] = s.ip[1];
-            payload[4] = s.ip[0];
-            let port = s.port.to_le_bytes();
-            payload[5] = port[0];
-            payload[6] = port[1];
-            payload[7] = s.tag;
+            let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
+            let n = connect_payload(s, &mut payload);
+            if n == 0 {
+                feed(s, i, sys, WsEv::NetError, now);
+                return;
+            }
             if net_write_frame(
                 sys,
                 s.net_out,
-                NET_CMD_CONNECT,
+                NET_CMD_CONNECT_TO,
                 payload.as_ptr(),
-                8,
+                n,
                 s.nbuf.as_mut_ptr(),
                 NET_BUF,
             ) == 0
@@ -621,10 +637,11 @@ unsafe fn feed(s: &mut WsState, i: usize, sys: &SyscallTable, ev: WsEv, now: u64
             if let Some(an) = ws_accept(&key_b64[..kn], &mut s.links[i].accept) {
                 s.links[i].accept_len = an as u16;
             }
-            let hl = s.host_len as usize;
+            // `Host:` is the authority, verbatim: the bytes the dial carried.
+            let hl = s.authority_len as usize;
             let pl = s.links[i].path_len as usize;
             let mut host = [0u8; NAME_BUF];
-            host[..hl].copy_from_slice(&s.host[..hl]);
+            host[..hl].copy_from_slice(&s.authority[..hl]);
             let mut path = [0u8; NAME_BUF];
             path[..pl].copy_from_slice(&s.links[i].path[..pl]);
             let mut out = [0u8; REQ_BUF];
@@ -942,7 +959,6 @@ unsafe fn pump_link(s: &mut WsState, i: usize, sys: &SyscallTable, now: u64) -> 
         if s.links[i].phase == WsPhase::Disconnected
             && s.draining == 0
             && s.links[i].wanted != 0
-            && s.ep_hex_len > 0
             && dialling(s).is_none()
         {
             feed(s, i, sys, WsEv::Start, now);

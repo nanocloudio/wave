@@ -92,10 +92,10 @@
 //! | Tag   | Name        | Type | Default | Description                                         |
 //! |-------|-------------|------|---------|-----------------------------------------------------|
 //! | 0     | mode        | u8   | 0       | 0=server, 1=client                                  |
-//! | 1     | port        | u16  | 80      | TCP listen port (server) or target port (client)    |
+//! | 1     | port        | u16  | 80      | TCP listen port (server)                            |
 //! | 2     | body        | str  | (none)  | Inline body for the default route (server)          |
 //! | 3     | path        | str  | "/"     | URL path (client mode)                              |
-//! | 4     | host_ip     | u32  | 0       | Target IP (client mode)                             |
+//! | 4     | —           | —    | —       | retired                                             |
 //! | 5     | protocol    | u8   | 0       | Client: 0 = HTTP/1.1, 1 = HTTP/2                    |
 //! | 6     | request_body | str | (none)  | Client request body                                 |
 //! | 7     | websocket   | u8   | 0       | Client: upgrade to WebSocket                        |
@@ -116,7 +116,7 @@
 //! | 109   | client_header_ms | u32 | 15000 | Client: request sent to final response head (0 = off) |
 //! | 110   | client_stall_ms | u32 | 15000 | Client: no byte progress (0 = off)                  |
 //! | 111   | client_total_ms | u32 | 60000 | Client: whole request, connect included (0 = off)   |
-//! | 112   | authority   | str  | localhost | Client: Host / `:authority` (falls back to host_ip) |
+//! | 112   | authority   | str  | (none)  | Client: `host[:port]` — dialled, verified, sent as Host / `:authority`; empty = open |
 //! | 113   | method      | u8   | 1 (GET) | Client: request verb                                |
 //! | 114   | client_keep_alive | u8 | 0   | Client: reuse one connection across exchanges       |
 //! | 115   | ws_multi_client | u8 | 0     | WebSocket fan-out: addressed clients, no displacement |
@@ -301,12 +301,10 @@ mod params_def {
         0, mode, u8, 0
             => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
 
+        // A bind is not an authority: the server listens here, and the
+        // client's port lives inside `authority`.
         1, port, u16, 80
-            => |s, d, len| {
-                let v = p_u16(d, len, 0, 80);
-                s.server.port = v;
-                s.client.port = v;
-            };
+            => |s, d, len| { s.server.port = p_u16(d, len, 0, 80); };
 
         2, body, str_chunked, 0
             => |s, d, len| { server::params::parse_route_body(s, 0, d, len); };
@@ -323,8 +321,7 @@ mod params_def {
                 }
             };
 
-        4, host_ip, u32, 0
-            => |s, d, len| { s.client.host_ip = p_u32(d, len, 0, 0); };
+        // 4: host_ip — retired. `authority` is the client's one address.
 
         5, protocol, u8, 0
             => |s, d, len| { s.client.protocol = p_u8(d, len, 0, 0); };
@@ -419,11 +416,20 @@ mod params_def {
     111, client_total_ms, u32, 60_000
         => |s, d, len| { s.client.client_total_ms = p_u32(d, len, 0, 60_000); };
 
+    // `host[:port]`: where the client connects, what the transport in front
+    // verifies, and what goes on the wire as `Host:` / `:authority`, all one
+    // value. Port 80 when it names none. Empty leaves the client OPEN to the
+    // authority each exchange record names.
     112, authority, str, 0 => |s, d, len| {
-        if len > client::AUTHORITY_MAX { s.client.request_invalid = 1; }
-        let n = len.min(client::AUTHORITY_MAX);
-        core::ptr::copy_nonoverlapping(d, s.client.authority.as_mut_ptr(), n);
-        s.client.authority_len = n as u16;
+        // Held whole or not at all. An over-long one is marked and refused at
+        // construction rather than trimmed to fit: the trim would name a
+        // different host, and one that still parses.
+        if len > client::AUTHORITY_MAX {
+            s.client.authority_oversize = 1;
+            return;
+        }
+        core::ptr::copy_nonoverlapping(d, s.client.authority.as_mut_ptr(), len);
+        s.client.authority_len = len as u16;
     };
     113, method, u8, 1 => |s, d, len| {
         let code = p_u8(d, len, 0, wire::method::METHOD_GET);
@@ -754,7 +760,10 @@ pub unsafe extern "C" fn module_new(
         }
 
         if s.mode == MODE_CLIENT {
-            client::post_params(s);
+            let rc = client::post_params(s);
+            if rc != 0 {
+                return rc;
+            }
         } else {
             server::post_params(s);
             // An anchored instance that cannot move its sessions must not
@@ -848,8 +857,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         0
                     };
                 }
-                if s.h3_mode == 0 && s.client.protocol == 0 {
-                    client::h1::idle(s);
+                if s.h3_mode == 0 {
+                    if s.client.protocol == 0 {
+                        client::h1::idle(s);
+                    } else {
+                        // h2 has no idle step of its own, and an armed client
+                        // with nothing in flight returns below without ever
+                        // reaching one. Its share of a fanned lane still has
+                        // to be drained, so do the part that is true whatever
+                        // the protocol.
+                        client::drain_unowned(s);
+                    }
                 }
                 let _ = client::exchange::poll_request(s);
                 if client::exchange::pending(s) {

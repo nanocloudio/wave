@@ -8,8 +8,8 @@
 //! two roles are one module because they are one protocol over one socket: a
 //! Binding request and its response differ by two bits of the message type,
 //! and splitting them would duplicate the parse, the fingerprint check and the
-//! endpoint pump to no end. Setting `server_ip` arms the client; leaving it
-//! zero is the server-only module this was before.
+//! endpoint pump to no end. An `authority` arms the client; without one the
+//! module is a server alone.
 //!
 //! Message mechanics live in the host-tested `modules/common/stun_core.rs`,
 //! and the client's retransmission schedule in `modules/common/stun_txn.rs`;
@@ -24,9 +24,11 @@
 //! Ports:  net_in/net_out (the datagram surface), result_out (out[1]) — one
 //!         `[status:u8][ip:4 BE][port:u16 LE][code:u16 LE]` per client
 //!         transaction, and nothing at all in server-only mode.
-//! Params: `port` (UDP port to bind, default 3478), `server_ip`/`server_port`
-//!         (the server to ask; `server_ip` non-zero arms the client),
-//!         `txn_seed` (varies the transaction-id sequence between instances).
+//! Params: `port` (UDP port to bind, default 3478), `authority`
+//!         (`host[:port]` of the server to ask, port 3478 when it names
+//!         none — a DNS name the network provider resolves, or a dotted
+//!         quad; setting it arms the client), `txn_seed` (varies the
+//!         transaction-id sequence between instances).
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -72,6 +74,12 @@ include!("../../common/stun_core.rs");
 
 // The client's transaction schedule. A plain submodule, unlike `stun_core`:
 // it computes no MESSAGE-INTEGRITY and so needs nothing in scope by bare name.
+// Where the client sends, named once as `host[:port]` — the same core the
+// other datagram connectors take their peer from.
+#[path = "../../common/dg_authority.rs"]
+mod dg_authority;
+use dg_authority::{DgAuthority, DG_AUTHORITY_MAX};
+
 #[cfg(not(feature = "host-test"))]
 #[path = "../../common/stun_txn.rs"]
 mod stun_txn;
@@ -129,14 +137,13 @@ struct StunState {
     msg: [u8; MSG_BUF],
     net_buf: [u8; NET_BUF],
 
-    // ── client role (armed by a non-zero `server_ip`) ────────────────────
+    // ── client role (armed by an `authority`) ───────────────────────────
     /// out[1]: one result record per transaction. −1 leaves the client silent
     /// about its answers, which is a graph that wired no consumer for them.
     result_out: i32,
-    /// The server to ask, big-endian like every other address here. Zero means
-    /// server-only: this module then starts no transaction and reports nothing.
-    server_ip: u32,
-    server_port: u16,
+    /// The server to ask. Unset means server-only: this module then starts no
+    /// transaction and reports nothing.
+    server: DgAuthority,
     /// Varies the transaction-id sequence between instances counting from the
     /// same place.
     txn_seed: u32,
@@ -162,25 +169,30 @@ struct StunState {
     draining: u8,
 }
 
+/// The port the server's authority takes when it names none.
+const DEFAULT_SERVER_PORT: u16 = 3478;
+
 define_params! {
     StunState;
 
     1, port, u16, 3478
         => |s, d, len| { s.port = p_u16(d, len, 0, 3478); };
-    2, server_ip, u32, 0
-        => |s, d, len| { s.server_ip = p_u32(d, len, 0, 0); };
-    3, server_port, u16, 3478
-        => |s, d, len| { s.server_port = p_u16(d, len, 0, 3478); };
+    // Tags 2 and 3 are retired; the next allocation is 5.
     4, txn_seed, u32, 0
         => |s, d, len| { s.txn_seed = p_u32(d, len, 0, 0); };
+    // The server to ask, `host[:port]`. Held whole or not at all: a prefix
+    // of a name is a different host, and construction refuses what does
+    // not fit.
+    5, authority, str, 0
+        => |s, d, len| { s.server.set(core::slice::from_raw_parts(d, len)); };
 }
 
 /// Is the client role armed?
 ///
-/// A server address is the whole configuration: there is nothing to ask
-/// without one, and asking is the only thing the client does.
+/// The server's authority is the whole configuration: there is nothing to
+/// ask without one, and asking is the only thing the client does.
 fn client_armed(s: &StunState) -> bool {
-    s.server_ip != 0
+    s.server.is_set()
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -240,12 +252,20 @@ pub extern "C" fn module_new(
         s.timeouts = 0;
         s.draining = 0;
         s.result_out = -1;
-        s.server_ip = 0;
+        s.server.clear();
         s.txn_active = 0;
         s.txn_count = 0;
         s.res_owed = 0;
         set_defaults(s);
         parse_tlv(s, params, params_len);
+        // An authority that was given must be one: a client armed with a
+        // peer it cannot address would ask nobody and report nothing.
+        if s.server.offered() && !s.server.adopt(DEFAULT_SERVER_PORT) {
+            let m =
+                b"[stun] refusing to construct: authority must be host[:port], at most 64 bytes";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -22;
+        }
         if client_armed(s) {
             s.result_out = dev_channel_port(sys, 1, 1);
         }
@@ -471,17 +491,7 @@ unsafe fn pump_client(s: &mut StunState) {
                 return;
             };
             at = next;
-            let sent = dev_dg_send_to_v4(
-                sys,
-                s.net_out,
-                s.ep_id,
-                s.server_ip,
-                s.server_port,
-                out.as_ptr(),
-                at,
-                s.net_buf.as_mut_ptr(),
-                NET_BUF,
-            );
+            let sent = send_to_server(s, out.as_ptr(), at);
             // Only a confirmed write advances the schedule. Counting a refused
             // one would burn a transmission the server never had a chance to
             // see, and seven of those retire a transaction that was never
@@ -490,6 +500,48 @@ unsafe fn pump_client(s: &mut StunState) {
                 s.txn.sent_at(now);
             }
         }
+    }
+}
+
+/// Send one request to the server. A literal authority is addressed; a
+/// named one travels as a name for the provider to resolve, which drops
+/// the datagram until the answer lands — the transaction's own retransmit
+/// schedule is what carries it across that.
+///
+/// # Safety
+/// `data` is valid for `len` reads.
+unsafe fn send_to_server(s: &mut StunState, data: *const u8, len: usize) -> usize {
+    let sys = &*s.syscalls;
+    let port = s.server.port();
+    match s.server.name() {
+        Some(name) => {
+            let mut held = [0u8; DG_AUTHORITY_MAX];
+            let n = name.len();
+            held[..n].copy_from_slice(name);
+            dev_dg_send_to_name_owned(
+                sys,
+                s.net_out,
+                s.ep_id,
+                0,
+                &held[..n],
+                port,
+                data,
+                len,
+                s.net_buf.as_mut_ptr(),
+                NET_BUF,
+            )
+        }
+        None => dev_dg_send_to_v4(
+            sys,
+            s.net_out,
+            s.ep_id,
+            s.server.ip().unwrap_or(0),
+            port,
+            data,
+            len,
+            s.net_buf.as_mut_ptr(),
+            NET_BUF,
+        ),
     }
 }
 
@@ -511,7 +563,7 @@ unsafe fn client_on_response(
     // A response from anywhere else is a stranger answering a question they
     // were not asked — and being told your own address by a stranger is the
     // one thing this exchange must not allow.
-    if from_ip != s.server_ip || from_port != s.server_port {
+    if !s.server.matches(from_ip, from_port) {
         return false;
     }
     if !s.txn.matches(&header.txn) {
@@ -520,6 +572,9 @@ unsafe fn client_on_response(
     if find_attribute(buf, header, ATTR_FINGERPRINT).is_some() && !verify_fingerprint(buf, header) {
         return false;
     }
+    // A server named rather than addressed is held to the address this
+    // first accepted response came from.
+    s.server.learn(from_ip);
     if !s.txn.accept() {
         return true;
     }

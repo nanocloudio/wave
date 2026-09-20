@@ -80,8 +80,11 @@ case with nothing to answer on, which is logged and counted instead.
 
 ## Parameters
 
-`endpoint` (hex `[ip:4][port:2 LE]`), `host` (the Host header), `access_key`,
-`secret`, `region` — see `define_params!` in `mod.rs`.
+`authority` (`host[:port]`, port 80 when it names none: where the connector
+dials — a name goes to the network provider as a name, for it to resolve —
+and, verbatim, the `Host` SigV4 signs), `access_key`, `secret`, `region` — see
+`define_params!` in `mod.rs`. The authority is at most 256 bytes; absent,
+longer, or not `host[:port]` refuses construction.
 
 The request/response records are deliberately `OctetStream`, not a registered
 content type: a `CONTENT_TYPES` entry moves the ABI-surface digest and

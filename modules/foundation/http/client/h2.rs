@@ -39,16 +39,15 @@
 //!   module wrapping the cleartext channel.
 
 use super::super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED,
-    NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
+    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
+    NET_MSG_DATA, NET_MSG_ERROR,
 };
 use super::super::wire::h2 as h2w;
 use super::super::wire::ws;
 use super::super::HttpState;
 use super::super::{
     dev_csprng_fill, dev_log, dev_millis, dev_requester_tag, net_read_frame,
-    net_read_frame_aligned, net_write_frame, E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT,
-    SOCK_TYPE_STREAM,
+    net_read_frame_aligned, E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT,
 };
 use super::{
     send_close_frame, Phase as H1Phase, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED,
@@ -173,33 +172,19 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     set_phase(s, H2Phase::Error);
                     return E_NET_FAILED;
                 }
-                let sys = &*s.syscalls;
-                let chan = s.net_out_chan;
-                let buf = s.net_buf.as_mut_ptr();
-                let mut payload = [0u8; 8];
-                payload[0] = SOCK_TYPE_STREAM;
-                let ip = s.client.host_ip.to_le_bytes();
-                payload[1] = ip[0];
-                payload[2] = ip[1];
-                payload[3] = ip[2];
-                payload[4] = ip[3];
-                payload[5] = (s.client.port & 0xFF) as u8;
-                payload[6] = (s.client.port >> 8) as u8;
-                // requester tag = our module index (see client.rs).
-                payload[7] = dev_requester_tag(sys);
-                let wrote = net_write_frame(
-                    sys,
-                    chan,
-                    NET_CMD_CONNECT,
-                    payload.as_ptr(),
-                    8,
-                    buf,
-                    NET_BUF_SIZE,
-                );
-                if wrote == 0 {
-                    return 0;
+                // Tagged with our module index (see
+                // modules/foundation/http/client/mod.rs), so a
+                // fanned `net_out` hands us only our own connection.
+                match super::dial(s) {
+                    Some(true) => {}
+                    Some(false) => return 0,
+                    None => {
+                        log(s, b"[http] no authority to dial");
+                        set_phase(s, H2Phase::Error);
+                        return E_CONNECT_FAILED;
+                    }
                 }
-                s.client.connect_start_ms = dev_millis(sys);
+                s.client.connect_start_ms = dev_millis(&*s.syscalls);
                 set_phase(s, H2Phase::WaitConnect);
                 return 0;
             }
@@ -873,13 +858,13 @@ unsafe fn build_request(s: &mut HttpState) {
         b":path",
         core::slice::from_raw_parts(path, plen),
     );
-    let mut authority = [0u8; 21]; // "255.255.255.255:65535"
-    let auth_len = format_authority(s.client.host_ip, s.client.port, authority.as_mut_ptr());
+    // `:authority` is the authority of the connection in hand, verbatim:
+    // the same bytes the dial carried and the transport verified.
     bo += super::super::wire::hpack::encode_header(
         buf.add(bo),
         REQUEST_BUF_SIZE - bo,
         b":authority",
-        core::slice::from_raw_parts(authority.as_ptr(), auth_len),
+        &s.client.conn_authority[..s.client.conn_authority_len as usize],
     );
 
     if is_ws {
@@ -1105,21 +1090,6 @@ unsafe fn pump_data_in(s: &mut HttpState) -> Option<()> {
         return Some(());
     }
     None
-}
-
-unsafe fn format_authority(host: u32, port: u16, dst: *mut u8) -> usize {
-    let mut o = 0usize;
-    let bytes = host.to_le_bytes();
-    for &b in &bytes {
-        o += super::super::fmt_u32_raw(dst.add(o), b as u32);
-        *dst.add(o) = b'.';
-        o += 1;
-    }
-    o = o.saturating_sub(1); // strip trailing '.'
-    *dst.add(o) = b':';
-    o += 1;
-    o += super::super::fmt_u32_raw(dst.add(o), port as u32);
-    o
 }
 
 // ── Network I/O ───────────────────────────────────────────────────────────

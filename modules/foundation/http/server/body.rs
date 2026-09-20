@@ -262,7 +262,7 @@ pub(crate) unsafe fn parse_file_index(s: &HttpState) -> i16 {
 /// phase to SendHeaders / DrainSend). Returns `false` if `file_chan`
 /// is currently held by another slot — caller should stay in
 /// DispatchRoute and retry on the next tick.
-pub(crate) unsafe fn step_legacy_file_dispatch(s: &mut HttpState) -> bool {
+pub(crate) unsafe fn step_unrouted_file_dispatch(s: &mut HttpState) -> bool {
     let (buf, plen) = match cur_slot(s) {
         Some(c) => (c.req_path.as_ptr(), c.req_path_len as usize),
         None => return true,

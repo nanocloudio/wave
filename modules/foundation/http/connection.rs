@@ -23,11 +23,57 @@ pub(crate) use super::abi::contracts::net::net_proto;
 /// IP-private RETRANSMIT/ACK opcodes.
 pub(crate) use net_proto::MSG_TRACE_CTX as NET_MSG_TRACE_CTX;
 pub(crate) use net_proto::{
-    CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT,
+    CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO,
     CMD_SEND as NET_CMD_SEND, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
     MSG_ERROR as NET_MSG_ERROR,
 };
+
+/// The port a dial takes when its authority names none.
+pub(crate) const DEFAULT_PORT: u16 = 80;
+
+/// Open a stream to `authority` (`host[:port]`; [`DEFAULT_PORT`] when it
+/// names none) with one `CMD_CONNECT_TO` on `chan`, tagged `tag`.
+///
+/// `Some(true)` when the transport took the frame, `Some(false)` when the
+/// channel refused it — offer it again next step, nothing has been asked of
+/// the peer — and `None` when `authority` is not one a dial can carry, which
+/// is a fault in whoever composed it rather than in the transport. Every
+/// dial this module makes, client or proxy, goes through here, so the
+/// record's shape is written once.
+///
+/// # Safety
+/// `scratch` must be valid for writes of `NET_BUF_SIZE` bytes.
+pub(crate) unsafe fn dial(
+    sys: &super::SyscallTable,
+    chan: i32,
+    scratch: *mut u8,
+    authority: &[u8],
+    tag: u8,
+) -> Option<bool> {
+    let (target, port) = net_proto::Target::parse(authority)?;
+    let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
+    let n = net_proto::write_connect_to(
+        &mut payload,
+        super::SOCK_TYPE_STREAM,
+        port.unwrap_or(DEFAULT_PORT),
+        &target,
+        Some(tag),
+    );
+    if n == 0 {
+        return None;
+    }
+    let wrote = super::net_write_frame(
+        sys,
+        chan,
+        NET_CMD_CONNECT_TO,
+        payload.as_ptr(),
+        n,
+        scratch,
+        NET_BUF_SIZE,
+    );
+    Some(wrote != 0)
+}
 
 /// Scratch buffer size for assembling outbound and reading inbound
 /// frames. Must be ≥ the IP module's largest single MSG_DATA payload
@@ -44,7 +90,7 @@ pub(crate) use net_proto::{
 /// payload per call, multiplying per-tick segment output by ~5×
 /// over the embedded path.
 ///
-/// **rp2350 / rp2040 / wasm32** — 1600 (legacy). Embedded targets
+/// **rp2350 / rp2040 / wasm32** — 1600. Embedded targets
 /// rarely sustain MSS-class flows, and a 1600-byte stack buffer
 /// fits inside the constrained per-step budget.
 #[cfg(target_arch = "aarch64")]

@@ -46,6 +46,14 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 // directly, and the firmware's symbol surface is unchanged because the mods are
 // private off host-test. `modules/**` has a hard inline-test ban
 // (../standards/tests.md §1), so reaching them through the rlib is the only route.
+// The peer, named once as `host[:port]`. A SIP dialog builds its request
+// URI and its Via from the peer's ADDRESS, so this authority must be a v4
+// literal: there is no address to write into a header for a name whose
+// resolution lives in the network provider.
+#[path = "../../common/dg_authority.rs"]
+mod dg_authority;
+use dg_authority::DgAuthority;
+
 #[cfg(not(feature = "host-test"))]
 #[path = "../../common/sip_core.rs"]
 mod sip_core;
@@ -107,10 +115,14 @@ struct SipModState {
 
     // Config.
     local_ip: u32,
+    /// The peer's address, from `authority` or from a `SipCommand`.
     peer_ip: u32,
     local_sip_port: u16,
     peer_sip_port: u16,
     rtp_port: u16,
+    /// `authority` as configured, kept so construction can refuse one that
+    /// is not a v4 literal by name.
+    peer: DgAuthority,
     auto_answer: u8,
     ptime: u8,
     sip_active: u8,
@@ -195,6 +207,7 @@ impl SipModState {
         self.sip_bound = 0;
         self.local_ip = 0;
         self.peer_ip = 0;
+        self.peer = DgAuthority::empty();
         self.local_sip_port = 5060;
         self.peer_sip_port = 5060;
         self.rtp_port = 5004;
@@ -827,6 +840,9 @@ unsafe fn media_stop(s: &mut SipModState) {
 // Parameters
 // ---------------------------------------------------------------------------
 
+/// The port a peer authority takes when it names none.
+const DEFAULT_PEER_SIP_PORT: u16 = 5060;
+
 mod params_def {
     use super::SipModState;
     use super::SCHEMA_MAX;
@@ -836,8 +852,10 @@ mod params_def {
         SipModState;
         1, local_ip, u32, 0 => |s, d, len| { s.local_ip = p_u32(d, len, 0, 0); };
         2, local_sip_port, u16, 5060 => |s, d, len| { s.local_sip_port = p_u16(d, len, 0, 5060); };
-        3, peer_ip, u32, 0 => |s, d, len| { s.peer_ip = p_u32(d, len, 0, 0); };
-        4, peer_sip_port, u16, 5060 => |s, d, len| { s.peer_sip_port = p_u16(d, len, 0, 5060); };
+        // Tags 3 and 4 are retired; the next allocation is 10.
+        9, authority, str, 0 => |s, d, len| {
+            s.peer.set(core::slice::from_raw_parts(d, len));
+        };
         5, rtp_port, u16, 5004 => |s, d, len| { s.rtp_port = p_u16(d, len, 0, 5004); };
         6, auto_answer, u8, 1 => |s, d, len| { s.auto_answer = p_u8(d, len, 0, 1); };
         8, ptime, u8, 20 => |s, d, len| { let v = p_u8(d, len, 0, 20); s.ptime = if v == 0 { 20 } else { v }; };
@@ -899,6 +917,19 @@ pub extern "C" fn module_new(
             params_def::parse_tlv(s, params, params_len);
         } else {
             params_def::set_defaults(s);
+        }
+
+        // The peer is where the signalling goes AND what its headers name,
+        // so a name the module cannot write into a header is refused rather
+        // than dialled.
+        if s.peer.offered() {
+            if !s.peer.adopt(DEFAULT_PEER_SIP_PORT) || s.peer.ip().is_none() {
+                let m = b"[sip] refusing to construct: authority must be a v4 literal host[:port]";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+                return -22;
+            }
+            s.peer_ip = s.peer.ip().unwrap_or(0);
+            s.peer_sip_port = s.peer.port();
         }
 
         if s.local_ip != 0 && s.peer_ip != 0 {

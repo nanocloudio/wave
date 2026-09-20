@@ -9,11 +9,12 @@
 //!
 //! **Control channel support:** If ctrl_chan is wired, the module starts idle
 //! and waits for SET_ENDPOINT + START commands. Without ctrl_chan, it requires
-//! peer_ip and auto-starts.
+//! an `authority` and auto-starts.
 //!
 //! **Params (TLV v2):**
-//!   tag 1: peer_ip    (u32, required without ctrl — peer IPv4 network byte order)
-//!   tag 2: peer_port  (u16, default 5004)
+//!   tag 22: authority (str, `host[:port]` of the media peer, port 5004 when
+//!           it names none — a DNS name the network provider resolves, or a
+//!           dotted quad. Required without ctrl; a SET_ENDPOINT replaces it)
 //!   tag 3: local_port (u16, default 5004)
 //!   tag 4: ssrc       (u32, default 0x46585254 — TX only)
 //!   tag 5: ptime      (u8, default 20 — TX packet interval in ms)
@@ -24,10 +25,8 @@
 //!   tag 10: srtp_auth_key (20 bytes, optional AES-CM/SHA1 auth key)
 //!   tag 11: srtp_cm_salt (14 bytes, optional AES-CM session salt)
 //!   tag 12: srtp_profile (u8, 0 = GCM, 1 = AES-CM/SHA1-80)
-//!   tag 13: turn_relay_ip (u32, optional relay server)
-//!   tag 14: turn_relay_port (u16, default 3478)
-//!   tag 15: turn_peer_ip (u32, peer permitted at relay)
-//!   tag 16: turn_peer_port (u16, default 5004)
+//!   tag 23: turn_relay (str, `host[:port]` of an optional relay, port 3478)
+//!   tag 24: turn_peer (str, `host[:port]` permitted at the relay, port 5004)
 //!   tag 17: dtls_srtp_export (56 bytes, DTLS-SRTP exporter material)
 //!   tag 18: dtls_srtp_role (u8, 0 = client, 1 = server)
 //!   tag 19: route (40 bytes: mid_len, MID[32], PT, SSRC, codec index)
@@ -58,6 +57,12 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+
+// Where the media goes, named once as `host[:port]` — the same core the
+// other datagram connectors take their peer from.
+#[path = "../../common/dg_authority.rs"]
+mod dg_authority;
+use dg_authority::{DgAuthority, DG_AUTHORITY_MAX};
 
 // RFC 3550 header decode, shared with `sip` so both sides agree on which bytes
 // of a packet are payload. Mounted as a module, and by the same `#[path]` +
@@ -259,9 +264,20 @@ struct RtpState {
     payload_type: u8,
     ctrl_mode: u8,
     _pad0: u8,
+    /// The media destination in force: seeded from `authority` when that
+    /// names a literal, and replaced by a SET_ENDPOINT. Zero while a named
+    /// authority has not been resolved and no endpoint has been set.
     peer_ip: u32,
     peer_port: u16,
     local_port: u16,
+    /// `authority` as configured. A name here is sent to by name until a
+    /// SET_ENDPOINT names an address instead.
+    peer: DgAuthority,
+    /// `turn_relay` / `turn_peer` as configured. Both must be literals: the
+    /// relay is recognised as the source of inbound traffic, and the peer is
+    /// encoded into the Send indication's XOR-PEER-ADDRESS.
+    turn_relay: DgAuthority,
+    turn_peer: DgAuthority,
     /// Beat rate limiter (`dbg_beat`): steps since the last emission. Counted
     /// in steps, not milliseconds — this module attests `timer_class =
     /// "agnostic"` and must not read a clock for telemetry pacing.
@@ -427,6 +443,9 @@ impl RtpState {
         self.peer_ip = 0;
         self.peer_port = 5004;
         self.local_port = 5004;
+        self.peer = DgAuthority::empty();
+        self.turn_relay = DgAuthority::empty();
+        self.turn_peer = DgAuthority::empty();
         self.dbg_steps = 0;
         self.ssrc = 0x46585254; // "FXRT"
         self.seq_num = 0;
@@ -481,6 +500,56 @@ impl RtpState {
 // Parameters
 // ============================================================================
 
+/// The port a media authority takes when it names none.
+const DEFAULT_PEER_PORT: u16 = 5004;
+/// The port a `turn_relay` authority takes when it names none.
+const DEFAULT_TURN_RELAY_PORT: u16 = 3478;
+/// The port a `turn_peer` authority takes when it names none.
+const DEFAULT_TURN_PEER_PORT: u16 = 5004;
+
+/// Adopt the relay pair into the addresses the TURN paths use. Both are
+/// optional; either one given must parse and must be a literal, because a
+/// relay is recognised by the address its packets arrive from and a
+/// permitted peer is four bytes inside a Send indication.
+///
+/// # Safety
+/// `sys` is this module's syscall table.
+unsafe fn adopt_turn(s: &mut RtpState, sys: &SyscallTable) -> bool {
+    let pairs: [(bool, u16); 2] = [
+        (true, DEFAULT_TURN_RELAY_PORT),
+        (false, DEFAULT_TURN_PEER_PORT),
+    ];
+    for (is_relay, default_port) in pairs {
+        let auth = if is_relay {
+            &mut s.turn_relay
+        } else {
+            &mut s.turn_peer
+        };
+        if !auth.offered() {
+            continue;
+        }
+        if !auth.adopt(default_port) || auth.ip().is_none() {
+            let m: &[u8] = if is_relay {
+                b"[rtp] refusing to construct: turn_relay must be a v4 literal host[:port]"
+            } else {
+                b"[rtp] refusing to construct: turn_peer must be a v4 literal host[:port]"
+            };
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return false;
+        }
+        let ip = auth.ip().unwrap_or(0);
+        let port = auth.port();
+        if is_relay {
+            s.turn_relay_ip = ip;
+            s.turn_relay_port = port;
+        } else {
+            s.turn_peer_ip = ip;
+            s.turn_peer_port = port;
+        }
+    }
+    true
+}
+
 mod params_def {
     use super::dtls_srtp_wire;
     use super::rtp_route;
@@ -491,11 +560,9 @@ mod params_def {
     define_params! {
         RtpState;
 
-        1, peer_ip, u32, 0
-            => |s, d, len| { s.peer_ip = p_u32(d, len, 0, 0); };
-
-        2, peer_port, u16, 5004
-            => |s, d, len| { s.peer_port = p_u16(d, len, 0, 5004); };
+        // Tags 1 and 2 are retired; the next allocation is 25.
+        22, authority, str, 0
+            => |s, d, len| { s.peer.set(core::slice::from_raw_parts(d, len)); };
 
         3, local_port, u16, 5004
             => |s, d, len| { s.local_port = p_u16(d, len, 0, 5004); };
@@ -539,14 +606,11 @@ mod params_def {
         12, srtp_profile, u8, 0
             => |s, d, len| { s.srtp_profile = p_u8(d, len, 0, 0).min(1); };
 
-        13, turn_relay_ip, u32, 0
-            => |s, d, len| { s.turn_relay_ip = p_u32(d, len, 0, 0); };
-        14, turn_relay_port, u16, 3478
-            => |s, d, len| { s.turn_relay_port = p_u16(d, len, 0, 3478); };
-        15, turn_peer_ip, u32, 0
-            => |s, d, len| { s.turn_peer_ip = p_u32(d, len, 0, 0); };
-        16, turn_peer_port, u16, 5004
-            => |s, d, len| { s.turn_peer_port = p_u16(d, len, 0, 5004); };
+        // Tags 13, 14, 15 and 16 are retired.
+        23, turn_relay, str, 0
+            => |s, d, len| { s.turn_relay.set(core::slice::from_raw_parts(d, len)); };
+        24, turn_peer, str, 0
+            => |s, d, len| { s.turn_peer.set(core::slice::from_raw_parts(d, len)); };
 
         17, dtls_srtp_export, u8, 0
             => |s, d, len| {
@@ -694,6 +758,27 @@ pub extern "C" fn module_new(
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
+            // An authority that was given must be one, and a literal seeds
+            // the destination in force. A name is sent to by name until a
+            // SET_ENDPOINT names an address.
+            if s.peer.offered() && !s.peer.adopt(DEFAULT_PEER_PORT) {
+                let m =
+                    b"[rtp] refusing to construct: authority must be host[:port], at most 64 bytes";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+                return -22;
+            }
+            if let Some(ip) = s.peer.ip() {
+                s.peer_ip = ip;
+            }
+            if s.peer.is_set() {
+                s.peer_port = s.peer.port();
+            }
+            // The relay pair is addresses, not names: the relay is
+            // recognised as the source of inbound traffic, and the permitted
+            // peer is encoded into the Send indication.
+            if !adopt_turn(s, sys) {
+                return -22;
+            }
         } else {
             params_def::set_defaults(s);
         }
@@ -706,8 +791,9 @@ pub extern "C" fn module_new(
         } else {
             // Static mode: the peer comes from parameters, so it must be
             // there before the endpoint can start.
-            if s.peer_ip == 0 {
-                dev_log(sys, 1, b"[rtp] no peer_ip".as_ptr(), 16);
+            if s.peer_ip == 0 && s.peer.name().is_none() {
+                let m = b"[rtp] no authority";
+                dev_log(sys, 1, m.as_ptr(), m.len());
                 return -10;
             }
         }
@@ -792,9 +878,12 @@ unsafe fn step_idle(s: &mut RtpState) -> i32 {
                 u32::from_le_bytes([s.ctrl_buf[4], s.ctrl_buf[5], s.ctrl_buf[6], s.ctrl_buf[7]]);
             s.peer_ip = addr;
             s.peer_port = port;
+            // An endpoint named by the signalling replaces the configured
+            // one; one destination is in force at a time.
+            s.peer.clear();
         }
         CTRL_START => {
-            if s.peer_ip == 0 {
+            if s.peer_ip == 0 && s.peer.name().is_none() {
                 dev_log(sys, 2, b"[rtp] no endpoint".as_ptr(), 17);
                 return 0;
             }
@@ -925,6 +1014,7 @@ unsafe fn step_running(s: &mut RtpState) -> i32 {
                     ]);
                     s.peer_ip = addr;
                     s.peer_port = port;
+                    s.peer.clear();
                 }
             }
         }
@@ -1558,6 +1648,35 @@ unsafe fn send_rtp_packet(s: &mut RtpState) {
         dest_ip = s.turn_relay_ip;
         dest_port = s.turn_relay_port;
     }
+    // A destination still held as a name — a configured authority no
+    // SET_ENDPOINT has replaced — travels as a name for the provider to
+    // resolve. It drops the packet until the answer lands, which for media
+    // is the next packet time.
+    if dest_ip == 0 && s.peer.name().is_some() && s.ep_id != 0xFF {
+        let port = s.peer.port();
+        let mut held = [0u8; DG_AUTHORITY_MAX];
+        let n = s.peer.name().map(|n| n.len()).unwrap_or(0);
+        if let Some(name) = s.peer.name() {
+            held[..n].copy_from_slice(name);
+        }
+        let sent = dev_dg_send_to_name_owned(
+            sys,
+            s.net_out_chan,
+            s.ep_id,
+            0,
+            &held[..n],
+            port,
+            pkt,
+            wire_total,
+            s.net_buf.as_mut_ptr(),
+            NET_BUF_SIZE,
+        );
+        if sent == 0 {
+            dev_log(sys, 2, b"[rtp] send err".as_ptr(), 14);
+        }
+        advance_after_send(s, payload_len);
+        return;
+    }
     let scratch = s.net_buf.as_mut_ptr();
     let frame_payload_len = DG_V4_PREFIX + wire_total;
     if s.ep_id != 0xFF && frame_payload_len + NET_FRAME_HDR <= NET_BUF_SIZE {
@@ -1582,26 +1701,28 @@ unsafe fn send_rtp_packet(s: &mut RtpState) {
         }
     }
 
+    advance_after_send(s, payload_len);
+}
+
+/// The bookkeeping every send does once the packet is on its way: the
+/// sequence and timestamp advance, the sender counters follow the stream's
+/// own numbering rather than the transport's verdict, and the accumulator
+/// gives up the bytes just sent.
+///
+/// # Safety
+/// `s` is this module's state; the accumulator holds `payload_len` bytes.
+unsafe fn advance_after_send(s: &mut RtpState, payload_len: usize) {
     // The timestamp of the packet just sent, captured BEFORE the advance
     // below. A Sender Report says "this RTP timestamp and this wallclock name
     // the same instant", and the advanced value names the NEXT packet — one
     // packet time in the future, which is a 20 ms lie at the default ptime.
     let sent_ts = s.timestamp;
-
-    // Advance sequence and timestamp
     s.seq_num = s.seq_num.wrapping_add(1);
     s.timestamp = s.timestamp.wrapping_add(payload_len as u32);
-
-    // §6.4.1's sender counters, advancing WITH the sequence number rather than
-    // with the transport's verdict on the write above. That write can be
-    // skipped or refused, and it is logged when it is — but the sequence
-    // number has already moved, so a count that disagreed with the stream's
-    // own numbering would describe a stream nobody sent.
     s.packets_sent = s.packets_sent.wrapping_add(1);
     s.octets_sent = s.octets_sent.wrapping_add(payload_len as u32);
     emit_rtcp_tx_stats(s, sent_ts);
 
-    // Shift remaining data in accumulator
     let remaining = s.acc_len as usize - payload_len;
     if remaining > 0 {
         __aeabi_memmove(

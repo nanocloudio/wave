@@ -14,6 +14,7 @@
 //! Route rows are built by `super::params`, not here — this file owns their
 //! shape and their matching, not their configuration.
 
+use super::super::connection::net_proto::Target;
 use super::{
     cur_slot, dyn_field, dyn_u32, hex_val, HttpState, TableSink, MAX_CONTENT_TYPE, MAX_DYN_KEY,
     MAX_DYN_ROUTES, MAX_FS_PATH, MAX_PATH, MAX_ROUTES, MAX_ROUTE_BACKENDS,
@@ -354,7 +355,15 @@ pub(crate) unsafe fn content_type_from_path(path: *const u8, plen: usize) -> &'s
 // `/dataplane/edge/<ns>/<name>` prefix, one key per route carrying the full
 // backend set:
 //
-//   host=<h>;path=<prefix>;be=<ip>:<port>:<w>:<r>,<ip>:<port>:<w>:<r>,…
+//   host=<h>;path=<prefix>;be=<authority>:<w>:<r>,<authority>:<w>:<r>,…
+//
+// Each backend is an authority — `host[:port]`, a DNS name, a dotted quad
+// or a bracketed v6 literal, port 80 when it names none — followed by its
+// weight and readiness. The authority may itself hold a colon, so an entry
+// is read from the RIGHT: the last two colon-separated fields are `<w>` and
+// `<r>`, both required, and everything before them is the authority. A name
+// is handed to the network provider as it is; resolving it is the
+// provider's job, at the dial.
 //
 // Host matching, weights and readiness are net-new capabilities the static
 // matcher does not have. The relay (`HANDLER_PROXY`, `super::proxy`) dials the
@@ -363,12 +372,16 @@ pub(crate) unsafe fn content_type_from_path(path: *const u8, plen: usize) -> &'s
 
 /// Host header buffer per dynamic route.
 pub(crate) const MAX_DYN_HOST: usize = 64;
+/// Longest backend authority a `be=` entry may carry. An entry over this is
+/// refused at parse and counted as dropped, never truncated: half a name is
+/// another name.
+pub(crate) const MAX_BACKEND_AUTHORITY: usize = 64;
 /// One backend of a dynamic route.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Backend {
-    pub(crate) ip: u32,
-    pub(crate) port: u16,
+    pub(crate) authority: [u8; MAX_BACKEND_AUTHORITY],
+    pub(crate) authority_len: u8,
     pub(crate) weight: u8,
     pub(crate) ready: bool,
 }
@@ -376,11 +389,16 @@ pub struct Backend {
 impl Backend {
     const fn new() -> Self {
         Self {
-            ip: 0,
-            port: 0,
+            authority: [0; MAX_BACKEND_AUTHORITY],
+            authority_len: 0,
             weight: 0,
             ready: false,
         }
+    }
+
+    /// The `host[:port]` this backend is dialled as.
+    pub fn authority(&self) -> &[u8] {
+        &self.authority[..self.authority_len as usize]
     }
 }
 
@@ -432,9 +450,9 @@ impl DynRoute {
 
     /// Weighted round-robin over `ready` backends with `weight > 0`.
     /// Advances `rr_cursor` by one each call; over `total_weight` calls
-    /// the distribution matches the weights. Returns `(ip, port)` or
-    /// `None` when no backend is ready.
-    pub fn select_backend(&mut self) -> Option<(u32, u16)> {
+    /// the distribution matches the weights. Returns the chosen backend's
+    /// index into `backends`, or `None` when no backend is ready.
+    pub fn select_backend(&mut self) -> Option<usize> {
         let mut total: u32 = 0;
         for b in &self.backends[..self.backend_count as usize] {
             if b.ready && b.weight > 0 {
@@ -446,16 +464,27 @@ impl DynRoute {
         }
         let mut target = self.rr_cursor as u32 % total;
         self.rr_cursor = self.rr_cursor.wrapping_add(1);
-        for b in &self.backends[..self.backend_count as usize] {
+        for (i, b) in self.backends[..self.backend_count as usize]
+            .iter()
+            .enumerate()
+        {
             if b.ready && b.weight > 0 {
                 let w = b.weight as u32;
                 if target < w {
-                    return Some((b.ip, b.port));
+                    return Some(i);
                 }
                 target -= w;
             }
         }
         None
+    }
+
+    /// The authority of backend `i`, as `select_backend` chose it.
+    pub fn backend_authority(&self, i: usize) -> &[u8] {
+        match self.backends.get(i) {
+            Some(b) => b.authority(),
+            None => &[],
+        }
     }
 }
 
@@ -491,37 +520,26 @@ impl DynRoutes {
     }
 }
 
-/// Parse a dotted-quad IPv4 (`a.b.c.d`) into a big-endian-packed u32
-/// (`a<<24 | b<<16 | c<<8 | d`).
-fn dyn_ipv4(b: &[u8]) -> u32 {
-    let mut octets = [0u32; 4];
-    let mut oi = 0usize;
-    let mut cur = 0u32;
-    let mut seen = false;
-    for &c in b {
-        if c == b'.' {
-            if oi < 4 {
-                octets[oi] = cur & 0xFF;
-            }
-            oi += 1;
-            cur = 0;
-            seen = false;
-        } else if c.is_ascii_digit() {
-            cur = cur.wrapping_mul(10).wrapping_add((c - b'0') as u32);
-            seen = true;
-        } else {
-            break;
-        }
+/// Split one `be=` entry into its parts from the right:
+/// `(<authority>, <w>, <r>)`. `None` for an entry with fewer than two
+/// colon-separated fields after the authority, an authority over
+/// `MAX_BACKEND_AUTHORITY`, or one that is not `host[:port]`.
+pub(crate) fn parse_backend(seg: &[u8]) -> Option<(&[u8], u32, u32)> {
+    let r_at = seg.iter().rposition(|&b| b == b':')?;
+    let w_at = seg[..r_at].iter().rposition(|&b| b == b':')?;
+    let authority = &seg[..w_at];
+    if authority.len() > MAX_BACKEND_AUTHORITY || Target::parse(authority).is_none() {
+        return None;
     }
-    if seen && oi < 4 {
-        octets[oi] = cur & 0xFF;
-    }
-    (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+    let weight = dyn_u32(&seg[w_at + 1..r_at]);
+    let ready = dyn_u32(&seg[r_at + 1..]);
+    Some((authority, weight, ready))
 }
 
 /// Fill a `DynRoute` slot from `key` + compact `value`
-/// (`host=…;path=…;be=<ip>:<port>:<w>:<r>,…`). Returns the number of
-/// backends dropped because the set exceeded `MAX_ROUTE_BACKENDS`.
+/// (`host=…;path=…;be=<authority>:<w>:<r>,…`). Returns the number of
+/// backends dropped: past `MAX_ROUTE_BACKENDS`, or refused by
+/// `parse_backend`.
 fn dyn_fill(dst: &mut DynRoute, key: &[u8], value: &[u8]) -> u32 {
     *dst = DynRoute::new();
     let kn = key.len().min(MAX_DYN_KEY);
@@ -550,23 +568,20 @@ fn dyn_fill(dst: &mut DynRoute, key: &[u8], value: &[u8]) -> u32 {
                 .unwrap_or(be.len());
             let seg = &be[start..end];
             if !seg.is_empty() {
-                // `<ip>:<port>:<w>:<r>`
-                let mut it = seg.split(|&b| b == b':');
-                let ip = it.next().map(dyn_ipv4).unwrap_or(0);
-                let port = it.next().map(dyn_u32).unwrap_or(0) as u16;
-                let weight = it.next().map(dyn_u32).unwrap_or(1);
-                let ready = it.next().map(dyn_u32).unwrap_or(1);
-                if (dst.backend_count as usize) < MAX_ROUTE_BACKENDS {
-                    let i = dst.backend_count as usize;
-                    dst.backends[i] = Backend {
-                        ip,
-                        port,
-                        weight: weight.min(255) as u8,
-                        ready: ready != 0,
-                    };
-                    dst.backend_count += 1;
-                } else {
-                    dropped += 1;
+                match parse_backend(seg) {
+                    Some((authority, weight, ready))
+                        if (dst.backend_count as usize) < MAX_ROUTE_BACKENDS =>
+                    {
+                        let i = dst.backend_count as usize;
+                        let mut b = Backend::new();
+                        b.authority[..authority.len()].copy_from_slice(authority);
+                        b.authority_len = authority.len() as u8;
+                        b.weight = weight.min(255) as u8;
+                        b.ready = ready != 0;
+                        dst.backends[i] = b;
+                        dst.backend_count += 1;
+                    }
+                    _ => dropped += 1,
                 }
             }
             if end >= be.len() {

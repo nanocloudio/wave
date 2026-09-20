@@ -167,9 +167,9 @@ server_mod!(
 
 use super::abi::SyscallTable;
 use super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND,
-    NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA,
-    NET_MSG_ERROR, NET_MSG_TRACE_CTX,
+    net_proto, NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
+    NET_MSG_TRACE_CTX,
 };
 use super::wire;
 use super::HttpState;
@@ -665,9 +665,9 @@ pub(crate) struct ConnSlot {
     /// Dyn-route index driving this relay (`-1` = static proxy route
     /// or none). Used to advance `rr_cursor` + reselect on failover.
     pub(crate) proxy_dyn_idx: i16,
-    /// Selected backend address for the (re)dial.
-    pub(crate) proxy_be_ip: u32,
-    pub(crate) proxy_be_port: u16,
+    /// The selected backend's authority, `host[:port]`, for the (re)dial.
+    pub(crate) proxy_be: [u8; routes::MAX_BACKEND_AUTHORITY],
+    pub(crate) proxy_be_len: u8,
     /// Client's source address for `X-Forwarded-For`. 0 (`0.0.0.0`)
     /// when unknown — the net layer's `MSG_ACCEPTED` carries only
     /// `[conn_id][local_port]`, not the peer address (P1 correction),
@@ -686,7 +686,7 @@ pub(crate) struct ConnSlot {
     pub(crate) backend_closed: u8,
     /// Read cursor into `recv_buf` for the client→backend body relay.
     pub(crate) proxy_creq_off: u16,
-    _proxy_pad: [u8; 2],
+    _proxy_pad: u8,
 }
 
 impl ConnSlot {
@@ -1042,10 +1042,12 @@ pub(crate) struct ServerState {
     pub(crate) max_body: u32,
 
     pub(crate) route_count: u8,
-    /// Configured at boot in `post_params` based on the wired routes.
-    /// Server-wide (not per-conn) — every connection's dispatch path
-    /// keys off the same configured mode.
-    pub(crate) legacy_mode: u8,
+    /// How a request is served when no route params were wired: 1 = the
+    /// inline `body` answers `/`, 2 = the file channel answers everything,
+    /// 0 = neither, and the route table decides. Settled at boot in
+    /// `post_params` and server-wide, so every connection's dispatch keys
+    /// off one answer rather than re-deriving it per request.
+    pub(crate) unrouted_mode: u8,
     pub(crate) cache_count: u8,
     pub(crate) cache_tick: u8,
     /// Telemetry-variable count. Updates arrive on `var_chan` and
@@ -2058,9 +2060,9 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
             r0.path_len = 1;
             r0.handler = HANDLER_STATIC;
             s.server.route_count = 1;
-            s.server.legacy_mode = 1;
+            s.server.unrouted_mode = 1;
         } else if s.server.file_chan >= 0 {
-            s.server.legacy_mode = 2;
+            s.server.unrouted_mode = 2;
         }
     }
 

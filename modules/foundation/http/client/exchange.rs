@@ -67,13 +67,26 @@
 //!
 //! `corr` is never 0 on a publish — the contract says so and `Publish::decode`
 //! enforces it — which is what lets a zero `exchange_corr` mean idle.
+//!
+//! # Where a request goes
+//!
+//! A record may end with the authority it is for. A client whose `authority`
+//! parameter is set is PINNED: a record naming nothing or naming the same
+//! bytes is performed there, and one naming anything else is refused as
+//! unroutable — the graph fixed where this client goes, and a record does
+//! not get to move it. A client with no `authority` is OPEN: it goes where
+//! each record says, keeping ONE connection, so a record for a different
+//! authority than the connection in hand closes that connection and dials
+//! the new one before the request is sent. A record naming nothing on an
+//! open client has nowhere to go and is refused.
 
+use super::super::connection::net_proto::Target;
 use super::super::exchange::{
     Publish, Reply, FLAG_BROADCAST, MSG_PUBLISH, MSG_REPLY, REFUSE_OVERSIZE, REFUSE_UNROUTABLE,
     REFUSE_UPSTREAM, STATUS_OK,
 };
 use super::super::HttpState;
-use super::{Phase, EXCHANGE_KEY_MAX, EXCHANGE_REPLY_MAX};
+use super::{log, Phase, EXCHANGE_KEY_MAX, EXCHANGE_REPLY_MAX};
 
 // The records this module reads and writes. Mounted rather than restated:
 // a producer outside Wave mounts the same file, so an offset written here
@@ -234,11 +247,51 @@ pub(crate) unsafe fn poll_request(s: &mut HttpState) -> bool {
         send_reply(s, REFUSE_UNROUTABLE, 0);
         return false;
     }
+    // Where this request goes. A pinned client refuses a record that names
+    // anywhere else; an open client goes where the record says, and refuses
+    // one that says nothing or names what no dial can carry.
+    let module_authority = &s.client.authority[..s.client.authority_len as usize];
+    let record_authority = request.authority;
+    let refused = if !module_authority.is_empty() {
+        !record_authority.is_empty() && record_authority != module_authority
+    } else {
+        record_authority.is_empty() || Target::parse(record_authority).is_none()
+    };
+    if refused {
+        log(
+            s,
+            b"[http] record authority refused: pinned or not host[:port]",
+        );
+        adopt(s, corr, key);
+        send_reply(s, REFUSE_UNROUTABLE, 0);
+        return false;
+    }
+    if record_authority.len() > super::AUTHORITY_MAX {
+        adopt(s, corr, key);
+        send_reply(s, REFUSE_OVERSIZE, 0);
+        return false;
+    }
     let (path_len, headers_len, body_len) = (
         request.path.len(),
         request.headers.len(),
         request.body.len(),
     );
+
+    // An open client takes the record's authority as the authority of the
+    // connection in hand. If a connection to another one is being held open
+    // it is marked stale, and `Init` closes it before dialling the new one.
+    // A pinned client's connection authority is its own and never moves.
+    if module_authority.is_empty() {
+        let n = record_authority.len();
+        if s.client.conn_present != 0
+            && &s.client.conn_authority[..s.client.conn_authority_len as usize] != record_authority
+        {
+            s.client.conn_stale = 1;
+            s.client.response.reusable = false;
+        }
+        s.client.conn_authority[..n].copy_from_slice(record_authority);
+        s.client.conn_authority_len = n as u16;
+    }
 
     s.client.method = method;
     s.client.exchange_extended = u8::from(extended);

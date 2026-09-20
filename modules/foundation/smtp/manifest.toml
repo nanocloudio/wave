@@ -8,7 +8,7 @@ hardware_targets = ["bcm2712"]
 timer_class      = "wall_clock"
 
 # Transport to the SMTP server (net_proto): net_in reads NET_MSG_* events from
-# linux_net/ip, net_out writes NET_CMD_CONNECT/SEND/CLOSE.
+# linux_net/ip, net_out writes NET_CMD_CONNECT_TO/SEND/CLOSE.
 [[ports]]
 name         = "net_in"
 direction    = "input"

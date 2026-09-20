@@ -25,8 +25,8 @@ pub(crate) mod h3;
 pub mod h3;
 
 use super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED,
-    NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
+    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
+    NET_MSG_DATA, NET_MSG_ERROR,
 };
 use super::wire;
 use super::HttpState;
@@ -121,6 +121,9 @@ pub(crate) const E_NET_FAILED: i32 = -30;
 pub(crate) const E_CONNECT_FAILED: i32 = -31;
 pub(crate) const E_SEND_FAILED: i32 = -32;
 pub(crate) const E_WRITE_FAILED: i32 = -34;
+/// Construction refused: the `authority` parameter is unusable — not
+/// `host[:port]`, or longer than [`AUTHORITY_MAX`].
+pub(crate) const E_BAD_AUTHORITY: i32 = -22;
 
 // ── Phase machine ─────────────────────────────────────────────────────────
 
@@ -154,7 +157,15 @@ pub(crate) struct ClientState {
     /// request whose response a caller is waiting for, and it does not sit
     /// open once there is nothing left to finish.
     pub(crate) draining: u8,
-    _conn_pad: [u8; 2],
+    /// 1 when the connection in hand must be closed before the next dial: an
+    /// open client was asked for a different authority than the one it is
+    /// holding open. `Init` closes it and dials afresh.
+    pub(crate) conn_stale: u8,
+    /// 1 when the `authority` parameter was longer than [`AUTHORITY_MAX`].
+    /// Recorded rather than truncated: a prefix of an authority is a
+    /// different host, and construction refuses it — with a diagnostic that
+    /// says it was the LENGTH, which a parse of the truncation could not.
+    pub(crate) authority_oversize: u8,
     pub(crate) out_chan: i32,
     /// `in[1]` — when wired (≥ 0), the WS client reads outgoing
     /// payloads from this channel and emits them as WS TEXT frames.
@@ -162,13 +173,21 @@ pub(crate) struct ClientState {
     /// one-shot `request_body` behavior.
     pub(crate) data_in_chan: i32,
 
-    pub(crate) host_ip: u32,
+    /// The `authority` parameter, `host[:port]`: where this client connects,
+    /// what the transport in front verifies, and what every request carries
+    /// verbatim as `Host:` / `:authority`. Empty means the client is OPEN:
+    /// each exchange record names the authority it is for.
     pub(crate) authority: [u8; AUTHORITY_MAX],
     pub(crate) authority_len: u16,
+    /// The authority of the connection in hand — dialled, being dialled, or
+    /// about to be. Equal to `authority` on a pinned client; on an open one
+    /// it is the record's, and a record naming another marks the connection
+    /// stale so the next dial goes where that record asked.
+    pub(crate) conn_authority: [u8; AUTHORITY_MAX],
+    pub(crate) conn_authority_len: u16,
     pub(crate) request_invalid: u8,
     pub(crate) keep_alive: u8,
     pub(crate) idle_since_ms: u64,
-    pub(crate) port: u16,
     pub(crate) path_len: u16,
     /// Status code of the response in flight, parsed when its headers
     /// complete. Zero before that, and for a status line this parser will not
@@ -350,8 +369,10 @@ pub(crate) unsafe fn parse_request_body(s: &mut HttpState, d: *const u8, len: us
 pub(crate) unsafe fn init(s: &mut HttpState) {
     s.client.out_chan = -1;
     s.client.data_in_chan = -1;
-    s.client.port = 80;
     s.client.authority_len = 0;
+    s.client.conn_authority_len = 0;
+    s.client.conn_stale = 0;
+    s.client.authority_oversize = 0;
     s.client.request_invalid = 0;
     s.client.content_type = [0; CONTENT_TYPE_MAX];
     s.client.content_type_len = 0;
@@ -365,10 +386,36 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.client.recv_window = 65535;
 }
 
-pub(crate) unsafe fn post_params(s: &mut HttpState) {
+/// Finish construction from the decoded params. Non-zero refuses the module:
+/// a client whose one address is not an address cannot be given a
+/// connection it would dial wrongly.
+pub(crate) unsafe fn post_params(s: &mut HttpState) -> i32 {
     let sys = &*s.syscalls;
     s.client.out_chan = dev_channel_port(sys, 1, 1); // out[1]: body data
     s.client.data_in_chan = dev_channel_port(sys, 0, 1); // in[1]: outbound WS payload data
+
+    // The authority is parsed once here so that a graph naming one that no
+    // dial can carry fails to load rather than failing its first request.
+    // Every connection a pinned client opens goes to it, so it is also the
+    // authority of the connection in hand from the start.
+    // Length first: a truncated authority can parse perfectly well as a
+    // shorter host, so checking the shape of what survived would accept a
+    // pin to somewhere the graph never named.
+    if s.client.authority_oversize != 0 {
+        log(
+            s,
+            b"[http] authority is longer than the 128 bytes held for it",
+        );
+        return E_BAD_AUTHORITY;
+    }
+    let n = s.client.authority_len as usize;
+    if n > 0 {
+        if net_proto::Target::parse(&s.client.authority[..n]).is_none() {
+            log(s, b"[http] authority is not host[:port]");
+            return E_BAD_AUTHORITY;
+        }
+        set_conn_authority(s, n);
+    }
 
     if s.client.path_len == 0 {
         s.client.path[0] = b'/';
@@ -385,6 +432,38 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     exchange::init(s);
 
     log(s, b"[http] client configured");
+    0
+}
+
+/// Make the module's own authority the authority of the connection in hand.
+unsafe fn set_conn_authority(s: &mut HttpState, n: usize) {
+    core::ptr::copy_nonoverlapping(
+        s.client.authority.as_ptr(),
+        s.client.conn_authority.as_mut_ptr(),
+        n,
+    );
+    s.client.conn_authority_len = n as u16;
+}
+
+/// Dial the authority of the connection in hand. `None` when there is none
+/// to dial — an open client with no record, or a bad one — which the caller
+/// answers as a failed connect; `Some(false)` when the transport refused the
+/// frame and it is to be offered again.
+pub(crate) unsafe fn dial(s: &mut HttpState) -> Option<bool> {
+    if s.net_out_chan < 0 || s.client.conn_authority_len == 0 {
+        return None;
+    }
+    let sys = &*s.syscalls;
+    let tag = dev_requester_tag(sys);
+    let chan = s.net_out_chan;
+    let n = s.client.conn_authority_len as usize;
+    super::connection::dial(
+        sys,
+        chan,
+        s.net_buf.as_mut_ptr(),
+        &s.client.conn_authority[..n],
+        tag,
+    )
 }
 
 #[inline(always)]
@@ -404,9 +483,8 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
         s.client.method,
         s.client.path.as_ptr(),
         s.client.path_len as usize,
-        s.client.host_ip,
         &wire::h1::RequestOptions {
-            authority: &s.client.authority[..s.client.authority_len as usize],
+            authority: &s.client.conn_authority[..s.client.conn_authority_len as usize],
             body_len: s.client.request_body_len as usize,
             content_type: &s.client.content_type[..s.client.content_type_len as usize],
             http11: true,
@@ -472,6 +550,34 @@ pub(crate) unsafe fn send_close_frame(s: &mut HttpState) -> bool {
     s.client.conn_id = 0;
     s.client.conn_present = 0;
     true
+}
+
+/// Drop what arrives for other consumers while this client holds no
+/// connection of its own.
+///
+/// `net_in` is fanned from a lane stream consumers share, so a client that has
+/// not dialled still receives every frame they do. Left unread those copies
+/// fill the edge, and a full edge back-pressures the provider until it can no
+/// longer deliver to the consumer the bytes were for — one idle leg stalling
+/// the leg doing the work, and only once a response outgrew the edge.
+///
+/// Draining is unconditional here precisely BECAUSE there is no connection: a
+/// client without one owns nothing that can arrive, so nothing it reads can be
+/// a frame it needed. With a connection the protocol decides what an
+/// unsolicited frame means — for h1 [`h1::idle`], which knows that data
+/// between exchanges makes a connection unreusable; for h2 the server's
+/// SETTINGS and PING are ordinary, so this must not touch it.
+pub(crate) unsafe fn drain_unowned(s: &mut HttpState) {
+    if s.client.conn_present != 0 || s.net_in_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    for _ in 0..8 {
+        let (kind, _n) = net_read_frame(sys, s.net_in_chan, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
+        if kind == 0 {
+            break;
+        }
+    }
 }
 
 /// True when a just-read established-stream frame (`MSG_DATA` / `MSG_CLOSED` /

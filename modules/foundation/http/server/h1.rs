@@ -31,8 +31,8 @@ use super::super::connection::{
 use super::super::wire;
 use super::body::{
     finish_response, parse_file_index, render_index_into, render_static_into,
-    render_template_route_into, step_legacy_file_dispatch, step_send_file, step_send_fs_file,
-    step_send_index, step_send_static, step_send_template,
+    render_template_route_into, step_send_file, step_send_fs_file, step_send_index,
+    step_send_static, step_send_template, step_unrouted_file_dispatch,
 };
 use super::cache::{
     cache_alloc, cache_evict_all, cache_fetch_step, cache_lookup, cache_release_for_route,
@@ -46,7 +46,7 @@ use super::proxy::{
 };
 use super::response::{
     build_error, build_error_416, build_header, build_header_fs_full, build_header_fs_partial,
-    build_header_with_len,
+    build_header_with_len, put_bytes, put_ipv4_decimal, put_u32_decimal,
 };
 #[cfg(feature = "app")]
 use super::routes::HANDLER_APP;
@@ -235,8 +235,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             match msg_type {
                 // Multi-anchor demux: on a shared `net_in` fan IP emits one
                 // MSG_BOUND per anchor's CMD_BIND. Treat only the bound for
-                // OUR listener port as ours (a port-less legacy frame is
-                // accepted). Ignoring a neighbour's bound here prevents this
+                // OUR listener port as ours; a frame carrying no port names
+                // no anchor to tell apart, so it is accepted. Ignoring a
+                // neighbour's bound here prevents this
                 // server from flipping to WaitAccept / `bound` on someone
                 // else's listen completing first.
                 NET_MSG_BOUND
@@ -780,10 +781,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
         }
 
         Phase::DispatchRoute => {
-            if s.server.legacy_mode == 2 {
+            if s.server.unrouted_mode == 2 {
                 // Returns false if file_chan was busy; caller stays
                 // in DispatchRoute and retries next tick.
-                let _ = step_legacy_file_dispatch(s);
+                let _ = step_unrouted_file_dispatch(s);
                 return 0;
             }
 
@@ -1549,7 +1550,13 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             cur.phase = Phase::DrainSend;
                         }
                     } else {
-                        begin_proxy(s, ip, port, -1);
+                        // The relay dials an authority; a static backend is
+                        // spelled as the literal it was configured as.
+                        let mut authority = [0u8; 21]; // "255.255.255.255:65535"
+                        let mut n = put_ipv4_decimal(authority.as_mut_ptr(), 21, 0, ip);
+                        n = put_bytes(authority.as_mut_ptr(), 21, n, b":");
+                        n = put_u32_decimal(authority.as_mut_ptr(), 21, n, port as u32);
+                        begin_proxy(s, &authority[..n], -1);
                     }
                 }
                 HANDLER_WEBSOCKET_ADMIT => {

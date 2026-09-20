@@ -14,16 +14,15 @@
 //! Backend selection is `super::routes`; this file owns the dial, the failover,
 //! and the byte pump.
 
-use super::super::connection::{NET_BUF_SIZE, NET_CMD_CONNECT, NET_CMD_SEND};
+use super::super::connection::{self, NET_CMD_SEND};
 use super::super::wire::ws;
 use super::response::{build_error, put_bytes, put_ipv4_decimal, put_u32_decimal};
-use super::routes::{match_dyn_route, HANDLER_PROXY};
+use super::routes::{match_dyn_route, HANDLER_PROXY, MAX_BACKEND_AUTHORITY};
 use super::{
     cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_slot,
     cur_slot_mut, current_slot_index, dev_millis, dev_requester_tag, find_slot_by_conn_id, log,
-    net_send_conn, net_write_frame, reset_connection, set_cur_phase, HttpState, Phase,
-    MAX_CONCURRENT_CONNS, MAX_DYN_ROUTES, NET_FRAME_HDR, RECV_BUF_SIZE, SEND_BUF_SIZE,
-    SOCK_TYPE_STREAM,
+    net_send_conn, reset_connection, set_cur_phase, HttpState, Phase, MAX_CONCURRENT_CONNS,
+    MAX_DYN_ROUTES, NET_FRAME_HDR, RECV_BUF_SIZE, SEND_BUF_SIZE,
 };
 
 /// Wall-clock budget for a backend connect before failover / 502.
@@ -49,51 +48,32 @@ pub(crate) fn is_proxy_relay_phase(p: Phase) -> bool {
     matches!(p, Phase::ProxyRelayHeaders | Phase::ProxyRelayBody)
 }
 
-/// Dial the active slot's selected backend via the runtime
-/// `NET_CMD_CONNECT` primitive — the exact payload the client side
-/// uses (`[sock_type][ip:4][port:2][requester_tag]`), reused
-/// server-side. Returns `true` when the CONNECT frame was written.
+/// Dial the active slot's selected backend with the same `CMD_CONNECT_TO`
+/// the client side sends (`connection::dial`), tagged with this module's
+/// requester tag. Returns `true` when the transport took the frame; a
+/// refusal is offered again next step, and a backend authority no dial can
+/// carry cannot reach here because the route table refused it at parse.
 pub(crate) unsafe fn proxy_dial(s: &mut HttpState) -> bool {
     if s.net_out_chan < 0 {
         return false;
     }
-    let (ip, port) = match cur_slot(s) {
-        Some(c) => (c.proxy_be_ip, c.proxy_be_port),
+    let (authority, n) = match cur_slot(s) {
+        Some(c) => (c.proxy_be, c.proxy_be_len as usize),
         None => return false,
     };
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
-    let buf = s.net_buf.as_mut_ptr();
-    let ip_bytes = ip.to_le_bytes();
-    let mut payload = [0u8; 8];
-    payload[0] = SOCK_TYPE_STREAM;
-    payload[1] = ip_bytes[0];
-    payload[2] = ip_bytes[1];
-    payload[3] = ip_bytes[2];
-    payload[4] = ip_bytes[3];
-    payload[5] = (port & 0xFF) as u8;
-    payload[6] = (port >> 8) as u8;
-    payload[7] = dev_requester_tag(sys);
-    let wrote = net_write_frame(
-        sys,
-        chan,
-        NET_CMD_CONNECT,
-        payload.as_ptr(),
-        8,
-        buf,
-        NET_BUF_SIZE,
-    );
-    wrote != 0
+    let tag = dev_requester_tag(sys);
+    connection::dial(sys, chan, s.net_buf.as_mut_ptr(), &authority[..n], tag) == Some(true)
 }
 
-/// Enter the proxy relay for the active slot against a chosen backend.
-/// `dyn_idx` is the dynamic-route index (for failover reselection) or
-/// `-1` for a static `HANDLER_PROXY` route. Proxy responses are
-/// close-delimited in v1 (no response parsing / keep-alive).
-pub(crate) unsafe fn begin_proxy(s: &mut HttpState, ip: u32, port: u16, dyn_idx: i16) {
+/// Enter the proxy relay for the active slot against a chosen backend,
+/// `authority` being its `host[:port]`. `dyn_idx` is the dynamic-route index
+/// (for failover reselection) or `-1` for a static `HANDLER_PROXY` route.
+/// Proxy responses are close-delimited (no response parsing / keep-alive).
+pub(crate) unsafe fn begin_proxy(s: &mut HttpState, authority: &[u8], dyn_idx: i16) {
     if let Some(cur) = cur_slot_mut(s) {
-        cur.proxy_be_ip = ip;
-        cur.proxy_be_port = port;
+        set_backend(cur, authority);
         cur.proxy_dyn_idx = dyn_idx;
         cur.proxy_attempt = 0;
         cur.backend_conn_id = -1;
@@ -120,12 +100,10 @@ pub(crate) unsafe fn proxy_connect_failed(s: &mut HttpState) {
         None => (2, -1),
     };
     if attempt == 0 && dyn_idx >= 0 && (dyn_idx as usize) < MAX_DYN_ROUTES {
-        let next = s.server.dyn_routes.live[dyn_idx as usize].select_backend();
-        if let Some((ip, port)) = next {
+        if let Some(next) = selected_backend(s, dyn_idx as usize) {
             s.server.proxy_retries = s.server.proxy_retries.wrapping_add(1);
             if let Some(cur) = cur_slot_mut(s) {
-                cur.proxy_be_ip = ip;
-                cur.proxy_be_port = port;
+                set_backend(cur, &next.0[..next.1]);
                 cur.proxy_attempt = 1;
                 cur.backend_conn_id = -1;
                 cur.proxy_connected = 0;
@@ -278,9 +256,9 @@ pub(crate) unsafe fn try_begin_dyn_proxy(s: &mut HttpState) -> bool {
     if di < 0 {
         return false;
     }
-    match s.server.dyn_routes.live[di as usize].select_backend() {
-        Some((ip, port)) => {
-            begin_proxy(s, ip, port, di as i16);
+    match selected_backend(s, di as usize) {
+        Some(next) => {
+            begin_proxy(s, &next.0[..next.1], di as i16);
             true
         }
         None => {
@@ -293,6 +271,27 @@ pub(crate) unsafe fn try_begin_dyn_proxy(s: &mut HttpState) -> bool {
             true
         }
     }
+}
+
+/// Copy `authority` into the slot as the backend to (re)dial.
+fn set_backend(cur: &mut super::ConnSlot, authority: &[u8]) {
+    let n = authority.len().min(MAX_BACKEND_AUTHORITY);
+    cur.proxy_be[..n].copy_from_slice(&authority[..n]);
+    cur.proxy_be_len = n as u8;
+}
+
+/// Pick the next ready backend of dynamic route `di` and copy its authority
+/// out, so the route table's borrow ends before the slot is written.
+unsafe fn selected_backend(
+    s: &mut HttpState,
+    di: usize,
+) -> Option<([u8; MAX_BACKEND_AUTHORITY], usize)> {
+    let route = &mut s.server.dyn_routes.live[di];
+    let i = route.select_backend()?;
+    let authority = route.backend_authority(i);
+    let mut out = [0u8; MAX_BACKEND_AUTHORITY];
+    out[..authority.len()].copy_from_slice(authority);
+    Some((out, authority.len()))
 }
 
 // ── Host-test hooks ───────────────────────────────────────────────────────

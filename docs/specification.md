@@ -436,8 +436,8 @@ the one fact a peer behind a NAT cannot learn any other way, and the
 first thing an ICE agent gathers. The **client** asks that question of
 a server and reports the answer as
 `[status:u8][ip:4 BE][port:u16 LE][code:u16 LE]` on `result_out`.
-Setting `server_ip` arms the client; leaving it zero is the
-responder-only module.
+An `authority` arms the client; without one it is the responder-only
+module.
 
 One module rather than two because it is one protocol over one
 socket: a Binding request and its response differ by two bits of the

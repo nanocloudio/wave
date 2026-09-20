@@ -69,14 +69,22 @@ what its deployment uses, and an unwired port is silent rather than an error.
 
 ## Parameters
 
-`mode` (0 server / 1 client), `port`, `body`, `path`, `host_ip`, `protocol`,
-`request_body`, `websocket`, `host_tcp`, `grpc`, then eight route blocks of
+`mode` (0 server / 1 client), `port` (server: the listen port), `body`, `path`,
+`protocol`, `request_body`, `websocket`, `host_tcp`, `grpc`, then eight route blocks of
 `route_N_{path,body,handler,proxy_ip,proxy_port,source,content_type,fs_path,fs_list,fs_filter}`,
 and the high-tag set: `routes_prefix`, `listeners_prefix`, `max_body_kib`,
 `content_type`, `surface_status`, then the connection-lifetime set
 `header_timeout_ms`, `keepalive_idle_ms`, `pressure_idle_ms`, `stall_ms`,
-`ws_idle_ms`.
-Tags are wire positions: append, never renumber.
+`ws_idle_ms`, and the client's `authority`.
+Tags are wire positions: append, never renumber; tag 4 is retired.
+
+`authority` (parameter 112) is the client's one address: `host[:port]` — a
+DNS name, a dotted quad or a bracketed IPv6 literal, port 80 when it names
+none. It is where the client connects (a name goes to the network provider
+as a name, for it to resolve), what a `tls` node in front verifies, and what
+every request carries verbatim as `Host:` / `:authority`. An authority that
+is not `host[:port]` refuses construction. Left empty, the client is OPEN:
+each exchange record names the authority it is for (below).
 
 Two shape the client's requests and its answers:
 
@@ -240,10 +248,17 @@ limit. A trickled header does not restart its head deadline.
 
 ## HTTP/1 client connections
 
-The client speaks HTTP/1.1. `authority` (parameter 112, up to 128 bytes,
-default `localhost`) selects the Host header, falling back to the configured
-IP. `method` (parameter 113) takes the same verb codes the request envelope
-carries, and defaults to GET.
+The client speaks HTTP/1.1. `Host:` is the `authority` (parameter 112, up to
+128 bytes), verbatim. `method` (parameter 113) takes the same verb codes the
+request envelope carries, and defaults to GET.
+
+An exchange record may end with the authority it is for. With `authority`
+set the client is pinned: a record naming nothing or the same bytes is
+performed there, and one naming anything else is refused as unroutable. With
+`authority` empty the client is open: it dials what each record names, keeps
+one connection, and a record for a different authority than the connection
+in hand closes that connection and dials the new one before the request goes
+out. A record naming nothing on an open client is refused.
 
 `client_keep_alive` (parameter 114, default 0) lets one connection to an origin
 serve exchanges in sequence. Only a complete, reusable response returns its

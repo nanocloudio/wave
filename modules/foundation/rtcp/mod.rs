@@ -24,7 +24,9 @@
 //!
 //! Ports:  net_in/net_out (the RTCP datagram surface), rtp_stats (in[1], from
 //!         `rtp`'s out[2]), reports_out (out[1], what the peer said about us).
-//! Params: `port` (local RTCP port), `peer_ip`/`peer_port` (where reports go),
+//! Params: `port` (local RTCP port), `authority` (`host[:port]` the reports
+//!         go to, port 5005 when it names none — a DNS name the network
+//!         provider resolves, or a dotted quad),
 //!         `ssrc` (this participant's synchronisation source), `cname`,
 //!         `bandwidth_bps` (session bandwidth the §6.2 interval divides).
 
@@ -54,6 +56,12 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+
+// Where the reports go, named once as `host[:port]` — the same core the
+// other datagram connectors take their peer from.
+#[path = "../../common/dg_authority.rs"]
+mod dg_authority;
+use dg_authority::{DgAuthority, DG_AUTHORITY_MAX};
 
 // The statistics records `rtp` emits. Their layout is owned by the shared
 // core rather than restated here — see `rtp_wire.rs` for why.
@@ -108,9 +116,10 @@ struct RtcpState {
     reports_out: i32,
 
     port: u16,
-    peer_port: u16,
-    peer_ip: u32,
     ssrc: u32,
+    /// Where the reports go. Unset sends none: a participant with no peer
+    /// has nobody to tell.
+    peer: DgAuthority,
     bandwidth_bps: u32,
     /// Seconds between the local millisecond clock's zero and the NTP epoch.
     ///
@@ -210,15 +219,17 @@ fn install_dtls_export(s: &mut RtcpState) {
     s.srtp_set = 1;
 }
 
+/// The port the peer's authority takes when it names none.
+const DEFAULT_PEER_PORT: u16 = 5005;
+
 define_params! {
     RtcpState;
 
     1, port, u16, 5005
         => |s, d, len| { s.port = p_u16(d, len, 0, 5005); };
-    2, peer_ip, u32, 0
-        => |s, d, len| { s.peer_ip = p_u32(d, len, 0, 0); };
-    3, peer_port, u16, 5005
-        => |s, d, len| { s.peer_port = p_u16(d, len, 0, 5005); };
+    // Tags 2 and 3 are retired; the next allocation is 14.
+    13, authority, str, 0
+        => |s, d, len| { s.peer.set(core::slice::from_raw_parts(d, len)); };
     4, ssrc, u32, 0x46585254
         => |s, d, len| { s.ssrc = p_u32(d, len, 0, 0x46585254); };
     5, cname, str, 0 => |s, d, len| {
@@ -320,8 +331,17 @@ pub extern "C" fn module_new(
         s.dropped = 0;
         s.byes = 0;
         s.draining = 0;
+        s.peer.clear();
         set_defaults(s);
         parse_tlv(s, params, params_len);
+        // An authority that was given must be one: reports addressed to a
+        // peer this module cannot name would go nowhere silently.
+        if s.peer.offered() && !s.peer.adopt(DEFAULT_PEER_PORT) {
+            let m =
+                b"[rtcp] refusing to construct: authority must be host[:port], at most 64 bytes";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -22;
+        }
         s.stats_in = dev_channel_port(sys, 0, 1);
         s.reports_out = dev_channel_port(sys, 1, 1);
         s.stats = RtcpReceiverStats::new(0);
@@ -480,10 +500,9 @@ unsafe fn pump_stats(s: &mut RtcpState) {
 /// publish, and publishing one for a stream never sent would hand a receiver a
 /// timestamp mapping for nothing.
 unsafe fn send_report(s: &mut RtcpState, now: u64) {
-    if s.ep_id == 0xFF || s.net_out < 0 || s.peer_ip == 0 {
+    if s.ep_id == 0xFF || s.net_out < 0 || !s.peer.is_set() {
         return;
     }
-    let sys = &*s.syscalls;
     let mut out = [0u8; MSG_BUF];
 
     // A report block only when there is a source to describe. A participant
@@ -551,23 +570,54 @@ unsafe fn send_report(s: &mut RtcpState, now: u64) {
         at
     };
 
-    let sent = dev_dg_send_to_v4(
-        sys,
-        s.net_out,
-        s.ep_id,
-        s.peer_ip,
-        s.peer_port,
-        out.as_ptr(),
-        send_len,
-        s.net_buf.as_mut_ptr(),
-        NET_BUF,
-    );
+    let sent = send_to_peer(s, out.as_ptr(), send_len);
     if sent != 0 {
         s.reports_sent = s.reports_sent.wrapping_add(1);
     }
     // The interval advances either way. A refused write is backpressure, and
     // retrying it inside the same interval would turn one report into a spin.
     s.next_report_ms = now.wrapping_add(schedule(s));
+}
+
+/// Send one compound to the peer. A literal authority is addressed; a
+/// named one travels as a name for the provider to resolve, which drops the
+/// datagram until the answer lands — the next report interval carries it.
+///
+/// # Safety
+/// `data` is valid for `len` reads.
+unsafe fn send_to_peer(s: &mut RtcpState, data: *const u8, len: usize) -> usize {
+    let sys = &*s.syscalls;
+    let port = s.peer.port();
+    match s.peer.name() {
+        Some(name) => {
+            let mut held = [0u8; DG_AUTHORITY_MAX];
+            let n = name.len();
+            held[..n].copy_from_slice(name);
+            dev_dg_send_to_name_owned(
+                sys,
+                s.net_out,
+                s.ep_id,
+                0,
+                &held[..n],
+                port,
+                data,
+                len,
+                s.net_buf.as_mut_ptr(),
+                NET_BUF,
+            )
+        }
+        None => dev_dg_send_to_v4(
+            sys,
+            s.net_out,
+            s.ep_id,
+            s.peer.ip().unwrap_or(0),
+            port,
+            data,
+            len,
+            s.net_buf.as_mut_ptr(),
+            NET_BUF,
+        ),
+    }
 }
 
 /// Decode a compound the peer sent and keep what it says about US.
@@ -709,10 +759,13 @@ unsafe fn pump_net(s: &mut RtcpState, now: u64) {
     // Only the peer this session was configured for. An RTCP endpoint is
     // reachable by anyone, and a report from a stranger would otherwise be
     // read as this session's loss and jitter.
-    if ip != s.peer_ip || port != s.peer_port {
+    if !s.peer.matches(ip, port) {
         s.dropped = s.dropped.wrapping_add(1);
         return;
     }
+    // A peer named rather than addressed is held to the address this first
+    // accepted report came from.
+    s.peer.learn(ip);
     let data_len = raw_len.min(MSG_BUF);
     core::ptr::copy_nonoverlapping(data_ptr, s.msg.as_mut_ptr(), data_len);
     let data_len = if s.srtp_set != 0 {

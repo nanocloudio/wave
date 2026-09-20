@@ -25,8 +25,9 @@
 //!
 //! Ports:  net_in/net_out (transport), status_out (HTTP status),
 //!         request_in (S3Request), response_out (S3Response).
-//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `host` (the Host header, e.g.
-//!         "127.0.0.1:19000"), `access_key`, `secret`, `region`.
+//! Params: `authority` (`host[:port]`, port 80 when it names none: where the
+//!         connector dials and, verbatim, the `Host` SigV4 signs),
+//!         `access_key`, `secret`, `region`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -58,7 +59,6 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 include!("../../common/s3_core.rs");
-include!("../../common/hex_core.rs");
 
 #[path = "../../common/s3_wire.rs"]
 mod s3_wire;
@@ -69,10 +69,19 @@ use s3_wire::*;
 // rather than a wrong answer. A connection id read at a hand-rolled offset is
 // invisible to review and to the compiler the moment the field widens.
 use abi::contracts::net::net_proto::{
-    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT, CMD_SEND as NET_CMD_SEND,
-    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
-    MSG_ERROR as NET_MSG_ERROR,
+    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO,
+    CMD_SEND as NET_CMD_SEND, MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED,
+    MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
+
+/// The port a dial takes when `authority` names none.
+const DEFAULT_PORT: u16 = 80;
+
+/// Construction refused: `authority` is absent, over [`NAME_BUF`] bytes, or
+/// not `host[:port]`. The connector has one endpoint and signs requests
+/// against it, so an instance that cannot name it is refused rather than
+/// left to sign for nowhere.
+const E_BAD_AUTHORITY: i32 = -22;
 
 const NET_BUF: usize = 2048;
 /// Signed request staging. Sized to hold the largest signed PUT: the head is a
@@ -102,12 +111,13 @@ struct S3State {
     net_out: i32,
     status_out: i32,
 
-    ip: [u8; 4],
+    /// `host[:port]`: where the connector dials and what SigV4 signs as the
+    /// `Host` header, one value. Parsed at construction, so a dial never
+    /// meets an authority it cannot carry.
+    authority: [u8; NAME_BUF],
+    authority_len: u16,
+    /// The authority's port, or [`DEFAULT_PORT`] when it names none.
     port: u16,
-    ep_hex: [u8; 16],
-    ep_hex_len: u16,
-    host: [u8; NAME_BUF],
-    host_len: u16,
     access_key: [u8; NAME_BUF],
     access_key_len: u16,
     secret: [u8; NAME_BUF],
@@ -127,8 +137,8 @@ struct S3State {
     /// CONNECT already established, and no record is admitted while a command
     /// is staged, so two commands are never outstanding together.
     cmd: u8,
-    cmd_payload: [u8; 8],
-    cmd_len: u8,
+    cmd_payload: [u8; net_proto::CONNECT_TO_MAX],
+    cmd_len: u16,
     /// 1 once `MSG_CONNECTED` established a connection, 0 otherwise. Tracks
     /// connection PRESENCE separately from `conn_id`'s value because the net
     /// stack can legitimately assign `conn_id == 0`; keying "connected" off
@@ -241,18 +251,7 @@ pub unsafe fn test_conservation(state: *mut u8) -> S3Conservation {
 define_params! {
     S3State;
 
-    1, endpoint, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ep_hex_len as usize) < 16 {
-            s.ep_hex[s.ep_hex_len as usize] = *d.add(i); s.ep_hex_len += 1; i += 1;
-        }
-    };
-    2, host, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.host_len as usize) < NAME_BUF {
-            s.host[s.host_len as usize] = *d.add(i); s.host_len += 1; i += 1;
-        }
-    };
+    // 1: endpoint — retired. 2: host — retired. `authority` (6) is both.
     3, access_key, str, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.access_key_len as usize) < NAME_BUF {
@@ -269,6 +268,20 @@ define_params! {
         let mut i = 0usize;
         while i < len && (s.region_len as usize) < NAME_BUF {
             s.region[s.region_len as usize] = *d.add(i); s.region_len += 1; i += 1;
+        }
+    };
+    6, authority, str, 0 => |s, d, len| {
+        // Held whole or not at all: a prefix of an authority is a
+        // different host, and construction refuses an instance whose
+        // authority does not parse.
+        let room = NAME_BUF - (s.authority_len as usize);
+        if len > room {
+            s.authority_len = 0;
+        } else {
+            let mut i = 0usize;
+            while i < len {
+                s.authority[s.authority_len as usize] = *d.add(i); s.authority_len += 1; i += 1;
+            }
         }
     };
 }
@@ -321,10 +334,8 @@ pub extern "C" fn module_new(
         // probe, so `examples/s3_client/` keeps working untouched.
         s.request_in = dev_channel_port(sys, 0, 1);
         s.response_out = dev_channel_port(sys, 1, 2);
-        s.ip = [0u8; 4];
+        s.authority_len = 0;
         s.port = 0;
-        s.ep_hex_len = 0;
-        s.host_len = 0;
         s.access_key_len = 0;
         s.secret_len = 0;
         s.region_len = 0;
@@ -350,11 +361,15 @@ pub extern "C" fn module_new(
         s.dropped_unparsable = 0;
         s.refused_malformed = 0;
         parse_tlv(s, params, params_len);
-        let mut ep = [0u8; 8];
-        if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
-            if n >= 6 {
-                s.ip = [ep[0], ep[1], ep[2], ep[3]];
-                s.port = u16::from_le_bytes([ep[4], ep[5]]);
+        // The one address this connector has. Refused here rather than at
+        // the dial: a request performed against nowhere would time out and
+        // blame the endpoint for a fault in the graph.
+        match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
+            Some((_, port)) => s.port = port.unwrap_or(DEFAULT_PORT),
+            None => {
+                let m = b"[s3] authority must be host[:port], at most 256 bytes";
+                dev_log(sys, 2, m.as_ptr(), m.len());
+                return E_BAD_AUTHORITY;
             }
         }
         // default region
@@ -384,9 +399,31 @@ unsafe fn emit_status(s: &mut S3State, text: &[u8]) {
 unsafe fn stage_command(s: &mut S3State, cmd: u8, payload: &[u8], now: u64) {
     let len = payload.len().min(s.cmd_payload.len());
     s.cmd_payload[..len].copy_from_slice(&payload[..len]);
-    s.cmd_len = len as u8;
+    s.cmd_len = len as u16;
     s.cmd = cmd;
     flush_command(s, now);
+}
+
+/// Stage the `CMD_CONNECT_TO` for this connector's authority, tagged with
+/// its requester tag. The authority was parsed at construction, so the
+/// payload always composes.
+unsafe fn stage_connect(s: &mut S3State, now: u64) {
+    let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
+    let n = match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
+        Some((target, _)) => net_proto::write_connect_to(
+            &mut payload,
+            SOCK_TYPE_STREAM,
+            s.port,
+            &target,
+            Some(s.tag),
+        ),
+        None => 0,
+    };
+    // `CONNECTING` and the connect budget begin inside `stage_command`, once
+    // the frame is on the channel. A refused CONNECT leaves the connector
+    // DISCONNECTED with the record still in flight, so the identical frame is
+    // offered again next step.
+    stage_command(s, NET_CMD_CONNECT_TO, &payload[..n], now);
 }
 
 /// Offer the staged transport command, keeping it staged while `net_out`
@@ -401,7 +438,7 @@ unsafe fn flush_command(s: &mut S3State, now: u64) {
     }
     let sys = &*s.syscalls;
     let len = s.cmd_len as usize;
-    let mut payload = [0u8; 8];
+    let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
     payload[..len].copy_from_slice(&s.cmd_payload[..len]);
     let wrote = net_write_frame(
         sys,
@@ -415,7 +452,7 @@ unsafe fn flush_command(s: &mut S3State, now: u64) {
     if wrote == 0 {
         return;
     }
-    if s.cmd == NET_CMD_CONNECT {
+    if s.cmd == NET_CMD_CONNECT_TO {
         s.phase = CONNECTING;
         s.started_ms = now;
     }
@@ -664,21 +701,7 @@ unsafe fn pump_request(s: &mut S3State, now: u64) {
     s.req_len = 0;
     s.req_sent = 0;
 
-    let mut payload = [0u8; 8];
-    payload[0] = SOCK_TYPE_STREAM;
-    payload[1] = s.ip[3];
-    payload[2] = s.ip[2];
-    payload[3] = s.ip[1];
-    payload[4] = s.ip[0];
-    let port = s.port.to_le_bytes();
-    payload[5] = port[0];
-    payload[6] = port[1];
-    payload[7] = s.tag;
-    // `CONNECTING` and the connect budget begin inside `stage_command`, once
-    // the frame is on the channel. A refused CONNECT leaves the connector
-    // DISCONNECTED with the record still in flight, so the identical frame is
-    // offered again next step.
-    stage_command(s, NET_CMD_CONNECT, &payload, now);
+    stage_connect(s, now);
 }
 
 /// Sign the pending driven request. Split from `pump_request` because SigV4
@@ -708,12 +731,12 @@ unsafe fn sign_pending(s: &mut S3State) -> bool {
     // The cores take slices, and `s.rec` is borrowed for the payload while
     // `s.req` is written — distinct fields, so the copies below are only to
     // satisfy the borrow checker on the credential arrays.
-    let hl = s.host_len as usize;
+    let hl = s.authority_len as usize;
     let al = s.access_key_len as usize;
     let sl = s.secret_len as usize;
     let rl = s.region_len as usize;
     let mut host = [0u8; NAME_BUF];
-    host[..hl].copy_from_slice(&s.host[..hl]);
+    host[..hl].copy_from_slice(&s.authority[..hl]);
     let mut ak = [0u8; NAME_BUF];
     ak[..al].copy_from_slice(&s.access_key[..al]);
     let mut sk = [0u8; NAME_BUF];
@@ -883,17 +906,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             && s.draining == 0
             && s.access_key_len > 0
         {
-            let mut payload = [0u8; 8];
-            payload[0] = SOCK_TYPE_STREAM;
-            payload[1] = s.ip[3];
-            payload[2] = s.ip[2];
-            payload[3] = s.ip[1];
-            payload[4] = s.ip[0];
-            let port = s.port.to_le_bytes();
-            payload[5] = port[0];
-            payload[6] = port[1];
-            payload[7] = s.tag;
-            stage_command(s, NET_CMD_CONNECT, &payload, now);
+            stage_connect(s, now);
         }
 
         if s.net_in >= 0 {
@@ -944,12 +957,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             let mut ts = [0u8; 16];
                             let mut date = [0u8; 8];
                             sigv4_time(dev_unix_millis(sys), &mut ts, &mut date);
-                            let hl = s.host_len as usize;
+                            let hl = s.authority_len as usize;
                             let al = s.access_key_len as usize;
                             let sl = s.secret_len as usize;
                             let rl = s.region_len as usize;
                             let mut host = [0u8; NAME_BUF];
-                            host[..hl].copy_from_slice(&s.host[..hl]);
+                            host[..hl].copy_from_slice(&s.authority[..hl]);
                             let mut ak = [0u8; NAME_BUF];
                             ak[..al].copy_from_slice(&s.access_key[..al]);
                             let mut sk = [0u8; NAME_BUF];

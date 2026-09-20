@@ -46,8 +46,7 @@ use binary for arbitrary octet streams.
 
 | Name | Meaning |
 | --- | --- |
-| `endpoint` | Hex `[ip:4][port:2 LE]` — a config carries text, so bytes arrive hex-encoded |
-| `host` | `Host:` header value |
+| `authority` | `host[:port]`, port 80 when it names none: where the connector dials — a name goes to the network provider as a name, for it to resolve — and, verbatim, its `Host:` header. One that is not `host[:port]` refuses construction |
 | `path` | Request path |
 | `message` | Text payload sent once the upgrade completes |
 
@@ -58,8 +57,7 @@ verbatim, so each core has a single source of truth wherever it is compiled:
 
 - `ws_core.rs` — upgrade request/verify and the masked frame codec;
 - `sha1_core.rs` — SHA-1 for the accept proof;
-- `b64_core.rs` — Base64 for the key nonce and proof;
-- `hex_core.rs` — hex decode for the `endpoint` parameter.
+- `b64_core.rs` — Base64 for the key nonce and proof.
 
 ## Boundary
 

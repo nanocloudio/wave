@@ -32,7 +32,8 @@
 //!
 //! Ports:  net_in/net_out (transport), status_out (human-readable status),
 //!         request_in (submissions), result_out (one result each).
-//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `helo` (EHLO domain),
+//! Params: `authority` (`host[:port]`, port 25 when it names none), `helo`
+//!         (EHLO domain),
 //!         `mail_from`, `rcpt_to`, `body` (message headers+body),
 //!         `auth_user`/`auth_pass` (SASL PLAIN credentials),
 //!         `channel_confidential` (the graph's assertion that a `tls` node
@@ -115,18 +116,24 @@ use smtp_wire::{
     SMTP_OUT_TIMEOUT, SMTP_REQ_HDR, SMTP_RES_HDR,
 };
 
-#[path = "../../common/hex_core.rs"]
-mod hex_core;
-use hex_core::hex_decode;
-
 // The NetProto opcodes and identity accessors come from the owning contract,
 // never redeclared locally, so a change to the wire is a compile error here
 // rather than a wrong answer.
 use abi::contracts::net::net_proto::{
-    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT as NET_CMD_CONNECT, CMD_SEND as NET_CMD_SEND,
-    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
-    MSG_ERROR as NET_MSG_ERROR,
+    self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO,
+    CMD_SEND as NET_CMD_SEND, MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED,
+    MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
+
+/// The port a dial takes when `authority` names none: SMTP submission's
+/// classic port, the one a relay on a LAN listens on.
+const DEFAULT_PORT: u16 = 25;
+
+/// Construction refused: `authority` is absent, over [`NAME_BUF`] bytes, or
+/// not `host[:port]`. A submission has one relay and no way to ask for
+/// another, so an instance that cannot name it is refused rather than left
+/// to fail every submission identically.
+const E_BAD_AUTHORITY: i32 = -22;
 
 const NET_BUF: usize = 2048;
 /// Raw body bytes held between arriving on `request_in` and reaching the wire.
@@ -167,10 +174,16 @@ struct SmtpState {
     request_in: i32,
     result_out: i32,
 
-    ip: [u8; 4],
+    /// `host[:port]`: where every submission is dialled. Parsed at
+    /// construction, so a dial never meets an authority it cannot carry.
+    authority: [u8; NAME_BUF],
+    authority_len: u16,
+    /// The authority's port, or [`DEFAULT_PORT`] when it names none.
     port: u16,
-    ep_hex: [u8; 16],
-    ep_hex_len: u16,
+    /// The authority's address when it is a v4 literal, for the result's
+    /// `peer_ip`. The result layout carries an address and no name, so a
+    /// name leaves this zero: the result then says only the port.
+    peer_ip: [u8; 4],
     helo: [u8; NAME_BUF],
     helo_len: u16,
     auth_user: [u8; CRED_BUF],
@@ -281,12 +294,7 @@ struct SmtpState {
 define_params! {
     SmtpState;
 
-    1, endpoint, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ep_hex_len as usize) < 16 {
-            s.ep_hex[s.ep_hex_len as usize] = *d.add(i); s.ep_hex_len += 1; i += 1;
-        }
-    };
+    // 1: endpoint — retired. `authority` (9) names the relay.
     2, helo, str, 0 => |s, d, len| {
         let mut i = 0usize;
         while i < len && (s.helo_len as usize) < NAME_BUF {
@@ -324,6 +332,20 @@ define_params! {
         }
     };
     8, channel_confidential, u32, 0 => |s, d, len| { s.channel_confidential = p_u32(d, len, 0, 0); };
+    9, authority, str, 0 => |s, d, len| {
+        // Held whole or not at all: a prefix of an authority is a
+        // different host, and construction refuses an instance whose
+        // authority does not parse.
+        let room = NAME_BUF - (s.authority_len as usize);
+        if len > room {
+            s.authority_len = 0;
+        } else {
+            let mut i = 0usize;
+            while i < len {
+                s.authority[s.authority_len as usize] = *d.add(i); s.authority_len += 1; i += 1;
+            }
+        }
+    };
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -372,9 +394,9 @@ pub extern "C" fn module_new(
         s.status_out = dev_channel_port(sys, 1, 1);
         s.request_in = dev_channel_port(sys, 0, 1);
         s.result_out = dev_channel_port(sys, 1, 2);
-        s.ip = [0u8; 4];
+        s.authority_len = 0;
         s.port = 0;
-        s.ep_hex_len = 0;
+        s.peer_ip = [0u8; 4];
         s.helo_len = 0;
         s.auth_user_len = 0;
         s.auth_pass_len = 0;
@@ -416,11 +438,23 @@ pub extern "C" fn module_new(
         s.admitted = 0;
         s.dropped_unparsable = 0;
         parse_tlv(s, params, params_len);
-        let mut ep = [0u8; 8];
-        if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
-            if n >= 6 {
-                s.ip = [ep[0], ep[1], ep[2], ep[3]];
-                s.port = u16::from_le_bytes([ep[4], ep[5]]);
+        // The one address this module has. Refused here rather than at the
+        // dial: a submission to nowhere would time out and blame the relay
+        // for a fault in the graph.
+        match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
+            Some((target, port)) => {
+                s.port = port.unwrap_or(DEFAULT_PORT);
+                if let net_proto::Target::V4(a) = target {
+                    s.peer_ip = a;
+                }
+            }
+            None => {
+                // Every path here reads the same from outside — nothing was
+                // stored — so the message names all three rather than
+                // asserting the one that happens to be commonest.
+                let m = b"[smtp] authority must be host[:port], at most 128 bytes";
+                dev_log(sys, 2, m.as_ptr(), m.len());
+                return E_BAD_AUTHORITY;
             }
         }
         // Default the EHLO domain when none was supplied.
@@ -525,7 +559,9 @@ unsafe fn flush_result(s: &mut SmtpState) {
                 detail: s.res_enh_detail,
             })
         },
-        peer_ip: s.ip,
+        // The result names the peer as an address: a v4 literal's bytes, or
+        // zero when the authority is a name the layout cannot carry.
+        peer_ip: s.peer_ip,
         peer_port: s.port,
         text_len,
     };
@@ -1067,30 +1103,35 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Connect once a submission is in hand. Nothing to send yet — the
         // server speaks first (220 greeting), which flips us to Greet.
         if s.op_active != 0 && s.phase == SmtpPhase::Disconnected && s.res_produced == 0 {
-            let mut payload = [0u8; 8];
-            payload[0] = SOCK_TYPE_STREAM;
-            payload[1] = s.ip[3];
-            payload[2] = s.ip[2];
-            payload[3] = s.ip[1];
-            payload[4] = s.ip[0];
-            let port = s.port.to_le_bytes();
-            payload[5] = port[0];
-            payload[6] = port[1];
-            payload[7] = s.tag;
+            // The authority was parsed at construction, so this always
+            // composes; the tag is what lets a fanned `net_out` hand this
+            // module only its own connection.
+            let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
+            let n = match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
+                Some((target, _)) => net_proto::write_connect_to(
+                    &mut payload,
+                    SOCK_TYPE_STREAM,
+                    s.port,
+                    &target,
+                    Some(s.tag),
+                ),
+                None => 0,
+            };
             // Enter `Connecting` only once the dial has actually been taken.
             // `net_write_frame` returns 0 on backpressure so a caller can
             // retry; advancing anyway started the connect deadline against a
             // CONNECT the channel had refused, and the exchange failed on a
             // timeout for a dial that was never made.
-            if net_write_frame(
-                sys,
-                s.net_out,
-                NET_CMD_CONNECT,
-                payload.as_ptr(),
-                8,
-                s.nbuf.as_mut_ptr(),
-                NET_BUF,
-            ) != 0
+            if n != 0
+                && net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CONNECT_TO,
+                    payload.as_ptr(),
+                    n,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                ) != 0
             {
                 s.phase = SmtpPhase::Connecting;
                 s.started_ms = now;

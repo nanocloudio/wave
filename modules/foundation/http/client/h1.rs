@@ -6,13 +6,13 @@
 //!
 
 use super::super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_CLOSED,
-    NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
+    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
+    NET_MSG_DATA, NET_MSG_ERROR,
 };
 use super::super::wire::h1;
 use super::super::{
     dev_channel_port, dev_log, dev_millis, dev_requester_tag, net_read_frame,
-    net_read_frame_aligned, net_write_frame, NET_FRAME_HDR, POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
+    net_read_frame_aligned, net_write_frame, NET_FRAME_HDR, POLL_IN, POLL_OUT,
 };
 use super::{
     build_request, is_foreign_frame, log, send_close_frame, HttpState, Phase, CONNECT_TIMEOUT_MS,
@@ -121,6 +121,16 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 );
                 s.client.h1_input_len = 0;
                 s.client.h1_input_offset = 0;
+                // A connection held open for another authority is closed
+                // before anything else: reusing it would put this request on
+                // a socket to a peer it does not name. A refused CLOSE keeps
+                // the phase here so it is offered again.
+                if s.client.conn_stale != 0 {
+                    if !send_close_frame(s) {
+                        return 0;
+                    }
+                    s.client.conn_stale = 0;
+                }
                 if s.client.conn_present != 0 {
                     s.client.phase = if build_request(s) {
                         Phase::SendRequest
@@ -128,6 +138,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         Phase::Error
                     };
                     continue;
+                }
+                if s.client.conn_authority_len == 0 {
+                    // An open client with no record in hand has nowhere to go;
+                    // a pinned one always has its authority here.
+                    log(s, b"[http] no authority to dial");
+                    s.client.phase = Phase::Error;
+                    return E_CONNECT_FAILED;
                 }
                 log(s, b"[http] connecting");
                 s.client.phase = Phase::Connecting;
@@ -139,36 +156,19 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     s.client.phase = Phase::Error;
                     return E_NET_FAILED;
                 }
-                let sys = &*s.syscalls;
-                let chan = s.net_out_chan;
-                let buf = s.net_buf.as_mut_ptr();
-                // CMD_CONNECT payload: [sock_type][ip:4][port:2][requester_tag].
                 // The tag (our module index) is echoed in MSG_CONNECTED so that
                 // when ip.net_out is fanned to another stream consumer (e.g. an
                 // OTLP exporter) we claim only our own outbound connection.
-                let mut payload = [0u8; 8];
-                payload[0] = SOCK_TYPE_STREAM;
-                let ip_bytes = s.client.host_ip.to_le_bytes();
-                payload[1] = ip_bytes[0];
-                payload[2] = ip_bytes[1];
-                payload[3] = ip_bytes[2];
-                payload[4] = ip_bytes[3];
-                payload[5] = (s.client.port & 0xFF) as u8;
-                payload[6] = (s.client.port >> 8) as u8;
-                payload[7] = dev_requester_tag(sys);
-                let wrote = net_write_frame(
-                    sys,
-                    chan,
-                    NET_CMD_CONNECT,
-                    payload.as_ptr(),
-                    8,
-                    buf,
-                    NET_BUF_SIZE,
-                );
-                if wrote == 0 {
-                    return 0;
+                match super::dial(s) {
+                    Some(true) => {}
+                    Some(false) => return 0,
+                    None => {
+                        log(s, b"[http] authority cannot be dialled");
+                        s.client.phase = Phase::Error;
+                        return E_CONNECT_FAILED;
+                    }
                 }
-                s.client.connect_start_ms = dev_millis(sys);
+                s.client.connect_start_ms = dev_millis(&*s.syscalls);
                 s.client.phase = Phase::WaitConnect;
                 return 0;
             }
@@ -186,7 +186,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
                         // Claim only our own outbound connection: MSG_CONNECTED
                         // is `[conn_id][requester_tag]`; the tag echoes our
-                        // CMD_CONNECT index. Untagged — which is what a sole
+                        // CMD_CONNECT_TO index. Untagged — which is what a sole
                         // consumer sees — or our tag → ours; any other tag
                         // belongs to a co-wired consumer sharing this fanned
                         // queue, so ignore it.
@@ -570,26 +570,49 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     }
 }
 
-/// Clear an idle connection on peer EOF, unsolicited bytes, or idle expiry.
-/// A closed idle socket is never automatically replayed after a request write.
+/// Drain what the step machine is not reading, and clear an idle connection
+/// on peer EOF, unsolicited bytes, or idle expiry. A closed idle socket is
+/// never automatically replayed after a request write.
 pub(crate) unsafe fn idle(s: &mut HttpState) {
-    if s.client.conn_present == 0 || s.client.phase != Phase::Done {
+    // Only the phases that do not read `net_in` themselves. While an exchange
+    // is in flight the step machine drains the channel — foreign frames
+    // included, by `is_foreign_frame` — and taking frames from under it here
+    // would strip a response of its own bytes.
+    if !matches!(s.client.phase, Phase::Init | Phase::Done | Phase::Error) {
+        return;
+    }
+    if s.net_in_chan < 0 {
         return;
     }
     let sys = &*s.syscalls;
-    if s.client.client_stall_ms != 0
+    if s.client.conn_present != 0
+        && s.client.phase == Phase::Done
+        && s.client.client_stall_ms != 0
         && dev_millis(sys).wrapping_sub(s.client.idle_since_ms)
             >= u64::from(s.client.client_stall_ms)
     {
         let _ = send_close_frame(s);
         return;
     }
+    // `net_in` is fanned from a lane that other stream consumers share, so
+    // frames for THEIR connections arrive here too and this client has to read
+    // and drop them. That holds in every idle phase, including before it has
+    // ever dialled: a copy left unread fills its edge, and the back-pressure
+    // from a full edge reaches the provider, which then cannot deliver to the
+    // consumer the bytes were for. One leg the deployment wired but the
+    // program never used would otherwise stall the leg doing the work — and
+    // only once a response outgrew the edge, so small ones would pass.
     for _ in 0..8 {
         let (kind, n) = net_read_frame(sys, s.net_in_chan, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
         if kind == 0 {
             break;
         }
-        if n >= 2
+        // Ours is the only connection that means anything here: a frame on it
+        // between exchanges is the peer saying something the response decoder
+        // never asked for, so the connection cannot be reused. Without a
+        // connection of our own, nothing that arrives can be ours.
+        if s.client.conn_present != 0
+            && n >= 2
             && net_proto::conn_id(&s.net_buf[NET_FRAME_HDR..NET_FRAME_HDR + n]) == s.client.conn_id
         {
             s.client.response.reusable = false;

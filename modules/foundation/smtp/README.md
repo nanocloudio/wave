@@ -30,7 +30,7 @@ else: it must own the connection lifecycle and drive the transport itself.
 | Port | Idx | Direction | Content type | Meaning |
 | --- | --- | --- | --- | --- |
 | `net_in` | 0 | input | `OctetStream` | `NET_MSG_*` transport events |
-| `net_out` | 0 | output | `OctetStream` | `NET_CMD_CONNECT` / `SEND` / `CLOSE` |
+| `net_out` | 0 | output | `OctetStream` | `NET_CMD_CONNECT_TO` / `SEND` / `CLOSE` |
 | `status_out` | 1 | output | `OctetStream` | One human-readable status line per submission |
 | `request_in` | 1 | input | `OctetStream` | `SmtpRequest` submissions |
 | `result_out` | 2 | output | `OctetStream` | Exactly one `SmtpResult` per submission |
@@ -72,7 +72,7 @@ outcome a person reads.
 
 | Id | Name | Meaning |
 | --- | --- | --- |
-| 1 | `endpoint` | Hex `[ip:4][port:2 LE]` — configs carry text, so bytes arrive hex-encoded |
+| 1 | — | retired |
 | 2 | `helo` | EHLO domain |
 | 3 | `mail_from` | Envelope sender |
 | 4 | `rcpt_to` | Envelope recipient (one) |
@@ -80,6 +80,7 @@ outcome a person reads.
 | 6 | `auth_user` | SASL PLAIN username; its presence is what configures authentication |
 | 7 | `auth_pass` | SASL PLAIN password |
 | 8 | `channel_confidential` | u32 LE; non-zero asserts a `tls` node sits in front. Anything else, including absent, reads as zero |
+| 9 | `authority` | `host[:port]`, port 25 when it names none: the relay to dial. A name goes to the network provider as a name, for it to resolve. At most 128 bytes; absent, longer, or not `host[:port]` refuses construction |
 
 Params describe a single submission. When an envelope is configured, that
 submission is performed once at startup as if its record had arrived — which is
