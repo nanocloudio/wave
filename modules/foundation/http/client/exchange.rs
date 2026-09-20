@@ -286,8 +286,11 @@ pub(crate) unsafe fn poll_request(s: &mut HttpState) -> bool {
         if s.client.conn_present != 0
             && &s.client.conn_authority[..s.client.conn_authority_len as usize] != record_authority
         {
+            // Keep it for its own authority rather than closing it: the next
+            // request may well be for the origin being left behind. The park
+            // itself happens in `Init`, where the connection is disposed of
+            // one way or the other and the record's borrow has ended.
             s.client.conn_stale = 1;
-            s.client.response.reusable = false;
         }
         s.client.conn_authority[..n].copy_from_slice(record_authority);
         s.client.conn_authority_len = n as u16;

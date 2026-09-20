@@ -126,10 +126,23 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // a socket to a peer it does not name. A refused CLOSE keeps
                 // the phase here so it is offered again.
                 if s.client.conn_stale != 0 {
-                    if !send_close_frame(s) {
+                    // Park it for its own authority if it is cleanly idle;
+                    // only a connection that cannot be kept is closed. Either
+                    // way this client is not holding it any more.
+                    if !super::park_connection(s) && !send_close_frame(s) {
                         return 0;
                     }
                     s.client.conn_stale = 0;
+                }
+                // A connection parked for this very authority is resumed
+                // rather than dialled again.
+                if s.client.conn_present == 0 {
+                    let n = s.client.conn_authority_len as usize;
+                    let mut authority = [0u8; super::AUTHORITY_MAX];
+                    authority[..n].copy_from_slice(&s.client.conn_authority[..n]);
+                    if super::resume_parked(s, &authority[..n]) {
+                        log(s, b"[http] resumed a parked connection");
+                    }
                 }
                 if s.client.conn_present != 0 {
                     s.client.phase = if build_request(s) {
@@ -607,14 +620,24 @@ pub(crate) unsafe fn idle(s: &mut HttpState) {
         if kind == 0 {
             break;
         }
+        let frame_conn = if n >= 2 {
+            Some(net_proto::conn_id(
+                &s.net_buf[NET_FRAME_HDR..NET_FRAME_HDR + n],
+            ))
+        } else {
+            None
+        };
+        // Anything at all on the PARKED connection ends its parking. It was
+        // kept on the promise that it was idle, and a frame is proof it was
+        // not — a close from the peer as much as unsolicited data.
+        if s.client.parked_present != 0 && frame_conn == Some(s.client.parked_id) {
+            let _ = super::close_parked(s);
+        }
         // Ours is the only connection that means anything here: a frame on it
         // between exchanges is the peer saying something the response decoder
         // never asked for, so the connection cannot be reused. Without a
         // connection of our own, nothing that arrives can be ours.
-        if s.client.conn_present != 0
-            && n >= 2
-            && net_proto::conn_id(&s.net_buf[NET_FRAME_HDR..NET_FRAME_HDR + n]) == s.client.conn_id
-        {
+        if s.client.conn_present != 0 && frame_conn == Some(s.client.conn_id) {
             s.client.response.reusable = false;
             let _ = send_close_frame(s);
             break;

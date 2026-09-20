@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# Rig build recipe for the pi5 target — the script `fluxor rig test` runs before
-# deploying. Invoked from the machine-local rig profile
+# Rig build recipe — the script `fluxor rig test` runs before deploying.
+# Invoked from the machine-local rig profile
 # ($XDG_CONFIG_HOME/fluxor/projects/wave/rig.toml) as:
 #
-#   command = ["bash", "tools/rig/build.sh", "${scenario.config}"]
+#   command = ["bash", "tools/rig/build.sh", "<board>", "${scenario.config}"]
+#
+# One script for every board rather than one per board: the two flows differ
+# only in which silicon the modules are built for and how the kernel and the
+# config blob are joined, and the guards around them — always rebuild the
+# firmware, never filter by mtime, run the pre-flights — are the same lesson
+# either way and are worth learning once.
 #
 # WHY THIS IS IN THE REPO. It used to be a 55-line script inlined in that
 # profile, which is not version controlled and does not travel. Everything it
@@ -14,8 +20,61 @@
 # guards and never invoke them. The profile is now a pointer; the knowledge is
 # reviewable, diffable, and the same everywhere.
 #
-# $1 is the scenario's graph config, passed through as `${scenario.config}`.
+# $1 is the board id; $2 is the scenario's graph config, passed through as
+# `${scenario.config}`.
 set -euo pipefail
+
+BOARD="${1:?usage: build.sh <board> <config>}"
+CONFIG="${2:?usage: build.sh <board> <config>}"
+
+# The kernel is Fluxor's, and its image tag is Fluxor's revision — read here
+# rather than inside each arm so a board arm cannot forget it and ship an
+# image that cannot say what it was built from.
+FLUXOR_IMAGE_TAG="$(git -C deps/fluxor rev-parse --short HEAD)"
+export FLUXOR_IMAGE_TAG
+RIG_STARTED=$(date +%s)
+
+# The CLI that packs the modules must be the one built from the same SDK the
+# modules compile against. Module sources resolve through the `deps/fluxor`
+# checkout, so a `fluxor` from the store packs against whatever SDK it was
+# published with — and every module is refused at pack time with an
+# ABI-surface mismatch the moment that checkout moves ahead of it. Resolve
+# the sibling's own build instead, exactly as Fluxor's rig recipe does.
+FLUXOR=deps/fluxor/target/aarch64-unknown-linux-gnu/release/fluxor
+if [ ! -x "$FLUXOR" ]; then
+  echo "rig recipe: no CLI at $FLUXOR — build it with" >&2
+  echo "  cargo build --release -p fluxor-tools --target aarch64-unknown-linux-gnu" >&2
+  echo "  (from $(cd deps/fluxor && pwd)); the store's CLI packs against a different SDK" >&2
+  exit 1
+fi
+FLUXOR=$(cd "$(dirname "$FLUXOR")" && pwd)/$(basename "$FLUXOR")
+
+pico2w_build() {
+  # Fluxor's native RP kernel. `firmware.sh` emits both the raw image and the
+  # ELF; the ELF is what becomes a UF2.
+  make -C deps/fluxor firmware TARGET=pico2w
+  mkdir -p target/pico2w
+  # `fluxor build` resolves target/<board>/firmware.bin against THIS project
+  # root, so the kernel has to be staged in even though it was built next door.
+  if ! cmp -s deps/fluxor/target/pico2w/firmware.bin target/pico2w/firmware.bin 2>/dev/null; then
+    cp deps/fluxor/target/pico2w/firmware.bin target/pico2w/firmware.bin
+  fi
+  bash tools/rig/preflight.sh modules rp2350
+  "$FLUXOR" modules build --target rp2350
+  bash tools/rig/preflight.sh embeds "$CONFIG"
+  picotool uf2 convert deps/fluxor/target/pico2w/firmware.elf -t elf \
+    target/pico2w/firmware.uf2
+  # ONE flashable image: kernel, trailer, modules and config blob. A
+  # kernel-only UF2 boots and then finds nothing to load, which on a board
+  # with no display is indistinguishable from a dead one.
+  "$FLUXOR" build "$CONFIG" --emit=combined \
+    --firmware target/pico2w/firmware.uf2 \
+    -o target/pico2w/packed.uf2
+  bash tools/rig/preflight.sh artifact target/pico2w/packed.uf2 "$RIG_STARTED"
+  echo "rig recipe: staged $CONFIG -> target/pico2w/packed.uf2"
+}
+
+pi5_build() {
 
 # 1. Stage Fluxor's kernel firmware. Build it in the pinned tree if absent.
 # ALWAYS rebuild, never "only if absent". A firmware.bin that merely EXISTS
@@ -35,21 +94,20 @@ fi
 # Pre-flight (../standards/rig.md §4). Versioned in the repo so a fresh
 # clone gets it; catches 0-byte fmods and dangling rig backends before
 # they surface as unrelated-looking errors.
-RIG_STARTED=$(date +%s)
 bash tools/rig/preflight.sh modules bcm2712
-fluxor modules build --target bcm2712
+"$FLUXOR" modules build --target bcm2712
 # Files the graph EMBEDS must exist now: `fluxor build` only warns on one it
 # cannot read, so a missing cert_file yields a green build, a tls module with no
 # certificate, and a load phase that commits nothing — a DUT-looking failure for
 # a build-host problem. Cost a run on 2026-08-10 when /tmp was swept.
-bash tools/rig/preflight.sh embeds "$1"
-fluxor build "$1"
+bash tools/rig/preflight.sh embeds "$CONFIG"
+"$FLUXOR" build "$CONFIG"
 # 3. Surface the image at a stable path so ANY scenario config deploys, not
 #    just the one whose stem matches the artifact name. `fluxor build` mirrors
 #    the config's subdirectory under images/ — a config at examples/rig/<name>.yaml
 #    lands at images/rig/<name>.img — so locate it by name rather than assuming a
 #    flat layout.
-STEM="$(basename "$1" .yaml)"
+STEM="$(basename "$CONFIG" .yaml)"
 DST=target/pi5/images/wave-pi5.img
 # NO mtime filter. An earlier version required the image to be newer than 10
 # minutes, intending a freshness guard. That is exactly backwards: when
@@ -64,3 +122,10 @@ SRC="$(find target/pi5/images -name "$STEM.img" -not -name "$(basename $DST)" | 
 [ "$SRC" -ef "$DST" ] || cp -f "$SRC" "$DST"
 bash tools/rig/preflight.sh artifact "$DST" "$RIG_STARTED"
 echo "rig recipe: staged $SRC -> $DST ($(stat -c %y "$SRC"))"
+}
+
+case "$BOARD" in
+  pi5)    pi5_build ;;
+  pico2w) pico2w_build ;;
+  *)      echo "rig recipe: no build arm for board '$BOARD'" >&2; exit 2 ;;
+esac

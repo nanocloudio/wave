@@ -159,8 +159,25 @@ pub(crate) struct ClientState {
     pub(crate) draining: u8,
     /// 1 when the connection in hand must be closed before the next dial: an
     /// open client was asked for a different authority than the one it is
-    /// holding open. `Init` closes it and dials afresh.
+    /// holding open and the one it holds cannot be kept.
     pub(crate) conn_stale: u8,
+    /// One connection kept open for an authority this client is not using
+    /// right now, so alternating between two origins does not redial each
+    /// time.
+    ///
+    /// Deliberately ONE, not a table. A pool of reusable connections is
+    /// where a client crosses a response onto the wrong request, and the
+    /// failure is silent and security-relevant. One slot gets the whole
+    /// benefit of the common case — a program talking to two origins — with
+    /// an invariant small enough to state: a parked connection is resumed
+    /// only for the exact authority it was opened for, and only if nothing
+    /// at all arrived on it while it was parked. Anything else closes it and
+    /// dials afresh.
+    pub(crate) parked_id: u16,
+    /// 1 when `parked_id` names a connection still worth resuming.
+    pub(crate) parked_present: u8,
+    pub(crate) parked_authority: [u8; AUTHORITY_MAX],
+    pub(crate) parked_authority_len: u16,
     /// 1 when the `authority` parameter was longer than [`AUTHORITY_MAX`].
     /// Recorded rather than truncated: a prefix of an authority is a
     /// different host, and construction refuses it — with a diagnostic that
@@ -372,6 +389,8 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.client.authority_len = 0;
     s.client.conn_authority_len = 0;
     s.client.conn_stale = 0;
+    s.client.parked_present = 0;
+    s.client.parked_authority_len = 0;
     s.client.authority_oversize = 0;
     s.client.request_invalid = 0;
     s.client.content_type = [0; CONTENT_TYPE_MAX];
@@ -550,6 +569,82 @@ pub(crate) unsafe fn send_close_frame(s: &mut HttpState) -> bool {
     s.client.conn_id = 0;
     s.client.conn_present = 0;
     true
+}
+
+/// Park the connection in hand for the authority it belongs to, instead of
+/// closing it, so a later request for that authority can resume it.
+///
+/// Refuses to park anything that is not cleanly reusable — a connection the
+/// response decoder marked unreusable, one mid-exchange, or one whose peer
+/// asked to close. A parked connection that is not certainly idle is worse
+/// than no parked connection at all.
+pub(crate) unsafe fn park_connection(s: &mut HttpState) -> bool {
+    if s.client.conn_present == 0
+        || s.client.keep_alive == 0
+        || !s.client.response.reusable
+        || s.client.draining != 0
+    {
+        return false;
+    }
+    // Only one may be parked; an existing one is closed rather than leaked.
+    if s.client.parked_present != 0 {
+        let _ = close_parked(s);
+    }
+    let n = s.client.conn_authority_len as usize;
+    if n == 0 || n > AUTHORITY_MAX {
+        return false;
+    }
+    s.client.parked_authority[..n].copy_from_slice(&s.client.conn_authority[..n]);
+    s.client.parked_authority_len = n as u16;
+    s.client.parked_id = s.client.conn_id;
+    s.client.parked_present = 1;
+    // The connection is no longer THIS client's active one; it stays open on
+    // the provider and is adopted again by id.
+    s.client.conn_present = 0;
+    s.client.conn_id = 0;
+    true
+}
+
+/// Resume the parked connection when it is for `authority`. The caller has
+/// already established that no connection is in hand.
+pub(crate) unsafe fn resume_parked(s: &mut HttpState, authority: &[u8]) -> bool {
+    if s.client.parked_present == 0 {
+        return false;
+    }
+    let n = s.client.parked_authority_len as usize;
+    if n != authority.len() || &s.client.parked_authority[..n] != authority {
+        return false;
+    }
+    s.client.conn_id = s.client.parked_id;
+    s.client.conn_present = 1;
+    s.client.parked_present = 0;
+    s.client.parked_authority_len = 0;
+    s.client.response.reusable = true;
+    true
+}
+
+/// Close whatever is parked, if anything. Used when it cannot be trusted any
+/// more — data arrived on it, or another authority needs the slot.
+pub(crate) unsafe fn close_parked(s: &mut HttpState) -> bool {
+    if s.client.parked_present == 0 {
+        return true;
+    }
+    let id = s.client.parked_id;
+    s.client.parked_present = 0;
+    s.client.parked_authority_len = 0;
+    let sys = &*s.syscalls;
+    let mut payload = [0u8; 2];
+    net_proto::put_conn_id(&mut payload, id);
+    let mut buf = [0u8; NET_BUF_SIZE];
+    net_write_frame(
+        sys,
+        s.net_out_chan,
+        NET_CMD_CLOSE,
+        payload.as_ptr(),
+        2,
+        buf.as_mut_ptr(),
+        NET_BUF_SIZE,
+    ) != 0
 }
 
 /// Drop what arrives for other consumers while this client holds no
