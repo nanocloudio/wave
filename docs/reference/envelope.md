@@ -15,7 +15,7 @@ connection at a time.
 
 | Layer | Constant | aarch64 (Pi 5, Linux host) | rp2350 | Owner | One past it |
 |---|---|---|---|---|---|
-| TCP connections | `ip::MAX_TCP_CONNS` | 65536 | 16 | Fluxor profile constant | SYN unanswered |
+| TCP connections | `ip::MAX_TCP_CONNS` | 65536 | 8 | Fluxor profile constant | SYN unanswered |
 | TLS sessions | `tls::MAX_SESSIONS` | 512 | 1 | Fluxor profile constant | accepted conn closed, `[tls] no session slot` |
 | HTTP slots | `http::MAX_CONCURRENT_CONNS` | 256 | 4 | Fluxor profile constant | idle keepalive evicted, else accept closed (`conns_refused_slots`) |
 | HTTP arena working set | `http::ARENA_WORKING_SET_CONNS` | 256 | 4 | Fluxor profile constant | accept closed (`conns_refused_arena`) |

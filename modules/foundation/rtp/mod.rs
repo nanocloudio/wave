@@ -37,16 +37,19 @@
 #![allow(
     dead_code,
     unused_imports,
+    reason = "the SDK is path-mounted into every module, so each compile sees \
+              the whole ABI surface while using a subset"
+)]
+#![allow(
     unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+    reason = "the `_ => Error` arms in the state-machine matches are deliberate: \
+              a new variant must not slip past the error path"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
-    reason = "the fluxor module ABI entry points (module_init/module_new/module_step): the \
-              runtime owns these pointers and their validity is the ABI's contract, and the \
-              signature is fixed by that contract rather than chosen here. Same allow as \
-              chronicle's and lattice's PIC modules carry, and required here because \
-              `fluxor ci` clippies modules/** directly."
+    reason = "the module ABI entry points take raw state and syscall pointers \
+              whose validity is the runtime's half of the contract, and the \
+              signature is fixed by that contract rather than chosen here"
 )]
 
 use core::ffi::c_void;

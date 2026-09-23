@@ -181,14 +181,9 @@ run_plaintext() {
 run_tls() {
   local yaml="examples/linux/wave_https.yaml"
   [ -f "$ROOT/$yaml" ] || fail "no TLS graph at $yaml"
-  need openssl
-
-  # A throwaway P-256 cert; the graph reads DER, as the rig graph does.
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -days 1 -subj "/CN=wave" \
-    >/dev/null 2>&1 || fail "openssl could not mint a test certificate"
-  openssl x509 -in "$WORK/cert.pem" -outform DER -out /tmp/wave_linux_cert.der 2>/dev/null
-  openssl ec -in "$WORK/key.pem" -outform DER -out /tmp/wave_linux_key.der 2>/dev/null
+  # The certificate this graph names is minted by tools/ci/dev_certs.sh, which
+  # reads the paths out of the graph itself; this script does not mint its own.
+  bash "$ROOT/tools/ci/dev_certs.sh" || fail "could not provision a test certificate"
 
   boot_graph "$yaml" "wave_https" "$TLS_PORT"
   local base="https://127.0.0.1:$TLS_PORT"

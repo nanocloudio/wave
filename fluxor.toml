@@ -62,42 +62,47 @@ limit_register_coverage = "fail"
 # there is simply no workspace left for it to have opted out of.
 
 [ci.test]
-# Five project gates, run in order at CI phase 3.5 (after the strict module
+# Nine project gates, run in order at CI phase 3.5 (after the strict module
 # build):
 #
-#   1. shadow_guard.sh — tests/ is shadow-tracked in .git-shadow/, so a
+#   1. dev_certs.sh — the TLS example graphs name a certificate and a key on
+#      disk under /tmp, which is RAM-backed here and empty after a reboot. This
+#      mints whatever is missing, reading the paths out of the graphs, so no
+#      later gate passes on residue an earlier run happened to leave behind.
+#   2. shadow_guard.sh — tests/ is shadow-tracked in .git-shadow/, so a
 #      primary-only checkout has zero files there and the test phases would
 #      pass vacuously. It also fails when the primary repo TRACKS a path under
 #      a shadow tier: ignoring a tree does not untrack what is already in it,
 #      so a force-add reaches the shared remote with every ignore rule still
 #      reading as correct.
-#   2. host_crates.sh — the module build fmt-checks and clippies the PIC
+#   3. host_crates.sh — the module build fmt-checks and clippies the PIC
 #      sources directly, which leaves the two host crates linted by nothing and
 #      `tools/load/wave-bench` built by nothing. This gate is that.
-#   3. fmod_size_budget.sh — the variant split's whole point is fitting smaller
+#   4. fmod_size_budget.sh — the variant split's whole point is fitting smaller
 #      devices, which is a claim about BYTES; enforced here, after the module
 #      build, so a variant cannot quietly stop being smaller than its superset.
-#   4. identity_accessor_guard.sh — module pumps must decode contract
+#   5. identity_accessor_guard.sh — module pumps must decode contract
 #      identities through the owning accessors, never literal offsets. Every
 #      remaining byte-decode site carries an individual justification in
 #      tools/ci/identity_accessor_allowlist.txt, and a stale or unjustified
 #      entry fails the gate.
-#   5. envelope_table.sh — the connection envelope, generated from the
+#   6. envelope_table.sh — the connection envelope, generated from the
 #      constants that compile it (SDK profile + Wave sources) and diffed
 #      against docs/reference/envelope.md, so the ceiling a reader consults is
 #      the ceiling the module compiled.
-#   6. fmod_pic_relocs.sh — no module may store an address of its own image in
+#   7. fmod_pic_relocs.sh — no module may store an address of its own image in
 #      its data. A `.fmod` is mapped at an arbitrary base with no relocations
 #      applied, so such an address is wrong at every read, and the shape that
 #      produces one is ordinary Rust a reviewer cannot see.
-#   7. http_exchange.sh — the exchange client against a real origin. It is here
+#   8. http_exchange.sh — the exchange client against a real origin. It is here
 #      rather than under a manual E2E because the fault it guards lands between
 #      the connection opening and the first byte going out, where every
 #      HTTP-level check sees silence rather than an error.
-#   8. http_app_reply.sh — the application fan-out's reply half. A forwarded
+#   9. http_app_reply.sh — the application fan-out's reply half. A forwarded
 #      request whose answer is never composed leaves the connection open and
 #      silent, which reaches a client as a timeout and names no component.
 scripts = [
+  "tools/ci/dev_certs.sh",
   "tools/ci/shadow_guard.sh",
   "tools/ci/host_crates.sh",
   "tools/ci/fmod_size_budget.sh",
@@ -107,6 +112,30 @@ scripts = [
   "tools/e2e/http_exchange.sh",
   "tools/e2e/http_app_reply.sh",
 ]
+
+# Crate-root `#![allow(...)]` is banned by `../standards/lints.md` §4. Each row
+# below declares a prefix where it is permitted and the reason it is; a file
+# outside them fails the gate. The lints each file names are the ones that
+# actually fire there — no module carries a suppression for a lint its own
+# compile never raises.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/"
+reason = """A PIC module is built one `.rs` at a time by a direct `rustc` \
+invocation, and the SDK is path-mounted into each of them, so every compile \
+sees the whole ABI surface while using a subset and several compiles see the \
+same mounted file. That is a property of how a module is built, not of any one \
+module, and the ABI entry points' raw-pointer signatures are the runtime's half \
+of the same contract."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/harness/"
+reason = """The harness mounts the module sources rather than linking them, which \
+rescales `pub(crate)` and multiplies the mounted SDK; the suppressions are \
+artefacts of mounting, not defects in a shipped module, and \
+`tests/harness/src/lib.rs` names each one. \
+`tests/harness/tests/shed_support/mod.rs` is shared helper code each suite uses \
+a subset of. Shadow-tracked (../standards/test-tracking.md §1), so these files \
+are not in the main repo's history."""
 
 [ci.hygiene]
 # `modules/**` are no_std PIC objects that cannot host a test harness, so inline

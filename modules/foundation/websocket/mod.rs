@@ -22,17 +22,15 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK + shared cores are include!'d wholesale; each module consumes only a subset"
+    reason = "the SDK is path-mounted into every module, so each compile sees \
+              the whole ABI surface while using a subset"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
-    reason = "the fluxor module ABI entry points (module_init/module_new/module_step): the \
-              runtime owns these pointers and their validity is the ABI's contract, and the \
-              signature is fixed by that contract rather than chosen here. Same allow as \
-              chronicle's and lattice's PIC modules carry, and required here because \
-              `fluxor ci` clippies modules/** directly."
+    reason = "the module ABI entry points take raw state and syscall pointers \
+              whose validity is the runtime's half of the contract, and the \
+              signature is fixed by that contract rather than chosen here"
 )]
 
 use core::ffi::c_void;

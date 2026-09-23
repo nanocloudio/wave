@@ -24,16 +24,13 @@
 //!     the wire.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![allow(
-    unsafe_code,
-    reason = "PIC module: ABI shim and zero-copy buffer plumbing"
-)]
+// PIC library code must not panic; surface errors through the ABI.
 #![deny(clippy::unwrap_used)]
 #![allow(
     dead_code,
     unused_imports,
-    unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
+    reason = "the SDK is path-mounted into every module, so each compile sees \
+              the whole ABI surface while using a subset"
 )]
 
 use core::ffi::c_void;
