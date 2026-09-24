@@ -66,15 +66,15 @@ grep -q "^SDP-MEDIA-PORT 5006" "$WORK/ua.log" \
   || fail "the answer's SDP named the wrong media port: $(grep SDP-MEDIA "$WORK/ua.log")"
 echo "   ok  the answer's SDP names the configured media port"
 
-# Audio must come BACK. The graph loops playout into the transmitter, so this
-# exercises receive -> jitter -> playout -> packetise -> transmit. More frames
-# return than were sent: playout runs at a constant ptime cadence once the call
-# is up, concealing gaps, which is the behaviour a voice path must have.
+# Audio must come BACK. The graph loops the received stream into the
+# transmitter, so this exercises receive -> reorder -> depacketise ->
+# packetise -> transmit on a real link.
 rtp_in="$(sed -n 's/.*RTP-RECEIVED \([0-9]*\).*/\1/p' "$WORK/ua.log")"
 [ -n "$rtp_in" ] && [ "$rtp_in" -gt 0 ] || fail "no RTP came back from the DUT"
 rtp_tone="$(sed -n 's/.*RTP-TONE \([0-9]*\).*/\1/p' "$WORK/ua.log")"
-# Tone, not merely packets: the jitter adapter conceals losses at cadence, so
-# a DUT that never heard a frame still returns a full run of silence.
+# Tone, not merely packets: a returned frame carrying the tone byte proves the
+# DUT's RECEIVE path carried our payload through, which a packet count alone
+# cannot tell from a transmitter talking to itself.
 [ -n "$rtp_tone" ] && [ "$rtp_tone" -gt 0 ] || fail "audio returned but ALL SILENCE — the receive path heard nothing"
 echo "   ok  audio returned from the DUT ($rtp_in packets, $rtp_tone tone)"
 

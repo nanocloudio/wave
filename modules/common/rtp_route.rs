@@ -9,7 +9,6 @@ pub struct RtpRoute {
     pub mid_len: u8,
     pub payload_type: u8,
     pub ssrc: u32,
-    pub codec_index: u8,
 }
 
 #[derive(Clone, Copy)]

@@ -206,8 +206,8 @@ def _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, t
     # ── Media ───────────────────────────────────────────────────────────
     # Send a run of PCMU frames at ptime cadence to the port the ANSWER named,
     # and count what comes back. The DUT graph loops its playout into its
-    # transmitter, so audio returning at all exercises receive -> jitter ->
-    # playout -> packetise -> transmit.
+    # transmitter, so audio returning at all exercises receive -> reorder ->
+    # depacketise -> packetise -> transmit.
     ssrc = 0x5AFE7357
     payload = bytes([0x55]) * SAMPLES_PER_FRAME  # a constant, non-silence tone
     received = 0
@@ -215,12 +215,10 @@ def _dialog(dut_ip, dut_port, local_ip, local_port, rtp_port, frames, call_id, t
     tone_frames = 0
 
     def _count(pkt):
-        # Concealment is µ-law silence (0xFF): a frame carrying ANY tone byte
-        # proves the DUT's RECEIVE path heard us. Counting packets alone is
-        # blind to a dead receive path — the jitter adapter conceals losses at
-        # cadence, so a DUT that never hears a single frame still transmits
-        # a full run of silence. The media-path mutation (rtp bound off the SDP
-        # port) is exactly what a packet count does not detect.
+        # A frame carrying ANY non-silence byte proves the DUT's RECEIVE path
+        # carried our payload through. Counting packets alone cannot tell that
+        # from a transmitter talking to itself, and the media-path mutation
+        # (rtp bound off the SDP port) is exactly what it does not detect.
         nonlocal received, got_payload_bytes, tone_frames
         if len(pkt) >= 12 and (pkt[0] >> 6) == 2:
             received += 1

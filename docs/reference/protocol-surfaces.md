@@ -44,11 +44,24 @@ rather than protocol mechanics — a different concern, in Wormhole.
 
 `rtp`'s `packets` port and `jitter`'s `rx_in` carry the realtime
 family's receive-record seam: one validated RTP payload per TLV frame,
-`[REC_RTP_RX][len][seq: u16 LE][payload]`, layout owned once in
+`[REC_RTP_RX_META][len][seq][timestamp][ssrc][payload_type][marker][codec][payload]`
+(a MID-bearing variant appends the RFC 8285 MID), layout owned once in
 `modules/common/rtp_wire.rs`. The sequence rides the record because
-the reorder buffer keys on it. `sip.rtp_ctrl` carries the shared
-8-byte media-control records (SET_ENDPOINT/START/STOP), fanned by the
-graph to `rtp.endpoint` and `jitter.media_ctrl`.
+the reorder window keys on it; the codec because the depacketizer needs
+the payload format and `rtp` is the module that negotiated it.
+
+Media itself crosses the family boundary as fluxor's encoded-media
+record stream (`abi::contracts::encoded`): `rtp.audio_in` /
+`rtp.video_in` take it to transmit, `jitter.audio_out` /
+`jitter.video_out` produce it from what was received. The payload
+formats between that stream and RTP — RFC 3551 PCMU, RFC 7587 Opus,
+RFC 6184 H.264, RFC 7741 VP8 — are `modules/common/rtp_payload.rs`;
+codec identity and clock arrive in the stream's `STREAM` record, so
+Wave parses nothing below the payload header but NAL boundaries.
+
+`sip.rtp_ctrl` carries the shared 8-byte media-control records
+(SET_ENDPOINT/START/STOP), fanned by the graph to `rtp.endpoint` and
+`jitter.media_ctrl`.
 
 `sip`'s `command_in` and `event_out` carry the same kind of layout.
 A command names one call and what to do about it — dial, accept,

@@ -3,24 +3,24 @@
 // (`net_write_frame` / `net_read_frame`), because channels are byte streams
 // and bare records concatenate.
 //
-//   [REC_RTP_RX: u8] [len: u16 LE] [seq: u16 LE] [payload…]
+//   [REC_RTP_RX_META: u8] [len: u16 LE]
+//       [seq: u16 LE][timestamp: u32 LE][ssrc: u32 LE][payload_type: u8]
+//       [marker: u8][codec: u8] [payload…]
 //
-// The sequence rides the record because the reorder buffer downstream keys on
-// it — a consumer that cannot see the sequence cannot see loss, let alone
-// conceal it. This file owns the layout; `rtp` writes
-// it, `jitter` reads it, and no third spelling exists.
+// with a MID-bearing variant (RFC 8285) that appends `[mid_len: u8][mid: 32]`
+// after the codec byte. The sequence rides the record because the reorder
+// stage keys on it; the codec byte (an `abi::contracts::encoded` codec) because
+// the depacketizer downstream needs the payload format, and `rtp` is the one
+// module that knows what was negotiated. This file owns the layout; `rtp`
+// writes it, `jitter` reads it, and no third spelling exists.
 
-/// Frame type of one validated receive record.
-pub const REC_RTP_RX: u8 = 0x01;
-/// Metadata-bearing receive record for negotiated media consumers.
+/// Frame type of a receive record.
 pub const REC_RTP_RX_META: u8 = 0x02;
-/// Metadata record variant carrying the RFC 8285 MID extension.
+/// Receive record variant carrying the RFC 8285 MID extension.
 pub const REC_RTP_RX_META_MID: u8 = 0x03;
 
-/// Bytes of sequence number leading the frame payload.
-pub const RTP_RX_SEQ_LEN: usize = 2;
-/// `[seq][timestamp][ssrc][payload_type][marker]` prefix length.
-pub const RTP_RX_META_LEN: usize = 2 + 4 + 4 + 1 + 1;
+/// `[seq][timestamp][ssrc][payload_type][marker][codec]` prefix length.
+pub const RTP_RX_META_LEN: usize = 2 + 4 + 4 + 1 + 1 + 1;
 pub const RTP_MID_MAX: usize = 32;
 pub const RTP_RX_META_MID_LEN: usize = RTP_RX_META_LEN + 1 + RTP_MID_MAX;
 
@@ -31,109 +31,27 @@ pub struct RtpReceiveMeta {
     pub ssrc: u32,
     pub payload_type: u8,
     pub marker: bool,
-}
-
-/// A bounded negotiated payload table shared by RTP and session adapters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RtpPayloadBinding {
-    pub payload_type: u8,
-    pub clock_rate: u32,
-    pub channels: u8,
-    pub codec: [u8; 16],
-    pub codec_len: u8,
-}
-
-pub const RTP_MAX_PAYLOAD_BINDINGS: usize = 16;
-
-#[derive(Clone, Copy)]
-pub struct RtpPayloadMap {
-    entries: [Option<RtpPayloadBinding>; RTP_MAX_PAYLOAD_BINDINGS],
-    len: usize,
-}
-
-impl Default for RtpPayloadMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RtpPayloadMap {
-    pub const fn new() -> Self {
-        Self {
-            entries: [None; RTP_MAX_PAYLOAD_BINDINGS],
-            len: 0,
-        }
-    }
-
-    pub fn insert(&mut self, binding: RtpPayloadBinding) -> bool {
-        if binding.codec_len == 0
-            || binding.codec_len as usize > binding.codec.len()
-            || binding.clock_rate == 0
-        {
-            return false;
-        }
-        for entry in self.entries.iter_mut().flatten() {
-            if entry.payload_type == binding.payload_type {
-                return false;
-            }
-        }
-        if self.len == self.entries.len() {
-            return false;
-        }
-        self.entries[self.len] = Some(binding);
-        self.len += 1;
-        true
-    }
-
-    pub fn get(&self, payload_type: u8) -> Option<RtpPayloadBinding> {
-        self.entries
-            .iter()
-            .flatten()
-            .find(|entry| entry.payload_type == payload_type)
-            .copied()
-    }
-}
-
-/// Read the sequence from a record payload. Callers bounds-check
-/// `payload.len() >= RTP_RX_SEQ_LEN` first.
-#[inline]
-pub fn rtp_rx_seq(payload: &[u8]) -> u16 {
-    u16::from_le_bytes([payload[0], payload[1]])
-}
-
-/// Write the sequence into the leading bytes of a record payload.
-#[inline]
-pub fn put_rtp_rx_seq(payload: &mut [u8], seq: u16) {
-    payload[0..RTP_RX_SEQ_LEN].copy_from_slice(&seq.to_le_bytes());
+    pub codec: u8,
 }
 
 /// Write the metadata prefix for one validated RTP receive record.
-pub fn put_rtp_rx_meta(
-    payload: &mut [u8],
-    seq: u16,
-    timestamp: u32,
-    ssrc: u32,
-    payload_type: u8,
-    marker: bool,
-) -> Option<usize> {
+pub fn put_rtp_rx_meta(payload: &mut [u8], meta: RtpReceiveMeta) -> Option<usize> {
     if payload.len() < RTP_RX_META_LEN {
         return None;
     }
-    payload[0..2].copy_from_slice(&seq.to_le_bytes());
-    payload[2..6].copy_from_slice(&timestamp.to_le_bytes());
-    payload[6..10].copy_from_slice(&ssrc.to_le_bytes());
-    payload[10] = payload_type;
-    payload[11] = marker as u8;
+    payload[0..2].copy_from_slice(&meta.seq.to_le_bytes());
+    payload[2..6].copy_from_slice(&meta.timestamp.to_le_bytes());
+    payload[6..10].copy_from_slice(&meta.ssrc.to_le_bytes());
+    payload[10] = meta.payload_type;
+    payload[11] = meta.marker as u8;
+    payload[12] = meta.codec;
     Some(RTP_RX_META_LEN)
 }
 
 /// Decode the fixed metadata prefix. The payload itself remains borrowed by
 /// the caller so no media buffer is copied by the wire layer.
 pub fn parse_rtp_rx_meta(payload: &[u8]) -> Option<RtpReceiveMeta> {
-    if payload.len() < RTP_RX_META_LEN {
-        return None;
-    }
-    if payload[11] > 1 {
+    if payload.len() < RTP_RX_META_LEN || payload[11] > 1 {
         return None;
     }
     Some(RtpReceiveMeta {
@@ -142,34 +60,29 @@ pub fn parse_rtp_rx_meta(payload: &[u8]) -> Option<RtpReceiveMeta> {
         ssrc: u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]),
         payload_type: payload[10],
         marker: payload[11] != 0,
+        codec: payload[12],
     })
 }
 
-pub fn put_rtp_rx_meta_mid(
-    payload: &mut [u8],
-    seq: u16,
-    timestamp: u32,
-    ssrc: u32,
-    payload_type: u8,
-    marker: bool,
-    mid: &[u8],
-) -> Option<usize> {
+pub fn put_rtp_rx_meta_mid(payload: &mut [u8], meta: RtpReceiveMeta, mid: &[u8]) -> Option<usize> {
     if mid.is_empty() || mid.len() > RTP_MID_MAX || payload.len() < RTP_RX_META_MID_LEN {
         return None;
     }
-    let at = put_rtp_rx_meta(payload, seq, timestamp, ssrc, payload_type, marker)?;
+    let at = put_rtp_rx_meta(payload, meta)?;
     payload[at] = mid.len() as u8;
     payload[at + 1..at + 1 + RTP_MID_MAX].fill(0);
     payload[at + 1..at + 1 + mid.len()].copy_from_slice(mid);
     Some(RTP_RX_META_MID_LEN)
 }
 
+/// Decode a MID-bearing prefix: the metadata, the MID, and its length. The
+/// media payload follows at `RTP_RX_META_MID_LEN`.
 pub fn parse_rtp_rx_meta_mid(payload: &[u8]) -> Option<(RtpReceiveMeta, [u8; RTP_MID_MAX], u8)> {
-    if payload.len() < RTP_RX_META_MID_LEN || payload[11] > 1 {
+    if payload.len() < RTP_RX_META_MID_LEN {
         return None;
     }
     let mid_len = payload[RTP_RX_META_LEN] as usize;
-    if mid_len == 0 || mid_len > RTP_MID_MAX || payload.len() != RTP_RX_META_MID_LEN {
+    if mid_len == 0 || mid_len > RTP_MID_MAX {
         return None;
     }
     let meta = parse_rtp_rx_meta(payload)?;

@@ -1,13 +1,13 @@
-version = "1.0.2"
+version = "1.1.0"
 hardware_targets = ["rp2350", "bcm2712"]
 
 # timer_class: this module reads no clock at all — verified, it calls neither
-# `dev_millis` nor `dev_micros`. Transmit is DATA-driven: it accumulates G.711
-# on `g711` and emits a packet every `ptime_bytes`, with the RTP timestamp
-# advancing by sample count, not by elapsed time. Receive is packet-driven.
-# Output is therefore a function of input, not of when the module runs, which
-# is exactly `agnostic`. The real-time pacing of the stream belongs to whoever
-# feeds `g711` (the codec/source) and to `sip`'s playout clock — not here.
+# `dev_millis` nor `dev_micros`. Transmit is DATA-driven: each access unit on
+# `audio_in` / `video_in` becomes its packets as it arrives, stamped with the
+# unit's own `pts`. Receive is packet-driven. Output is therefore a function of
+# input, not of when the module runs, which is exactly `agnostic`. The
+# real-time pacing of the stream belongs to whoever feeds the media input and
+# to the receiver's playout — not here.
 # NOTE this is an EXPLICIT attestation, not the absent-field default: absent
 # means "assume step-counted" and blocks admission to a variable-cadence
 # domain. If a future revision ever paces
@@ -19,17 +19,32 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 
+# Media to send (in[1] or in[2] — one, never both: one instance is one RTP
+# stream). The fluxor encoded-media record stream; its STREAM record must name
+# the negotiated `codec` at that payload format's RTP clock. Fragments up to
+# `max_payload`; a larger access unit arrives as several.
 [[ports]]
-name = "g711"
+name = "audio_in"
 index = 1
 direction = "input"
-content_type = "OctetStream"
+content_type = "AudioEncoded"
+
+[ports.facts]
+codec = ["pcmu", "opus"]
+packing = "raw"
+max_payload = 4096
 
 [[ports]]
-name = "encoded_media"
-index = 3
+name = "video_in"
+index = 2
 direction = "input"
-content_type = "OctetStream"
+content_type = "VideoEncoded"
+
+[ports.facts]
+codec = ["h264", "vp8"]
+packing = ["raw", "annexb", "length_prefixed"]
+clock_rate = 90000
+max_payload = 4096
 
 [[ports]]
 name = "net_out"
@@ -37,10 +52,9 @@ direction = "output"
 content_type = "NetProto"
 
 # Validated receive records (out[1]): metadata-bearing `[seq,timestamp,ssrc,PT,
-# marker][payload…]`, with a MID extension variant when RFC 8285 supplies one.
-# Each record is tagged, so a consumer that reads only the fixed prefix and one
-# that needs the MID share the port without either having to know which the
-# sender chose. The `jitter` adapter accepts both.
+# marker,codec][payload…]`, with a MID extension variant when RFC 8285 supplies
+# one (layout: modules/common/rtp_wire.rs). The `jitter` adapter reorders and
+# depacketizes them into the encoded-media record stream.
 [[ports]]
 name = "packets"
 index = 1

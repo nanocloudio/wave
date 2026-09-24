@@ -1,19 +1,18 @@
-version = "0.1.0"
+version = "0.2.0"
 hardware_targets = ["rp2350", "bcm2712"]
 
-# timer_class: playout paces on `dev_millis` at the `ptime` cadence, and MUST —
-# a relaxed scheduler tick that stretched the interval would stretch the audio.
-# Reading the wall clock is what makes a variable cadence safe here, and
-# declaring it is what lets the validator know.
+# timer_class: how long a missing packet is waited for is real time — a relaxed
+# scheduler tick must stretch scheduling, never the hold — so the hold reads
+# `dev_millis`. Declaring it is what lets the validator know.
 timer_class = "wall_clock"
 
-# The RTP-family reorder/playout adapter: validated RTP
-# payloads in as `[seq: u16 LE][payload…]` records, loss-concealed µ-law
-# playout out at `ptime` cadence. The buffer is modules/common/jitter_core.rs;
-# call policy stays with `sip`, adaptive playout with Grove.
+# The RTP-family reorder and depacketize adapter: receive records in, the
+# encoded-media record stream out. The window is modules/common/jitter_core.rs
+# and the payload formats modules/common/rtp_payload.rs; call policy stays with
+# `sip`, concealment with the decoder, playout with the sink.
 
-# Validated RTP payloads (in[0]): one `[seq][payload]` record per packet, from
-# `rtp.packets`.
+# Receive records (in[0]): `[seq,timestamp,ssrc,PT,marker,codec][payload…]`
+# from `rtp.packets` (modules/common/rtp_wire.rs).
 [[ports]]
 name = "rx_in"
 index = 0
@@ -31,13 +30,40 @@ direction = "input"
 content_type = "OctetStream"
 buffer_size = 256
 
-# Playout (out[0]): loss-concealed µ-law at `ptime` cadence.
+# The received stream (out[0] for audio, out[1] for video): one packet's
+# payload per record at most, so a fragment never exceeds one RTP payload plus
+# the start codes H.264 depacketizing adds. `max_record` is the largest single
+# write: one packet's records plus a stream close staged on STOP
+# (`PENDING_MAX` in mod.rs).
 [[ports]]
-name = "ulaw_out"
+name = "audio_out"
 index = 0
 direction = "output"
-content_type = "OctetStream"
-buffer_size = 2048
+content_type = "AudioEncoded"
+buffer_size = 4096
+max_record = 2508
+
+# No `codec` fact: the stream is whatever `rtp` negotiated, which a manifest
+# cannot know. Its STREAM record says; the consumer checks in-band.
+[ports.facts]
+packing = "raw"
+max_payload = 1460
+
+[[ports]]
+name = "video_out"
+index = 1
+direction = "output"
+content_type = "VideoEncoded"
+buffer_size = 8192
+max_record = 2508
+
+# max_payload: one RTP payload grown by the Annex B start codes depacketizing
+# adds. A STAP-A of one-byte NAL units is the worst case, at five output bytes
+# per three input — 1460 x 5/3, rounded up.
+[ports.facts]
+packing = ["raw", "annexb"]
+clock_rate = 90000
+max_payload = 2440
 
 [[resources]]
 requires_contract = "channel"

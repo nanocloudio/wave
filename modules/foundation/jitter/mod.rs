@@ -1,22 +1,27 @@
-//! `jitter` — the RTP-family reorder/playout adapter.
+//! `jitter` — the RTP-family reorder and depacketize adapter.
 //!
-//! The minimum receive-side buffering the realtime family owns:
-//! validated RTP payloads in, loss-concealed playout
-//! out, at the codec's frame cadence. The data structure and both operations
-//! are `modules/common/jitter_core.rs`, mounted verbatim; this file is the
-//! pump — records in, a wall clock for pacing, backpressure out.
+//! Validated RTP payloads in, the fluxor encoded-media record stream out
+//! (`abi::contracts::encoded`). The reorder window is
+//! `modules/common/jitter_core.rs` and the payload formats are
+//! `modules/common/rtp_payload.rs`, both mounted verbatim; this file is the
+//! pump — records in, in-order release, a bounded wait for holes, backpressure
+//! out.
 //!
 //! It decides nothing about the call. `sip` decides when media starts and
 //! stops and says so on the same control records it drives the `rtp`
 //! transmitter with; this module obeys START/STOP and ignores SET_ENDPOINT,
-//! which addresses the transmitter. Adaptive playout, clock recovery and
-//! topology-aware buffering are Grove's, not Wave's.
+//! which addresses the transmitter.
+//!
+//! It conceals nothing. A packet that never arrives is waited for at most
+//! `max_hold_ms`, then skipped, and the next unit carries `DISCONTINUITY` so the
+//! decoder conceals — concealment is codec work. Playout pacing is not here
+//! either: presenting media on time belongs to the sink that owns the clock.
 //!
 //! Ports:
-//!   in[0]  `rx_in`    — `[seq: u16 LE][payload…]` records, one validated RTP
-//!                       payload per record (`rtp.packets`).
-//!   in[1]  `ctrl`     — the shared media-control records (START/STOP).
-//!   out[0] `ulaw_out` — playout µ-law at `ptime` cadence.
+//!   in[0]  `rx_in`      — receive records from `rtp.packets` (`rtp_wire.rs`).
+//!   in[1]  `media_ctrl` — the shared media-control records (START/STOP).
+//!   out[0] `audio_out`  — `AudioEncoded` records, for an audio stream.
+//!   out[1] `video_out`  — `VideoEncoded` records, for a video stream.
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
@@ -35,21 +40,30 @@ use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
+use abi::contracts::encoded as enc;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// The reorder window and loss-concealing playout ring — the single
-// implementation, shared with the host vectors
-// (tests/harness/tests/sip_jitter_vectors.rs).
+// The reorder window — the single implementation, shared with the host
+// vectors (tests/harness/tests/jitter.rs).
 #[cfg(not(feature = "host-test"))]
 #[path = "../../common/jitter_core.rs"]
 mod jitter_core;
 #[cfg(feature = "host-test")]
 #[path = "../../common/jitter_core.rs"]
 pub mod jitter_core;
-use jitter_core::JitterBuffer;
+use jitter_core::{JitterBuffer, JitterPacketMeta, JITTER_SLOT_SIZE};
+
+// RTP payload formats → encoded-media records.
+#[cfg(not(feature = "host-test"))]
+#[path = "../../common/rtp_payload.rs"]
+mod rtp_payload;
+#[cfg(feature = "host-test")]
+#[path = "../../common/rtp_payload.rs"]
+pub mod rtp_payload;
+use rtp_payload::{depacketized_max, Depacketizer, Received};
 
 // The receive-record seam from `rtp` — one owner for the layout.
 #[cfg(not(feature = "host-test"))]
@@ -59,8 +73,8 @@ mod rtp_wire;
 #[path = "../../common/rtp_wire.rs"]
 pub mod rtp_wire;
 use rtp_wire::{
-    parse_rtp_rx_meta, parse_rtp_rx_meta_mid, rtp_rx_seq, REC_RTP_RX, REC_RTP_RX_META,
-    REC_RTP_RX_META_MID, RTP_RX_META_LEN, RTP_RX_META_MID_LEN, RTP_RX_SEQ_LEN,
+    parse_rtp_rx_meta, parse_rtp_rx_meta_mid, REC_RTP_RX_META, REC_RTP_RX_META_MID,
+    RTP_RX_META_LEN, RTP_RX_META_MID_LEN,
 };
 
 /// The shared media-control records (`sip.rtp_ctrl`, fanned here and to the
@@ -70,27 +84,41 @@ const CTRL_START: u8 = 0x02;
 const CTRL_STOP: u8 = 0x03;
 const CTRL_MSG_SIZE: usize = 8;
 
-/// Playout scratch: one ptime frame of 8 kHz G.711.
-const PLAYOUT_BUF: usize = jitter_core::JITTER_SLOT_SIZE;
-
 /// Records consumed from `rx_in` per step — bounds the drain loop while
-/// outrunning any admitted cadence (a 50/s stream against 4/step at a 1 ms
-/// tick).
+/// outrunning any admitted cadence.
 const RX_DRAIN_BUDGET: u32 = 4;
+
+/// Packets released per step.
+const RELEASE_BUDGET: u32 = 8;
+
+/// Staged output: the most records one packet produces, plus the close of a
+/// stream (a truncated unit end and `END`) appended on STOP.
+const PENDING_MAX: usize = depacketized_max(JITTER_SLOT_SIZE) + enc::UNIT_HEADER + enc::END_LEN;
+
+/// One receive record with its NetProto envelope.
+const RX_BUF_SIZE: usize = NET_FRAME_HDR + RTP_RX_META_MID_LEN + JITTER_SLOT_SIZE;
 
 #[repr(C)]
 struct JitterState {
     syscalls: *const SyscallTable,
     rx_in: i32,
     ctrl_in: i32,
-    ulaw_out: i32,
+    audio_out: i32,
+    video_out: i32,
+    /// The output the current stream's records go to.
+    stream_out: i32,
     jitter: JitterBuffer,
+    depack: Depacketizer,
     playing: u8,
-    ptime: u8,
-    target_fill: u16,
-    last_playout_ms: u64,
-    playout_buf: [u8; PLAYOUT_BUF],
-    rx_buf: [u8; 512],
+    max_hold_ms: u16,
+    /// When the head hole was first seen; `None` while there is none.
+    hole_since_ms: Option<u64>,
+    /// Records for a stream whose medium has no wired output. Counted, never
+    /// silent.
+    unrouted: u32,
+    pending_len: u16,
+    pending: [u8; PENDING_MAX],
+    rx_buf: [u8; RX_BUF_SIZE],
 }
 
 impl JitterState {
@@ -98,14 +126,18 @@ impl JitterState {
         self.syscalls = syscalls;
         self.rx_in = -1;
         self.ctrl_in = -1;
-        self.ulaw_out = -1;
+        self.audio_out = -1;
+        self.video_out = -1;
+        self.stream_out = -1;
         self.jitter = JitterBuffer::new();
+        self.depack = Depacketizer::new();
         self.playing = 0;
-        self.ptime = 20;
-        self.target_fill = 3;
-        self.last_playout_ms = 0;
-        self.playout_buf = [0; PLAYOUT_BUF];
-        self.rx_buf = [0; 512];
+        self.max_hold_ms = 60;
+        self.hole_since_ms = None;
+        self.unrouted = 0;
+        self.pending_len = 0;
+        self.pending = [0; PENDING_MAX];
+        self.rx_buf = [0; RX_BUF_SIZE];
     }
 }
 
@@ -116,8 +148,8 @@ mod params_def {
 
     define_params! {
         JitterState;
-        1, ptime, u8, 20 => |s, d, len| { let v = p_u8(d, len, 0, 20); s.ptime = if v == 0 { 20 } else { v }; };
-        2, target_fill, u16, 3 => |s, d, len| { s.target_fill = p_u16(d, len, 0, 3); };
+        // Tags 1 and 2 are closed; the next allocation is 4.
+        3, max_hold_ms, u16, 60 => |s, d, len| { s.max_hold_ms = p_u16(d, len, 0, 60); };
     }
 }
 
@@ -155,11 +187,9 @@ pub extern "C" fn module_new(
         let sys = &*s.syscalls;
 
         s.rx_in = in_chan;
-        s.ulaw_out = out_chan;
-        let ch = dev_channel_port(sys, 0, 1); // in[1]: ctrl
-        if ch >= 0 {
-            s.ctrl_in = ch;
-        }
+        s.audio_out = out_chan;
+        s.video_out = dev_channel_port(sys, 1, 1);
+        s.ctrl_in = dev_channel_port(sys, 0, 1);
 
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
@@ -186,13 +216,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         step_ctrl(s);
         step_rx(s);
-        step_playout(s);
+        step_release(s);
         0
     }
 }
 
-/// Obey the fanned media-control records. START resets the ring and arms
-/// playout; STOP disarms and clears. SET_ENDPOINT addresses the transmitter.
+/// Obey the fanned media-control records. START resets the window and arms
+/// release; STOP closes the stream downstream with `END` and clears.
 unsafe fn step_ctrl(s: &mut JitterState) {
     let sys = &*s.syscalls;
     if s.ctrl_in < 0 {
@@ -211,13 +241,22 @@ unsafe fn step_ctrl(s: &mut JitterState) {
         match m[0] {
             CTRL_START => {
                 s.jitter.reset();
+                s.depack.reset();
+                s.hole_since_ms = None;
                 s.playing = 1;
-                s.last_playout_ms = dev_millis(sys);
                 dev_log(sys, 3, b"[jit] start".as_ptr(), 11);
             }
             CTRL_STOP => {
+                if s.playing != 0 {
+                    // Close the stream after anything still staged: a decoder
+                    // must see END to flush what it holds.
+                    let at = s.pending_len as usize;
+                    let n = s.depack.finish(&mut s.pending[at..]);
+                    s.pending_len += n as u16;
+                }
                 s.playing = 0;
                 s.jitter.reset();
+                s.hole_since_ms = None;
                 dev_log(sys, 3, b"[jit] stop".as_ptr(), 10);
             }
             CTRL_SET_ENDPOINT => {}
@@ -226,7 +265,7 @@ unsafe fn step_ctrl(s: &mut JitterState) {
     }
 }
 
-/// Drain `rx_in` records into the reorder ring. Always — an undrained leg of
+/// Drain `rx_in` records into the reorder window. Always — an undrained leg of
 /// a fan-out stalls its producer; a record that arrives while stopped is
 /// consumed and dropped, which is the STOP semantics, not a loss.
 unsafe fn step_rx(s: &mut JitterState) {
@@ -242,76 +281,110 @@ unsafe fn step_rx(s: &mut JitterState) {
             return;
         }
         let (msg_type, plen) = net_read_frame(sys, s.rx_in, s.rx_buf.as_mut_ptr(), s.rx_buf.len());
-        let payload_offset = if msg_type == REC_RTP_RX_META {
-            RTP_RX_META_LEN
-        } else if msg_type == REC_RTP_RX_META_MID {
-            RTP_RX_META_MID_LEN
-        } else if msg_type == REC_RTP_RX {
-            RTP_RX_SEQ_LEN
-        } else {
-            0
-        };
-        if payload_offset == 0 || plen < payload_offset {
-            // Unknown frame or a runt too short for a sequence: consumed
-            // whole (the framing keeps the FIFO aligned) and dropped.
-            if msg_type == 0 {
-                return;
-            }
-            continue;
+        if msg_type == 0 {
+            return;
         }
         if s.playing == 0 {
             continue;
         }
-        let payload = &s.rx_buf[NET_FRAME_HDR..NET_FRAME_HDR + plen];
-        let seq = rtp_rx_seq(payload);
-        if msg_type == REC_RTP_RX_META || msg_type == REC_RTP_RX_META_MID {
-            let mid_meta = if msg_type == REC_RTP_RX_META_MID {
-                parse_rtp_rx_meta_mid(payload)
-            } else {
-                parse_rtp_rx_meta(payload).map(|meta| (meta, [0; 32], 0))
-            };
-            if let Some((meta, mid, mid_len)) = mid_meta {
-                let mid_slice = &mid[..mid_len as usize];
-                s.jitter.insert_meta_mid(
-                    seq,
-                    &payload[payload_offset..],
-                    jitter_core::JitterPacketMeta {
-                        timestamp: meta.timestamp,
-                        ssrc: meta.ssrc,
-                        payload_type: meta.payload_type,
-                        marker: meta.marker,
-                    },
-                    mid_slice,
-                );
+        let record = &s.rx_buf[NET_FRAME_HDR..NET_FRAME_HDR + plen];
+        let parsed = match msg_type {
+            REC_RTP_RX_META => parse_rtp_rx_meta(record).map(|m| (m, RTP_RX_META_LEN)),
+            REC_RTP_RX_META_MID => {
+                parse_rtp_rx_meta_mid(record).map(|(m, _, _)| (m, RTP_RX_META_MID_LEN))
             }
-        } else {
-            s.jitter.insert(seq, &payload[payload_offset..]);
-        }
+            _ => None,
+        };
+        // An unknown frame or a runt is consumed whole — the framing keeps the
+        // FIFO aligned — and dropped.
+        let Some((meta, at)) = parsed else {
+            continue;
+        };
+        s.jitter.insert(
+            meta.seq,
+            &record[at..],
+            JitterPacketMeta {
+                timestamp: meta.timestamp,
+                ssrc: meta.ssrc,
+                payload_type: meta.payload_type,
+                marker: meta.marker,
+                codec: meta.codec,
+            },
+        );
     }
 }
 
-/// Loss-concealing playout at `ptime` cadence — the one clock this module
-/// reads, and the reason it attests `wall_clock`: a relaxed scheduler tick
-/// must stretch scheduling, never the audio.
-unsafe fn step_playout(s: &mut JitterState) {
+/// Offer the staged records; `false` while the output is full.
+unsafe fn flush_pending(s: &mut JitterState) -> bool {
+    let len = s.pending_len as usize;
+    if len == 0 {
+        return true;
+    }
+    if s.stream_out < 0 {
+        s.unrouted = s.unrouted.wrapping_add(1);
+        s.pending_len = 0;
+        return true;
+    }
     let sys = &*s.syscalls;
-    if s.playing == 0 || s.ulaw_out < 0 {
-        return;
+    // All-or-nothing: a refused write leaves the stream intact to re-offer.
+    if (sys.channel_write)(s.stream_out, s.pending.as_ptr(), len) < 0 {
+        return false;
     }
-    if s.jitter.fill_count() < s.target_fill && s.last_playout_ms != 0 {
-        // Still pre-buffering before first playout.
-    }
-    let now = dev_millis(sys);
-    if now.wrapping_sub(s.last_playout_ms) < s.ptime as u64 {
-        return;
-    }
-    let out_poll = (sys.channel_poll)(s.ulaw_out, POLL_OUT);
-    if out_poll <= 0 || (out_poll as u32) & POLL_OUT == 0 {
-        return;
-    }
-    let out_len = (s.ptime as usize * 8).min(PLAYOUT_BUF);
-    if s.jitter.playout(out_len, &mut s.playout_buf).is_some() {
-        let _ = (sys.channel_write)(s.ulaw_out, s.playout_buf.as_ptr(), out_len);
-        s.last_playout_ms = now;
+    s.pending_len = 0;
+    true
+}
+
+/// Release in-order packets as records, waiting at most `max_hold_ms` on a
+/// hole before skipping it.
+unsafe fn step_release(s: &mut JitterState) {
+    let sys = &*s.syscalls;
+    let mut budget = RELEASE_BUDGET;
+    while budget > 0 {
+        budget -= 1;
+        if !flush_pending(s) {
+            return;
+        }
+        if s.playing == 0 {
+            return;
+        }
+        if let Some(pkt) = s.jitter.peek() {
+            s.stream_out = if enc::is_video(pkt.meta.codec) {
+                s.video_out
+            } else {
+                s.audio_out
+            };
+            let n = s.depack.packet(
+                Received {
+                    codec: pkt.meta.codec,
+                    timestamp: pkt.meta.timestamp,
+                    marker: pkt.meta.marker,
+                    lost_before: pkt.lost_before,
+                    payload: pkt.payload,
+                },
+                &mut s.pending,
+            );
+            s.pending_len = n as u16;
+            s.jitter.release();
+            s.hole_since_ms = None;
+            continue;
+        }
+        if !s.jitter.waiting_on_hole() {
+            s.hole_since_ms = None;
+            return;
+        }
+        // The one clock this module reads, and the reason it attests
+        // `wall_clock`: how long a hole is waited for is real time, not steps.
+        let now = dev_millis(sys);
+        match s.hole_since_ms {
+            None => {
+                s.hole_since_ms = Some(now);
+                return;
+            }
+            Some(since) if now.wrapping_sub(since) < u64::from(s.max_hold_ms) => return,
+            Some(_) => {
+                s.jitter.skip_hole();
+                s.hole_since_ms = None;
+            }
+        }
     }
 }

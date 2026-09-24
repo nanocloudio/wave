@@ -2,8 +2,10 @@
 //!
 //! Combined RTP transmitter and receiver using a single UDP socket.
 //!
-//! - **TX path** (when in_chan is wired): Reads G.711 u-law from input,
-//!   packetizes into RTP (RFC 3550), and sends via UDP.
+//! - **TX path** (when `audio_in` or `video_in` is wired): reads the fluxor
+//!   encoded-media record stream (`abi::contracts::encoded`), packetizes each
+//!   access unit in the negotiated payload format (`rtp_payload`), and sends
+//!   via UDP.
 //! - **RX path** (when out_chan is wired): Receives RTP from UDP, validates
 //!   headers, extracts payload, and writes to output channel.
 //!
@@ -17,8 +19,10 @@
 //!           dotted quad. Required without ctrl; a SET_ENDPOINT replaces it)
 //!   tag 3: local_port (u16, default 5004)
 //!   tag 4: ssrc       (u32, default 0x46585254 — TX only)
-//!   tag 5: ptime      (u8, default 20 — TX packet interval in ms)
 //!   tag 6: payload_type (u8, default 0 — negotiated RTP PT for TX and RX)
+//!   tag 25: codec     (str, default "pcmu" — the negotiated payload format:
+//!           pcmu, opus, h264 or vp8. TX refuses a stream of any other codec;
+//!           RX tags every receive record with it)
 //!   tag 7: rx_ssrc    (u32, default 0 — accept any inbound SSRC)
 //!   tag 8: srtp_key   (16 bytes, optional AES-128-GCM master key)
 //!   tag 9: srtp_salt  (12 bytes, optional AES-128-GCM master salt)
@@ -29,7 +33,7 @@
 //!   tag 24: turn_peer (str, `host[:port]` permitted at the relay, port 5004)
 //!   tag 17: dtls_srtp_export (56 bytes, DTLS-SRTP exporter material)
 //!   tag 18: dtls_srtp_role (u8, 0 = client, 1 = server)
-//!   tag 19: route (40 bytes: mid_len, MID[32], PT, SSRC, codec index)
+//!   tag 19: route (38 bytes: mid_len, MID[32], PT, SSRC)
 //!   tag 20: dtls_srtp_cm_export (60 bytes, AES-CM master key/salt material)
 //!   tag 21: turn_channel (u16, optional bound TURN channel number)
 
@@ -56,7 +60,12 @@ use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
+use abi::contracts::encoded as enc;
 use abi::SyscallTable;
+
+/// `codec` when the `codec` parameter named no payload format this module
+/// carries; `module_new` refuses to construct with it.
+const CODEC_UNSUPPORTED: u8 = 0xFF;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
@@ -94,8 +103,8 @@ mod rtp_wire;
 #[path = "../../common/rtp_wire.rs"]
 pub mod rtp_wire;
 use rtp_wire::{
-    put_rtcp_stat_rx_meta, put_rtcp_stat_tx, put_rtp_rx_meta, put_rtp_rx_meta_mid, REC_RTP_RX_META,
-    REC_RTP_RX_META_MID, RTCP_STAT_MAX_LEN, RTP_RX_META_LEN, RTP_RX_META_MID_LEN,
+    put_rtcp_stat_rx_meta, put_rtcp_stat_tx, put_rtp_rx_meta, put_rtp_rx_meta_mid, RtpReceiveMeta,
+    REC_RTP_RX_META, REC_RTP_RX_META_MID, RTCP_STAT_MAX_LEN, RTP_RX_META_LEN, RTP_RX_META_MID_LEN,
 };
 
 mod turn_wire {
@@ -116,22 +125,14 @@ mod turn_wire {
 pub mod dtls_srtp_wire;
 #[path = "../../common/rtp_congestion.rs"]
 pub mod rtp_congestion;
-#[path = "../../common/rtp_h264.rs"]
-pub mod rtp_h264;
-#[path = "../../common/rtp_media.rs"]
-pub mod rtp_media;
-#[path = "../../common/rtp_media_wire.rs"]
-pub mod rtp_media_wire;
 #[path = "../../common/rtp_pacer.rs"]
 pub mod rtp_pacer;
+#[path = "../../common/rtp_payload.rs"]
+pub mod rtp_payload;
 #[path = "../../common/rtp_route.rs"]
 pub mod rtp_route;
 #[path = "../../common/rtp_sync.rs"]
 pub mod rtp_sync;
-#[path = "../../common/rtp_video.rs"]
-pub mod rtp_video;
-#[path = "../../common/rtp_vp8.rs"]
-pub mod rtp_vp8;
 #[path = "../../common/srtp_core.rs"]
 pub mod srtp_core;
 
@@ -178,11 +179,26 @@ unsafe fn __aeabi_memmove(dest: *mut u8, src: *const u8, n: usize) {
 /// silently, which reads as a dead receive path rather than as a buffer bound.
 const NET_BUF_SIZE: usize = 2048;
 
-/// Maximum payload per RTP packet we TRANSMIT (up to 40ms @ 8kHz)
-const MAX_PAYLOAD: usize = 320;
+/// Largest RTP payload we TRANSMIT. What we send is a policy choice: 1200
+/// bytes leaves room under a 1500-byte MTU for IP, UDP, SRTP and a TURN
+/// envelope, which is the budget WebRTC peers assume.
+const TX_MTU: usize = 1200;
 
 /// Total packet buffer (header + max payload)
-const PKT_BUF_SIZE: usize = RTP_HEADER_SIZE + MAX_PAYLOAD + srtp_core::SRTP_AUTH_TAG_LEN;
+const PKT_BUF_SIZE: usize = RTP_HEADER_SIZE + TX_MTU + srtp_core::SRTP_AUTH_TAG_LEN;
+
+/// Largest `UNIT` fragment payload the media input accepts — the `max_payload`
+/// fact on `audio_in` / `video_in`. A larger access unit arrives as several
+/// fragments, so this bounds the carry, not the unit.
+const MEDIA_FRAGMENT_MAX: usize = 4096;
+
+/// Carry for the encoded-media record stream: one whole record at most, since
+/// a record is packetized as soon as it is complete.
+const MEDIA_CARRY: usize = enc::UNIT_HEADER + MEDIA_FRAGMENT_MAX;
+
+/// Media records packetized per step. Bounds the step while comfortably
+/// outrunning any admitted media cadence.
+const TX_RECORD_BUDGET: u32 = 8;
 const MAX_RX_SSRC: usize = 4;
 
 #[derive(Clone, Copy)]
@@ -220,7 +236,6 @@ const RX_MAX_PAYLOAD: usize = 1472 - RTP_HEADER_SIZE;
 
 /// Receive scratch: NetProto frame header + datagram source prefix + packet.
 const RX_BUF_SIZE: usize = NET_FRAME_HDR + DG_V4_PREFIX + RTP_HEADER_SIZE + RX_MAX_PAYLOAD;
-const MEDIA_BUF_SIZE: usize = rtp_media_wire::FRAME_HEADER_LEN + rtp_media_wire::MAX_ENCODED_FRAME;
 
 // ============================================================================
 // Control Channel Protocol (8-byte messages, little-endian)
@@ -253,17 +268,18 @@ enum RtpPhase {
 #[repr(C)]
 struct RtpState {
     syscalls: *const SyscallTable,
-    in_chan: i32,
+    /// `audio_in` (in[1]) or `video_in` (in[2]) — whichever the graph wired.
+    media_chan: i32,
     out_chan: i32,
     ctrl_chan: i32,
     net_in_chan: i32,
     net_out_chan: i32,
-    encoded_chan: i32,
     /// datagram endpoint id assigned by IP module on CMD_DG_BIND.
     /// `0xFF` means unallocated.
     ep_id: u8,
     phase: RtpPhase,
-    ptime: u8,
+    /// The negotiated payload format, as an `abi::contracts::encoded` codec.
+    codec: u8,
     payload_type: u8,
     ctrl_mode: u8,
     _pad0: u8,
@@ -288,11 +304,20 @@ struct RtpState {
     ssrc: u32,
     // TX state
     seq_num: u16,
-    ptime_bytes: u16,
+    /// RTP timestamp of the access unit being sent: `pts` at the payload
+    /// clock, which the stream contract makes the stream's own clock.
     timestamp: u32,
-    acc_len: u16,
-    _pad_tx: u16,
     tx_marker: u8,
+    /// The current media stream passed `rtp_payload` and matches `codec`.
+    tx_stream_ok: u8,
+    /// Inside a fragmented access unit.
+    tx_in_unit: u8,
+    /// Streams refused (wrong codec or clock, unsupported packing), units
+    /// dropped for not fitting one packet, and record-stream faults. Counted,
+    /// never silent.
+    tx_refused_streams: u32,
+    tx_oversize_units: u32,
+    tx_faults: u32,
     // RX state
     last_seq: u16,
     seq_valid: u8,
@@ -345,13 +370,16 @@ struct RtpState {
     pending_type: u8,
     // Buffers
     ctrl_buf: [u8; CTRL_MSG_SIZE],
-    acc_buf: [u8; MAX_PAYLOAD],
+    /// The packet payload `send_rtp_packet` sends.
+    acc_buf: [u8; TX_MTU],
     pkt_buf: [u8; PKT_BUF_SIZE],
     rx_buf: [u8; RX_BUF_SIZE],
     out_buf: [u8; RTP_RX_META_MID_LEN + RX_MAX_PAYLOAD],
     net_buf: [u8; NET_BUF_SIZE],
-    media_buf: [u8; MEDIA_BUF_SIZE],
-    media_len: u16,
+    media_carry: [u8; MEDIA_CARRY],
+    media_carry_len: u16,
+    tx_sequence: enc::Sequence,
+    packetizer: rtp_payload::Packetizer,
 }
 
 impl RtpState {
@@ -431,15 +459,14 @@ impl RtpState {
 
     fn init(&mut self, syscalls: *const SyscallTable) {
         self.syscalls = syscalls;
-        self.in_chan = -1;
+        self.media_chan = -1;
         self.out_chan = -1;
         self.ctrl_chan = -1;
         self.net_in_chan = -1;
         self.net_out_chan = -1;
-        self.encoded_chan = -1;
         self.ep_id = 0xFF;
         self.phase = RtpPhase::Init;
-        self.ptime = 20;
+        self.codec = enc::CODEC_PCMU;
         self.payload_type = 0; // PCMU
         self.ctrl_mode = 0;
         self._pad0 = 0;
@@ -452,10 +479,12 @@ impl RtpState {
         self.dbg_steps = 0;
         self.ssrc = 0x46585254; // "FXRT"
         self.seq_num = 0;
-        self.ptime_bytes = 160; // 20ms * 8 samples/ms
-        self._pad_tx = 0;
         self.timestamp = 0;
-        self.acc_len = 0;
+        self.tx_stream_ok = 0;
+        self.tx_in_unit = 0;
+        self.tx_refused_streams = 0;
+        self.tx_oversize_units = 0;
+        self.tx_faults = 0;
         self.last_seq = 0;
         self.seq_valid = 0;
         self._pad_rx = 0;
@@ -494,7 +523,9 @@ impl RtpState {
         self.pending_out = 0;
         self.pending_offset = 0;
         self.pending_type = REC_RTP_RX_META;
-        self.media_len = 0;
+        self.media_carry_len = 0;
+        self.tx_sequence = enc::Sequence::new();
+        self.packetizer = rtp_payload::Packetizer::new();
         self.tx_marker = 0;
     }
 }
@@ -555,15 +586,17 @@ unsafe fn adopt_turn(s: &mut RtpState, sys: &SyscallTable) -> bool {
 
 mod params_def {
     use super::dtls_srtp_wire;
+    use super::rtp_payload;
     use super::rtp_route;
     use super::RtpState;
+    use super::CODEC_UNSUPPORTED;
     use super::SCHEMA_MAX;
     use super::{p_u16, p_u32, p_u8};
 
     define_params! {
         RtpState;
 
-        // Tags 1 and 2 are retired; the next allocation is 25.
+        // Tags 1, 2 and 5 are retired; the next allocation is 26.
         22, authority, str, 0
             => |s, d, len| { s.peer.set(core::slice::from_raw_parts(d, len)); };
 
@@ -573,15 +606,18 @@ mod params_def {
         4, ssrc, u32, 0x46585254
             => |s, d, len| { s.ssrc = p_u32(d, len, 0, 0x46585254); };
 
-        5, ptime, u8, 20
-            => |s, d, len| {
-                let v = p_u8(d, len, 0, 20);
-                s.ptime = if v == 0 { 20 } else { v };
-                s.ptime_bytes = (s.ptime as u16) * 8;
-            };
-
         6, payload_type, u8, 0
             => |s, d, len| { s.payload_type = p_u8(d, len, 0, 0); };
+
+        // Absent (the default dispatch passes no bytes) leaves PCMU, which is
+        // what payload type 0 names.
+        25, codec, str, 0
+            => |s, d, len| {
+                if len != 0 {
+                    s.codec = rtp_payload::codec_named(core::slice::from_raw_parts(d, len))
+                        .unwrap_or(CODEC_UNSUPPORTED);
+                }
+            };
 
         7, rx_ssrc, u32, 0
             => |s, d, len| { s.rx_ssrc = p_u32(d, len, 0, 0); };
@@ -662,7 +698,7 @@ mod params_def {
 
         19, route, u8, 0
             => |s, d, len| {
-                if len == 40 {
+                if len == 38 {
                     let d = core::slice::from_raw_parts(d, len);
                     if d[0] as usize > rtp_route::RTP_MID_MAX { return; }
                     let mut mid = [0u8; rtp_route::RTP_MID_MAX];
@@ -673,7 +709,6 @@ mod params_def {
                         mid_len,
                         payload_type: d[33],
                         ssrc: u32::from_le_bytes([d[34], d[35], d[36], d[37]]),
-                        codec_index: d[38],
                     };
                     let _ = s.route_table.upsert(route);
                 }
@@ -724,23 +759,22 @@ pub extern "C" fn module_new(
 
         let sys = &*s.syscalls;
 
-        // Net channels: in[0] = net_in (from IP), in[1] = g711 audio data
-        // out[0] = net_out (to IP), out[1] = packets (audio out)
-        // Primary in/out are net channels; audio ports are secondary
+        // in[0] = net_in (from IP), out[0] = net_out (to IP): the primary
+        // channels. in[1] = audio_in, in[2] = video_in: the media to send.
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
 
-        // Discover additional ports: in[1] = g711 audio input
-        let ch = dev_channel_port(sys, 0, 1); // in[1]
-        if ch >= 0 {
-            s.in_chan = ch;
+        // One instance is one RTP stream — one SSRC, one payload type — so it
+        // sends audio or video, never both.
+        let audio = dev_channel_port(sys, 0, 1);
+        let video = dev_channel_port(sys, 0, 2);
+        if audio >= 0 && video >= 0 {
+            let m = b"[rtp] refusing to construct: audio_in and video_in are both wired; \
+                      one RTP stream carries one medium";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -22;
         }
-        // Optional encoded-media input (in[3]). A graph that wires it gets
-        // codec-aware packetization; one that wires only `g711` sends raw PCMU
-        // and pays for no packetizer. Wiring both is legal — encoded media
-        // takes the step whenever it has a frame ready, so `g711` becomes the
-        // fallback rather than a second source competing for the same SSRC.
-        s.encoded_chan = dev_channel_port(sys, 0, 3);
+        s.media_chan = if audio >= 0 { audio } else { video };
 
         // out[1] = decoded packets output
         let ch = dev_channel_port(sys, 1, 1); // out[1]
@@ -784,6 +818,11 @@ pub extern "C" fn module_new(
             }
         } else {
             params_def::set_defaults(s);
+        }
+        if s.codec == CODEC_UNSUPPORTED {
+            let m = b"[rtp] refusing to construct: codec must be pcmu, opus, h264 or vp8";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -22;
         }
 
         if ctrl_chan >= 0 {
@@ -1024,9 +1063,7 @@ unsafe fn step_running(s: &mut RtpState) -> i32 {
     }
 
     // TX path
-    if s.in_chan >= 0 {
-        step_tx(s);
-    }
+    step_tx(s);
 
     // RX path — ALWAYS, even when the receive output is unwired. `net_in` is
     // one leg of the ingress fan-out, so it receives every inbound datagram
@@ -1040,101 +1077,160 @@ unsafe fn step_running(s: &mut RtpState) -> i32 {
 }
 
 // ============================================================================
-// TX: accumulate G.711, build RTP packets, send
+// TX: encoded-media records in, RTP packets out
 // ============================================================================
 
+/// A parsed media record, reduced to values and carry offsets so the carry
+/// can be released before the packets go out.
+enum MediaRecord {
+    Stream {
+        codec: u8,
+        packing: u8,
+        clock_rate: u32,
+        config: (usize, usize),
+    },
+    Unit {
+        flags: u8,
+        pts: i64,
+        payload: (usize, usize),
+    },
+    End,
+}
+
 unsafe fn step_tx(s: &mut RtpState) {
-    if s.encoded_chan >= 0 && ((*s.syscalls).channel_poll)(s.encoded_chan, POLL_IN) > 0 {
-        step_encoded_tx(s);
-        return;
-    }
     let sys = &*s.syscalls;
-    let in_chan = s.in_chan;
-
-    let in_poll = (sys.channel_poll)(in_chan, POLL_IN);
-    if in_poll <= 0 || ((in_poll as u32) & POLL_IN) == 0 {
+    if s.media_chan < 0 {
         return;
     }
-
-    let space = MAX_PAYLOAD - s.acc_len as usize;
-    if space == 0 {
-        send_rtp_packet(s);
-        return;
+    let len = s.media_carry_len as usize;
+    if len < MEDIA_CARRY {
+        let n = (sys.channel_read)(
+            s.media_chan,
+            s.media_carry.as_mut_ptr().add(len),
+            MEDIA_CARRY - len,
+        );
+        if n > 0 {
+            s.media_carry_len += n as u16;
+        }
     }
-
-    let read = (sys.channel_read)(
-        in_chan,
-        s.acc_buf.as_mut_ptr().add(s.acc_len as usize),
-        space,
-    );
-    if read <= 0 {
-        return;
-    }
-    s.acc_len += read as u16;
-
-    while s.acc_len >= s.ptime_bytes {
-        send_rtp_packet(s);
+    let mut budget = TX_RECORD_BUDGET;
+    while budget > 0 {
+        budget -= 1;
+        let carried = s.media_carry_len as usize;
+        let parsed = match enc::parse(&s.media_carry[..carried], MEDIA_CARRY) {
+            enc::Parse::NeedMore => return,
+            enc::Parse::Fault(_) => None,
+            enc::Parse::Record { record, consumed } => {
+                if s.tx_sequence.admit(&record).is_err() {
+                    None
+                } else {
+                    let start =
+                        |part: &[u8]| part.as_ptr() as usize - s.media_carry.as_ptr() as usize;
+                    Some((
+                        match record {
+                            enc::Record::Stream(st) => {
+                                let at = start(st.config);
+                                MediaRecord::Stream {
+                                    codec: st.codec,
+                                    packing: st.packing,
+                                    clock_rate: st.clock_rate,
+                                    config: (at, at + st.config.len()),
+                                }
+                            }
+                            enc::Record::Unit(u) => {
+                                let at = start(u.payload);
+                                MediaRecord::Unit {
+                                    flags: u.flags,
+                                    pts: u.pts,
+                                    payload: (at, at + u.payload.len()),
+                                }
+                            }
+                            enc::Record::End => MediaRecord::End,
+                        },
+                        consumed,
+                    ))
+                }
+            }
+        };
+        let Some((record, consumed)) = parsed else {
+            // The record boundary is lost, or the producer broke the record
+            // order. Nothing after it can be trusted until a new STREAM.
+            s.tx_faults = s.tx_faults.wrapping_add(1);
+            s.media_carry_len = 0;
+            s.tx_sequence = enc::Sequence::new();
+            s.tx_stream_ok = 0;
+            s.tx_in_unit = 0;
+            dev_log(sys, 2, b"[rtp] media stream fault".as_ptr(), 24);
+            return;
+        };
+        match record {
+            MediaRecord::Stream {
+                codec,
+                packing,
+                clock_rate,
+                config,
+            } => {
+                let ok = codec == s.codec
+                    && rtp_payload::rtp_clock(codec) == Some(clock_rate)
+                    && s.packetizer.stream(
+                        codec,
+                        packing,
+                        &s.media_carry[config.0..config.1],
+                        TX_MTU,
+                    );
+                s.tx_stream_ok = u8::from(ok);
+                s.tx_in_unit = 0;
+                if !ok {
+                    s.tx_refused_streams = s.tx_refused_streams.wrapping_add(1);
+                    let m = b"[rtp] media stream refused: not the negotiated codec and clock";
+                    dev_log(sys, 2, m.as_ptr(), m.len());
+                }
+            }
+            MediaRecord::Unit {
+                flags,
+                pts,
+                payload,
+            } => {
+                if s.tx_stream_ok != 0 {
+                    send_unit_fragment(s, flags, pts, payload);
+                }
+            }
+            MediaRecord::End => {
+                s.tx_stream_ok = 0;
+                s.tx_in_unit = 0;
+            }
+        }
+        let remaining = s.media_carry_len as usize - consumed;
+        s.media_carry.copy_within(consumed..consumed + remaining, 0);
+        s.media_carry_len = remaining as u16;
     }
 }
 
-/// Consume one bounded encoded-media record and send its H264/VP8 RTP
-/// fragments through the same SRTP/TURN transport path as PCMU.
-unsafe fn step_encoded_tx(s: &mut RtpState) {
-    let state_ptr = s as *mut RtpState;
-    let sys = &*s.syscalls;
-    if (sys.channel_poll)(s.encoded_chan, POLL_IN) <= 0 {
-        return;
+/// Packetize one `UNIT` fragment held at `payload` in the carry and send every
+/// packet it completes. The unit's RTP timestamp is its `pts`: the stream
+/// contract puts it in ticks at the stream clock, and the stream was admitted
+/// only if that clock is the payload format's.
+unsafe fn send_unit_fragment(s: &mut RtpState, flags: u8, pts: i64, payload: (usize, usize)) {
+    if s.tx_in_unit == 0 {
+        s.packetizer.begin_unit(flags);
+        s.timestamp = pts as u32;
     }
-    let room = MEDIA_BUF_SIZE - s.media_len as usize;
-    if room == 0 {
-        s.media_len = 0;
-        return;
+    let last = flags & enc::FLAG_CONTINUES == 0;
+    let mut used = 0usize;
+    while let Some(packet) = s.packetizer.next(
+        &s.media_carry[payload.0..payload.1],
+        &mut used,
+        last,
+        &mut s.acc_buf,
+    ) {
+        s.tx_marker = u8::from(packet.marker);
+        send_rtp_packet(s, packet.len);
     }
-    let n = (sys.channel_read)(
-        s.encoded_chan,
-        s.media_buf.as_mut_ptr().add(s.media_len as usize),
-        room,
-    );
-    if n <= 0 {
-        return;
-    }
-    s.media_len += n as u16;
-    let Some(frame) = rtp_media_wire::decode(&s.media_buf[..s.media_len as usize]) else {
-        if s.media_len as usize >= MEDIA_BUF_SIZE {
-            s.media_len = 0;
-        }
-        return;
-    };
-    let Some(mut packets) =
-        rtp_media::EncodedPacketizer::new(frame, MAX_PAYLOAD - 2, s.seq_num, s.ssrc)
-    else {
-        s.media_len = 0;
-        return;
-    };
-    let saved_ptime = s.ptime_bytes;
-    let saved_ts = s.timestamp;
-    let pt = match frame.codec {
-        rtp_media_wire::CODEC_H264 => 102,
-        rtp_media_wire::CODEC_VP8 => 96,
-        _ => s.payload_type,
-    };
-    s.payload_type = pt;
-    let mut payload = [0u8; MAX_PAYLOAD];
-    while let Some(meta) = packets.next(&mut payload) {
-        s.acc_buf[..meta.len].copy_from_slice(&payload[..meta.len]);
-        s.acc_len = meta.len as u16;
-        s.tx_marker = u8::from(meta.marker);
-        s.timestamp = meta.timestamp;
-        // `packets` borrows the bounded media buffer. The transport sender
-        // touches only the independent packet/net buffers; use the module's
-        // established raw ABI boundary to avoid copying a video access unit.
-        send_rtp_packet(&mut *state_ptr);
-    }
-    s.payload_type = pt;
-    s.ptime_bytes = saved_ptime;
-    s.timestamp = saved_ts.wrapping_add(1);
     s.tx_marker = 0;
-    s.media_len = 0;
+    s.tx_in_unit = u8::from(!last);
+    if last && s.packetizer.dropped_oversize() {
+        s.tx_oversize_units = s.tx_oversize_units.wrapping_add(1);
+    }
 }
 
 // ============================================================================
@@ -1447,30 +1543,20 @@ unsafe fn step_rx_one(s: &mut RtpState) -> bool {
     if !s.route_table.is_empty() && s.route_table.resolve(mid, h.payload_type, h.ssrc).is_none() {
         return true;
     }
+    let meta = RtpReceiveMeta {
+        seq,
+        timestamp: h.timestamp,
+        ssrc: h.ssrc,
+        payload_type: h.payload_type,
+        marker: h.marker,
+        codec: s.codec,
+    };
     let (record_type, prefix_len) = if mid.is_empty() {
-        (
-            REC_RTP_RX_META,
-            put_rtp_rx_meta(
-                &mut s.out_buf,
-                seq,
-                h.timestamp,
-                h.ssrc,
-                h.payload_type,
-                h.marker,
-            ),
-        )
+        (REC_RTP_RX_META, put_rtp_rx_meta(&mut s.out_buf, meta))
     } else {
         (
             REC_RTP_RX_META_MID,
-            put_rtp_rx_meta_mid(
-                &mut s.out_buf,
-                seq,
-                h.timestamp,
-                h.ssrc,
-                h.payload_type,
-                h.marker,
-                mid,
-            ),
+            put_rtp_rx_meta_mid(&mut s.out_buf, meta, mid),
         )
     };
     let Some(prefix_len) = prefix_len else {
@@ -1523,7 +1609,7 @@ unsafe fn close_connection(s: &mut RtpState) {
     // Reset TX state
     s.seq_num = 0;
     s.timestamp = 0;
-    s.acc_len = 0;
+    s.tx_in_unit = 0;
     // Reset RX state
     s.last_seq = 0;
     s.seq_valid = 0;
@@ -1539,16 +1625,11 @@ unsafe fn close_connection(s: &mut RtpState) {
 // RTP Packet Construction and Send
 // ============================================================================
 
-unsafe fn send_rtp_packet(s: &mut RtpState) {
+/// Send `acc_buf[..payload_len]` as one RTP packet at the current timestamp,
+/// with the marker in `tx_marker`.
+unsafe fn send_rtp_packet(s: &mut RtpState, payload_len: usize) {
     let sys = &*s.syscalls;
-
-    let payload_len = if s.acc_len < s.ptime_bytes {
-        s.acc_len as usize
-    } else {
-        s.ptime_bytes as usize
-    };
-
-    if payload_len == 0 {
+    if payload_len == 0 || payload_len > TX_MTU {
         return;
     }
 
@@ -1708,33 +1789,18 @@ unsafe fn send_rtp_packet(s: &mut RtpState) {
 }
 
 /// The bookkeeping every send does once the packet is on its way: the
-/// sequence and timestamp advance, the sender counters follow the stream's
-/// own numbering rather than the transport's verdict, and the accumulator
-/// gives up the bytes just sent.
+/// sequence advances, and the sender counters follow the stream's own
+/// numbering rather than the transport's verdict. The timestamp does not
+/// advance here — it is the access unit's, and every packet of a unit shares
+/// it.
 ///
 /// # Safety
-/// `s` is this module's state; the accumulator holds `payload_len` bytes.
+/// `s` is this module's state.
 unsafe fn advance_after_send(s: &mut RtpState, payload_len: usize) {
-    // The timestamp of the packet just sent, captured BEFORE the advance
-    // below. A Sender Report says "this RTP timestamp and this wallclock name
-    // the same instant", and the advanced value names the NEXT packet — one
-    // packet time in the future, which is a 20 ms lie at the default ptime.
-    let sent_ts = s.timestamp;
     s.seq_num = s.seq_num.wrapping_add(1);
-    s.timestamp = s.timestamp.wrapping_add(payload_len as u32);
     s.packets_sent = s.packets_sent.wrapping_add(1);
     s.octets_sent = s.octets_sent.wrapping_add(payload_len as u32);
-    emit_rtcp_tx_stats(s, sent_ts);
-
-    let remaining = s.acc_len as usize - payload_len;
-    if remaining > 0 {
-        __aeabi_memmove(
-            s.acc_buf.as_mut_ptr(),
-            s.acc_buf.as_ptr().add(payload_len),
-            remaining,
-        );
-    }
-    s.acc_len = remaining as u16;
+    emit_rtcp_tx_stats(s, s.timestamp);
 }
 
 // ============================================================================

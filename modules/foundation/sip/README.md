@@ -6,7 +6,7 @@ semantics above both. This module is SIGNALLING ONLY: a
 UDP endpoint wrapper around two cores in `modules/common` — `sip_core` (message
 formatters and response/SDP parsers) and `sip_dialog` (the transaction FSM).
 The media path is the separate `rtp` (endpoint, packetise/depacketise) and
-`jitter` (reorder/playout) modules, driven over control records.
+`jitter` (reorder/depacketize) modules, driven over control records.
 
 ## What it owns, and what it does not
 
@@ -73,21 +73,18 @@ the first answer would be the one nobody authorised.
 | --- | --- | --- | --- |
 | 1 | `local_ip` | 0 | Local address, used in Via/Contact and SDP |
 | 2 | `local_sip_port` | 5060 | Local signalling port |
-| 3 | `peer_ip` | 0 | Peer address |
-| 4 | `peer_sip_port` | 5060 | Peer signalling port |
 | 5 | `rtp_port` | 5004 | Local RTP receive port, advertised in SDP |
 | 6 | `auto_answer` | 1 | Answer an inbound INVITE without asking above. Ignored while `command_in` is wired |
-| 8 | `ptime` | 20 | Packet time in ms; also the playout cadence |
+| 9 | `authority` | (none) | Peer signalling endpoint as `host[:port]`, port 5060 |
 
-Id 7 is unused — the ids are wire positions, so the gap is preserved rather than
-closed.
+Ids 3, 4, 7 and 8 are closed — the ids are wire positions, so a gap stays a
+gap rather than being reused.
 
 ## Timing
 
-`timer_class = "wall_clock"`. Two clocks, both `dev_millis`: the T1 retransmit
-timer (500 ms, in the `Inviting` / `WaitAck` / `ByeSent` states) and the `ptime`
-playout cadence. Playout must track real time — a scheduler-pass proxy would
-stretch the audio whenever the tick relaxed.
+`timer_class = "wall_clock"`. One clock, `dev_millis`: the T1 retransmit timer
+(500 ms, in the `Inviting` / `WaitAck` / `ByeSent` states). A scheduler-pass
+proxy would stretch the retransmit interval whenever the tick relaxed.
 
 ## Shared cores
 
@@ -96,7 +93,6 @@ vectors compile identical bytes:
 
 - `sip_core.rs` — INVITE/ACK/BYE/200-OK formatters, response and SDP parsers;
 - `sip_dialog.rs` — the bounded UAC/UAS transaction FSM, protocol facts only;
-- `jitter_core.rs` — bounded reorder window and loss-concealing playout;
 - `hex_core.rs` — hex for byte-valued parameters.
 
 ## Not claimed
@@ -117,9 +113,7 @@ original request, and an unconfigured module staying inert.
 graph and an independent RTP peer on the host, and it is the remaining gap for
 this module.
 
-Two behaviours worth knowing. Playout is
-loss-**concealing**: once a call is up the channel emits one `ptime` frame per
-cadence tick whether or not a packet arrived, writing µ-law silence when it did
-not — a voice path that stopped emitting would starve the codec downstream. And
-`jitter_core` takes its playout base from the *first* packet it sees, so a
-sequence number below that one is out of window and dropped by design.
+One behaviour worth knowing, though it lives in `jitter`: the reorder window
+takes its base from the *first* packet it sees, so a sequence number below that
+one is out of window and dropped by design. Loss is reported downstream as a
+discontinuity, not concealed — concealment is the decoder's.

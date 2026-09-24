@@ -318,20 +318,24 @@ lossless steady-state backpressure.
 
 ### `rtp`
 
-The media endpoint: RFC 3550 packet handling both ways on one
-symmetric port — G.711 in, packets out; datagrams in, validated
-`[seq][payload]` records out for the `jitter` adapter. It declares
-rp2350 and bcm2712, so the media path builds for the same targets as
-`sip`, which drives it over control records. Broader payload
-formats, RTCP, SRTP, and multi-party session policy are not
-implemented.
+The media endpoint for one RTP stream: RFC 3550 packet handling both
+ways on one symmetric port — encoded access units in (fluxor's
+encoded-media record stream, on `audio_in` or `video_in`), packets
+out; datagrams in, receive records out for the `jitter` adapter.
+Each access unit is packetized in the negotiated payload format —
+PCMU, Opus, H.264 or VP8 — and stamped with its own `pts` as the RTP
+timestamp, which is why the stream must arrive at the payload
+format's clock. It declares rp2350 and bcm2712, so the media path
+builds for the same targets as `sip`, which drives it over control
+records. Multi-party session policy is not implemented.
 
 Transmit and receive bounds are deliberately different numbers. Wave
-transmits at most 40 ms per packet, a policy choice; it accepts up
-to one Ethernet MTU, because packet duration is the sender's choice
-and RFC 3551 sets no ceiling on it. A packet too large to accept is
-refused and counted, never delivered as the fraction that happened
-to fit.
+transmits at most 1200 bytes of payload per packet, a policy choice
+that leaves room for SRTP and TURN under a 1500-byte MTU; it accepts
+up to one Ethernet MTU, because packet size is the sender's choice
+and RFC 3551 sets no ceiling on packet duration. A packet too large
+to accept is refused and counted, never delivered as the fraction
+that happened to fit.
 
 ### `rtcp`
 
@@ -369,20 +373,21 @@ An RFC 3261 subset UAC/UAS for a two-party PCMU call, signalling
 only: INVITE/ACK/BYE/200-OK, a bounded transaction FSM, and SDP
 negotiation facts. It owns protocol facts and no media path — call
 policy is Conclave's, the G.711 codec is Spectra's, and the media
-endpoint and reorder/playout are the separate `rtp` and `jitter`
+endpoint and reorder/depacketize are the separate `rtp` and `jitter`
 modules, driven over shared control records. `wall_clock` timer
 class for the T1 retransmit timer.
 
 ### `jitter`
 
-The realtime family's reorder/playout adapter: validated
-`[seq][payload]` records from `rtp` in, loss-concealed µ-law playout
-out at `ptime` cadence, obeying the same START/STOP records `sip`
-drives the transmitter with. The ring is the host-vectored
-`jitter_core`; `wall_clock` timer class, because playout must track
-real time or a relaxed scheduler tick would stretch the audio.
-Adaptive playout, clock recovery and topology-aware buffering are
-Grove's, not Wave's.
+The realtime family's reorder and depacketize adapter: receive
+records from `rtp` in, fluxor's encoded-media record stream out in
+sequence order, obeying the same START/STOP records `sip` drives the
+transmitter with. A missing packet is waited for at most
+`max_hold_ms`, then skipped and reported downstream as a
+discontinuity — concealment is the decoder's. The window is the
+host-vectored `jitter_core`; `wall_clock` timer class, because the
+hold is real time. Playout pacing, adaptive playout, clock recovery
+and topology-aware buffering are Grove's, not Wave's.
 
 Registration, authentication, TLS/SIPS, re-INVITE, transfer, hold,
 forking, multi-party mixing, RTCP and SRTP are not implemented.
@@ -501,7 +506,8 @@ none of them is a protocol role, however complete its vectors.
 | `rtcp` | Realtime | Deployable fmod, both report directions: RFC 3550 §6 compound framing, SR and RR with SDES, the §A.3/§A.8 receiver statistics, the §6.2 interval, and the round trip closed against a peer's echo of our own Sender Report |
 | `rtcp_core` | Realtime | I/O-free codec and arithmetic core: compound framing, SR/RR/SDES/BYE, report blocks, the receiver statistics and the interval, pinned to the RFC's own formulas |
 | `jitter` | Realtime | Deployable adapter fmod over `jitter_core` |
-| `jitter_core` | Realtime | Bounded reorder/playout core, mounted by `jitter` |
+| `jitter_core` | Realtime | Bounded reorder window, mounted by `jitter` |
+| `rtp_payload` | Realtime | RTP payload formats (PCMU, Opus, H.264, VP8) to and from the encoded-media record stream, mounted by `rtp` and `jitter` |
 | `sframe_core` | Realtime | I/O-free framing core, RFC 9605 header layout pinned to all 289 published vectors. Framing only: no composition yet encrypts, authenticates, handles replay or rotates keys, so this is not SFrame end-to-end encryption |
 | `webrtc_sdp` | Realtime | I/O-free codec core for the SDP attributes that make a description a WebRTC one — bounded session-description facts, not a WebRTC stack |
 | `sip_core`, `sip_dialog`, `sip_wire`, `rtp_core` | Realtime | Codec and transaction cores mounted by `sip`/`rtp` |

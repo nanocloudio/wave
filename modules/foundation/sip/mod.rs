@@ -122,7 +122,6 @@ struct SipModState {
     /// is not a v4 literal by name.
     peer: DgAuthority,
     auto_answer: u8,
-    ptime: u8,
     sip_active: u8,
     _pad0: u8,
 
@@ -210,7 +209,6 @@ impl SipModState {
         self.peer_sip_port = 5060;
         self.rtp_port = 5004;
         self.auto_answer = 1;
-        self.ptime = 20;
         self.sip_active = 0;
         self.peer_rtp_ip = 0;
         self.peer_rtp_port = 0;
@@ -850,13 +848,12 @@ mod params_def {
         SipModState;
         1, local_ip, u32, 0 => |s, d, len| { s.local_ip = p_u32(d, len, 0, 0); };
         2, local_sip_port, u16, 5060 => |s, d, len| { s.local_sip_port = p_u16(d, len, 0, 5060); };
-        // Tags 3 and 4 are retired; the next allocation is 10.
+        // Tags 3, 4, 7 and 8 are closed; the next allocation is 10.
         9, authority, str, 0 => |s, d, len| {
             s.peer.set(core::slice::from_raw_parts(d, len));
         };
         5, rtp_port, u16, 5004 => |s, d, len| { s.rtp_port = p_u16(d, len, 0, 5004); };
         6, auto_answer, u8, 1 => |s, d, len| { s.auto_answer = p_u8(d, len, 0, 1); };
-        8, ptime, u8, 20 => |s, d, len| { let v = p_u8(d, len, 0, 20); s.ptime = if v == 0 { 20 } else { v }; };
     }
 }
 

@@ -7,8 +7,10 @@
 # change could have eaten it silently. A variant that quietly stops being smaller
 # than the thing it is a subset of has stopped doing its job.
 #
-# Ceilings are set ~8% above the measured size — tight enough that a real
-# regression trips, loose enough that ordinary work does not. When a ceiling is
+# Ceilings are set 5-8% above the measured size — tight enough that a real
+# regression trips, loose enough that ordinary work does not. A row re-based
+# after deliberate growth takes the 5% end, which is the tightest margin that
+# has not produced a false trip. When a ceiling is
 # hit deliberately, RAISE IT IN THIS FILE in the same commit as the change, so
 # the growth is a decision with a diff rather than a discovery months later.
 #
@@ -60,9 +62,9 @@ rp2350|http-h2.fmod|157000|149495 (2026-09-10, +14.0K since the 2026-09-07 row: 
 rp2350|http-web.fmod|98000|90020 (2026-09-07, current ABI and readiness hardening)
 rp2350|http-app.fmod|103000|95004 (2026-09-07, current ABI and readiness hardening)
 rp2350|http-exchange.fmod|207000|196791 (2026-09-10, +19.7K since the 2026-09-07 row: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
-rp2350|rtp.fmod|23900|22080 (2026-09-19, +3.0K over the media baseline: the peer is an authority — the media destination, the TURN relay and the permitted peer are each one host[:port], parsed at construction, and a named peer is sent to by name over the datagram surface)
+rp2350|rtp.fmod|26500|25200 (2026-09-24, +3.1K: the encoded-media record stream in, and the RFC 3551/7587/6184/7741 payload formats packetizing it; the private media record and its codec table are gone; ceiling re-based 5% above measured)
 rp2350|rtcp.fmod|14600|13501 (2026-09-08, +7.0K: SRTCP protection over the RFC 3550 §6 control plane (see `rtcp_core.rs`) — AES-GCM, the 31-bit SRTCP index and its replay window, plus RFC 4585 NACK and PLI feedback)
-bcm2712|rtp.fmod|29600|27394 (2026-09-08, +22.2K: negotiated media — the SRTP profiles, the video packetizers, the route table, pacing, congestion control, clock sync and the TURN relay path)
+bcm2712|rtp.fmod|32700|31096 (2026-09-24, +3.7K: the encoded-media record stream in, and the RFC 3551/7587/6184/7741 payload formats packetizing it; the private media record and its codec table are gone; ceiling re-based 5% above measured)
 bcm2712|rtcp.fmod|15700|14485 (2026-09-08, +7.1K: SRTCP protection over the RFC 3550 §6 control plane, both report directions, plus RFC 4585 NACK and PLI feedback)
 bcm2712|sip.fmod|22300|20651 (2026-09-08, first row)
 rp2350|sip.fmod|17000|16295 (2026-08-23, +2.7K: the application command/event contract — a call is offered and decided rather than auto-answered, and every terminal outcome is reported)
@@ -72,8 +74,8 @@ bcm2712|mail.fmod|24000|21081 (2026-08-23, first row; RFC 5322 + MIME assembly o
 rp2350|ws_stream.fmod|3000|2717 (2026-08-07)
 rp2040|ws_stream.fmod|2800|2589 (2026-09-08, first row)
 bcm2712|ws_stream.fmod|2510|2325 (2026-09-08, first row)
-rp2350|jitter.fmod|4340|4021 (2026-09-08, first row; the reorder ring and its playout clock)
-bcm2712|jitter.fmod|4410|4085 (2026-09-08, first row; the reorder ring and its playout clock)
+rp2350|jitter.fmod|6200|5844 (2026-09-24, +1.8K: depacketizing to the encoded-media record stream and the bounded hold on a hole; µ-law concealment and the playout clock are gone; ceiling re-based 5% above measured)
+bcm2712|jitter.fmod|9100|8652 (2026-09-24, +4.6K: depacketizing to the encoded-media record stream and the bounded hold on a hole; µ-law concealment and the playout clock are gone; ceiling re-based 5% above measured)
 bcm2712|http.fmod|359000|341855 (2026-09-10, +34.2K since the 2026-09-05 row: the session anchor and the h2 tunnel seam (+16.2K) on top of the HTTP/3 client, RTP media stack and lifetime deadlines that landed unmeasured; ceiling re-based 5% above measured)
 bcm2712|http-h2.fmod|301000|286423 (2026-09-10, +23.6K since the 2026-09-05 row: the session anchor and the h2 tunnel seam on top of work that landed unmeasured; ceiling re-based 5% above measured)
 bcm2712|http-web.fmod|207000|191646 (2026-09-05, +9.1K since the 2026-08-16 row: request metrics and the connection lifetime deadlines with the WebSocket ping policy)
