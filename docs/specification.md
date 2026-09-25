@@ -323,7 +323,7 @@ ways on one symmetric port — encoded access units in (fluxor's
 encoded-media record stream, on `audio_in` or `video_in`), packets
 out; datagrams in, receive records out for the `jitter` adapter.
 Each access unit is packetized in the negotiated payload format —
-PCMU, Opus, H.264 or VP8 — and stamped with its own `pts` as the RTP
+PCMU, PCMA, Opus, H.264 or VP8 — and stamped with its own `pts` as the RTP
 timestamp, which is why the stream must arrive at the payload
 format's clock. It declares rp2350 and bcm2712, so the media path
 builds for the same targets as `sip`, which drives it over control
@@ -507,7 +507,7 @@ none of them is a protocol role, however complete its vectors.
 | `rtcp_core` | Realtime | I/O-free codec and arithmetic core: compound framing, SR/RR/SDES/BYE, report blocks, the receiver statistics and the interval, pinned to the RFC's own formulas |
 | `jitter` | Realtime | Deployable adapter fmod over `jitter_core` |
 | `jitter_core` | Realtime | Bounded reorder window, mounted by `jitter` |
-| `rtp_payload` | Realtime | RTP payload formats (PCMU, Opus, H.264, VP8) to and from the encoded-media record stream, mounted by `rtp` and `jitter` |
+| `rtp_payload` | Realtime | RTP payload formats (PCMU, PCMA, Opus, H.264, VP8) to and from the encoded-media record stream, mounted by `rtp` and `jitter` |
 | `sframe_core` | Realtime | I/O-free framing core, RFC 9605 header layout pinned to all 289 published vectors. Framing only: no composition yet encrypts, authenticates, handles replay or rotates keys, so this is not SFrame end-to-end encryption |
 | `webrtc_sdp` | Realtime | I/O-free codec core for the SDP attributes that make a description a WebRTC one — bounded session-description facts, not a WebRTC stack |
 | `sip_core`, `sip_dialog`, `sip_wire`, `rtp_core` | Realtime | Codec and transaction cores mounted by `sip`/`rtp` |

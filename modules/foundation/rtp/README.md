@@ -4,7 +4,7 @@ A combined transmitter and receiver for one negotiated RTP stream over a UDP
 `NetProto` binding. Media to send arrives as the fluxor encoded-media record
 stream (`abi::contracts::encoded`) on `audio_in` or `video_in`; each access unit
 is packetized in the negotiated payload format by the shared `rtp_payload` core
-— RFC 3551 PCMU, RFC 7587 Opus, RFC 6184 H.264, RFC 7741 VP8. The shared media
+— RFC 3551 PCMU and PCMA, RFC 7587 Opus, RFC 6184 H.264, RFC 7741 VP8. The shared media
 cores also provide route validation, pacing, congestion control, and
 RTP-to-wall-clock synchronization for higher-level media graphs.
 It builds for rp2350 and bcm2712 — the same targets as `sip`, which drives it
@@ -23,7 +23,7 @@ all move that boundary.
 | Port | Direction | Content | Carries |
 | --- | --- | --- | --- |
 | `net_in` / `net_out` | in / out | `NetProto` | UDP datagrams to and from the bound endpoint |
-| `audio_in` | in (1) | `AudioEncoded` | PCMU or Opus access units to send |
+| `audio_in` | in (1) | `AudioEncoded` | PCMU, PCMA or Opus access units to send |
 | `video_in` | in (2) | `VideoEncoded` | H.264 or VP8 access units to send |
 | `packets` | out (1) | `OctetStream` | receive records for `jitter` (`rtp_wire.rs`) |
 | `rtcp_stats` | out (2) | `OctetStream` | per-packet statistics for `rtcp` |
@@ -39,7 +39,7 @@ exporter material, and TURN relay and ChannelData settings.
 ## What the stream must say
 
 The media input's `STREAM` record must name the negotiated `codec` at that
-payload format's RTP clock (8 kHz PCMU, 48 kHz Opus, 90 kHz video). A stream
+payload format's RTP clock (8 kHz PCMU/PCMA, 48 kHz Opus, 90 kHz video). A stream
 that does not is refused and counted until the next `STREAM`: the unit's `pts`
 becomes the RTP timestamp directly, which is only right at the payload clock.
 Codec identity and clock are facts the stream states, not ones this module

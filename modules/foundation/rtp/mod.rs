@@ -21,8 +21,8 @@
 //!   tag 4: ssrc       (u32, default 0x46585254 — TX only)
 //!   tag 6: payload_type (u8, default 0 — negotiated RTP PT for TX and RX)
 //!   tag 25: codec     (str, default "pcmu" — the negotiated payload format:
-//!           pcmu, opus, h264 or vp8. TX refuses a stream of any other codec;
-//!           RX tags every receive record with it)
+//!           pcmu, pcma, opus, h264 or vp8. TX refuses a stream of any other
+//!           codec; RX tags every receive record with it)
 //!   tag 7: rx_ssrc    (u32, default 0 — accept any inbound SSRC)
 //!   tag 8: srtp_key   (16 bytes, optional AES-128-GCM master key)
 //!   tag 9: srtp_salt  (12 bytes, optional AES-128-GCM master salt)
@@ -820,7 +820,7 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
         if s.codec == CODEC_UNSUPPORTED {
-            let m = b"[rtp] refusing to construct: codec must be pcmu, opus, h264 or vp8";
+            let m = b"[rtp] refusing to construct: codec must be pcmu, pcma, opus, h264 or vp8";
             dev_log(sys, 1, m.as_ptr(), m.len());
             return -22;
         }

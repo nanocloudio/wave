@@ -3,8 +3,9 @@
 The receive-side buffering the realtime family owns: validated RTP payloads in,
 the fluxor encoded-media record stream (`abi::contracts::encoded`) out, in
 order. The reorder window is the host-tested `modules/common/jitter_core.rs`;
-the payload formats — RFC 3551 PCMU, RFC 7587 Opus, RFC 6184 H.264, RFC 7741
-VP8 — are `modules/common/rtp_payload.rs`. This module is the pump around them.
+the payload formats — RFC 3551 PCMU and PCMA, RFC 7587 Opus, RFC 6184 H.264,
+RFC 7741 VP8 — are `modules/common/rtp_payload.rs`. This module is the pump
+around them.
 
 It exists so `sip` does not privately own a media path: signalling decides
 when media starts and stops, and says so on control records; this module
@@ -16,7 +17,7 @@ obeys them and owns nothing about the call.
 | --- | --- | --- | --- | --- |
 | `rx_in` | in 0 | input | `OctetStream` | Receive records from `rtp.packets`: sequence, timestamp, SSRC, payload type, marker, codec, payload (`rtp_wire.rs`) |
 | `media_ctrl` | in 1 | input | `OctetStream` | The shared media-control records: START arms release and resets the window, STOP closes the stream with `END` and clears, SET_ENDPOINT addresses the transmitter and is ignored |
-| `audio_out` | out 0 | output | `AudioEncoded` | The received stream, for PCMU or Opus |
+| `audio_out` | out 0 | output | `AudioEncoded` | The received stream, for PCMU, PCMA or Opus |
 | `video_out` | out 1 | output | `VideoEncoded` | The received stream, for H.264 (Annex B) or VP8 |
 
 The codec comes from the receive records, which `rtp` tags with the codec it

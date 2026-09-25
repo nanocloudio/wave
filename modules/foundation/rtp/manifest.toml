@@ -30,7 +30,7 @@ direction = "input"
 content_type = "AudioEncoded"
 
 [ports.facts]
-codec = ["pcmu", "opus"]
+codec = ["pcmu", "pcma", "opus"]
 packing = "raw"
 max_payload = 4096
 

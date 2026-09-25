@@ -1,6 +1,6 @@
 //! RTP payload formats between the fluxor encoded-media record stream and RTP
-//! packets: RFC 3551 PCMU, RFC 7587 Opus, RFC 6184 H.264 (packetization mode
-//! 1), RFC 7741 VP8.
+//! packets: RFC 3551 PCMU and PCMA, RFC 7587 Opus, RFC 6184 H.264
+//! (packetization mode 1), RFC 7741 VP8.
 //!
 //! The split with the codec side is fixed by the stream contract
 //! (`abi::contracts::encoded`): codec, packing and clock come from the stream's
@@ -21,7 +21,7 @@ use super::abi::contracts::encoded as enc;
 /// carries no payload format for.
 pub const fn rtp_clock(codec: u8) -> Option<u32> {
     match codec {
-        enc::CODEC_PCMU => Some(8_000),
+        enc::CODEC_PCMU | enc::CODEC_PCMA => Some(8_000),
         enc::CODEC_OPUS => Some(48_000),
         enc::CODEC_H264 | enc::CODEC_VP8 => Some(90_000),
         _ => None,
@@ -34,6 +34,7 @@ pub const fn rtp_clock(codec: u8) -> Option<u32> {
 pub fn codec_named(name: &[u8]) -> Option<u8> {
     let codec = match name {
         b"pcmu" => enc::CODEC_PCMU,
+        b"pcma" => enc::CODEC_PCMA,
         b"opus" => enc::CODEC_OPUS,
         b"h264" => enc::CODEC_H264,
         b"vp8" => enc::CODEC_VP8,
@@ -47,6 +48,7 @@ pub const fn can_packetize(codec: u8, packing: u8) -> bool {
     matches!(
         (codec, packing),
         (enc::CODEC_PCMU, enc::PACKING_RAW)
+            | (enc::CODEC_PCMA, enc::PACKING_RAW)
             | (enc::CODEC_OPUS, enc::PACKING_RAW)
             | (enc::CODEC_H264, enc::PACKING_ANNEXB)
             | (enc::CODEC_H264, enc::PACKING_LENGTH_PREFIXED)
@@ -60,7 +62,7 @@ pub const fn can_packetize(codec: u8, packing: u8) -> bool {
 /// and the decoder reads the real count from each packet's TOC.
 pub const fn received_stream(codec: u8) -> Option<(u8, u8, u32)> {
     match codec {
-        enc::CODEC_PCMU => Some((enc::PACKING_RAW, 1, 8_000)),
+        enc::CODEC_PCMU | enc::CODEC_PCMA => Some((enc::PACKING_RAW, 1, 8_000)),
         enc::CODEC_OPUS => Some((enc::PACKING_RAW, 2, 48_000)),
         enc::CODEC_H264 => Some((enc::PACKING_ANNEXB, 0, 90_000)),
         enc::CODEC_VP8 => Some((enc::PACKING_RAW, 0, 90_000)),
@@ -593,7 +595,10 @@ impl Depacketizer {
             self.discontinuity = true;
         }
 
-        if matches!(pkt.codec, enc::CODEC_PCMU | enc::CODEC_OPUS) {
+        if matches!(
+            pkt.codec,
+            enc::CODEC_PCMU | enc::CODEC_PCMA | enc::CODEC_OPUS
+        ) {
             let flags = enc::FLAG_KEY
                 | if core::mem::take(&mut self.discontinuity) {
                     enc::FLAG_DISCONTINUITY
