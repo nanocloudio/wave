@@ -268,6 +268,13 @@ access = "read"
 requires_contract = "storage.namespace"
 access = "read"
 
+# A request body past `body_inline_max` is STAGED in the store (the blob and
+# its expiry) and forwarded by reference (`body_ref_prefix`). Write grant on
+# storage.object; unused unless the param is set.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
 # HANDLER_FS_FILE routes serve files by path through the FS_CONTRACT
 # (`fat32` on bare-metal, `linux_fs_dispatch` on the host). Granting
 # `fs` enables `provider_call(-1, FS_OPEN, ...)`.
@@ -299,9 +306,9 @@ access = "read"
 #         severe.
 # id  9 = app_timeouts, id 10 = app_envelopes_lost, id 11 =
 #         app_envelopes_oversize: the application fan-out's shed paths.
-#         `lost` is never expected in a healthy graph — it means a response was
-#         dropped rather than delayed, so the application believes it answered
-#         a client that never was.
+#         `lost` stays zero: an envelope a busy connection cannot take is held
+#         for that connection, and one that holds too much closes (counted as
+#         conns_timeout_stall, id 22 — a peer that stopped reading).
 # id 12 = ws_envelopes_dropped, id 13 = h2_streams_refused.
 # id 16 = ws_events_dropped: a WebSocket lifecycle event lost because the retry
 #         ring was already full. Non-zero means an application's view of which
@@ -365,7 +372,8 @@ metrics = [
   #        table is three quarters full), or a WebSocket past `ws_idle_ms`.
   #   22 = conns_timeout_stall: bytes stopped moving mid-request for
   #        `stall_ms` — a body that stopped arriving or a peer that stopped
-  #        reading.
+  #        reading — or a peer held more application answers than
+  #        `app::STASH_MAX` because it was not reading them.
   #   23 = conns_evicted_idle: an accept found no free slot and took the
   #        longest-idle keepalive connection's. Rising steadily means the
   #        slot table is sized below the working set.

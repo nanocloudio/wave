@@ -44,7 +44,10 @@
 //! broken under h2.
 
 use super::super::wire::method;
-use super::{cur_slot, cur_slot_mut, dev_millis, find_slot_by_conn_id, HttpState, MAX_PATH};
+use super::{
+    cur_slot, cur_slot_mut, dev_millis, find_slot_by_conn_id, heap_alloc, heap_free, HttpState,
+    MAX_PATH,
+};
 
 /// Fixed prefix of an `HttpRequest` envelope:
 /// `[conn_id u16][stream_id u16][method u8][flags u8][path_len u16]
@@ -76,6 +79,10 @@ pub(crate) const FLAG_MORE_BODY: u8 = 0x01;
 /// anonymous caller to whoever it claims to be. A typed trailer sits in a
 /// structure the client cannot reach at all.
 pub(crate) const FLAG_PEER_IDENTITY: u8 = 0x02;
+/// Request flag: the BODY is a reference, `sha256:<hex>` — the body itself
+/// was staged in the store at `body_ref_prefix` + `sha256/<hex>` because it
+/// was larger than `body_inline_max` (an envelope is one channel record).
+pub(crate) const FLAG_BODY_REF: u8 = 0x04;
 
 /// Longest request header block forwarded to the application, in bytes.
 ///
@@ -95,6 +102,30 @@ pub(crate) const MAX_FWD_HEADERS: usize = 2048;
 /// than any interactive request and shorter than every client's own timeout, so
 /// the client sees a status rather than a silence.
 pub(crate) const APP_TIMEOUT_MS: u64 = 30_000;
+
+/// Response flag: the application HOLDS this stream open on purpose — a watch,
+/// an event stream — and ends it itself. Between events such a stream is idle
+/// for as long as the application has nothing to say, so its progress deadline
+/// is `HOLD_TIMEOUT_MS`, not `APP_TIMEOUT_MS`. Meaningful with
+/// `FLAG_MORE_BODY`; ignored without it. Request and response flags are two
+/// vocabularies over the same byte, so this shares a value with
+/// [`FLAG_BODY_REF`]: an envelope is one or the other, never both.
+pub(crate) const FLAG_HOLD: u8 = 0x04;
+
+/// A held stream's progress deadline: longer than any server-side watch
+/// timeout an application sets (Kubernetes caps one at 30 min, then doubles it
+/// at random), and still finite — an application that holds a stream and never
+/// ends it cannot keep its slot forever.
+pub(crate) const HOLD_TIMEOUT_MS: u64 = 3_600_000;
+
+/// The progress deadline a streamed response runs under, from its flags.
+pub(crate) fn progress_timeout_ms(flags: u8) -> u64 {
+    if flags & FLAG_HOLD != 0 {
+        HOLD_TIMEOUT_MS
+    } else {
+        APP_TIMEOUT_MS
+    }
+}
 
 /// Serialise one `HttpRequest` envelope and write it to `req_out`.
 ///
@@ -119,6 +150,17 @@ pub(crate) unsafe fn write_request_envelope(
     // function by different paths and both must carry it.
     let peer = super::peer_svid(s, conn_id);
     let peer_len = peer.map_or(0, |p| 2 + p.len());
+    // A body past the inline bound goes by reference.
+    let mut refbuf = [0u8; 7 + 64];
+    let staged = s.server.body_ref_prefix_len > 0 && body.len() > s.server.body_inline_max as usize;
+    let body: &[u8] = if staged {
+        if !stage_body(s, body, &mut refbuf) {
+            return EmitResult::StageFailed;
+        }
+        &refbuf[..]
+    } else {
+        body
+    };
     let total = REQ_HDR + path.len() + hdrs.len() + body.len() + peer_len;
     if total > super::super::abi::CHANNEL_BUFFER_SIZE {
         return EmitResult::TooLarge;
@@ -132,7 +174,7 @@ pub(crate) unsafe fn write_request_envelope(
         FLAG_PEER_IDENTITY
     } else {
         0
-    }; // whole body in this envelope
+    } | if staged { FLAG_BODY_REF } else { 0 }; // whole body (or its reference) here
     buf[6..8].copy_from_slice(&(path.len() as u16).to_le_bytes());
     buf[8..10].copy_from_slice(&(hdrs.len() as u16).to_le_bytes());
     buf[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
@@ -158,6 +200,104 @@ pub(crate) unsafe fn write_request_envelope(
         return EmitResult::Full;
     }
     EmitResult::Sent
+}
+
+/// How long a staged body stays before it is collected (its expiry key).
+const STAGED_TTL_MS: u64 = 300_000;
+
+const OBJ_PUT: u32 = 0x1420;
+
+/// Stage `body` in the store as `<prefix>sha256/<hex>` (content-addressed:
+/// the same body is the same key) with its expiry at `<prefix>at/<hex>`,
+/// and write `sha256:<hex>` into `out`. False when the store refused either.
+unsafe fn stage_body(s: &HttpState, body: &[u8], out: &mut [u8; 71]) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = super::super::body_digest::sha256(body);
+    let mut hex = [0u8; 64];
+    for (i, b) in digest.iter().enumerate() {
+        hex[2 * i] = HEX[(b >> 4) as usize];
+        hex[2 * i + 1] = HEX[(b & 0x0f) as usize];
+    }
+    let pfx = &s.server.body_ref_prefix[..s.server.body_ref_prefix_len as usize];
+    let sys = &*s.syscalls;
+    let mut key = [0u8; 48 + 8 + 64];
+    let kl = cat3(&mut key, pfx, b"sha256/", &hex);
+    if !obj_put(sys, &key[..kl], body) {
+        return false;
+    }
+    // The expiry: a store `ttl` chain collects the body after it, whether or
+    // not a request ever consumed it.
+    let mut digits = [0u8; 20];
+    let dl = dec_u64(dev_millis(sys).saturating_add(STAGED_TTL_MS), &mut digits);
+    let mut val = [0u8; 40];
+    let vl = cat3(&mut val, b"{\"deadline\":", &digits[..dl], b"}");
+    let kl = cat3(&mut key, pfx, b"at/", &hex);
+    if !obj_put(sys, &key[..kl], &val[..vl]) {
+        return false;
+    }
+    out[..7].copy_from_slice(b"sha256:");
+    out[7..].copy_from_slice(&hex);
+    true
+}
+
+/// `v` in decimal into `out`; its length.
+fn dec_u64(mut v: u64, out: &mut [u8; 20]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut n = 0usize;
+    loop {
+        tmp[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 || n == 20 {
+            break;
+        }
+    }
+    for i in 0..n {
+        out[i] = tmp[n - 1 - i];
+    }
+    n
+}
+
+/// `a ++ b ++ c` into `dst`: its length (short of `dst`, it stops there).
+fn cat3(dst: &mut [u8], a: &[u8], b: &[u8], c: &[u8]) -> usize {
+    let mut n = 0usize;
+    for part in [a, b, c] {
+        for &x in part {
+            if let Some(d) = dst.get_mut(n) {
+                *d = x;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// storage.object PUT (unconditional), value by pointer.
+unsafe fn obj_put(sys: &super::super::abi::SyscallTable, key: &[u8], value: &[u8]) -> bool {
+    let mut arg = [0u8; 256];
+    if key.len() + 32 > arg.len() {
+        return false;
+    }
+    let mut fence = [0u8; 62];
+    let mut p = 0usize;
+    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    p += 2;
+    arg[p..p + key.len()].copy_from_slice(key);
+    p += key.len();
+    arg[p] = 0; // content_type_len
+    p += 1;
+    arg[p..p + 8].copy_from_slice(&(value.as_ptr() as u64).to_le_bytes());
+    p += 8;
+    arg[p..p + 8].copy_from_slice(&(value.len() as u64).to_le_bytes());
+    p += 8;
+    arg[p] = 0; // precondition: any
+    arg[p + 1] = 0; // no etag
+    p += 2;
+    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
+    p += 8;
+    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
+    p += 2;
+    (sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p) == 0
 }
 
 /// Emit the current h1 slot's request on `req_out` and start its timeout.
@@ -219,6 +359,9 @@ pub(crate) enum EmitResult {
     TooLarge,
     /// The ring is full right now; retry next tick.
     Full,
+    /// A body past `body_inline_max` could not be staged in the store (no
+    /// store, or the write refused): the request cannot be forwarded whole.
+    StageFailed,
 }
 
 /// The raw header block of a request head: everything after the request line's
@@ -321,6 +464,17 @@ pub(crate) unsafe fn app_deadline_passed(s: &HttpState, idx: usize) -> bool {
     dev_millis(&*s.syscalls) >= slot.app_deadline_ms
 }
 
+/// The most one connection may have held for it while it is slow to read:
+/// past this the peer is not reading at the rate it is being answered, and the
+/// connection closes (counted with `conns_timeout_stall` — a peer that stopped
+/// reading). Host builds that forward to an application hold two 1 MiB
+/// objects' worth of watch events — what a client busy with its own large
+/// write lets pile up; everywhere else, a couple of envelopes.
+#[cfg(all(feature = "app", target_arch = "aarch64"))]
+pub(crate) const STASH_MAX: u32 = 4 << 20;
+#[cfg(not(all(feature = "app", target_arch = "aarch64")))]
+pub(crate) const STASH_MAX: u32 = 2 * super::super::abi::CHANNEL_BUFFER_SIZE as u32 + 8;
+
 /// Read one `HttpResponse` from `resp_in` and compose it onto the connection
 /// that asked for it. Returns true if an envelope was consumed.
 ///
@@ -328,10 +482,18 @@ pub(crate) unsafe fn app_deadline_passed(s: &HttpState, idx: usize) -> bool {
 /// channel feeds every waiting connection, so a per-slot read would let
 /// whichever slot happened to step first consume an envelope addressed to a
 /// different one.
+///
+/// An envelope for a connection that cannot take it yet (its `send_buf` still
+/// draining) is held FOR THAT CONNECTION, in order, and delivered as it frees
+/// (`pump_stashes`, first thing here). Never written back onto `resp_in`: that
+/// reordered a streamed body's chunks, and a peer that stopped reading kept its
+/// envelopes circling the one channel every other connection is answered
+/// through until a writeback was refused and somebody's response was lost.
 pub(crate) unsafe fn drain_responses(s: &mut HttpState) -> bool {
     if s.server.app_in_chan < 0 {
         return false;
     }
+    pump_stashes(s);
     let sys = &*s.syscalls;
     let chan = s.server.app_in_chan;
     let poll = (sys.channel_poll)(chan, super::POLL_IN);
@@ -369,89 +531,220 @@ pub(crate) unsafe fn drain_responses(s: &mut HttpState) -> bool {
             return false;
         }
     };
+    let envelope = &buf[..total];
 
-    // An h2 stream on the named connection takes precedence: under h2 the
-    // ConnSlot is the connection, not the request, and many requests share it.
-    #[cfg(feature = "h2")]
-    {
-        if let Some(conn_idx) = find_slot_by_conn_id(s, conn_id) {
-            let has_h2 = !(*s.server.slots.as_ptr().add(conn_idx)).h2.is_null();
-            if has_h2 {
-                let saved = s.server.cur_slot;
-                s.server.cur_slot = conn_idx as i32;
-                let stream_idx = super::h2::find_app_stream(s, stream_id);
-                if stream_idx >= 0 {
-                    // `send_buf` is per-connection on h2 as well, so the same
-                    // writeback backpressure applies.
-                    let busy = {
-                        let slot = &*s.server.slots.as_ptr().add(conn_idx);
-                        slot.send_len > slot.send_offset
-                    };
-                    if busy {
-                        s.server.cur_slot = saved;
-                        if (sys.channel_write)(chan, buf.as_ptr(), total) <= 0 {
-                            // The envelope left the mailbox on read and the
-                            // writeback was refused, so it is gone. The
-                            // application believes it answered and the client
-                            // will not be answered — a lost response, not a
-                            // delayed one, and the only place that fact exists.
-                            s.server.app_envelopes_lost =
-                                s.server.app_envelopes_lost.wrapping_add(1);
-                        }
-                        return false;
-                    }
-                    let view = match parse_response(&buf[..total]) {
-                        Some(v) => v,
-                        None => {
-                            s.server.cur_slot = saved;
-                            return false;
-                        }
-                    };
-                    let (status, ct, body, more) = (
-                        view.status,
-                        view.content_type,
-                        view.body,
-                        (view.flags & FLAG_MORE_BODY) != 0,
-                    );
-                    super::h2::deliver_app_response(s, stream_idx, status, ct, body, more);
-                    s.server.cur_slot = saved;
-                    return true;
-                }
-                s.server.cur_slot = saved;
-            }
-        }
-    }
-
-    let target = match find_awaiting_slot(s, conn_id, stream_id) {
+    let target = match app_target(s, conn_id, stream_id) {
         Some(i) => i,
         // No slot is waiting: the connection closed between the application's
         // write and this read, or the request already timed out. Nothing left
         // to answer.
         None => return false,
     };
+    // Behind what is already held, never ahead of it: the held envelopes are
+    // earlier parts of the same answers.
+    let held = (*s.server.slots.as_ptr().add(target)).app_stash_len != 0;
+    if !held && deliver(s, target, envelope) != Delivery::Busy {
+        return true;
+    }
+    if !stash_push(s, target, envelope) {
+        too_slow(s, target);
+    }
+    true
+}
 
-    // The target's `send_buf` must be free before it is composed into. On
-    // contention the envelope goes BACK on the channel and is retried next
-    // tick — the same writeback the WS fan-out uses, and for the same reason:
-    // the envelope has already left the mailbox, so dropping it here would
-    // lose a response the application believes it delivered.
+/// The slot an envelope answers: an h2 connection by its id (the stream is
+/// found at delivery), an h1 one only while its request is pending.
+unsafe fn app_target(s: &mut HttpState, conn_id: u16, stream_id: u16) -> Option<usize> {
+    #[cfg(feature = "h2")]
+    {
+        if let Some(i) = find_slot_by_conn_id(s, conn_id) {
+            if !(*s.server.slots.as_ptr().add(i)).h2.is_null() {
+                return Some(i);
+            }
+        }
+    }
+    find_awaiting_slot(s, conn_id, stream_id)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Delivery {
+    /// Composed onto the connection.
+    Done,
+    /// Its `send_buf` is still draining: hold the envelope.
+    Busy,
+    /// Nothing waits for it any more (the stream or request is gone).
+    Gone,
+}
+
+/// Compose `envelope` onto slot `idx` if its `send_buf` is free.
+unsafe fn deliver(s: &mut HttpState, idx: usize, envelope: &[u8]) -> Delivery {
     let busy = {
-        let slot = &*s.server.slots.as_ptr().add(target);
+        let slot = &*s.server.slots.as_ptr().add(idx);
         slot.send_len > slot.send_offset
     };
-    if busy {
-        if (sys.channel_write)(chan, buf.as_ptr(), total) <= 0 {
-            // See the h2 path above: a refused writeback loses the response.
-            s.server.app_envelopes_lost = s.server.app_envelopes_lost.wrapping_add(1);
+    // An h2 stream on the named connection takes precedence: under h2 the
+    // ConnSlot is the connection, not the request, and many requests share it.
+    #[cfg(feature = "h2")]
+    {
+        if !(*s.server.slots.as_ptr().add(idx)).h2.is_null() {
+            let view = match parse_response(envelope) {
+                Some(v) => v,
+                None => return Delivery::Gone,
+            };
+            let saved = s.server.cur_slot;
+            s.server.cur_slot = idx as i32;
+            let stream_idx = super::h2::find_app_stream(s, view.stream_id);
+            let out = if stream_idx < 0 {
+                Delivery::Gone
+            } else if busy {
+                // `send_buf` is per-connection on h2 as well.
+                Delivery::Busy
+            } else {
+                let more = (view.flags & FLAG_MORE_BODY) != 0;
+                let timeout = progress_timeout_ms(view.flags);
+                super::h2::deliver_app_response(
+                    s,
+                    stream_idx,
+                    view.status,
+                    view.content_type,
+                    view.body,
+                    more,
+                    timeout,
+                );
+                Delivery::Done
+            };
+            s.server.cur_slot = saved;
+            return out;
         }
+    }
+    if busy {
+        return Delivery::Busy;
+    }
+    let slot = &*s.server.slots.as_ptr().add(idx);
+    if slot.app_pending == 0 {
+        return Delivery::Gone;
+    }
+    let saved = s.server.cur_slot;
+    s.server.cur_slot = idx as i32;
+    compose_response(s, envelope);
+    s.server.cur_slot = saved;
+    Delivery::Done
+}
+
+/// Hold `envelope` behind whatever slot `idx` already holds. False when the
+/// stash would pass `STASH_MAX` or the arena cannot grow it.
+unsafe fn stash_push(s: &mut HttpState, idx: usize, envelope: &[u8]) -> bool {
+    let sys = &*s.syscalls;
+    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+    let need = 4 + envelope.len() as u32;
+    // Reclaim what was delivered before growing.
+    if slot.app_stash_at != 0 && slot.app_stash_at + slot.app_stash_len + need > slot.app_stash_cap
+    {
+        core::ptr::copy(
+            slot.app_stash.add(slot.app_stash_at as usize),
+            slot.app_stash,
+            slot.app_stash_len as usize,
+        );
+        slot.app_stash_at = 0;
+    }
+    let want = slot.app_stash_at + slot.app_stash_len + need;
+    if want > STASH_MAX {
         return false;
     }
-
-    let saved = s.server.cur_slot;
-    s.server.cur_slot = target as i32;
-    compose_response(s, &buf[..total]);
-    s.server.cur_slot = saved;
+    if want > slot.app_stash_cap {
+        let mut cap = if slot.app_stash_cap == 0 {
+            super::super::abi::CHANNEL_BUFFER_SIZE as u32 + 8
+        } else {
+            slot.app_stash_cap
+        };
+        while cap < want {
+            cap = cap.saturating_mul(2);
+        }
+        let cap = cap.min(STASH_MAX);
+        let fresh = heap_alloc(sys, cap);
+        if fresh.is_null() {
+            return false;
+        }
+        if !slot.app_stash.is_null() {
+            core::ptr::copy_nonoverlapping(
+                slot.app_stash.add(slot.app_stash_at as usize),
+                fresh,
+                slot.app_stash_len as usize,
+            );
+            heap_free(sys, slot.app_stash);
+        }
+        slot.app_stash = fresh;
+        slot.app_stash_cap = cap;
+        slot.app_stash_at = 0;
+    }
+    let at = slot
+        .app_stash
+        .add((slot.app_stash_at + slot.app_stash_len) as usize);
+    core::ptr::copy_nonoverlapping((envelope.len() as u32).to_le_bytes().as_ptr(), at, 4);
+    core::ptr::copy_nonoverlapping(envelope.as_ptr(), at.add(4), envelope.len());
+    slot.app_stash_len += need;
     true
+}
+
+/// Deliver what each connection holds, in order, as far as its `send_buf`
+/// allows. A drained stash is freed: a connection is slow for a moment far
+/// more often than for its whole life.
+unsafe fn pump_stashes(s: &mut HttpState) {
+    for idx in 0..super::MAX_CONCURRENT_CONNS {
+        loop {
+            let (p, len) = {
+                let slot = &*s.server.slots.as_ptr().add(idx);
+                if slot.app_stash_len == 0 {
+                    break;
+                }
+                (
+                    slot.app_stash.add(slot.app_stash_at as usize),
+                    slot.app_stash_len,
+                )
+            };
+            let mut lb = [0u8; 4];
+            core::ptr::copy_nonoverlapping(p, lb.as_mut_ptr(), 4);
+            let el = u32::from_le_bytes(lb);
+            if 4 + el > len {
+                // Cannot happen (`stash_push` writes both); fail closed.
+                too_slow(s, idx);
+                break;
+            }
+            let envelope = core::slice::from_raw_parts(p.add(4), el as usize);
+            if deliver(s, idx, envelope) == Delivery::Busy {
+                break;
+            }
+            let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+            slot.app_stash_at += 4 + el;
+            slot.app_stash_len -= 4 + el;
+            if slot.app_stash_len == 0 {
+                heap_free(&*s.syscalls, slot.app_stash);
+                slot.app_stash = core::ptr::null_mut();
+                slot.app_stash_cap = 0;
+                slot.app_stash_at = 0;
+            }
+        }
+    }
+}
+
+/// Slot `idx`'s peer is not reading as fast as it is answered: what it holds
+/// is dropped and the connection closes — a short read the client can see and
+/// retry (a watch re-lists), never a gap in the middle of a body.
+unsafe fn too_slow(s: &mut HttpState, idx: usize) {
+    s.server.conns_timeout_stall = s.server.conns_timeout_stall.wrapping_add(1);
+    let sys = &*s.syscalls;
+    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+    if !slot.app_stash.is_null() {
+        heap_free(sys, slot.app_stash);
+        slot.app_stash = core::ptr::null_mut();
+    }
+    slot.app_stash_cap = 0;
+    slot.app_stash_len = 0;
+    slot.app_stash_at = 0;
+    slot.app_pending = 0;
+    slot.app_streaming = 0;
+    slot.keepalive = 0;
+    slot.phase = super::Phase::CloseConn;
 }
 
 /// Compose a parsed `HttpResponse` into the current slot's `send_buf` and set
@@ -516,6 +809,7 @@ unsafe fn compose_response(s: &mut HttpState, envelope: &[u8]) {
         let dst = super::cur_send_buf_mut_ptr(s).add(off);
         core::ptr::copy_nonoverlapping(body.as_ptr(), dst, n);
     }
+    let now = dev_millis(&*s.syscalls);
     if let Some(cur) = cur_slot_mut(s) {
         cur.send_len = (off + n) as u16;
         cur.send_offset = 0;
@@ -524,7 +818,13 @@ unsafe fn compose_response(s: &mut HttpState, envelope: &[u8]) {
         // expected for it, and clearing the flag would make the next chunk
         // look like a response to a request nobody sent.
         cur.app_pending = if streaming { 1 } else { 0 };
-        cur.app_deadline_ms = if streaming { cur.app_deadline_ms } else { 0 };
+        // Streaming is progress: the deadline restarts, and a HELD stream
+        // (`FLAG_HOLD`) runs under the long one from its first envelope.
+        cur.app_deadline_ms = if streaming {
+            now.saturating_add(progress_timeout_ms(view.flags))
+        } else {
+            0
+        };
         // A single-envelope body that did not fit `send_buf` cannot be
         // finished by a length-delimited response, so the connection closes
         // after it and the truncation is visible to the client as a short read
@@ -577,7 +877,7 @@ unsafe fn compose_stream_chunk(s: &mut HttpState, view: &RespView<'_>) {
             // the request. Without the refresh, any transfer longer than
             // `APP_TIMEOUT_MS` is cut off mid-body no matter how steadily the
             // application is feeding it — which is every large artefact.
-            cur.app_deadline_ms = now.saturating_add(APP_TIMEOUT_MS);
+            cur.app_deadline_ms = now.saturating_add(progress_timeout_ms(view.flags));
         }
         cur.phase = super::Phase::DrainSend;
     }

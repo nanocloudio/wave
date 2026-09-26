@@ -195,6 +195,14 @@ pub(crate) unsafe fn match_route_path(s: &HttpState, req: *const u8, plen: usize
     // body on requests that should have 404'd. Among prefix-eligible
     // candidates the longest-matching wins; ties resolve to the lower
     // index. Returns -1 when no route matches → caller returns 404.
+    // A route names a PATH; the query is not part of it. `/api?timeout=32s`
+    // is a request for `/api` — the form a Kubernetes client uses for
+    // discovery — so matching stops at the first `?`.
+    let mut q = 0usize;
+    while q < plen && *req.add(q) != b'?' {
+        q += 1;
+    }
+    let plen = q;
     let mut best: i8 = -1;
     let mut best_len: usize = 0;
     let mut i = 0u8;

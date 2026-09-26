@@ -93,9 +93,18 @@ static HUFF: [(u32, u8); 257] = [
     (0x3fffffff, 30),
 ];
 
-/// Longest header name/value we Huffman-decode into a scratch buffer; longer
-/// entries are dropped (like any header the callsite doesn't consume).
+/// Longest header NAME we Huffman-decode into a scratch buffer; a longer
+/// entry is dropped (like any header the callsite doesn't consume).
 pub(crate) const HUFF_SCRATCH: usize = 256;
+
+/// Longest header VALUE we Huffman-decode. A value is not bounded the way a
+/// name is: a bearer credential is a JWT of 800–1500 bytes, and Go's and
+/// curl's HPACK encoders Huffman-code it, so a scratch buffer sized for names
+/// would drop the `authorization` header of any request carrying a real
+/// token — silently, as any undecodable entry is dropped. This is as long as
+/// the whole forwarded header block instead (the server's `MAX_FWD_HEADERS`,
+/// 2 KiB), since a value longer than that could not be forwarded anyway.
+pub(crate) const HUFF_VALUE_SCRATCH: usize = 2048;
 
 /// Decode an HPACK Huffman string `src` into `out`, returning the number of
 /// bytes written. `None` on: overflow of `out`, an EOS symbol in the stream,

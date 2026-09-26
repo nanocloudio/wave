@@ -300,6 +300,12 @@ unsafe fn alloc_slot(s: &mut HttpState, id: u32) -> i8 {
         if slot.state == SlotState::Idle {
             slot.id = id;
             slot.state = SlotState::Open;
+            // Response state starts fresh. A slot carries `headers_sent`
+            // across its whole response, streamed or not, so a reused slot
+            // that inherited it would frame the next stream's first envelope
+            // as DATA with no HEADERS before it — a PROTOCOL_ERROR that takes
+            // down the connection, not just the stream.
+            slot.headers_sent = 0;
             slot.method_kind = 0;
             slot.end_stream_in = 0;
             slot.req_path_len = 0;
@@ -587,10 +593,20 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // stopped reading a response, and the connection is closed rather than
     // left pinning its buffers. Checked with `send_buf` drained, because
     // GOAWAY needs it.
+    //
+    // A stream AWAITING THE APPLICATION is neither: the next bytes are the
+    // application's to send, so the peer owes nothing and a quiet connection
+    // is not a stalled one. Such a stream is governed by its own deadline
+    // (`APP_TIMEOUT_MS`, or `HOLD_TIMEOUT_MS` for a stream held open on
+    // purpose — a watch), swept below, and takes a limit of 0 here: no
+    // connection-level deadline applies while the application holds the turn.
     if cur_send_len(s) == 0 && cur_h2(s).sub == Sub::Active {
         let open = any_stream_open(s);
-        let limit = if open {
+        let peer_open = any_stream_open_on_peer(s);
+        let limit = if peer_open {
             s.server.stall_ms
+        } else if open {
+            0
         } else {
             super::keepalive_limit_ms(s)
         };
@@ -1994,6 +2010,16 @@ unsafe fn dispatch_request(s: &mut HttpState, slot_idx: i8) {
                     let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(slot_idx as usize);
                     slot.state = SlotState::Pending;
                 }
+                super::app::EmitResult::StageFailed => {
+                    emit_response(
+                        s,
+                        stream_id,
+                        b"503",
+                        b"text/plain",
+                        b"Request body could not be staged\n",
+                    );
+                    free_slot(s, slot_idx);
+                }
                 _ => {
                     emit_response(
                         s,
@@ -2093,7 +2119,9 @@ pub(crate) unsafe fn find_app_stream(s: &HttpState, stream_id: u16) -> i8 {
 
 /// Serve an application response on an h2 stream.
 ///
-/// `more` marks a streamed body whose continuation arrives in later envelopes.
+/// `more` marks a streamed body whose continuation arrives in later envelopes;
+/// `timeout_ms` is the progress deadline it then runs under
+/// (`app::progress_timeout_ms` — long for a held stream).
 /// h2 needs no `Content-Length` to frame one — END_STREAM on the final DATA
 /// frame is the delimiter — so unlike h1, a streamed response here costs the
 /// connection nothing.
@@ -2105,6 +2133,7 @@ pub(crate) unsafe fn deliver_app_response(
     content_type: &[u8],
     body: &[u8],
     more: bool,
+    timeout_ms: u64,
 ) {
     let (stream_id, verb, head_sent) = {
         let slot = &*cur_h2(s).streams.as_ptr().add(slot_idx as usize);
@@ -2145,7 +2174,7 @@ pub(crate) unsafe fn deliver_app_response(
         slot.app_pending = 1;
         // Time since last progress, not since the request — see the h1
         // counterpart in `app::compose_stream_chunk`.
-        slot.app_deadline_ms = now.saturating_add(super::app::APP_TIMEOUT_MS);
+        slot.app_deadline_ms = now.saturating_add(timeout_ms);
     } else {
         free_slot(s, slot_idx);
     }
@@ -2523,6 +2552,21 @@ unsafe fn any_stream_open(s: &HttpState) -> bool {
     let mut i = 0;
     while i < MAX_STREAMS {
         if h2.streams[i].state != SlotState::Idle {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Is a stream open whose next move is the PEER's — one not waiting on the
+/// application? Only those can stall.
+unsafe fn any_stream_open_on_peer(s: &HttpState) -> bool {
+    let h2 = cur_h2(s);
+    let mut i = 0;
+    while i < MAX_STREAMS {
+        let st = &h2.streams[i];
+        if st.state != SlotState::Idle && st.app_pending == 0 {
             return true;
         }
         i += 1;

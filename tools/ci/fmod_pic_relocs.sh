@@ -72,22 +72,26 @@ scan() {
 
 for obj in "${OBJS[@]}"; do
   rel="${obj#"$ROOT"/}"
+  relocs="$(scan "$obj")"
   while IFS=$'\t' read -r sec rtype rsym; do
     [ -n "$rtype" ] || continue
 
-    # Only relocations whose TARGET section is allocatable data. `.rela.text`
-    # is not one: a relocation there is resolved into an instruction the
-    # compiler chose to make PC-relative.
+    # Only relocations whose TARGET section is allocatable data. `.text` is
+    # not one: a relocation there is resolved into an instruction the compiler
+    # chose to make PC-relative. Both spellings of the relocation section are
+    # matched: aarch64 emits RELA (`.rela.*`), 32-bit ARM emits REL
+    # (`.rel.*`), and a gate that knew only one silently passed every object
+    # for the flash-constrained targets it matters most for.
     case "$sec" in
-      .rela.data.rel.ro*|.rela.rodata*|.rela.data*) ;;
+      .rel.data.rel.ro*|.rel.rodata*|.rel.data*) target="${sec#.rel}" ;;
+      .rela.data.rel.ro*|.rela.rodata*|.rela.data*) target="${sec#.rela}" ;;
       *) continue ;;
     esac
     case "$rtype" in
-      R_AARCH64_ABS64|R_AARCH64_ABS32|R_X86_64_64|R_RISCV_64) ;;
+      R_AARCH64_ABS64|R_AARCH64_ABS32|R_ARM_ABS32|R_X86_64_64|R_RISCV_64) ;;
       *) continue ;;
     esac
 
-    target="${sec#.rela}"
     found=$((found + 1))
 
     if [ "$MODE" = "--print" ]; then
@@ -108,12 +112,24 @@ for obj in "${OBJS[@]}"; do
         esac
         ;;
     esac
-    # A `core::panic::Location` promoted into `.data.rel.ro`: one pointer to
+    # A `core::panic::Location` promoted into `.data.rel.ro`: ONE pointer to
     # the file name a panic would report. Reached only from a panic, and a
     # panicking module is already on its way to abort.
+    #
+    # The count is the discriminator, not the shape. A name table lowered from
+    # a `match` points at string data too, so a rule that asked only where the
+    # pointer led would exempt the very thing this gate exists to catch; a
+    # Location is one pointer and a table is several. (Reading the pointed-at
+    # bytes and requiring a `.rs` path, as fluxor's own build lint does, is
+    # stronger still, but the addend of a REL relocation lives in the section
+    # contents rather than the entry, so it is not available from `readelf -r`
+    # alone on 32-bit ARM.)
     case "$target" in
       *.Lanon.*)
-        [ "$rsym" = ".rodata.str1.1" ] && continue
+        if [ "$rsym" = ".rodata.str1.1" ] &&
+           [ "$(printf '%s\n' "$relocs" | grep -cF "$sec"$'\t')" -eq 1 ]; then
+          continue
+        fi
         ;;
     esac
 
@@ -121,7 +137,7 @@ for obj in "${OBJS[@]}"; do
     echo "   $target" >&2
     echo "   holds an absolute address of '$rsym', which the flat image cannot relocate." >&2
     fail=1
-  done < <(scan "$obj")
+  done <<< "$relocs"
 done
 
 if [ "$MODE" = "--print" ]; then

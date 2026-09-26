@@ -286,11 +286,11 @@ where
 // RFC 7541 Appendix B Huffman table + decoder, shared with QPACK (h3). See
 // modules/common/huffman_core.rs for why it is one file rather than two
 // transcriptions.
-// The table now lives in `super::huffman` so QPACK (h3) can reach it without
-// pulling in h2. Re-exported here because `hpack::huffman_decode` is the name
-// the conformance vectors and bounds sweep already pin.
-pub(crate) use super::huffman::HUFF_SCRATCH;
+// The table lives in `super::huffman` so QPACK (h3) can reach it without
+// pulling in h2, and is re-exported here because `hpack::huffman_decode` is
+// the name the conformance vectors and the bounds sweep pin.
 pub use super::huffman::{huffman_decode, huffman_table_valid};
+pub(crate) use super::huffman::{HUFF_SCRATCH, HUFF_VALUE_SCRATCH};
 
 /// Decode a literal-form header (§6.2.x). `prefix_bits` is the integer
 /// prefix used to encode the indexed name (6 for incremental, 4 for
@@ -330,7 +330,7 @@ where
     // (callsites ignore headers they don't consume), never surfaced as
     // raw Huffman bytes.
     let mut name_scratch = [0u8; HUFF_SCRATCH];
-    let mut val_scratch = [0u8; HUFF_SCRATCH];
+    let mut val_scratch = [0u8; HUFF_VALUE_SCRATCH];
 
     let name_slice: &[u8] = if name_huffman {
         let raw = core::slice::from_raw_parts(name_buf.add(name_off), name_len);

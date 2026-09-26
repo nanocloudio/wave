@@ -539,6 +539,17 @@ pub(crate) struct ConnSlot {
     /// While it is set, `Phase::DrainSend` returns to `AwaitApp` for the next
     /// chunk instead of finishing the response.
     pub(crate) app_streaming: u8,
+    /// Application envelopes that arrived for this connection while its
+    /// `send_buf` was busy, held IN ORDER (`[u32 len][envelope]`…) and
+    /// delivered as it frees (`app::pump_stashes`). Per connection, so one
+    /// peer that stops reading holds up nobody else; null until first needed,
+    /// freed once drained and by `free_slot`. Past `app::STASH_MAX` the peer
+    /// is too slow to serve and the connection closes.
+    pub(crate) app_stash: *mut u8,
+    pub(crate) app_stash_cap: u32,
+    /// Bytes held, from `app_stash_at` (the next envelope to deliver).
+    pub(crate) app_stash_len: u32,
+    pub(crate) app_stash_at: u32,
 
     pub(crate) req_path: [u8; MAX_PATH],
     /// Heap-allocated request buffer. Allocated by
@@ -944,6 +955,11 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
         slot.body_cap = 0;
         slot.body_len = 0;
     }
+    // And for application envelopes held for a peer that was slow to read.
+    if !slot.app_stash.is_null() {
+        heap_free(&*sys, slot.app_stash);
+        slot.app_stash = core::ptr::null_mut();
+    }
     // Zero the rest of the slot then re-set sentinels.
     let p = slot as *mut ConnSlot as *mut u8;
     core::ptr::write_bytes(p, 0, core::mem::size_of::<ConnSlot>());
@@ -1040,6 +1056,20 @@ pub(crate) struct ServerState {
     /// Over the cap is 413, which is a refusal the client can act on — unlike
     /// a truncation, which it cannot detect.
     pub(crate) max_body: u32,
+    /// `body_ref_prefix` (param 120): where a request body past
+    /// `body_inline_max` is STAGED instead of forwarded — the store key
+    /// `<prefix>sha256/<hex>`, with its expiry at `<prefix>at/<hex>`. Empty:
+    /// never staged.
+    pub(crate) body_ref_prefix: [u8; 48],
+    pub(crate) body_ref_prefix_len: u8,
+    /// 1 when `body_ref_prefix` was longer than the 48 bytes held for it.
+    /// Recorded rather than truncated: a prefix of a prefix names a
+    /// different place in the store, and one that a `ttl` chain configured
+    /// for the real prefix would never collect. Construction refuses it.
+    pub(crate) body_ref_prefix_oversize: u8,
+    /// `body_inline_max` (param 121): the largest body forwarded in the
+    /// envelope when `body_ref_prefix` is set.
+    pub(crate) body_inline_max: u32,
 
     pub(crate) route_count: u8,
     /// How a request is served when no route params were wired: 1 = the
@@ -1244,11 +1274,13 @@ pub(crate) struct ServerState {
     /// Application requests answered 504 by the module because the
     /// application never replied (`http.app.timeouts`).
     pub(crate) app_timeouts: u32,
-    /// Application responses lost because the backpressure writeback to
-    /// `resp_in` was itself refused (`http.app.envelopes.lost`). The
-    /// application believes it answered; the client will not be answered.
-    /// Non-zero means the response path dropped data, not merely delayed
-    /// it, and is never expected in a healthy graph.
+    /// Application responses lost on the response path
+    /// (`http.app.envelopes.lost`). Structurally zero: an envelope a busy
+    /// connection cannot take is held for that connection
+    /// (`app::stash_push`), and one that holds more than `app::STASH_MAX`
+    /// closes instead (`conns_timeout_stall`), so no path reaches a response
+    /// that is neither delivered nor accounted for. The id is published so a
+    /// dashboard reads zero rather than a gap.
     pub(crate) app_envelopes_lost: u32,
     /// Envelopes discarded because they exceeded what one channel read
     /// can carry (`http.app.envelopes.oversize`). A configuration error:

@@ -1195,6 +1195,16 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             }
                             return 0;
                         }
+                        app::EmitResult::StageFailed => {
+                            build_error(
+                                s,
+                                b"503 Service Unavailable",
+                                b"Request body could not be staged\n",
+                            );
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::DrainSend;
+                            }
+                        }
                         app::EmitResult::TooLarge => {
                             build_error(
                                 s,

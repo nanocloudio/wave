@@ -124,6 +124,8 @@
 //! | 117   | session_drain_ms | u32 | 500 | Session anchor: the swap window and DRAIN deadline |
 //! | 118   | handoff_after_frames | u32 | 0 | Session anchor: swap workers every N envelopes (0 = never) |
 //! | 119   | sessions_prefix | str | (none) | Session anchor: store prefix whose `active` row picks the worker |
+//! | 120   | body_ref_prefix | str | (none) | App routes: stage a body past `body_inline_max` at `<prefix>sha256/<hex>`, forward `sha256:<hex>`. At most 48 bytes |
+//! | 121   | body_inline_max | u32 | 0 | App routes: the largest body forwarded inline when `body_ref_prefix` is set |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 // PIC library code must not panic; surface errors through the ABI.
@@ -148,6 +150,11 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+
+// The digest a staged request body is addressed by (server/app.rs).
+mod body_digest {
+    include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+}
 
 // The ordered-ack exchange surface. Mounted unconditionally, not behind the
 // `exchange` feature: the sizes it anchors (`PAYLOAD_MAX`) bound buffers in
@@ -438,6 +445,21 @@ mod params_def {
     119, sessions_prefix, str, 0
         => |s, d, len| { server::session::set_sessions_prefix(s, d, len); };
 
+    // Request bodies by reference (server/app.rs `stage_body`).
+    120, body_ref_prefix, str, 0
+        => |s, d, len| {
+            // Held whole or not at all; an over-long one is marked here and
+            // refused at construction.
+            if len > 48 {
+                s.server.body_ref_prefix_oversize = 1;
+                return;
+            }
+            core::ptr::copy_nonoverlapping(d, s.server.body_ref_prefix.as_mut_ptr(), len);
+            s.server.body_ref_prefix_len = len as u8;
+        };
+    121, body_inline_max, u32, 0
+        => |s, d, len| { s.server.body_inline_max = p_u32(d, len, 0, 0); };
+
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };
 
@@ -635,6 +657,28 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<HttpState>() as u32
 }
 
+/// Room for ONE request body held whole on its way to the application —
+/// `max_body_kib` is a runtime param, but the arena is sized before params
+/// are read, so the budget is the largest cap the profile supports: 4 MiB
+/// covers upstream Kubernetes' 3 MiB request ceiling (a 1 MiB ConfigMap,
+/// JSON-escaped) with the allocator's power-of-two growth. A body the arena
+/// cannot hold is 413, as one past the cap is. Only host-profile (aarch64)
+/// builds that forward bodies (`app`) reserve it; everywhere else a body is
+/// bounded by the body pool, as before.
+#[cfg(all(feature = "app", target_arch = "aarch64"))]
+const REQUEST_BODY_BUDGET: u32 = 4 << 20;
+#[cfg(not(all(feature = "app", target_arch = "aarch64")))]
+const REQUEST_BODY_BUDGET: u32 = 0;
+
+/// Room for application answers held for connections slow to read them
+/// (`server::app::STASH_MAX` each): four at their limit at once on host
+/// builds that forward to an application. Past it a slow connection closes
+/// sooner, which is the same outcome as passing its own limit.
+#[cfg(all(feature = "app", target_arch = "aarch64"))]
+const STASH_BUDGET: u32 = 16 << 20;
+#[cfg(not(all(feature = "app", target_arch = "aarch64")))]
+const STASH_BUDGET: u32 = 0;
+
 /// Heap arena size — sized for the **working set**, not the slot
 /// table ceiling. The slot table (`MAX_CONCURRENT_CONNS`) is the
 /// architectural cap on simultaneous in-flight connections; the
@@ -676,6 +720,8 @@ pub extern "C" fn module_arena_size() -> u32 {
     // (recv_buf, send_buf, h2).
     let alloc_overhead = (16u32 * 3).saturating_mul(working_set);
     body_budget
+        .saturating_add(REQUEST_BODY_BUDGET)
+        .saturating_add(STASH_BUDGET)
         .saturating_add(conns_buffers)
         .saturating_add(h2_buffers)
         .saturating_add(alloc_overhead)
@@ -755,6 +801,11 @@ pub unsafe extern "C" fn module_new(
             }
         } else {
             server::post_params(s);
+            if s.server.body_ref_prefix_oversize != 0 {
+                let m = b"[http] body_ref_prefix is longer than the 48 bytes held for it";
+                dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
+                return -22;
+            }
             // An anchored instance that cannot move its sessions must not
             // load: the refusal is a construction error, not a runtime one.
             let rc = server::session::validate(s);

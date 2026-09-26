@@ -26,6 +26,8 @@ modules/foundation/http/server/app.rs|let stream_id = u16::from_le_bytes([buf[2]
 modules/foundation/http/server/app.rs|let status = u16::from_le_bytes([buf[4], buf[5]]);|fan-out envelope length/count fields, owned by this file's layout
 modules/foundation/http/server/app.rs|let hdr_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;|fan-out envelope length/count fields, owned by this file's layout
 modules/foundation/http/server/app.rs|let body_len = u16::from_le_bytes([buf[10], buf[11]]) as usize;|fan-out envelope length/count fields, owned by this file's layout
+modules/foundation/http/server/app.rs|core::ptr::copy_nonoverlapping((envelope.len() as u32).to_le_bytes().as_ptr(), at, 4);|length prefix of a held envelope in a connection's stash, a layout private to this file
+modules/foundation/http/server/app.rs|let el = u32::from_le_bytes(lb);|length prefix of a held envelope in a connection's stash, a layout private to this file
 modules/foundation/http/server/h3.rs|out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());|TLV frame length field, not an identity
 modules/foundation/http/server/h3.rs|out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());|TLV frame length field, not an identity
 modules/foundation/http/server/h3.rs|out[FRAME_HDR + 5..FRAME_HDR + 13].copy_from_slice(&0u64.to_le_bytes());|mux close/reset reason code field, not an identity
@@ -70,3 +72,8 @@ modules/foundation/http/client/h3.rs|frame[1..3].copy_from_slice(&plen.to_le_byt
 modules/foundation/http/client/h3.rs|frame[FRAME_HDR + 5..].copy_from_slice(&0x10Cu64.to_le_bytes());|H3_REQUEST_CANCELLED close-reason code, not an identity
 modules/foundation/http/client/h3.rs|frame[1..3].copy_from_slice(&(plen as u16).to_le_bytes());|TLV frame length field, not an identity
 modules/foundation/http/client/h3.rs|close[1..3].copy_from_slice(&(plen as u16).to_le_bytes());|TLV frame length field, not an identity
+modules/foundation/http/server/app.rs|arg[p..p + 8].copy_from_slice(&(value.len() as u64).to_le_bytes());|storage.object PUT argument block (value length) for a staged request body — the contract ships no encoder; not an identity
+modules/foundation/http/server/app.rs|arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());|storage.object PUT argument block (fence buffer pointer) — the contract ships no encoder; not an identity
+modules/foundation/http/server/app.rs|arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());|storage.object PUT argument block (fence buffer capacity) — the contract ships no encoder; not an identity
+modules/foundation/http/server/app.rs|arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());|storage.object PUT argument block (key length) — the contract ships no encoder; not an identity
+modules/foundation/http/server/app.rs|arg[p..p + 8].copy_from_slice(&(value.as_ptr() as u64).to_le_bytes());|storage.object PUT argument block (value pointer) — the contract ships no encoder; not an identity
