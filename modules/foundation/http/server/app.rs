@@ -154,10 +154,14 @@ pub(crate) unsafe fn write_request_envelope(
     let mut refbuf = [0u8; 7 + 64];
     let staged = s.server.body_ref_prefix_len > 0 && body.len() > s.server.body_inline_max as usize;
     let body: &[u8] = if staged {
-        if !stage_body(s, body, &mut refbuf) {
-            return EmitResult::StageFailed;
+        match stage_body(s, body, &mut refbuf) {
+            Staged::Done => &refbuf[..],
+            // Taken and not yet decided. The caller holds the request where it
+            // is and emits again, which re-derives the same key from the same
+            // body \u2014 the byte-identical repeat the contract asks for.
+            Staged::Pending => return EmitResult::Full,
+            Staged::Failed => return EmitResult::StageFailed,
         }
-        &refbuf[..]
     } else {
         body
     };
@@ -205,12 +209,24 @@ pub(crate) unsafe fn write_request_envelope(
 /// How long a staged body stays before it is collected (its expiry key).
 const STAGED_TTL_MS: u64 = 300_000;
 
-const OBJ_PUT: u32 = 0x1420;
+/// What staging a body came to.
+enum Staged {
+    /// In the store, and `out` names it.
+    Done,
+    /// The store took a write and has not decided it. Nothing is lost by
+    /// asking again with the same arguments; nothing may be concluded yet.
+    Pending,
+    /// The store refused, or there is no store.
+    Failed,
+}
 
 /// Stage `body` in the store as `<prefix>sha256/<hex>` (content-addressed:
 /// the same body is the same key) with its expiry at `<prefix>at/<hex>`,
-/// and write `sha256:<hex>` into `out`. False when the store refused either.
-unsafe fn stage_body(s: &HttpState, body: &[u8], out: &mut [u8; 71]) -> bool {
+/// and write `sha256:<hex>` into `out`.
+///
+/// Both writes are idempotent in the key they choose, so a repeat after
+/// `Pending` cannot stage a second copy or a different one.
+unsafe fn stage_body(s: &HttpState, body: &[u8], out: &mut [u8; 71]) -> Staged {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = super::super::body_digest::sha256(body);
     let mut hex = [0u8; 64];
@@ -222,8 +238,9 @@ unsafe fn stage_body(s: &HttpState, body: &[u8], out: &mut [u8; 71]) -> bool {
     let sys = &*s.syscalls;
     let mut key = [0u8; 48 + 8 + 64];
     let kl = cat3(&mut key, pfx, b"sha256/", &hex);
-    if !obj_put(sys, &key[..kl], body) {
-        return false;
+    match obj_put(sys, &key[..kl], body) {
+        Staged::Done => {}
+        other => return other,
     }
     // The expiry: a store `ttl` chain collects the body after it, whether or
     // not a request ever consumed it.
@@ -232,12 +249,13 @@ unsafe fn stage_body(s: &HttpState, body: &[u8], out: &mut [u8; 71]) -> bool {
     let mut val = [0u8; 40];
     let vl = cat3(&mut val, b"{\"deadline\":", &digits[..dl], b"}");
     let kl = cat3(&mut key, pfx, b"at/", &hex);
-    if !obj_put(sys, &key[..kl], &val[..vl]) {
-        return false;
+    match obj_put(sys, &key[..kl], &val[..vl]) {
+        Staged::Done => {}
+        other => return other,
     }
     out[..7].copy_from_slice(b"sha256:");
     out[7..].copy_from_slice(&hex);
-    true
+    Staged::Done
 }
 
 /// `v` in decimal into `out`; its length.
@@ -273,10 +291,16 @@ fn cat3(dst: &mut [u8], a: &[u8], b: &[u8], c: &[u8]) -> usize {
 }
 
 /// storage.object PUT (unconditional), value by pointer.
-unsafe fn obj_put(sys: &super::super::abi::SyscallTable, key: &[u8], value: &[u8]) -> bool {
+///
+/// A write may be TAKEN rather than decided, so the return code is classified
+/// by the contract's own `write_answer` rather than compared with zero: an
+/// `EINPROGRESS` read as a refusal would fail a request whose body is on its
+/// way into the store.
+unsafe fn obj_put(sys: &super::super::abi::SyscallTable, key: &[u8], value: &[u8]) -> Staged {
+    use super::super::abi::contracts::storage::object;
     let mut arg = [0u8; 256];
     if key.len() + 32 > arg.len() {
-        return false;
+        return Staged::Failed;
     }
     let mut fence = [0u8; 62];
     let mut p = 0usize;
@@ -297,7 +321,11 @@ unsafe fn obj_put(sys: &super::super::abi::SyscallTable, key: &[u8], value: &[u8
     p += 8;
     arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
     p += 2;
-    (sys.provider_call)(-1, OBJ_PUT, arg.as_mut_ptr(), p) == 0
+    match object::write_answer((sys.provider_call)(-1, object::PUT, arg.as_mut_ptr(), p)) {
+        object::WriteAnswer::Decided(0) => Staged::Done,
+        object::WriteAnswer::Decided(_) => Staged::Failed,
+        object::WriteAnswer::Pending => Staged::Pending,
+    }
 }
 
 /// Emit the current h1 slot's request on `req_out` and start its timeout.

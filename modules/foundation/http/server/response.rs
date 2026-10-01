@@ -102,9 +102,11 @@ pub(crate) unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type
 ///
 /// Differs from every other builder here in that the STATUS is data: it arrives
 /// as a number in an `HttpResponse` envelope rather than being chosen from a
-/// fixed set of literals. It is rendered as three digits with a reason phrase
-/// omitted — RFC 9112 §4 makes the phrase optional, and inventing one for a
-/// status this module has no opinion about would be worse than leaving it out.
+/// fixed set of literals. It is rendered as three digits, the space RFC 9112
+/// §4 requires after them, and no reason phrase: the phrase is optional, and
+/// inventing one for a status this module has no opinion about would be worse
+/// than leaving it out. The space is not optional — a client parsing the
+/// status line strictly (this module's own) refuses a line without it.
 ///
 /// `extra` is the application's own header block: complete `Name: value\r\n`
 /// lines, appended verbatim. The application owns response semantics, so it
@@ -133,7 +135,7 @@ pub(crate) unsafe fn build_app_header(
         b'0' + (s3 % 10) as u8,
     ];
     off = put_bytes(dst, cap, off, &digits);
-    off = put_bytes(dst, cap, off, b"\r\nConnection: ");
+    off = put_bytes(dst, cap, off, b" \r\nConnection: ");
     off = put_bytes(
         dst,
         cap,
@@ -186,7 +188,7 @@ pub(crate) unsafe fn build_app_header_open_ended(
             b'0' + (s3 % 10) as u8,
         ],
     );
-    off = put_bytes(dst, cap, off, b"\r\nConnection: close\r\nContent-Type: ");
+    off = put_bytes(dst, cap, off, b" \r\nConnection: close\r\nContent-Type: ");
     off = put_bytes(dst, cap, off, content_type);
     off = put_bytes(dst, cap, off, b"\r\n");
     off = put_app_headers(dst, cap, off, extra);
