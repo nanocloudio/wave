@@ -37,7 +37,14 @@ SDK the modules build against, one profile per target class:
 |---|---|---|---|---|
 | aarch64 (bcm2712, Linux host) | 256 | 256 | 8192 | 4100 |
 | wasm32 | 256 | 64 | 4096 | 4100 |
-| embedded (rp2350) | 1 | 1 | 2048 | 4100 |
+| embedded (rp2350) | 4 | 4 | 2048 | 4100 |
+| embedded (rp2040) | 1 | 1 | 2048 | 4100 |
+
+The two embedded rows are one profile that reads the silicon it is
+building for: four slots cost about 24 KiB, which is a tenth of the
+RP2350's arena and over a third of the RP2040's, so the smaller die
+serves one connection — a single-page local UI rather than a browser
+opening parallel sockets.
 
 `MAX_CONCURRENT_CONNS` matches fluxor's IP-module TCP connection
 ceiling on host platforms. The slot table is the parallelism bound;
@@ -175,80 +182,82 @@ When a route's handler is `HANDLER_APP` (11), the request is handed
 to a downstream module and its answer is served back. The symmetric
 counterpart to WebSocket fan-out above: there the module owns the WS
 envelope and something else owns the protocol inside it; here it
-owns HTTP framing, connection state and bounded body handling, and
+owns HTTP framing, connection state and bounded bodies, and
 something else owns what the request means.
 
-- `req_out` (out[6], `HttpRequest`): the matched request, as
-  `[conn_id u16][stream_id u16][method u8][flags u8][path_len u16]
-  [hdr_len u16][body_len u16]` followed by the path, the raw header
-  block and the decoded body. Header fields are forwarded verbatim
-  rather than filtered — an application's API is defined in terms of
-  headers a gateway cannot know in advance. Pseudo-headers are
-  excluded on h2: `:method` is that generation's encoding of the
-  request line, not a field.
-- `resp_in` (in[6], `HttpResponse`):
-  `[conn_id u16][stream_id u16][status u16][flags u8][ct_len u8]
-  [hdr_len u16][body_len u16]` then the content type, the
-  application's own headers and the body.
+Source: `modules/foundation/http/server/app.rs`; the records are
+`modules/common/http_app.rs`.
 
-**Peer identity.** `flags` bit 1 marks a request whose connection
-completed a handshake that verified the peer. The fingerprint follows
-the body as `[svid_len u16 LE][svid]`, past every length in the fixed
-head, so a consumer that does not read the bit sees exactly what it
-saw before. The three section lengths are the envelope's ABI — every
-consumer reads path, headers and body by them — which is why the
-identity is a trailer rather than a fourth field.
+### Records
 
-It is not a synthetic header such as `X-Forwarded-Client-Cert`
-either. A header is forgeable by the client unless the server strips
-every copy of it first, and one missed strip promotes an anonymous
-caller to whoever it claims to be; a trailer sits in a structure the
-client cannot reach at all.
+Every record is `[kind u8][flags u8][origin u8][0][conn u32][stream u64]`
+then its payload. The 14 bytes after `kind` and `flags` name the exchange;
+the application treats them as opaque and echoes them.
 
-The identity belongs to the connection, not the request. It arrives
-once per handshake on `peer_identity` (in[9]) — often before the
-accept it belongs to — and is released when the connection ends,
-because connection ids are recycled and a stale entry would
-authenticate the next holder as the previous one.
+| Direction | Kind | Payload |
+|---|---|---|
+| `req_out` | HEAD | `[method u8][target_len u16][hdr_len u16][peer_len u16][resp_credit u32]` target, header lines, peer fingerprint |
+| both | BODY | body bytes; `MORE` unless it ends the body |
+| both | ABORT | `[reason u8]` |
+| both | CREDIT | `[bytes u32]` — response credit on `req_out`, request credit on `resp_in` |
+| both | DATAGRAM | `[context u64]` payload, an HTTP/3 datagram |
+| `resp_in` | HEAD | `[status u16][ct_len u8][hdr_len u16]` content type, header lines, body |
 
-`drain_responses` routes an envelope by `(conn_id, stream_id)` —
-never `conn_id` alone, because h2 multiplexes many requests over one
-connection and an application is entitled to answer them out of
-order. Under h1 `stream_id` carries a request generation instead: a
-connection released with a request still outstanding can be followed
-by a new peer holding the same recycled id, and the generation keeps
-the late answer from matching the new peer's request. Applications
-echo the field back in both cases. If the target slot's `send_buf`
-is busy, the envelope is written back to `resp_in` and retried next
-tick, the same backpressure the WS fan-out uses; unlike WS fan-out
-there is no retention, since replaying a previous response to a new
-request would answer request N with response N-1.
+`origin` is 1 for a TCP connection (h1, whose `stream` is a request
+generation, and h2, whose `stream` is the stream id) and 2 for a QUIC session
+(h3, whose `stream` is the transport's stream handle). The target is the
+request target as received, path and query; header lines are `name: value\r\n`,
+and h2 and h3 add `host` from `:authority`. Header fields are forwarded
+verbatim rather than filtered — an application's API is defined in terms of
+headers a gateway cannot know in advance — and a block past
+`MAX_FWD_HEADERS` is refused 431 rather than forwarded short.
 
-`Content-Length`, `Connection` and `Transfer-Encoding` are dropped
-from the application's header block and emitted by the module: they
-describe this connection's framing, which only the module knows. Two
-`Content-Length` values on the wire is the ambiguity RFC 9112 §6.3
-refuses on the request side.
+### Correlation
 
-**Streaming.** `flags` bit 0 (`MORE_BODY`) marks a body arriving
-across several envelopes — the only way a response can exceed
-`SEND_BUF_SIZE`, which is what serving artefacts requires. On h1 the
-first envelope's `Content-Length` header (if the application
-declared one) frames the whole transfer and keep-alive survives;
-without one the response is close-delimited. On h2 no length is
-needed at all: END_STREAM on the final DATA frame delimits it.
+`drain_responses` reads `resp_in` once per step and hands each record to the
+exchange its id names — never by connection alone, because h2 multiplexes
+many requests over one connection and an application may answer them in any
+order. Under h1 the `stream` half is a request generation: a connection
+released with an exchange open can be followed by a new peer holding the same
+recycled id, and the generation keeps a late answer from reaching it. A record
+for an exchange that is no longer open is dropped and counted
+(`app_records_stale`).
 
-**Timeout.** A request unanswered for `APP_TIMEOUT_MS` (30 s) is
-answered 504 by the module, per stream under h2, so one hung request
-does not exhaust the slot table. Mid-stream the connection is closed
-instead — a 504 appended to a body already on the wire would be read
-as content.
+### Credit
+
+One channel carries every exchange, so no exchange may be held back by
+leaving the channel unread. Each direction runs on credit instead:
+
+- request-body bytes go to the application only as far as it has granted
+  CREDIT. Until it does, bytes stay in the connection's `recv_buf` (h1) or
+  the stream's receive buffer inside its flow-control window (h2, h3), which
+  is refilled only as bytes are forwarded — so a held body closes the
+  client's window and nothing else;
+- response-body bytes are accepted from the application up to the HEAD's
+  `resp_credit` plus the CREDIT records sent back as bytes leave for the peer.
+  What the application sent ahead of the connection is held in the exchange's
+  record queue, never past its credit; a record past it is a violation, and
+  the exchange is aborted (`app_violations`).
+
+`100 Continue` is sent on the application's first request credit: credit is
+the application's consent to receive the body.
+
+### Ending
+
+An exchange ends when both directions have, or when either side sends ABORT.
+The module aborts toward the application when the peer goes, a body passes its
+route ceiling or does not parse, the application lets its progress deadline
+lapse (`APP_TIMEOUT_MS`, `HOLD_TIMEOUT_MS` for a held stream), or the server
+drains; aborts that `req_out` cannot take yet are queued, no new exchange is
+opened while one waits, and a drain is not complete until they are delivered.
+A response that ends before the request ends the exchange, and the module
+stops reading the request body.
 
 **Graph wiring.** Both edges need a non-zero `buffer_group:`, which
-puts the channel in mailbox mode so one write is one whole envelope.
+puts the channel in mailbox mode so one write is one whole record.
 The default is a byte-streaming FIFO, which fragments structured
 records — so omitting the group does not fail loudly, it delivers
-half an envelope.
+half a record.
 
 ```yaml
 - from: http.req_out

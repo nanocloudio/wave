@@ -71,6 +71,7 @@ pub const ERR_FLOW_CONTROL_ERROR: u32 = 0x3;
 pub const ERR_FRAME_SIZE_ERROR: u32 = 0x6;
 pub const ERR_STREAM_CLOSED: u32 = 0x5;
 pub const ERR_REFUSED_STREAM: u32 = 0x7;
+pub const ERR_CANCEL: u32 = 0x8;
 pub const ERR_COMPRESSION_ERROR: u32 = 0x9;
 pub const ERR_ENHANCE_YOUR_CALM: u32 = 0xB;
 

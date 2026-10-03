@@ -40,5 +40,8 @@ front door. This page indexes the doc set.
 - [reference/protocol-surfaces.md](reference/protocol-surfaces.md) —
   the fluxor content surfaces Wave consumes, and which module
   declares which.
+- [reference/storage-object-naming.md](reference/storage-object-naming.md) —
+  how an S3 bucket and key name a `storage.object` object, the scopes a
+  capability over them names, and where multipart uploads are staged.
 - [../modules/common/README.md](../modules/common/README.md) — the
   shared I/O-free codec cores and which modules mount them.

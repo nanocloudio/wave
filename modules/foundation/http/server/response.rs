@@ -51,6 +51,33 @@ pub(crate) unsafe fn put_u32_decimal(
     off
 }
 
+/// Append a decimal u64 at `off` in `dst`, returning the new offset.
+pub(crate) unsafe fn put_u64_decimal(
+    dst: *mut u8,
+    dst_cap: usize,
+    mut off: usize,
+    mut v: u64,
+) -> usize {
+    let mut digits = [0u8; 20];
+    let mut n = 0usize;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        if off < dst_cap {
+            *dst.add(off) = digits[n];
+            off += 1;
+        }
+    }
+    off
+}
+
 pub(crate) unsafe fn put_bytes(dst: *mut u8, dst_cap: usize, mut off: usize, src: &[u8]) -> usize {
     let mut k = 0usize;
     while k < src.len() && off < dst_cap {
@@ -101,7 +128,7 @@ pub(crate) unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type
 /// Stage the head for an application-supplied response (`HANDLER_APP`).
 ///
 /// Differs from every other builder here in that the STATUS is data: it arrives
-/// as a number in an `HttpResponse` envelope rather than being chosen from a
+/// as a number in a response HEAD record rather than being chosen from a
 /// fixed set of literals. It is rendered as three digits, the space RFC 9112
 /// §4 requires after them, and no reason phrase: the phrase is optional, and
 /// inventing one for a status this module has no opinion about would be worse
@@ -113,16 +140,27 @@ pub(crate) unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type
 /// owns `Location`, `WWW-Authenticate`, `Docker-Content-Digest` and anything
 /// else its API defines. The four headers `is_framing_header` names are NOT the
 /// application's to set — they describe this connection's framing and content,
-/// which this module emits from the envelope's own fields — so any copies in
+/// which this module emits from the record's own fields — so any copies in
 /// `extra` are dropped rather than duplicated onto the wire.
+///
+/// `content_length` is the framing the peer reads the body by; `None` makes
+/// the response close-delimited, and clears keep-alive. False when the head
+/// does not fit `send_buf`: nothing is staged, and the caller answers for it.
 pub(crate) unsafe fn build_app_header(
     s: &mut HttpState,
     status: u16,
     content_type: &[u8],
-    content_length: u32,
+    content_length: Option<u64>,
     extra: &[u8],
-) {
-    let keepalive = cur_slot(s).map(|c| c.keepalive != 0).unwrap_or(false);
+) -> bool {
+    let keepalive =
+        content_length.is_some() && cur_slot(s).map(|c| c.keepalive != 0).unwrap_or(false);
+    if content_length.is_none() {
+        // Close-delimited: the body's end is the connection's end.
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.keepalive = 0;
+        }
+    }
     let dst = cur_send_buf_mut_ptr(s);
     let cap = SEND_BUF_SIZE;
     let mut off = 0usize;
@@ -144,59 +182,30 @@ pub(crate) unsafe fn build_app_header(
     );
     off = put_bytes(dst, cap, off, b"\r\nContent-Type: ");
     off = put_bytes(dst, cap, off, content_type);
-    off = put_bytes(dst, cap, off, b"\r\nContent-Length: ");
-    off = put_u32_decimal(dst, cap, off, content_length);
+    if let Some(n) = content_length {
+        off = put_bytes(dst, cap, off, b"\r\nContent-Length: ");
+        off = put_u64_decimal(dst, cap, off, n);
+    }
     off = put_bytes(dst, cap, off, b"\r\n");
 
     // Application headers, line by line, skipping any that would contradict
     // the framing headers above.
     off = put_app_headers(dst, cap, off, extra);
-
     off = put_bytes(dst, cap, off, b"\r\n");
+    // A head that reached the end of the buffer was cut somewhere; one cut
+    // head is a different response, so it is refused whole.
+    if off >= cap {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_offset = 0;
+            cur.send_len = 0;
+        }
+        return false;
+    }
     if let Some(cur) = cur_slot_mut(s) {
         cur.send_offset = 0;
         cur.send_len = off as u16;
     }
-}
-
-/// Stage an application response head with NO `Content-Length` — the body's
-/// end is the connection's end.
-///
-/// Used when an application streams a body across several envelopes without
-/// declaring a total. Like `build_header`, it is close-delimited and therefore
-/// clears keep-alive; the caller does that before calling, because it must also
-/// be reflected in the `Connection:` header written here.
-pub(crate) unsafe fn build_app_header_open_ended(
-    s: &mut HttpState,
-    status: u16,
-    content_type: &[u8],
-    extra: &[u8],
-) {
-    let dst = cur_send_buf_mut_ptr(s);
-    let cap = SEND_BUF_SIZE;
-    let mut off = 0usize;
-
-    off = put_bytes(dst, cap, off, b"HTTP/1.1 ");
-    let s3 = status.min(999);
-    off = put_bytes(
-        dst,
-        cap,
-        off,
-        &[
-            b'0' + (s3 / 100) as u8,
-            b'0' + ((s3 / 10) % 10) as u8,
-            b'0' + (s3 % 10) as u8,
-        ],
-    );
-    off = put_bytes(dst, cap, off, b" \r\nConnection: close\r\nContent-Type: ");
-    off = put_bytes(dst, cap, off, content_type);
-    off = put_bytes(dst, cap, off, b"\r\n");
-    off = put_app_headers(dst, cap, off, extra);
-    off = put_bytes(dst, cap, off, b"\r\n");
-    if let Some(cur) = cur_slot_mut(s) {
-        cur.send_offset = 0;
-        cur.send_len = off as u16;
-    }
+    true
 }
 
 /// Append an application's header block line by line, dropping any line that

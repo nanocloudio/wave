@@ -1,0 +1,47 @@
+version          = "0.1.0"
+hardware_targets = ["bcm2712"]
+timer_class      = "wall_clock"
+
+# An S3 server behind `http`'s application routes. `request_in` takes the
+# `http_app` records `http` writes on `req_out`; `response_out` answers them on
+# `resp_in`. Both edges need a non-zero `buffer_group`, which makes each write
+# one whole record.
+#
+# Objects are stored through any `storage.object` provider, under the grant the
+# provider answered for each access key's capability. The credentials file is
+# read through `fs`.
+[[ports]]
+name         = "request_in"
+direction    = "input"
+content_type = "HttpRequest"
+max_record   = 8192
+buffer_size  = 65536
+
+[[ports]]
+name         = "response_out"
+direction    = "output"
+content_type = "HttpResponse"
+max_record   = 8192
+buffer_size  = 65536
+
+[[resources]]
+requires_contract = "channel"
+access            = "read"
+
+[[resources]]
+requires_contract = "storage.object"
+access            = "write"
+
+[[resources]]
+requires_contract = "fs"
+access            = "read"
+
+[observability]
+# id 0 = bytes_in: request-body bytes received from `http`.
+# id 1 = bytes_out: response record bytes written to `http`.
+# id 2 = requests: exchanges opened.
+# id 3 = errors: exchanges answered with an S3 error.
+# id 4 = aborts: exchanges ended after their response had begun.
+# id 5 = refused: exchanges refused `503 SlowDown` because every place was
+#        taken — the in-flight ceiling, not a provider fault.
+metrics = ["bytes_in", "bytes_out", "requests", "errors", "aborts", "refused"]

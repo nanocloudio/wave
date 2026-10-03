@@ -101,9 +101,13 @@ pub(crate) const HUFF_SCRATCH: usize = 256;
 /// name is: a bearer credential is a JWT of 800–1500 bytes, and Go's and
 /// curl's HPACK encoders Huffman-code it, so a scratch buffer sized for names
 /// would drop the `authorization` header of any request carrying a real
-/// token — silently, as any undecodable entry is dropped. This is as long as
-/// the whole forwarded header block instead (the server's `MAX_FWD_HEADERS`,
-/// 2 KiB), since a value longer than that could not be forwarded anyway.
+/// token — silently, as any undecodable entry is dropped.
+///
+/// 2 KiB is the decode budget, not the forwarding one: this is a stack array
+/// in the literal-header path, which an rp2040 pays for on every request,
+/// while the server's `MAX_FWD_HEADERS` bounds a whole block it holds in
+/// state. A single value longer than this is dropped even though the block
+/// could carry it.
 pub(crate) const HUFF_VALUE_SCRATCH: usize = 2048;
 
 /// Decode an HPACK Huffman string `src` into `out`, returning the number of

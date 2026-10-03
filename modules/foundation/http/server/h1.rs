@@ -48,12 +48,10 @@ use super::response::{
     build_error, build_error_416, build_header, build_header_fs_full, build_header_fs_partial,
     build_header_with_len, put_bytes, put_ipv4_decimal, put_u32_decimal,
 };
-#[cfg(feature = "app")]
-use super::routes::HANDLER_APP;
 use super::routes::{
-    content_type_from_path, match_route, Route, HANDLER_FILE, HANDLER_FS_FILE, HANDLER_FS_LIST,
-    HANDLER_GRPC, HANDLER_PROXY, HANDLER_STATIC, HANDLER_STREAM, HANDLER_TEMPLATE,
-    HANDLER_WEBSOCKET, HANDLER_WEBSOCKET_ADMIT, HANDLER_WEBSOCKET_FANOUT,
+    content_type_from_path, match_route, match_route_path, Route, HANDLER_APP, HANDLER_FILE,
+    HANDLER_FS_FILE, HANDLER_FS_LIST, HANDLER_GRPC, HANDLER_PROXY, HANDLER_STATIC, HANDLER_STREAM,
+    HANDLER_TEMPLATE, HANDLER_WEBSOCKET, HANDLER_WEBSOCKET_ADMIT, HANDLER_WEBSOCKET_FANOUT,
     HANDLER_WEBSOCKET_SESSION,
 };
 use super::ws::{
@@ -94,7 +92,7 @@ use super::{cur_h2_mut, ensure_h2_state};
 /// no body, and is followed by the real status line on the same connection
 /// (RFC 9110 §15.2). So it is written straight into `send_buf` rather than
 /// through `build_header*`, none of which can express "more to follow".
-unsafe fn stage_interim_continue(s: &mut HttpState) {
+pub(crate) unsafe fn stage_interim_continue(s: &mut HttpState) {
     const INTERIM: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
     let dst = cur_send_buf_mut_ptr(s);
     if dst.is_null() {
@@ -109,17 +107,27 @@ unsafe fn stage_interim_continue(s: &mut HttpState) {
     }
 }
 
+/// Arm the body reader to read and drop the current request's body within
+/// `limit`, staging `100 Continue` when the client is waiting for one, and
+/// return to dispatch once it is consumed.
+unsafe fn begin_discard(s: &mut HttpState, limit: u64) -> i32 {
+    let (decoder, continue_first) = match cur_slot(s) {
+        Some(c) => (c.body_decoder, c.body_continue_wanted != 0),
+        None => return 0,
+    };
+    reqbody::arm(s, decoder, limit);
+    if continue_first {
+        stage_interim_continue(s);
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.body_continue_wanted = 0;
+        cur.phase = Phase::RecvBody;
+    }
+    2
+}
+
 pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
     drain_variables(s);
-
-    // Application responses are drained once per step, before any slot runs.
-    // Deliberately NOT per-slot: `resp_in` is one channel feeding every
-    // connection in `Phase::AwaitApp`, so a per-slot read would let whichever
-    // slot stepped first consume an envelope addressed to a different one.
-    // `drain_responses` routes by `(conn_id, stream_id)` and composes onto the
-    // slot that asked, whichever slot happens to be current.
-    #[cfg(feature = "app")]
-    app::drain_responses(s);
 
     // Background-drain inbound network messages during phases that
     // don't already poll `net_in_chan` themselves. Without this the
@@ -475,17 +483,19 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         // malformed, it asks for something unsupported (RFC
                         // 9110 §9.1). The parser reports the distinction by
                         // returning METHOD_NONE with the path intact.
-                        Some((verb, _)) if verb == wire::method::METHOD_NONE => {
+                        Some(line) if line.method == wire::method::METHOD_NONE => {
                             build_error(s, b"501 Not Implemented", b"Not Implemented\n");
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::DrainSend;
                             }
                             return 0;
                         }
-                        Some((verb, n)) => {
+                        Some(line) => {
                             if let Some(cur) = cur_slot_mut(s) {
-                                cur.req_method = verb;
-                                cur.req_path_len = n as u16;
+                                cur.req_method = line.method;
+                                cur.req_path_len = line.target_len.min(MAX_PATH) as u16;
+                                cur.req_target_at = line.target_at as u16;
+                                cur.req_target_len = line.target_len as u16;
                                 cur.recv_parsed = 1;
                             }
                         }
@@ -556,17 +566,15 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     } else {
                         None
                     };
-                    // Decide the body BEFORE dispatch, because the answer can
-                    // be the whole response: contradictory framing is 400, an
-                    // over-cap length is 413, and a body-bearing method with no
-                    // framing at all is 411. Each of those is a refusal that
-                    // must happen without ever routing the request.
+                    // Decide what the head says about the body BEFORE dispatch,
+                    // because the answer can be the whole response:
+                    // contradictory framing is 400 and a body-bearing method
+                    // with no framing at all is 411, each refused without ever
+                    // routing the request. Whether the body FITS is the matched
+                    // route's question, asked at dispatch.
                     let plan = reqbody::plan_body(s, head);
                     let refusal: Option<(&[u8], &[u8])> = match plan {
                         reqbody::BodyPlan::Invalid => Some((b"400 Bad Request", b"Bad Request\n")),
-                        reqbody::BodyPlan::TooLarge => {
-                            Some((b"413 Content Too Large", b"Content Too Large\n"))
-                        }
                         reqbody::BodyPlan::LengthRequired => {
                             Some((b"411 Length Required", b"Length Required\n"))
                         }
@@ -576,33 +584,39 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         build_error(s, status, body);
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.header_end_off = head_len as u16;
+                            cur.keepalive = 0;
                             cur.phase = Phase::DrainSend;
                         }
                         return 0;
                     }
-                    // The head STAYS in `recv_buf`, and the body reader
-                    // consumes from `header_end_off` onward. Shifting the head
-                    // away would be simpler arithmetic and would destroy the
-                    // one copy of the request headers there is — which
-                    // `HANDLER_APP` forwards verbatim to the application, since
-                    // a gateway cannot know which of them the application's API
-                    // is defined in terms of.
-                    let body_follows = matches!(plan, reqbody::BodyPlan::Read { .. });
-                    let wants_continue = matches!(
-                        plan,
-                        reqbody::BodyPlan::Read {
-                            continue_first: true
+                    // The head STAYS in `recv_buf` and the body is read from
+                    // `header_end_off` onward: the head is the request's only
+                    // copy of its headers, which `HANDLER_APP` forwards and the
+                    // proxy relays verbatim.
+                    if let Some(cur) = cur_slot_mut(s) {
+                        match plan {
+                            reqbody::BodyPlan::Read {
+                                decoder,
+                                declared,
+                                continue_first,
+                            } => {
+                                cur.body_decoder = decoder;
+                                cur.body_pending = 1;
+                                cur.body_declared = declared.unwrap_or(u64::MAX);
+                                cur.body_continue_wanted = continue_first as u8;
+                            }
+                            _ => {
+                                cur.body_pending = 0;
+                                cur.body_declared = 0;
+                                cur.body_continue_wanted = 0;
+                            }
                         }
-                    );
+                    }
 
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.keepalive = if keepalive { 1 } else { 0 };
                         cur.header_end_off = head_len as u16;
-                        cur.phase = if body_follows {
-                            Phase::RecvBody
-                        } else {
-                            Phase::DispatchRoute
-                        };
+                        cur.phase = Phase::DispatchRoute;
                         let flags = match header_ctx {
                             Some((tid, pid, flags)) => {
                                 cur.span_trace_id = tid;
@@ -629,14 +643,6 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         // and no RNG.
                         cur.span_start_us = span_now;
                     }
-                    // `Expect: 100-continue` — stage the interim response now.
-                    // The client is WAITING for it and will not send the body
-                    // until it arrives, so deferring this to the body reader
-                    // would deadlock: the reader waits for bytes the client is
-                    // withholding pending a response the reader has not sent.
-                    if wants_continue {
-                        stage_interim_continue(s);
-                    }
                     return 2;
                 } else if cur_recv_len(s) as usize >= RECV_BUF_SIZE {
                     let l = cur_recv_len(s) as usize;
@@ -655,7 +661,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
 
         Phase::RecvBody => {
             // A staged `100 Continue` must reach the wire before the body is
-            // read — see `stage_interim_continue`.
+            // read — the client is withholding it until then.
             if cur_slot(s).map(|c| c.body_continue).unwrap_or(0) != 0 {
                 let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
                 if remaining > 0 {
@@ -680,17 +686,20 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
             }
 
-            match reqbody::step_recv_body(s) {
+            // The matched route answers without the body; it is read and
+            // dropped within the route's ceiling, so the next request on the
+            // connection begins where this one ends.
+            match reqbody::discard(s) {
                 reqbody::BodyStep::Done => {
                     if let Some(cur) = cur_slot_mut(s) {
+                        cur.body_pending = 0;
                         cur.phase = Phase::DispatchRoute;
                     }
                     return 2;
                 }
-                reqbody::BodyStep::NeedMore => {
+                reqbody::BodyStep::Progress | reqbody::BodyStep::Wait => {
                     // The peer hung up mid-body. The request will never be
-                    // complete, so there is nothing to answer — close rather
-                    // than dispatch a truncated body as if it were whole.
+                    // complete, so there is nothing to answer.
                     if cur_slot(s).map(|c| c.peer_closed).unwrap_or(0) != 0 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::CloseConn;
@@ -711,6 +720,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // Close rather than keep-alive: the rest of the body is
                     // still arriving and this server has stopped reading it,
                     // so there is no way to find the next request boundary.
+                    s.server.bodies_refused = s.server.bodies_refused.wrapping_add(1);
                     build_error(s, b"413 Content Too Large", b"Content Too Large\n");
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.keepalive = 0;
@@ -722,7 +732,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
         }
 
         #[cfg(not(feature = "app"))]
-        Phase::AwaitApp => {
+        Phase::AppExchange => {
             // Unreachable without the feature (nothing dispatches HANDLER_APP),
             // but the variant is kept so phase numbering stays identical across
             // builds. Fail closed, as H2Active does.
@@ -732,52 +742,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             return 0;
         }
         #[cfg(feature = "app")]
-        Phase::AwaitApp => {
-            // Responses are drained centrally (`app::drain_responses`, once per
-            // step) rather than polled per slot: one channel feeds every
-            // waiting connection, and a per-slot read would let whichever slot
-            // stepped first consume an envelope addressed to another.
-            //
-            // So this arm only handles the case the drain cannot: nothing came
-            // back in time.
-            if let Some(idx) = current_slot_index(s) {
-                if app::app_deadline_passed(s, idx) {
-                    s.server.app_timeouts = s.server.app_timeouts.wrapping_add(1);
-                    // Mid-stream, the response head and part of its body are
-                    // already on the wire. A 504 here would append a second
-                    // status line INSIDE the first response's body, which the
-                    // client would read as content. Closing is the only honest
-                    // signal left: it surfaces as the truncated transfer it is.
-                    let streaming = cur_slot(s).map(|c| c.app_streaming != 0).unwrap_or(false);
-                    if let Some(cur) = cur_slot_mut(s) {
-                        cur.app_pending = 0;
-                        cur.app_streaming = 0;
-                        cur.app_deadline_ms = 0;
-                        cur.keepalive = 0;
-                    }
-                    if streaming {
-                        if let Some(cur) = cur_slot_mut(s) {
-                            cur.phase = Phase::CloseConn;
-                        }
-                        return 2;
-                    }
-                    build_error(s, b"504 Gateway Timeout", b"Gateway Timeout\n");
-                    if let Some(cur) = cur_slot_mut(s) {
-                        cur.phase = Phase::DrainSend;
-                    }
-                    return 0;
-                }
-            }
-            // Peer hung up while the application was still thinking: nothing
-            // to deliver the answer to.
-            if cur_slot(s).map(|c| c.peer_closed).unwrap_or(0) != 0 {
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.app_pending = 0;
-                    cur.phase = Phase::CloseConn;
-                }
-                return 2;
-            }
-            return 0;
+        Phase::AppExchange => {
+            return app::h1_step(s);
         }
 
         Phase::DispatchRoute => {
@@ -832,13 +798,37 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 return 0;
             }
 
-            let ri = match_route(s);
+            // Matched against the full request target where it sits in the
+            // head, so a path longer than `req_path` routes as itself rather
+            // than as its first `MAX_PATH` bytes.
+            let (target_at, target_len) = cur_slot(s)
+                .map(|c| (c.req_target_at as usize, c.req_target_len as usize))
+                .unwrap_or((0, 0));
+            let ri = match_route_path(s, cur_recv_buf_ptr(s).add(target_at), target_len);
+            let (body_pending, body_declared) = cur_slot(s)
+                .map(|c| (c.body_pending != 0, c.body_declared))
+                .unwrap_or((false, 0));
+            let limit = reqbody::route_limit(s, ri);
+            // A declared length past the ceiling is refused before a byte of
+            // the body is read, and before `100 Continue` invites it.
+            if body_pending && body_declared != u64::MAX && body_declared > limit {
+                s.server.bodies_refused = s.server.bodies_refused.wrapping_add(1);
+                build_error(s, b"413 Content Too Large", b"Content Too Large\n");
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.keepalive = 0;
+                    cur.phase = Phase::DrainSend;
+                }
+                return 0;
+            }
             if ri < 0 {
                 // No static route — consult the dynamic-route proxy
                 // table, consulted after the static arena. An empty table
                 // falls through to the fixed 404 surface.
                 if try_begin_dyn_proxy(s) {
                     return 2;
+                }
+                if body_pending {
+                    return begin_discard(s, limit);
                 }
                 build_error(s, b"404 Not Found", b"Not Found\n");
                 if let Some(cur) = cur_slot_mut(s) {
@@ -852,6 +842,22 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let route = &*s.server.routes.as_ptr().add(ri as usize);
             let handler = route.handler;
             let src_idx = route.source_index;
+            // An application takes the request as an exchange and a proxy
+            // relays the body as framed; every other handler answers without
+            // it, so it is read and dropped first.
+            if body_pending && handler != HANDLER_APP && handler != HANDLER_PROXY {
+                return begin_discard(s, limit);
+            }
+            // Only an application route sees the target past `req_path`;
+            // every other handler reads `req_path`, and serving a clipped path
+            // would answer for a different resource.
+            if handler != HANDLER_APP && target_len > MAX_PATH {
+                build_error(s, b"414 URI Too Long", b"URI Too Long\n");
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::DrainSend;
+                }
+                return 0;
+            }
 
             match handler {
                 HANDLER_STATIC | HANDLER_TEMPLATE => {
@@ -1159,64 +1165,53 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
                 #[cfg(feature = "app")]
                 HANDLER_APP => {
-                    // Hand the whole request to the application module. The
-                    // head is still in `recv_buf` — the body reader consumed
-                    // only what followed it — so the headers can be forwarded
-                    // verbatim.
+                    // The head is still in `recv_buf`: the target and header
+                    // block are forwarded from it as they arrived.
                     let head_len = cur_slot(s).map(|c| c.header_end_off as usize).unwrap_or(0);
-                    let head = core::slice::from_raw_parts(cur_recv_buf_ptr(s), head_len);
-                    match app::emit_request(s, head) {
-                        app::EmitResult::Sent => {
-                            if let Some(cur) = cur_slot_mut(s) {
-                                cur.app_pending = 1;
-                                // `app_stream_id` is the request generation and
-                                // was stamped by `emit_request`; setting it here
-                                // would erase the discriminator.
-
-                                cur.phase = Phase::AwaitApp;
+                    let recv = cur_recv_buf_ptr(s);
+                    let head = core::slice::from_raw_parts(recv, head_len);
+                    let target = core::slice::from_raw_parts(recv.add(target_at), target_len);
+                    let headers = wire::h1::header_block(head);
+                    let continue_first = cur_slot(s)
+                        .map(|c| c.body_continue_wanted != 0)
+                        .unwrap_or(false);
+                    match app::h1_begin(s, target, headers, body_pending, continue_first) {
+                        app::Emit::Sent => {
+                            if body_pending {
+                                if let Some(decoder) = cur_slot(s).map(|c| c.body_decoder) {
+                                    reqbody::arm(s, decoder, limit);
+                                }
                             }
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.phase = Phase::AppExchange;
+                            }
+                            return 2;
                         }
                         // The ring is momentarily full. Stay in DispatchRoute
                         // and retry — the application is alive, just behind.
-                        app::EmitResult::Full => return 0,
-                        // Both remaining cases are configuration errors that no
-                        // retry will fix: a route declaring HANDLER_APP with
-                        // nothing wired to `req_out`, or a `max_body_kib`
-                        // larger than the ring that must carry it. 503 names
-                        // the server as the broken party, which is accurate.
-                        app::EmitResult::Unwired => {
+                        app::Emit::Full => return 0,
+                        app::Emit::Unwired => {
                             build_error(
                                 s,
                                 b"503 Service Unavailable",
                                 b"No application wired to req_out\n",
                             );
-                            if let Some(cur) = cur_slot_mut(s) {
-                                cur.phase = Phase::DrainSend;
-                            }
-                            return 0;
                         }
-                        app::EmitResult::StageFailed => {
+                        app::Emit::TooLarge => {
                             build_error(
                                 s,
-                                b"503 Service Unavailable",
-                                b"Request body could not be staged\n",
+                                b"431 Request Header Fields Too Large",
+                                b"Request Header Fields Too Large\n",
                             );
-                            if let Some(cur) = cur_slot_mut(s) {
-                                cur.phase = Phase::DrainSend;
-                            }
-                        }
-                        app::EmitResult::TooLarge => {
-                            build_error(
-                                s,
-                                b"503 Service Unavailable",
-                                b"Request exceeds the req_out ring\n",
-                            );
-                            if let Some(cur) = cur_slot_mut(s) {
-                                cur.phase = Phase::DrainSend;
-                            }
-                            return 0;
                         }
                     }
+                    if let Some(cur) = cur_slot_mut(s) {
+                        if body_pending {
+                            cur.keepalive = 0;
+                        }
+                        cur.phase = Phase::DrainSend;
+                    }
+                    return 0;
                 }
                 HANDLER_FS_LIST => {
                     // Dual-mode: when the request path exactly matches
@@ -2070,21 +2065,6 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
-                // A streamed application response is not finished when this
-                // chunk drains — more envelopes are coming for the same
-                // request. Returning to AwaitApp rather than finishing is what
-                // lets a body exceed `send_buf`, which is the difference
-                // between serving an API and serving artefacts.
-                if cfg!(feature = "app")
-                    && cur_slot(s).map(|c| c.app_streaming != 0).unwrap_or(false)
-                {
-                    if let Some(cur) = cur_slot_mut(s) {
-                        cur.send_len = 0;
-                        cur.send_offset = 0;
-                        cur.phase = Phase::AwaitApp;
-                    }
-                    return 2;
-                }
                 finish_response(s);
                 return 0;
             }

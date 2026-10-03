@@ -1,17 +1,19 @@
 //! Echo application for `foundation/http`'s `HANDLER_APP` fan-out.
 //!
 //! A conformance fixture, not a product module — see `manifest.toml` for why it
-//! sits in `modules/fixtures/`. It reads one `HttpRequest` envelope, and writes
-//! back an `HttpResponse` whose body reflects what it was handed:
+//! sits in `modules/fixtures/`. It answers each exchange with a body that
+//! reflects what it was handed:
 //!
 //! ```text
-//! method=PUT path=/v2/blobs body=hello world
+//! method=PUT path=/v2/blobs body=hello world bytes=11
 //! ```
 //!
 //! That shape is chosen so a shell assertion can read it. An E2E that only
 //! checked for HTTP 200 would pass against a gateway that answered by itself
 //! and never consulted an application at all; echoing the method, the path and
-//! the body proves each of the three crossed the port pair intact.
+//! the body proves each of the three crossed the port pair intact. `body=`
+//! carries the body's first `ECHO_MAX` bytes and `bytes=` its whole length, so
+//! a body of any size streamed across many records is accounted for.
 //!
 //! Two behaviours exist for the sake of the tests that need them, both keyed
 //! off the request path rather than configuration, so one graph exercises all
@@ -19,9 +21,9 @@
 //!
 //!   * `/status/NNN` answers with status NNN — the gateway must forward an
 //!     application's status verbatim, including ones it would never choose.
-//!   * `/stream` answers across several envelopes with `MORE_BODY` set, which
-//!     is the only way a body larger than the connection's send buffer reaches
-//!     the wire.
+//!   * `/stream` answers across several records with `MORE` set, paced by the
+//!     response credit the gateway grants, which is the only way a body larger
+//!     than the connection's send buffer reaches the wire.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 // PIC library code must not panic; surface errors through the ABI.
@@ -41,10 +43,12 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-const BUF_BYTES: usize = abi::CHANNEL_BUFFER_SIZE;
-const REQ_HDR: usize = 12;
-const RESP_HDR: usize = 12;
-const FLAG_MORE_BODY: u8 = 0x01;
+#[path = "../../common/http_app.rs"]
+mod http_app;
+use http_app::{
+    app_flag, app_parse_request, app_write_body, app_write_credit, app_write_response_head, AppId,
+    AppRecord, AppResponseHead, APP_RECORD_MAX,
+};
 
 /// `module_step` return code for "did work, step me again".
 ///
@@ -54,25 +58,77 @@ const FLAG_MORE_BODY: u8 = 0x01;
 /// serves many requests reports `Burst`.
 const STEP_DID_WORK: i32 = 2;
 
+/// Exchanges answered at once. The gateway may open many; one past this waits
+/// in the channel until an answer frees a place.
+const EXCHANGES: usize = 4;
+
+/// Body bytes echoed back; the rest are counted.
+const ECHO_MAX: usize = 1024;
+
+/// Longest path echoed back.
+const PATH_MAX: usize = 256;
+
+/// Request-body credit granted at once: everything the request will send.
+/// The fixture consumes as it reads, so it has no reason to hold a body back.
+const BODY_CREDIT: u32 = 1 << 30;
+
 /// Chunks emitted for `/stream`, and the size of each. 4 x 2 KiB exceeds the
 /// http module's `SEND_BUF_SIZE` on every target, which is the point: a
-/// single-envelope response could not carry it.
-const STREAM_CHUNKS: usize = 4;
+/// single-record response could not carry it.
+const STREAM_CHUNKS: u8 = 4;
 const STREAM_CHUNK_BYTES: usize = 2048;
+
+#[derive(Clone, Copy)]
+struct Exchange {
+    used: bool,
+    id: AppId,
+    method: u8,
+    path: [u8; PATH_MAX],
+    path_len: usize,
+    body: [u8; ECHO_MAX],
+    body_len: usize,
+    total: u64,
+    req_done: bool,
+    /// Response-body bytes the gateway still accepts.
+    resp_credit: u32,
+    /// The body credit grant still owes its way to the gateway.
+    credit_owed: bool,
+    /// `/stream` chunks sent; `STREAM_CHUNKS` once the response is whole.
+    stream_sent: u8,
+    streaming: bool,
+}
+
+const IDLE: Exchange = Exchange {
+    used: false,
+    id: AppId {
+        origin: 0,
+        conn: 0,
+        stream: 0,
+    },
+    method: 0,
+    path: [0; PATH_MAX],
+    path_len: 0,
+    body: [0; ECHO_MAX],
+    body_len: 0,
+    total: 0,
+    req_done: false,
+    resp_credit: 0,
+    credit_owed: false,
+    stream_sent: 0,
+    streaming: false,
+};
 
 #[repr(C)]
 struct State {
     syscalls: *const SyscallTable,
     request_in: i32,
     response_out: i32,
-    /// Connection and stream of a `/stream` response still being emitted.
-    stream_conn: u16,
-    stream_id: u16,
-    /// Chunks already emitted for it; `0` when no stream is in flight.
-    stream_sent: u8,
-    stream_active: u8,
-    buf: [u8; BUF_BYTES],
-    out: [u8; BUF_BYTES],
+    /// A record read from `request_in` and not yet taken — no place was free.
+    held: bool,
+    held_len: usize,
+    ex: [Exchange; EXCHANGES],
+    buf: [u8; APP_RECORD_MAX],
+    out: [u8; APP_RECORD_MAX],
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -113,8 +169,8 @@ pub extern "C" fn module_new(
     s.request_in = unsafe { dev_channel_port(sys_ref, 0, 0) };
     // SAFETY: as above.
     s.response_out = unsafe { dev_channel_port(sys_ref, 1, 0) };
-    s.stream_active = 0;
-    s.stream_sent = 0;
+    s.held = false;
+    s.ex = [IDLE; EXCHANGES];
     0
 }
 
@@ -127,189 +183,245 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: the kernel passes the same `state` buffer it validated in
     // `module_new`, and this module is stepped single-threaded.
     let s = unsafe { &mut *(state as *mut State) };
-    if s.syscalls.is_null() {
-        return -1;
+    if s.syscalls.is_null() || s.request_in < 0 || s.response_out < 0 {
+        return 0;
     }
     // SAFETY: set from a non-null pointer in `module_new`.
     let sys = unsafe { &*s.syscalls };
+    let mut worked = false;
 
-    // A `/stream` response in flight takes priority: its chunks must reach the
-    // gateway in order and before any later request is answered, because the
-    // gateway correlates them by position within the stream, not by index.
-    if s.stream_active != 0 {
-        return emit_stream_chunk(s, sys);
+    // Owed writes first: credit grants and answers, each retried until the
+    // gateway's channel takes it.
+    for i in 0..EXCHANGES {
+        worked |= s.advance(sys, i);
     }
 
-    if s.request_in < 0 || s.response_out < 0 {
-        return 0;
+    // Then one record in. Poll before reading: the poll is what registers
+    // this module's interest in `request_in`, and a module that reads blind is
+    // never woken again once parked.
+    if !s.held {
+        // SAFETY: a syscall-table call on a channel this module owns.
+        let ready = unsafe { (sys.channel_poll)(s.request_in, POLL_IN) };
+        if ready > 0 && (ready as u32 & POLL_IN) != 0 {
+            // SAFETY: `buf` is a fixed array in module state and the read is
+            // bounded by its length; the channel is a mailbox, so one read is
+            // one whole record.
+            let n = unsafe { (sys.channel_read)(s.request_in, s.buf.as_mut_ptr(), APP_RECORD_MAX) };
+            if n > 0 {
+                s.held = true;
+                s.held_len = n as usize;
+            }
+        }
     }
-    // Poll before reading. Not an optimisation: the scheduler parks a module
-    // that reports idle and wakes it on channel activity, and the poll is what
-    // registers this module's interest in `request_in`. A module that reads
-    // blind is never woken again once parked.
-    let ready = unsafe { (sys.channel_poll)(s.request_in, POLL_IN) };
-    if ready <= 0 || (ready as u32 & POLL_IN) == 0 {
-        return 0;
+    if s.held && s.take(sys) {
+        s.held = false;
+        worked = true;
     }
-    // SAFETY: `buf` is a fixed array in module state; the read is bounded by
-    // its length and the channel is a mailbox, so a short read cannot split an
-    // envelope.
-    let n = unsafe { (sys.channel_read)(s.request_in, s.buf.as_mut_ptr(), BUF_BYTES) };
-    if n < REQ_HDR as i32 {
-        return 0;
-    }
-    let n = n as usize;
-
-    let conn_id = u16::from_le_bytes([s.buf[0], s.buf[1]]);
-    let stream_id = u16::from_le_bytes([s.buf[2], s.buf[3]]);
-    let method = s.buf[4];
-    let path_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([s.buf[8], s.buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([s.buf[10], s.buf[11]]) as usize;
-    if REQ_HDR + path_len + hdr_len + body_len > n {
-        // The envelope claims more than it carries. Dropping it leaves the
-        // gateway to time the request out, which is the honest outcome for a
-        // malformed contract — answering anyway would hide the break.
-        return 0;
-    }
-    let path_at = REQ_HDR;
-    let body_at = REQ_HDR + path_len + hdr_len;
-
-    // `/stream`: begin a multi-envelope response. Matched ANYWHERE in the
-    // path, not as a prefix: the route this fixture sits behind is mounted
-    // (`/app/`), so the path it receives is `/app/stream` — an application
-    // never sees its own mount point stripped, and matching on a prefix would
-    // silently fall through to the echo instead.
-    if contains(&s.buf[path_at..path_at + path_len], b"/stream") {
-        s.stream_conn = conn_id;
-        s.stream_id = stream_id;
-        s.stream_sent = 0;
-        s.stream_active = 1;
-        return emit_stream_chunk(s, sys);
-    }
-
-    // `/status/NNN`: answer with the status the caller named.
-    let status = parse_status(&s.buf[path_at..path_at + path_len]).unwrap_or(200);
-
-    // Layout is header, then content type, then body — in that order, because
-    // each is written once at its final offset. Building the body first and
-    // shifting it aside for the content type would be the same bytes and one
-    // more chance to overlap them.
-    const CT: &[u8] = b"text/plain";
-    let mut o = RESP_HDR;
-    o = s.put(o, CT);
-    let body_at_out = o;
-
-    o = s.put(o, b"method=");
-    o = s.put(o, method_name(method));
-    o = s.put(o, b" path=");
-    o = s.copy_in(o, path_at, path_len);
-    o = s.put(o, b" body=");
-    o = s.copy_in(o, body_at, body_len);
-    let body_bytes = o - body_at_out;
-
-    s.write_resp_header(conn_id, stream_id, status, CT.len(), body_bytes, false);
-    // SAFETY: `out` is a fixed array in module state; `o` never exceeds
-    // `BUF_BYTES` because `put`/`copy_in` both clamp to it.
-    unsafe {
-        (sys.channel_write)(s.response_out, s.out.as_ptr(), o);
-    }
-    STEP_DID_WORK
-}
-
-/// Emit the next chunk of a `/stream` response. Every chunk but the last
-/// carries `MORE_BODY`; the gateway ends the response on the one that does not.
-fn emit_stream_chunk(s: &mut State, sys: &SyscallTable) -> i32 {
-    let idx = s.stream_sent as usize;
-    let last = idx + 1 >= STREAM_CHUNKS;
-    // Each chunk is filled with a distinct byte so a test can tell chunk order
-    // from the body alone — a reassembly that dropped or reordered one would
-    // otherwise look identical to a correct transfer.
-    let fill = b'a' + idx as u8;
-
-    // Only the FIRST chunk carries a content type; a continuation is body
-    // bytes and nothing else, and re-sending the head mid-body would put a
-    // second response inside the first.
-    let ct: &[u8] = if idx == 0 {
-        b"application/octet-stream"
+    if worked {
+        STEP_DID_WORK
     } else {
-        b""
-    };
-    let mut o = RESP_HDR;
-    o = s.put(o, ct);
-    let body_at_out = o;
-    let mut i = 0usize;
-    while i < STREAM_CHUNK_BYTES && o < BUF_BYTES {
-        s.out[o] = fill;
-        o += 1;
-        i += 1;
+        0
     }
-    let body_bytes = o - body_at_out;
-
-    let (conn, stream) = (s.stream_conn, s.stream_id);
-    s.write_resp_header(conn, stream, 200, ct.len(), body_bytes, !last);
-
-    // SAFETY: as `module_step`'s write — `out` is fixed-size and `o` is clamped.
-    let wrote = unsafe { (sys.channel_write)(s.response_out, s.out.as_ptr(), o) };
-    if wrote <= 0 {
-        // Ring full: keep the stream armed and retry next step rather than
-        // dropping a chunk the gateway is waiting for.
-        return 0;
-    }
-    s.stream_sent += 1;
-    if last {
-        s.stream_active = 0;
-        s.stream_sent = 0;
-    }
-    STEP_DID_WORK
 }
 
 impl State {
-    /// Stamp the fixed response prefix. Called AFTER the content type and body
-    /// are in place, because it needs their measured lengths.
-    fn write_resp_header(
-        &mut self,
-        conn_id: u16,
-        stream_id: u16,
-        status: u16,
-        ct_len: usize,
-        body_bytes: usize,
-        more: bool,
-    ) {
-        self.out[0..2].copy_from_slice(&conn_id.to_le_bytes());
-        self.out[2..4].copy_from_slice(&stream_id.to_le_bytes());
-        self.out[4..6].copy_from_slice(&status.to_le_bytes());
-        self.out[6] = if more { FLAG_MORE_BODY } else { 0 };
-        self.out[7] = ct_len as u8;
-        self.out[8..10].copy_from_slice(&0u16.to_le_bytes()); // no extra headers
-        self.out[10..12].copy_from_slice(&(body_bytes as u16).to_le_bytes());
+    /// Take the held record. False when it needs a place none is free for.
+    fn take(&mut self, sys: &SyscallTable) -> bool {
+        let mut touched = None;
+        let raw = &self.buf[..self.held_len];
+        let Some(rec) = app_parse_request(raw) else {
+            // A record that does not parse is dropped: the gateway's own
+            // deadline answers the exchange, which is the honest outcome for
+            // a broken contract.
+            return true;
+        };
+        match rec {
+            AppRecord::Head(h) => {
+                let Some(i) = self.ex.iter().position(|e| !e.used) else {
+                    return false;
+                };
+                let mut e = IDLE;
+                e.used = true;
+                e.id = h.id;
+                e.method = h.method;
+                e.path_len = h.target.len().min(PATH_MAX);
+                e.path[..e.path_len].copy_from_slice(&h.target[..e.path_len]);
+                e.req_done = h.flags & app_flag::MORE == 0;
+                e.resp_credit = h.resp_credit;
+                e.credit_owed = !e.req_done;
+                e.streaming = contains(&e.path[..e.path_len], b"/stream");
+                self.ex[i] = e;
+                touched = Some(i);
+            }
+            AppRecord::Body { id, flags, data } => {
+                if let Some(i) = self.find(&id) {
+                    let e = &mut self.ex[i];
+                    let room = ECHO_MAX - e.body_len;
+                    let n = data.len().min(room);
+                    e.body[e.body_len..e.body_len + n].copy_from_slice(&data[..n]);
+                    e.body_len += n;
+                    e.total += data.len() as u64;
+                    e.req_done = flags & app_flag::MORE == 0;
+                    touched = Some(i);
+                }
+            }
+            AppRecord::Credit { id, bytes } => {
+                if let Some(i) = self.find(&id) {
+                    let e = &mut self.ex[i];
+                    e.resp_credit = e.resp_credit.saturating_add(bytes);
+                    touched = Some(i);
+                }
+            }
+            AppRecord::Abort { id, .. } => {
+                if let Some(i) = self.find(&id) {
+                    self.ex[i] = IDLE;
+                }
+            }
+            AppRecord::Datagram { .. } => {}
+        }
+        if let Some(i) = touched {
+            self.advance(sys, i);
+        }
+        true
     }
 
-    /// Append `src` to `out` at `off`, clamped to the buffer.
-    fn put(&mut self, mut off: usize, src: &[u8]) -> usize {
-        let mut i = 0usize;
-        while i < src.len() && off < BUF_BYTES {
-            self.out[off] = src[i];
-            off += 1;
-            i += 1;
-        }
-        off
+    fn find(&self, id: &AppId) -> Option<usize> {
+        self.ex.iter().position(|e| e.used && e.id == *id)
     }
 
-    /// Copy `len` bytes from the request buffer at `at` into `out` at `off`.
-    ///
-    /// Indexed rather than sliced: `buf` and `out` are fields of the same
-    /// struct, so a shared slice of one and a mutable slice of the other
-    /// cannot be held at the same time.
-    fn copy_in(&mut self, mut off: usize, at: usize, len: usize) -> usize {
-        let mut i = 0usize;
-        while i < len && off < BUF_BYTES && at + i < BUF_BYTES {
-            self.out[off] = self.buf[at + i];
-            off += 1;
-            i += 1;
+    /// Do what exchange `i` owes, as far as the gateway's channel takes it.
+    fn advance(&mut self, sys: &SyscallTable, i: usize) -> bool {
+        if !self.ex[i].used {
+            return false;
         }
-        off
+        let mut worked = false;
+        if self.ex[i].credit_owed {
+            let n = app_write_credit(&self.ex[i].id, BODY_CREDIT, &mut self.out).unwrap_or(0);
+            if !self.write(sys, n) {
+                return false;
+            }
+            self.ex[i].credit_owed = false;
+            worked = true;
+        }
+        if !self.ex[i].req_done {
+            return worked;
+        }
+        if self.ex[i].streaming {
+            while self.ex[i].stream_sent < STREAM_CHUNKS {
+                if !self.stream_chunk(sys, i) {
+                    return worked;
+                }
+                worked = true;
+            }
+            self.ex[i] = IDLE;
+            return true;
+        }
+        if self.answer(sys, i) {
+            self.ex[i] = IDLE;
+            worked = true;
+        }
+        worked
     }
+
+    /// Answer exchange `i` whole. False when the channel refused it.
+    fn answer(&mut self, sys: &SyscallTable, i: usize) -> bool {
+        let e = &self.ex[i];
+        let status = parse_status(&e.path[..e.path_len]).unwrap_or(200);
+        let mut body = [0u8; ECHO_MAX + PATH_MAX + 64];
+        let mut o = 0usize;
+        o = put(&mut body, o, b"method=");
+        o = put(&mut body, o, method_name(e.method));
+        o = put(&mut body, o, b" path=");
+        o = put(&mut body, o, &e.path[..e.path_len]);
+        o = put(&mut body, o, b" body=");
+        o = put(&mut body, o, &e.body[..e.body_len]);
+        o = put(&mut body, o, b" bytes=");
+        let mut digits = [0u8; 20];
+        let dn = decimal(e.total, &mut digits);
+        o = put(&mut body, o, &digits[..dn]);
+        let head = AppResponseHead {
+            id: e.id,
+            flags: 0,
+            status,
+            content_type: b"text/plain",
+            headers: &[],
+            body: &body[..o],
+        };
+        let n = app_write_response_head(&head, &mut self.out).unwrap_or(0);
+        self.write(sys, n)
+    }
+
+    /// Emit the next `/stream` chunk when the gateway has credit for it. Each
+    /// chunk is filled with a distinct byte so a test can tell chunk order
+    /// from the body alone — a reassembly that dropped or reordered one would
+    /// otherwise look identical to a correct transfer.
+    fn stream_chunk(&mut self, sys: &SyscallTable, i: usize) -> bool {
+        let e = self.ex[i];
+        if (e.resp_credit as usize) < STREAM_CHUNK_BYTES {
+            return false;
+        }
+        let fill = b'a' + e.stream_sent;
+        let chunk = [fill; STREAM_CHUNK_BYTES];
+        let last = e.stream_sent + 1 >= STREAM_CHUNKS;
+        let flags = if last { 0 } else { app_flag::MORE };
+        let n = if e.stream_sent == 0 {
+            // The first record is the head; it carries the content type and
+            // the first chunk.
+            let head = AppResponseHead {
+                id: e.id,
+                flags,
+                status: 200,
+                content_type: b"application/octet-stream",
+                headers: &[],
+                body: &chunk,
+            };
+            app_write_response_head(&head, &mut self.out).unwrap_or(0)
+        } else {
+            app_write_body(&e.id, flags, &chunk, &mut self.out).unwrap_or(0)
+        };
+        if !self.write(sys, n) {
+            return false;
+        }
+        let e = &mut self.ex[i];
+        e.resp_credit -= STREAM_CHUNK_BYTES as u32;
+        e.stream_sent += 1;
+        true
+    }
+
+    /// Write the first `n` bytes of `out` as one record.
+    fn write(&mut self, sys: &SyscallTable, n: usize) -> bool {
+        if n == 0 {
+            return true;
+        }
+        // SAFETY: `out` is a fixed array in module state and `n` is bounded
+        // by the encoder that filled it.
+        unsafe { (sys.channel_write)(self.response_out, self.out.as_ptr(), n) > 0 }
+    }
+}
+
+/// Append `src` at `off`, clamped to the buffer.
+fn put(dst: &mut [u8], off: usize, src: &[u8]) -> usize {
+    let n = src.len().min(dst.len() - off);
+    dst[off..off + n].copy_from_slice(&src[..n]);
+    off + n
+}
+
+/// `v` in decimal into `out`; its length.
+fn decimal(mut v: u64, out: &mut [u8; 20]) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut n = 0usize;
+    loop {
+        tmp[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..n {
+        out[i] = tmp[n - 1 - i];
+    }
+    n
 }
 
 /// Offset of `needle` in `hay`, if present.
@@ -327,6 +439,10 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
+/// Whether `needle` occurs in `hay`. Matched anywhere in the path, not as a
+/// prefix: the route this fixture sits behind is mounted (`/app/`), so the
+/// path it receives is `/app/stream` — an application never sees its own
+/// mount point stripped.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     find(hay, needle).is_some()
 }

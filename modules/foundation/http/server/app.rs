@@ -1,116 +1,70 @@
-//! HTTP application fan-out — handing a request to a graph node and taking the
-//! response back.
+//! HTTP application fan-out — handing a request to a graph node and serving
+//! what it answers, both directions streamed.
 //!
 //! Every other handler answers from something this module already holds: an
 //! inline body, a template, a file, an upstream to relay to. `HANDLER_APP`
 //! answers from something it cannot know — a downstream module decides what the
-//! request means. Wave keeps HTTP framing, connection state, keep-alive and
-//! bounded body handling; the application keeps method dispatch, authorization
-//! and what a path denotes. That split is not invented here: it is what
-//! `docs/specification.md` already says Wave does not own.
+//! request means. This module keeps HTTP framing, connection state, keep-alive
+//! and bounded bodies; the application keeps method dispatch, authorisation and
+//! what a path denotes.
 //!
-//! **Modelled on `ws.rs`, deliberately.** WebSocket fan-out is the same shape —
-//! envelopes out on one port, envelopes back on another, routed to the
-//! connection they belong to — so two of its rules are reused verbatim:
+//! The records are `modules/common/http_app.rs`. One exchange is one request and
+//! its response; every connection on every generation shares the one
+//! `req_out` / `resp_in` pair, and every record names its exchange. This file
+//! owns what all three generations share: the per-exchange state and credit,
+//! the queue that holds an application's records until its connection can take
+//! them, the abort queue, and the one reader of `resp_in`. It also drives the
+//! HTTP/1.1 exchange, which lives on the `ConnSlot`; HTTP/2 and HTTP/3 drive
+//! theirs from their own stream tables through the same pieces.
 //!
-//! * *Backpressure by writeback.* If the target slot cannot accept a response
-//!   yet, the envelope goes back on the input channel and is retried next tick,
-//!   rather than being dropped or blocking the pump.
-//! * *One mailbox write per envelope*, capped at the channel buffer, so a
-//!   partial write can never present as a truncated request.
+//! **Credit, not channel backpressure.** One channel carries every exchange,
+//! so holding one body back by leaving the channel unread would hold back all
+//! of them. Each direction therefore runs on credit: this module forwards
+//! request-body bytes only as the application grants them, and grants
+//! response-body credit only as bytes leave for the peer. An exchange whose
+//! peer or application is slow stops on its own credit and nothing else does.
+//! When the application grants none, `recv_buf` fills, the demux stops reading
+//! the connection, and the transport's window closes — the backpressure reaches
+//! the client.
 //!
-//! And one detail is deliberately NOT reused: WS fan-out retains the last
-//! envelope so a late subscriber sees current state. Replaying a previous
-//! response to a new request would answer request N with response N-1, which is
-//! the bug `HANDLER_WEBSOCKET_SESSION` exists to avoid. There is no retention
-//! here.
-//!
-//! **Correlation is `(conn_id, stream_id)`, never `conn_id` alone.** Under h2 a
-//! connection carries many requests at once, and an application that answers
-//! them out of order — which it is entitled to do — would have its responses
-//! delivered to the wrong requests.
-//!
-//! Under h1 a connection carries one request at a time, so `stream_id` is not
-//! separating concurrent requests; it is a REQUEST GENERATION, and it is
-//! load-bearing for a different reason. Connection ids are recycled by the
-//! transport, so a connection released with a request still outstanding is
-//! followed by a new peer holding the same id and also awaiting an answer.
-//! Pinning `stream_id` to 0 made those two indistinguishable, and the late
-//! answer was served to the new peer: a valid, well-framed, entirely wrong
-//! reply. See `ServerState::app_gen_next`.
-//!
-//! Either way the rule for an application is the same and was always the same:
-//! **echo `stream_id` back**. An application that hardcodes 0 was already
-//! broken under h2.
+//! **Correlation is the record's id, never the connection alone.** Under h2 a
+//! connection carries many requests at once and an application may answer
+//! them in any order. Under h1 the id's stream is a request generation:
+//! connection ids are recycled by the transport, and a late answer to a
+//! connection's previous holder must not reach the next one.
 
+use super::super::http_app::{
+    app_abort, app_flag, app_kind, app_origin, app_parse_response, app_seal_body, app_write_abort,
+    app_write_credit, app_write_request_head, AppId, AppRecord, AppRequestHead, APP_BODY_MAX,
+    APP_HDR, APP_RECORD_MAX,
+};
 use super::super::wire::method;
 use super::{
-    cur_slot, cur_slot_mut, dev_millis, find_slot_by_conn_id, heap_alloc, heap_free, HttpState,
-    MAX_PATH,
+    cur_slot, cur_slot_mut, find_slot_by_conn_id, heap_alloc, heap_free, HttpState,
+    MAX_CONCURRENT_CONNS, SEND_BUF_SIZE,
 };
 
-/// Fixed prefix of an `HttpRequest` envelope:
-/// `[conn_id u16][stream_id u16][method u8][flags u8][path_len u16]
-///  [hdr_len u16][body_len u16]`.
-pub(crate) const REQ_HDR: usize = 12;
+/// Longest request header block forwarded, in bytes. A request whose header
+/// block is longer is refused with 431, never forwarded with fields missing:
+/// an application cannot tell a header that was dropped from one that was
+/// never sent, and an `Authorization` that vanished is a different request.
+pub(crate) const MAX_FWD_HEADERS: usize = 4096;
 
-/// Fixed prefix of an `HttpResponse` envelope:
-/// `[conn_id u16][stream_id u16][status u16][flags u8][ct_len u8]
-///  [hdr_len u16][body_len u16]`.
-pub(crate) const RESP_HDR: usize = 12;
+/// Longest request target (path and query) forwarded, in bytes. A request
+/// target past it is refused with 414. A presigned object URL carries its
+/// signature in the query, which is what this is sized for.
+pub(crate) const MAX_TARGET: usize = 2048;
 
-/// `flags` bit 0 — more body follows in a subsequent envelope for the same
-/// `(conn_id, stream_id)`. Reserved by this phase and honoured by the streaming
-/// path; a single-envelope request/response leaves it clear.
-pub(crate) const FLAG_MORE_BODY: u8 = 0x01;
-/// Request flag: a PEER IDENTITY trailer follows the body.
+/// How long an application may go without progress on an exchange — a
+/// response record, or credit for more of the request — before the server
+/// answers for it, in milliseconds.
 ///
-/// `[svid_len:u16 LE][svid]`, appended after `body`, present only when the
-/// connection completed an mTLS handshake that actually verified the peer.
-///
-/// A trailer behind a flag rather than a field in the fixed head, because the
-/// three section lengths are the envelope's ABI: every consumer reads path,
-/// headers and body by them. A consumer that does not know this bit reads
-/// exactly what it did before and never looks past `body_len`.
-///
-/// And a trailer rather than a synthetic header such as
-/// `X-Forwarded-Client-Cert`: a header is forgeable by the client unless the
-/// server strips every copy of it first, and one missed strip promotes an
-/// anonymous caller to whoever it claims to be. A typed trailer sits in a
-/// structure the client cannot reach at all.
-pub(crate) const FLAG_PEER_IDENTITY: u8 = 0x02;
-/// Request flag: the BODY is a reference, `sha256:<hex>` — the body itself
-/// was staged in the store at `body_ref_prefix` + `sha256/<hex>` because it
-/// was larger than `body_inline_max` (an envelope is one channel record).
-pub(crate) const FLAG_BODY_REF: u8 = 0x04;
-
-/// Longest request header block forwarded to the application, in bytes.
-///
-/// The block is forwarded RAW rather than parsed: an application module needs
-/// `Authorization`, `Content-Type`, `Range` and whatever else its API defines,
-/// and a gateway that decided in advance which headers matter would have to be
-/// edited every time an application learned a new one. Bounded because it is
-/// copied into a fixed envelope buffer.
-pub(crate) const MAX_FWD_HEADERS: usize = 2048;
-
-/// How long a request may wait for its application response before the server
-/// answers 504 itself, in milliseconds.
-///
-/// Without this, an application module that never replies holds a connection
-/// slot forever, and enough such requests exhaust the slot table — a hung
-/// downstream becomes a dead server rather than a degraded one. 30 s is longer
-/// than any interactive request and shorter than every client's own timeout, so
-/// the client sees a status rather than a silence.
+/// Measured from the last progress rather than from the request, so a long
+/// upload the application keeps crediting is never cut off. Without it, an
+/// application that never replies holds a slot forever, and enough such
+/// requests exhaust the table — a hung downstream becomes a dead server
+/// rather than a degraded one.
 pub(crate) const APP_TIMEOUT_MS: u64 = 30_000;
-
-/// Response flag: the application HOLDS this stream open on purpose — a watch,
-/// an event stream — and ends it itself. Between events such a stream is idle
-/// for as long as the application has nothing to say, so its progress deadline
-/// is `HOLD_TIMEOUT_MS`, not `APP_TIMEOUT_MS`. Meaningful with
-/// `FLAG_MORE_BODY`; ignored without it. Request and response flags are two
-/// vocabularies over the same byte, so this shares a value with
-/// [`FLAG_BODY_REF`]: an envelope is one or the other, never both.
-pub(crate) const FLAG_HOLD: u8 = 0x04;
 
 /// A held stream's progress deadline: longer than any server-side watch
 /// timeout an application sets (Kubernetes caps one at 30 min, then doubles it
@@ -118,859 +72,1072 @@ pub(crate) const FLAG_HOLD: u8 = 0x04;
 /// ends it cannot keep its slot forever.
 pub(crate) const HOLD_TIMEOUT_MS: u64 = 3_600_000;
 
-/// The progress deadline a streamed response runs under, from its flags.
+/// Response-body credit an exchange starts with, and the most of an
+/// application's answer this module holds for one exchange. Four records on
+/// hosts, so an application can run ahead of the peer by a few round trips;
+/// one record on embedded targets.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const RESP_WINDOW: u32 = 4 * APP_BODY_MAX as u32;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const RESP_WINDOW: u32 = APP_BODY_MAX as u32;
+
+/// Most bytes one exchange's record queue holds: its credit window, plus the
+/// head record and one record of slack for the prefixes the window does not
+/// count. An application inside its credit never reaches it.
+pub(crate) const QUEUE_LIMIT: u32 = RESP_WINDOW + 2 * (APP_RECORD_MAX as u32 + 4);
+
+/// Response credit is granted back once this much has left for the peer, or
+/// when the exchange's queue runs empty, whichever comes first — one CREDIT
+/// record per record's worth of body rather than one per frame.
+const GRANT_MIN: u32 = APP_BODY_MAX as u32;
+
+/// Request-body records one h1 connection forwards per step.
+const FORWARDS_PER_STEP: usize = 4;
+
+/// Records read from `resp_in` per step: enough that one busy exchange does
+/// not starve the rest, few enough that a step stays bounded.
+const RECORDS_PER_STEP: usize = 16;
+
+#[cfg(feature = "h2")]
+const H2_EXCHANGES: usize = MAX_CONCURRENT_CONNS * super::h2::MAX_STREAMS;
+#[cfg(not(feature = "h2"))]
+const H2_EXCHANGES: usize = 0;
+#[cfg(feature = "h3")]
+const H3_EXCHANGES: usize = super::h3::MAX_H3_STREAMS;
+#[cfg(not(feature = "h3"))]
+const H3_EXCHANGES: usize = 0;
+
+/// Most exchanges open at once: one per h1 connection, `MAX_STREAMS` per h2
+/// connection, and the h3 stream table.
+pub(crate) const MAX_EXCHANGES: usize = MAX_CONCURRENT_CONNS + H2_EXCHANGES + H3_EXCHANGES;
+
+/// Aborts waiting for room on `req_out`. No HEAD is sent while one waits, so
+/// every waiting abort belongs to an exchange that was open when it was
+/// queued, and the queue can never hold more than `MAX_EXCHANGES`.
+pub(crate) const ABORT_QUEUE: usize = MAX_EXCHANGES;
+
+/// Exchange state bits.
+pub(crate) mod ex {
+    /// The HEAD went out: the application knows this exchange.
+    pub(crate) const OPEN: u8 = 0x01;
+    /// The request direction has ended.
+    pub(crate) const REQ_DONE: u8 = 0x02;
+    /// The application's response HEAD has arrived.
+    pub(crate) const RESP_HEAD: u8 = 0x04;
+    /// The application's response has ended.
+    pub(crate) const RESP_DONE: u8 = 0x08;
+    /// The application has granted request-body credit at least once.
+    pub(crate) const CREDITED: u8 = 0x10;
+    /// The client asked for `100 Continue` and has not been sent it.
+    pub(crate) const CONTINUE: u8 = 0x20;
+}
+
+/// One exchange's state, held by whichever table owns its request: a
+/// `ConnSlot` (h1), an h2 stream, an h3 stream.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Exchange {
+    /// The id's stream half: an h1 request generation, an h2 stream id, an
+    /// h3 stream handle.
+    pub(crate) stream: u64,
+    /// `dev_millis` past which the application has failed to make progress;
+    /// 0 when the application does not hold the turn.
+    pub(crate) deadline_ms: u64,
+    /// Request-body bytes the application has granted and not yet received.
+    pub(crate) req_credit: u32,
+    /// Response-body bytes the application may still send.
+    pub(crate) resp_credit: u32,
+    /// Response-body bytes that have left for the peer and not yet been
+    /// granted back.
+    pub(crate) resp_owed: u32,
+    pub(crate) state: u8,
+    /// The response HEAD's flags (`HOLD`, `WEBSOCKET`, …).
+    pub(crate) resp_flags: u8,
+    pub(crate) _pad: [u8; 2],
+}
+
+impl Exchange {
+    pub(crate) const fn idle() -> Self {
+        Self {
+            stream: 0,
+            deadline_ms: 0,
+            req_credit: 0,
+            resp_credit: 0,
+            resp_owed: 0,
+            state: 0,
+            resp_flags: 0,
+            _pad: [0; 2],
+        }
+    }
+
+    pub(crate) fn is(&self, bits: u8) -> bool {
+        self.state & bits == bits
+    }
+
+    pub(crate) fn open(&self) -> bool {
+        self.is(ex::OPEN)
+    }
+
+    /// Both directions have ended.
+    pub(crate) fn finished(&self) -> bool {
+        self.is(ex::REQ_DONE | ex::RESP_DONE)
+    }
+}
+
+/// An application's records for one exchange, held until its connection can
+/// take them, in order. A front record can be taken in parts: its head first,
+/// then its body as room allows.
+#[repr(C)]
+pub(crate) struct RecordQueue {
+    buf: *mut u8,
+    cap: u32,
+    /// Offset of the front record's length prefix.
+    at: u32,
+    /// Bytes held from `at`.
+    len: u32,
+    /// Body bytes of the front record already taken.
+    front_taken: u32,
+    /// The front record's head has been taken.
+    front_head_done: u8,
+    _pad: [u8; 3],
+}
+
+impl RecordQueue {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            buf: core::ptr::null_mut(),
+            cap: 0,
+            at: 0,
+            len: 0,
+            front_taken: 0,
+            front_head_done: 0,
+            _pad: [0; 3],
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Append one record. False when it would pass `QUEUE_LIMIT` or the arena
+    /// cannot hold it.
+    pub(crate) unsafe fn push(
+        &mut self,
+        sys: &super::super::abi::SyscallTable,
+        rec: &[u8],
+    ) -> bool {
+        let need = 4 + rec.len() as u32;
+        if self.at != 0 && self.at + self.len + need > self.cap {
+            core::ptr::copy(self.buf.add(self.at as usize), self.buf, self.len as usize);
+            self.at = 0;
+        }
+        let want = self.len + need;
+        if want > QUEUE_LIMIT {
+            return false;
+        }
+        if want > self.cap {
+            let mut cap = if self.cap == 0 {
+                APP_RECORD_MAX as u32 + 4
+            } else {
+                self.cap
+            };
+            while cap < want {
+                cap = cap.saturating_mul(2);
+            }
+            let cap = cap.min(QUEUE_LIMIT);
+            let fresh = heap_alloc(sys, cap);
+            if fresh.is_null() {
+                return false;
+            }
+            if !self.buf.is_null() {
+                core::ptr::copy_nonoverlapping(
+                    self.buf.add(self.at as usize),
+                    fresh,
+                    self.len as usize,
+                );
+                heap_free(sys, self.buf);
+            }
+            self.buf = fresh;
+            self.cap = cap;
+            self.at = 0;
+        }
+        let p = self.buf.add((self.at + self.len) as usize);
+        core::ptr::copy_nonoverlapping((rec.len() as u32).to_le_bytes().as_ptr(), p, 4);
+        core::ptr::copy_nonoverlapping(rec.as_ptr(), p.add(4), rec.len());
+        self.len += need;
+        true
+    }
+
+    /// The front record, whole.
+    pub(crate) unsafe fn front<'a>(&self) -> Option<&'a [u8]> {
+        if self.len < 4 {
+            return None;
+        }
+        let p = self.buf.add(self.at as usize);
+        let mut lb = [0u8; 4];
+        core::ptr::copy_nonoverlapping(p, lb.as_mut_ptr(), 4);
+        let n = u32::from_le_bytes(lb);
+        if 4 + n > self.len {
+            return None;
+        }
+        Some(core::slice::from_raw_parts(p.add(4), n as usize))
+    }
+
+    pub(crate) fn front_taken(&self) -> usize {
+        self.front_taken as usize
+    }
+
+    pub(crate) fn front_head_done(&self) -> bool {
+        self.front_head_done != 0
+    }
+
+    pub(crate) fn take_front_head(&mut self) {
+        self.front_head_done = 1;
+    }
+
+    pub(crate) fn take_front_body(&mut self, n: usize) {
+        self.front_taken += n as u32;
+    }
+
+    /// Drop the front record.
+    pub(crate) unsafe fn pop(&mut self, sys: &super::super::abi::SyscallTable) {
+        if let Some(rec) = self.front() {
+            let n = 4 + rec.len() as u32;
+            self.at += n;
+            self.len -= n;
+        }
+        self.front_taken = 0;
+        self.front_head_done = 0;
+        if self.len == 0 {
+            self.release(sys);
+        }
+    }
+
+    /// Forget every record, keeping the buffer for the next exchange. For an
+    /// owner that cannot reach the allocator where it ends an exchange.
+    pub(crate) fn clear(&mut self) {
+        self.at = 0;
+        self.len = 0;
+        self.front_taken = 0;
+        self.front_head_done = 0;
+    }
+
+    /// Free what the queue holds.
+    pub(crate) unsafe fn release(&mut self, sys: &super::super::abi::SyscallTable) {
+        if !self.buf.is_null() {
+            heap_free(sys, self.buf);
+        }
+        *self = Self::empty();
+    }
+}
+
+/// The body bytes a response record carries, and whether it is a HEAD.
+pub(crate) fn record_body(rec: &[u8]) -> (&[u8], bool) {
+    match app_parse_response(rec) {
+        Some(AppRecord::Head(h)) => (h.body, true),
+        Some(AppRecord::Body { data, .. }) => (data, false),
+        _ => (&[], false),
+    }
+}
+
+/// Whether a record (HEAD or BODY) ends the response.
+pub(crate) fn record_ends(rec: &[u8]) -> bool {
+    rec.len() > 1 && rec[1] & app_flag::MORE == 0
+}
+
+/// The progress deadline a response runs under, from its HEAD's flags.
 pub(crate) fn progress_timeout_ms(flags: u8) -> u64 {
-    if flags & FLAG_HOLD != 0 {
+    if flags & app_flag::HOLD != 0 {
         HOLD_TIMEOUT_MS
     } else {
         APP_TIMEOUT_MS
     }
 }
 
-/// Serialise one `HttpRequest` envelope and write it to `req_out`.
-///
-/// Both generations funnel through here, so an application module cannot tell
-/// which one carried a request — and should not be able to. They differ only in
-/// where the parts come from: h1's live on the `ConnSlot`, h2's on the
-/// `StreamSlot`, because an h2 connection carries many requests at once.
-///
-/// The slices must not alias the envelope buffer; in practice they point into
-/// slot fields or the receive buffer.
-pub(crate) unsafe fn write_request_envelope(
-    s: &HttpState,
-    conn_id: u16,
-    stream_id: u16,
-    verb: u8,
-    path: &[u8],
-    hdrs: &[u8],
-    body: &[u8],
-) -> EmitResult {
-    // The peer identity belongs to the CONNECTION, not the request, so it is
-    // looked up here rather than threaded through callers: h1 and h2 reach this
-    // function by different paths and both must carry it.
-    let peer = super::peer_svid(s, conn_id);
-    let peer_len = peer.map_or(0, |p| 2 + p.len());
-    // A body past the inline bound goes by reference.
-    let mut refbuf = [0u8; 7 + 64];
-    let staged = s.server.body_ref_prefix_len > 0 && body.len() > s.server.body_inline_max as usize;
-    let body: &[u8] = if staged {
-        match stage_body(s, body, &mut refbuf) {
-            Staged::Done => &refbuf[..],
-            // Taken and not yet decided. The caller holds the request where it
-            // is and emits again, which re-derives the same key from the same
-            // body \u2014 the byte-identical repeat the contract asks for.
-            Staged::Pending => return EmitResult::Full,
-            Staged::Failed => return EmitResult::StageFailed,
-        }
-    } else {
-        body
-    };
-    let total = REQ_HDR + path.len() + hdrs.len() + body.len() + peer_len;
-    if total > super::super::abi::CHANNEL_BUFFER_SIZE {
-        return EmitResult::TooLarge;
-    }
-
-    let mut buf = [0u8; super::super::abi::CHANNEL_BUFFER_SIZE];
-    buf[0..2].copy_from_slice(&conn_id.to_le_bytes());
-    buf[2..4].copy_from_slice(&stream_id.to_le_bytes());
-    buf[4] = verb;
-    buf[5] = if peer.is_some() {
-        FLAG_PEER_IDENTITY
-    } else {
-        0
-    } | if staged { FLAG_BODY_REF } else { 0 }; // whole body (or its reference) here
-    buf[6..8].copy_from_slice(&(path.len() as u16).to_le_bytes());
-    buf[8..10].copy_from_slice(&(hdrs.len() as u16).to_le_bytes());
-    buf[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
-
-    let mut off = REQ_HDR;
-    for part in [path, hdrs, body] {
-        if !part.is_empty() {
-            core::ptr::copy_nonoverlapping(part.as_ptr(), buf.as_mut_ptr().add(off), part.len());
-            off += part.len();
-        }
-    }
-    // The trailer goes AFTER the body, past every length in the fixed head, so
-    // it is invisible to a reader that does not know the flag.
-    if let Some(svid) = peer {
-        buf[off..off + 2].copy_from_slice(&(svid.len() as u16).to_le_bytes());
-        off += 2;
-        core::ptr::copy_nonoverlapping(svid.as_ptr(), buf.as_mut_ptr().add(off), svid.len());
-        off += svid.len();
-    }
-
-    let sys = &*s.syscalls;
-    if (sys.channel_write)(s.server.app_out_chan, buf.as_ptr(), off) <= 0 {
-        return EmitResult::Full;
-    }
-    EmitResult::Sent
+/// What taking a response record into an exchange came to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Admit {
+    /// A HEAD or BODY is queued for the connection.
+    Queued,
+    /// Request-body credit arrived.
+    Credit,
+    /// The application abandoned the exchange.
+    Abort,
+    /// The application broke the exchange's rules: body past its credit, a
+    /// second HEAD, a BODY before the HEAD or after the end. The exchange is
+    /// aborted.
+    Violation,
+    /// The exchange is not expecting records; the record is dropped.
+    Stale,
 }
 
-/// How long a staged body stays before it is collected (its expiry key).
-const STAGED_TTL_MS: u64 = 300_000;
-
-/// What staging a body came to.
-enum Staged {
-    /// In the store, and `out` names it.
-    Done,
-    /// The store took a write and has not decided it. Nothing is lost by
-    /// asking again with the same arguments; nothing may be concluded yet.
-    Pending,
-    /// The store refused, or there is no store.
-    Failed,
-}
-
-/// Stage `body` in the store as `<prefix>sha256/<hex>` (content-addressed:
-/// the same body is the same key) with its expiry at `<prefix>at/<hex>`,
-/// and write `sha256:<hex>` into `out`.
-///
-/// Both writes are idempotent in the key they choose, so a repeat after
-/// `Pending` cannot stage a second copy or a different one.
-unsafe fn stage_body(s: &HttpState, body: &[u8], out: &mut [u8; 71]) -> Staged {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = super::super::body_digest::sha256(body);
-    let mut hex = [0u8; 64];
-    for (i, b) in digest.iter().enumerate() {
-        hex[2 * i] = HEX[(b >> 4) as usize];
-        hex[2 * i + 1] = HEX[(b & 0x0f) as usize];
-    }
-    let pfx = &s.server.body_ref_prefix[..s.server.body_ref_prefix_len as usize];
-    let sys = &*s.syscalls;
-    let mut key = [0u8; 48 + 8 + 64];
-    let kl = cat3(&mut key, pfx, b"sha256/", &hex);
-    match obj_put(sys, &key[..kl], body) {
-        Staged::Done => {}
-        other => return other,
-    }
-    // The expiry: a store `ttl` chain collects the body after it, whether or
-    // not a request ever consumed it.
-    let mut digits = [0u8; 20];
-    let dl = dec_u64(dev_millis(sys).saturating_add(STAGED_TTL_MS), &mut digits);
-    let mut val = [0u8; 40];
-    let vl = cat3(&mut val, b"{\"deadline\":", &digits[..dl], b"}");
-    let kl = cat3(&mut key, pfx, b"at/", &hex);
-    match obj_put(sys, &key[..kl], &val[..vl]) {
-        Staged::Done => {}
-        other => return other,
-    }
-    out[..7].copy_from_slice(b"sha256:");
-    out[7..].copy_from_slice(&hex);
-    Staged::Done
-}
-
-/// `v` in decimal into `out`; its length.
-fn dec_u64(mut v: u64, out: &mut [u8; 20]) -> usize {
-    let mut tmp = [0u8; 20];
-    let mut n = 0usize;
-    loop {
-        tmp[n] = b'0' + (v % 10) as u8;
-        n += 1;
-        v /= 10;
-        if v == 0 || n == 20 {
-            break;
-        }
-    }
-    for i in 0..n {
-        out[i] = tmp[n - 1 - i];
-    }
-    n
-}
-
-/// `a ++ b ++ c` into `dst`: its length (short of `dst`, it stops there).
-fn cat3(dst: &mut [u8], a: &[u8], b: &[u8], c: &[u8]) -> usize {
-    let mut n = 0usize;
-    for part in [a, b, c] {
-        for &x in part {
-            if let Some(d) = dst.get_mut(n) {
-                *d = x;
-                n += 1;
-            }
-        }
-    }
-    n
-}
-
-/// storage.object PUT (unconditional), value by pointer.
-///
-/// A write may be TAKEN rather than decided, so the return code is classified
-/// by the contract's own `write_answer` rather than compared with zero: an
-/// `EINPROGRESS` read as a refusal would fail a request whose body is on its
-/// way into the store.
-unsafe fn obj_put(sys: &super::super::abi::SyscallTable, key: &[u8], value: &[u8]) -> Staged {
-    use super::super::abi::contracts::storage::object;
-    let mut arg = [0u8; 256];
-    if key.len() + 32 > arg.len() {
-        return Staged::Failed;
-    }
-    let mut fence = [0u8; 62];
-    let mut p = 0usize;
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    arg[p] = 0; // content_type_len
-    p += 1;
-    arg[p..p + 8].copy_from_slice(&(value.as_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 8].copy_from_slice(&(value.len() as u64).to_le_bytes());
-    p += 8;
-    arg[p] = 0; // precondition: any
-    arg[p + 1] = 0; // no etag
-    p += 2;
-    arg[p..p + 8].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 2].copy_from_slice(&62u16.to_le_bytes());
-    p += 2;
-    match object::write_answer((sys.provider_call)(-1, object::PUT, arg.as_mut_ptr(), p)) {
-        object::WriteAnswer::Decided(0) => Staged::Done,
-        object::WriteAnswer::Decided(_) => Staged::Failed,
-        object::WriteAnswer::Pending => Staged::Pending,
-    }
-}
-
-/// Emit the current h1 slot's request on `req_out` and start its timeout.
-///
-/// `head` is the request head as it still sits in `recv_buf`; the header block
-/// is taken from it verbatim.
-pub(crate) unsafe fn emit_request(s: &mut HttpState, head: &[u8]) -> EmitResult {
-    if s.server.app_out_chan < 0 {
-        return EmitResult::Unwired;
-    }
-    let (conn_id, verb, path, body) = match cur_slot(s) {
-        Some(c) => (
-            c.conn_id as u16,
-            c.req_method,
-            core::slice::from_raw_parts(
-                c.req_path.as_ptr(),
-                (c.req_path_len as usize).min(MAX_PATH),
-            ),
-            if c.body_buf.is_null() {
-                &[][..]
-            } else {
-                core::slice::from_raw_parts(c.body_buf, c.body_len as usize)
-            },
-        ),
-        None => return EmitResult::Unwired,
-    };
-
-    let hdr = header_block(head);
-    let hdrs = &hdr[..hdr.len().min(MAX_FWD_HEADERS)];
-
-    // Under h1 a connection carries one request at a time, so `stream_id` does
-    // not have to distinguish concurrent requests — but it does have to
-    // distinguish this request from one asked by a PREVIOUS holder of the same
-    // connection id, whose answer may still be in flight. See
-    // `ServerState::app_gen_next`.
-    let gen = s.server.app_gen_next;
-    s.server.app_gen_next = gen.wrapping_add(1);
-    let res = write_request_envelope(s, conn_id, gen, verb, path, hdrs, body);
-    if res == EmitResult::Sent {
-        // Latch the deadline as the request goes out, not when it was received:
-        // the timeout measures how long the APPLICATION has had it.
-        let now = dev_millis(&*s.syscalls);
-        if let Some(cur) = cur_slot_mut(s) {
-            cur.app_deadline_ms = now.saturating_add(APP_TIMEOUT_MS);
-            cur.app_stream_id = gen;
-        }
-    }
-    res
-}
-
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum EmitResult {
-    Sent,
-    /// `req_out` is not wired — the graph declares a HANDLER_APP route with
-    /// nothing behind it.
-    Unwired,
-    /// The envelope exceeds the channel buffer. A configuration error
-    /// (`max_body_kib` larger than the `req_out` ring), not a transient one.
-    TooLarge,
-    /// The ring is full right now; retry next tick.
-    Full,
-    /// A body past `body_inline_max` could not be staged in the store (no
-    /// store, or the write refused): the request cannot be forwarded whole.
-    StageFailed,
-}
-
-/// The raw header block of a request head: everything after the request line's
-/// CRLF, up to the blank line that terminates the head.
-fn header_block(head: &[u8]) -> &[u8] {
-    let mut i = 0usize;
-    while i + 1 < head.len() {
-        if head[i] == b'\r' && head[i + 1] == b'\n' {
-            break;
-        }
-        i += 1;
-    }
-    if i + 1 >= head.len() {
-        return &[];
-    }
-    let start = i + 2;
-    // The head ends with CRLFCRLF; drop the final CRLF so the block is just
-    // the field lines.
-    let end = head.len().saturating_sub(2);
-    if end <= start {
-        return &[];
-    }
-    &head[start..end]
-}
-
-/// A parsed `HttpResponse` envelope, as borrowed spans into the read buffer.
-pub struct RespView<'a> {
-    pub conn_id: u16,
-    pub stream_id: u16,
-    pub status: u16,
-    pub flags: u8,
-    pub content_type: &'a [u8],
-    pub headers: &'a [u8],
-    pub body: &'a [u8],
-}
-
-/// Parse one `HttpResponse` envelope. Returns `None` if the buffer is too
-/// short to hold what its own header claims — a malformed envelope is dropped
-/// rather than read past.
-pub fn parse_response(buf: &[u8]) -> Option<RespView<'_>> {
-    if buf.len() < RESP_HDR {
-        return None;
-    }
-    let conn_id = u16::from_le_bytes([buf[0], buf[1]]);
-    let stream_id = u16::from_le_bytes([buf[2], buf[3]]);
-    let status = u16::from_le_bytes([buf[4], buf[5]]);
-    let flags = buf[6];
-    let ct_len = buf[7] as usize;
-    let hdr_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([buf[10], buf[11]]) as usize;
-
-    let need = RESP_HDR
-        .checked_add(ct_len)?
-        .checked_add(hdr_len)?
-        .checked_add(body_len)?;
-    if buf.len() < need {
-        return None;
-    }
-    let ct_at = RESP_HDR;
-    let hdr_at = ct_at + ct_len;
-    let body_at = hdr_at + hdr_len;
-    Some(RespView {
-        conn_id,
-        stream_id,
-        status,
-        flags,
-        content_type: &buf[ct_at..hdr_at],
-        headers: &buf[hdr_at..body_at],
-        body: &buf[body_at..need],
-    })
-}
-
-/// Find the slot awaiting the response identified by `(conn_id, stream_id)`.
-///
-/// Returns `None` when no slot is waiting — a response for a connection that
-/// has since closed, or a duplicate. Dropping it is correct: there is nothing
-/// left to answer.
-pub(crate) unsafe fn find_awaiting_slot(
+/// Take one response record into its exchange: credit accounting, ordering
+/// and the progress deadline. A HEAD or BODY is pushed onto `q`.
+pub(crate) unsafe fn admit(
     s: &mut HttpState,
-    conn_id: u16,
-    stream_id: u16,
-) -> Option<usize> {
-    let idx = find_slot_by_conn_id(s, conn_id)?;
-    let slot = &*s.server.slots.as_ptr().add(idx);
-    if slot.app_stream_id == stream_id && slot.app_pending != 0 {
-        Some(idx)
-    } else {
-        None
+    x: &mut Exchange,
+    q: &mut RecordQueue,
+    rec: &[u8],
+) -> Admit {
+    if !x.open() {
+        return Admit::Stale;
     }
-}
-
-/// Whether the slot's application request has outlived `APP_TIMEOUT_MS`.
-pub(crate) unsafe fn app_deadline_passed(s: &HttpState, idx: usize) -> bool {
-    let slot = &*s.server.slots.as_ptr().add(idx);
-    if slot.app_pending == 0 || slot.app_deadline_ms == 0 {
-        return false;
-    }
-    // `dev_millis` is a u64 millisecond count, so a plain comparison is safe:
-    // there is no wrap to defend against inside any plausible uptime.
-    dev_millis(&*s.syscalls) >= slot.app_deadline_ms
-}
-
-/// The most one connection may have held for it while it is slow to read:
-/// past this the peer is not reading at the rate it is being answered, and the
-/// connection closes (counted with `conns_timeout_stall` — a peer that stopped
-/// reading). Host builds that forward to an application hold two 1 MiB
-/// objects' worth of watch events — what a client busy with its own large
-/// write lets pile up; everywhere else, a couple of envelopes.
-#[cfg(all(feature = "app", target_arch = "aarch64"))]
-pub(crate) const STASH_MAX: u32 = 4 << 20;
-#[cfg(not(all(feature = "app", target_arch = "aarch64")))]
-pub(crate) const STASH_MAX: u32 = 2 * super::super::abi::CHANNEL_BUFFER_SIZE as u32 + 8;
-
-/// Read one `HttpResponse` from `resp_in` and compose it onto the connection
-/// that asked for it. Returns true if an envelope was consumed.
-///
-/// Driven once per `module_step` from the server pump rather than per slot: one
-/// channel feeds every waiting connection, so a per-slot read would let
-/// whichever slot happened to step first consume an envelope addressed to a
-/// different one.
-///
-/// An envelope for a connection that cannot take it yet (its `send_buf` still
-/// draining) is held FOR THAT CONNECTION, in order, and delivered as it frees
-/// (`pump_stashes`, first thing here). Never written back onto `resp_in`: that
-/// reordered a streamed body's chunks, and a peer that stopped reading kept its
-/// envelopes circling the one channel every other connection is answered
-/// through until a writeback was refused and somebody's response was lost.
-pub(crate) unsafe fn drain_responses(s: &mut HttpState) -> bool {
-    if s.server.app_in_chan < 0 {
-        return false;
-    }
-    pump_stashes(s);
-    let sys = &*s.syscalls;
-    let chan = s.server.app_in_chan;
-    let poll = (sys.channel_poll)(chan, super::POLL_IN);
-    if poll <= 0 || (poll as u32 & super::POLL_IN) == 0 {
-        return false;
-    }
-
-    let mut buf = [0u8; super::super::abi::CHANNEL_BUFFER_SIZE];
-    let n = (sys.channel_read)(
-        chan,
-        buf.as_mut_ptr(),
-        super::super::abi::CHANNEL_BUFFER_SIZE,
-    );
-    if n < RESP_HDR as i32 {
-        return false;
-    }
-    let read_len = n as usize;
-    let (conn_id, stream_id, total) = match parse_response(&buf[..read_len]) {
-        Some(v) => (
-            v.conn_id,
-            v.stream_id,
-            RESP_HDR + v.content_type.len() + v.headers.len() + v.body.len(),
-        ),
-        // The envelope claims more than this read carries. Two causes, and
-        // they are counted the same because the consequence is identical: an
-        // application speaking a broken protocol, or — far more likely — an
-        // envelope larger than one channel read, on a port whose declared
-        // record size exceeds the reader's. Dropping is the only safe option
-        // once the read has consumed it, but dropping SILENTLY is not: the
-        // request would wait out the full application timeout and surface as
-        // a 504, pointing the investigation at the application rather than at
-        // the port sizing that actually caused it.
-        None => {
-            s.server.app_envelopes_oversize = s.server.app_envelopes_oversize.wrapping_add(1);
-            return false;
-        }
+    let Some(parsed) = app_parse_response(rec) else {
+        return Admit::Violation;
     };
-    let envelope = &buf[..total];
-
-    let target = match app_target(s, conn_id, stream_id) {
-        Some(i) => i,
-        // No slot is waiting: the connection closed between the application's
-        // write and this read, or the request already timed out. Nothing left
-        // to answer.
-        None => return false,
-    };
-    // Behind what is already held, never ahead of it: the held envelopes are
-    // earlier parts of the same answers.
-    let held = (*s.server.slots.as_ptr().add(target)).app_stash_len != 0;
-    if !held && deliver(s, target, envelope) != Delivery::Busy {
-        return true;
-    }
-    if !stash_push(s, target, envelope) {
-        too_slow(s, target);
-    }
-    true
-}
-
-/// The slot an envelope answers: an h2 connection by its id (the stream is
-/// found at delivery), an h1 one only while its request is pending.
-unsafe fn app_target(s: &mut HttpState, conn_id: u16, stream_id: u16) -> Option<usize> {
-    #[cfg(feature = "h2")]
-    {
-        if let Some(i) = find_slot_by_conn_id(s, conn_id) {
-            if !(*s.server.slots.as_ptr().add(i)).h2.is_null() {
-                return Some(i);
+    let now = s.server.now_ms;
+    match parsed {
+        AppRecord::Credit { bytes, .. } => {
+            if x.is(ex::REQ_DONE) {
+                return Admit::Stale;
             }
+            x.req_credit = x.req_credit.saturating_add(bytes);
+            x.state |= ex::CREDITED;
+            if !x.is(ex::RESP_HEAD) {
+                x.deadline_ms = now.saturating_add(APP_TIMEOUT_MS);
+            }
+            Admit::Credit
         }
-    }
-    find_awaiting_slot(s, conn_id, stream_id)
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Delivery {
-    /// Composed onto the connection.
-    Done,
-    /// Its `send_buf` is still draining: hold the envelope.
-    Busy,
-    /// Nothing waits for it any more (the stream or request is gone).
-    Gone,
-}
-
-/// Compose `envelope` onto slot `idx` if its `send_buf` is free.
-unsafe fn deliver(s: &mut HttpState, idx: usize, envelope: &[u8]) -> Delivery {
-    let busy = {
-        let slot = &*s.server.slots.as_ptr().add(idx);
-        slot.send_len > slot.send_offset
-    };
-    // An h2 stream on the named connection takes precedence: under h2 the
-    // ConnSlot is the connection, not the request, and many requests share it.
-    #[cfg(feature = "h2")]
-    {
-        if !(*s.server.slots.as_ptr().add(idx)).h2.is_null() {
-            let view = match parse_response(envelope) {
-                Some(v) => v,
-                None => return Delivery::Gone,
-            };
-            let saved = s.server.cur_slot;
-            s.server.cur_slot = idx as i32;
-            let stream_idx = super::h2::find_app_stream(s, view.stream_id);
-            let out = if stream_idx < 0 {
-                Delivery::Gone
-            } else if busy {
-                // `send_buf` is per-connection on h2 as well.
-                Delivery::Busy
+        AppRecord::Abort { .. } => Admit::Abort,
+        AppRecord::Datagram { .. } => Admit::Stale,
+        AppRecord::Head(h) => {
+            if x.is(ex::RESP_HEAD) || h.body.len() as u32 > x.resp_credit {
+                return Admit::Violation;
+            }
+            if !q.push(&*s.syscalls, rec) {
+                return Admit::Violation;
+            }
+            x.resp_credit -= h.body.len() as u32;
+            x.resp_flags = h.flags;
+            x.state |= ex::RESP_HEAD;
+            if h.flags & app_flag::MORE == 0 {
+                x.state |= ex::RESP_DONE;
+                x.deadline_ms = 0;
             } else {
-                let more = (view.flags & FLAG_MORE_BODY) != 0;
-                let timeout = progress_timeout_ms(view.flags);
-                super::h2::deliver_app_response(
-                    s,
-                    stream_idx,
-                    view.status,
-                    view.content_type,
-                    view.body,
-                    more,
-                    timeout,
-                );
-                Delivery::Done
-            };
-            s.server.cur_slot = saved;
-            return out;
-        }
-    }
-    if busy {
-        return Delivery::Busy;
-    }
-    let slot = &*s.server.slots.as_ptr().add(idx);
-    if slot.app_pending == 0 {
-        return Delivery::Gone;
-    }
-    let saved = s.server.cur_slot;
-    s.server.cur_slot = idx as i32;
-    compose_response(s, envelope);
-    s.server.cur_slot = saved;
-    Delivery::Done
-}
-
-/// Hold `envelope` behind whatever slot `idx` already holds. False when the
-/// stash would pass `STASH_MAX` or the arena cannot grow it.
-unsafe fn stash_push(s: &mut HttpState, idx: usize, envelope: &[u8]) -> bool {
-    let sys = &*s.syscalls;
-    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
-    let need = 4 + envelope.len() as u32;
-    // Reclaim what was delivered before growing.
-    if slot.app_stash_at != 0 && slot.app_stash_at + slot.app_stash_len + need > slot.app_stash_cap
-    {
-        core::ptr::copy(
-            slot.app_stash.add(slot.app_stash_at as usize),
-            slot.app_stash,
-            slot.app_stash_len as usize,
-        );
-        slot.app_stash_at = 0;
-    }
-    let want = slot.app_stash_at + slot.app_stash_len + need;
-    if want > STASH_MAX {
-        return false;
-    }
-    if want > slot.app_stash_cap {
-        let mut cap = if slot.app_stash_cap == 0 {
-            super::super::abi::CHANNEL_BUFFER_SIZE as u32 + 8
-        } else {
-            slot.app_stash_cap
-        };
-        while cap < want {
-            cap = cap.saturating_mul(2);
-        }
-        let cap = cap.min(STASH_MAX);
-        let fresh = heap_alloc(sys, cap);
-        if fresh.is_null() {
-            return false;
-        }
-        if !slot.app_stash.is_null() {
-            core::ptr::copy_nonoverlapping(
-                slot.app_stash.add(slot.app_stash_at as usize),
-                fresh,
-                slot.app_stash_len as usize,
-            );
-            heap_free(sys, slot.app_stash);
-        }
-        slot.app_stash = fresh;
-        slot.app_stash_cap = cap;
-        slot.app_stash_at = 0;
-    }
-    let at = slot
-        .app_stash
-        .add((slot.app_stash_at + slot.app_stash_len) as usize);
-    core::ptr::copy_nonoverlapping((envelope.len() as u32).to_le_bytes().as_ptr(), at, 4);
-    core::ptr::copy_nonoverlapping(envelope.as_ptr(), at.add(4), envelope.len());
-    slot.app_stash_len += need;
-    true
-}
-
-/// Deliver what each connection holds, in order, as far as its `send_buf`
-/// allows. A drained stash is freed: a connection is slow for a moment far
-/// more often than for its whole life.
-unsafe fn pump_stashes(s: &mut HttpState) {
-    for idx in 0..super::MAX_CONCURRENT_CONNS {
-        loop {
-            let (p, len) = {
-                let slot = &*s.server.slots.as_ptr().add(idx);
-                if slot.app_stash_len == 0 {
-                    break;
-                }
-                (
-                    slot.app_stash.add(slot.app_stash_at as usize),
-                    slot.app_stash_len,
-                )
-            };
-            let mut lb = [0u8; 4];
-            core::ptr::copy_nonoverlapping(p, lb.as_mut_ptr(), 4);
-            let el = u32::from_le_bytes(lb);
-            if 4 + el > len {
-                // Cannot happen (`stash_push` writes both); fail closed.
-                too_slow(s, idx);
-                break;
+                x.deadline_ms = now.saturating_add(progress_timeout_ms(h.flags));
             }
-            let envelope = core::slice::from_raw_parts(p.add(4), el as usize);
-            if deliver(s, idx, envelope) == Delivery::Busy {
-                break;
+            Admit::Queued
+        }
+        AppRecord::Body { flags, data, .. } => {
+            if !x.is(ex::RESP_HEAD) || x.is(ex::RESP_DONE) || data.len() as u32 > x.resp_credit {
+                return Admit::Violation;
             }
-            let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
-            slot.app_stash_at += 4 + el;
-            slot.app_stash_len -= 4 + el;
-            if slot.app_stash_len == 0 {
-                heap_free(&*s.syscalls, slot.app_stash);
-                slot.app_stash = core::ptr::null_mut();
-                slot.app_stash_cap = 0;
-                slot.app_stash_at = 0;
+            if !q.push(&*s.syscalls, rec) {
+                return Admit::Violation;
             }
+            x.resp_credit -= data.len() as u32;
+            if flags & app_flag::MORE == 0 {
+                x.state |= ex::RESP_DONE;
+                x.deadline_ms = 0;
+            } else {
+                x.deadline_ms = now.saturating_add(progress_timeout_ms(x.resp_flags));
+            }
+            Admit::Queued
         }
     }
 }
 
-/// Slot `idx`'s peer is not reading as fast as it is answered: what it holds
-/// is dropped and the connection closes — a short read the client can see and
-/// retry (a watch re-lists), never a gap in the middle of a body.
-unsafe fn too_slow(s: &mut HttpState, idx: usize) {
-    s.server.conns_timeout_stall = s.server.conns_timeout_stall.wrapping_add(1);
-    let sys = &*s.syscalls;
-    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
-    if !slot.app_stash.is_null() {
-        heap_free(sys, slot.app_stash);
-        slot.app_stash = core::ptr::null_mut();
-    }
-    slot.app_stash_cap = 0;
-    slot.app_stash_len = 0;
-    slot.app_stash_at = 0;
-    slot.app_pending = 0;
-    slot.app_streaming = 0;
-    slot.keepalive = 0;
-    slot.phase = super::Phase::CloseConn;
+/// Note that `n` response-body bytes left for the peer, and grant credit back
+/// once enough has, or once nothing more is held.
+pub(crate) unsafe fn note_delivered(
+    s: &mut HttpState,
+    id: &AppId,
+    x: &mut Exchange,
+    n: usize,
+    queue_empty: bool,
+) {
+    x.resp_owed = x.resp_owed.saturating_add(n as u32);
+    grant(s, id, x, queue_empty);
 }
 
-/// Compose a parsed `HttpResponse` into the current slot's `send_buf` and set
-/// it running.
-unsafe fn compose_response(s: &mut HttpState, envelope: &[u8]) {
-    let view = match parse_response(envelope) {
-        Some(v) => v,
-        None => return,
-    };
-
-    // A continuation envelope: the head already went out, and this carries the
-    // next slice of body. Recognised by the slot rather than by the envelope,
-    // because only the slot knows whether a head was sent.
-    if cur_slot(s).map(|c| c.app_streaming != 0).unwrap_or(false) {
-        compose_stream_chunk(s, &view);
+/// Send owed response credit if it is time to.
+pub(crate) unsafe fn grant(s: &mut HttpState, id: &AppId, x: &mut Exchange, queue_empty: bool) {
+    if x.resp_owed == 0 || x.is(ex::RESP_DONE) || !x.open() {
         return;
     }
-
-    let verb = cur_slot(s).map(|c| c.req_method).unwrap_or(0);
-    let allows_body = status_allows_body(view.status, verb);
-    let body: &[u8] = if allows_body { view.body } else { &[] };
-
-    let ct: &[u8] = if view.content_type.is_empty() {
-        b"application/octet-stream"
-    } else {
-        view.content_type
+    if x.resp_owed < GRANT_MIN && !queue_empty {
+        return;
+    }
+    let mut rec = [0u8; APP_HDR + 4];
+    let Some(n) = app_write_credit(id, x.resp_owed, &mut rec) else {
+        return;
     };
+    if write_out(s, &rec[..n]) {
+        x.resp_credit = x.resp_credit.saturating_add(x.resp_owed);
+        x.resp_owed = 0;
+    }
+}
 
-    // Streaming: `MORE_BODY` says this envelope is the first slice of a body
-    // that will arrive across several. The length cannot come from this
-    // envelope, so it comes from the application's own `Content-Length` header
-    // if it declared one — and if it did not, the response is close-delimited
-    // and the connection ends with the body.
-    //
-    // That is the honest pair of options. A gateway cannot invent a total it
-    // has not been told, and a keep-alive connection whose response has no
-    // determinable end is how the NEXT response gets misread.
-    let streaming = (view.flags & FLAG_MORE_BODY) != 0 && allows_body;
-    let declared_total = if streaming {
-        declared_length(view.headers)
-    } else {
-        Some(view.body.len() as u32)
+/// Write one record to `req_out`.
+pub(crate) unsafe fn write_out(s: &mut HttpState, rec: &[u8]) -> bool {
+    if s.server.app_out_chan < 0 {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    (sys.channel_write)(s.server.app_out_chan, rec.as_ptr(), rec.len()) > 0
+}
+
+/// What sending a request HEAD came to.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Emit {
+    Sent,
+    /// `req_out` is full, or aborts are waiting ahead of it; try again.
+    Full,
+    /// Nothing is wired to `req_out`: a route declares HANDLER_APP with no
+    /// application behind it. 503.
+    Unwired,
+    /// The head does not fit one record. 431.
+    TooLarge,
+}
+
+/// Send a request HEAD, opening an exchange the application then answers.
+pub(crate) unsafe fn emit_head(s: &mut HttpState, head: &AppRequestHead<'_>) -> Emit {
+    if s.server.app_out_chan < 0 {
+        return Emit::Unwired;
+    }
+    if head.headers.len() > MAX_FWD_HEADERS || head.target.len() > MAX_TARGET {
+        return Emit::TooLarge;
+    }
+    // Aborts first: an exchange the application still believes open must be
+    // closed before another is opened, and holding heads back is what bounds
+    // the abort queue.
+    if !flush_aborts(s) {
+        return Emit::Full;
+    }
+    let mut rec = [0u8; APP_RECORD_MAX];
+    let Some(n) = app_write_request_head(head, &mut rec) else {
+        return Emit::TooLarge;
     };
+    if write_out(s, &rec[..n]) {
+        s.server.app_exchanges = s.server.app_exchanges.wrapping_add(1);
+        Emit::Sent
+    } else {
+        Emit::Full
+    }
+}
 
-    match declared_total {
-        Some(total) => {
-            super::response::build_app_header(s, view.status, ct, total, view.headers);
+/// A fresh exchange, as its HEAD goes out.
+pub(crate) fn opened(stream: u64, now: u64, has_body: bool, continue_first: bool) -> Exchange {
+    let mut x = Exchange::idle();
+    x.stream = stream;
+    x.state = ex::OPEN;
+    if !has_body {
+        x.state |= ex::REQ_DONE;
+    } else if continue_first {
+        x.state |= ex::CONTINUE;
+    }
+    x.resp_credit = RESP_WINDOW;
+    x.deadline_ms = now.saturating_add(APP_TIMEOUT_MS);
+    x
+}
+
+/// Send one request-body record sealed in `rec`. `data_len` bytes are in place
+/// at `rec[APP_HDR..]`; `last` ends the request.
+pub(crate) unsafe fn emit_body(
+    s: &mut HttpState,
+    id: &AppId,
+    rec: &mut [u8],
+    data_len: usize,
+    last: bool,
+) -> bool {
+    let flags = if last { 0 } else { app_flag::MORE };
+    let Some(n) = app_seal_body(id, flags, data_len, rec) else {
+        return false;
+    };
+    write_out(s, &rec[..n])
+}
+
+/// Tell the application an exchange is over from this side. Queued when
+/// `req_out` is full; nothing is lost.
+pub(crate) unsafe fn abort(s: &mut HttpState, id: AppId, reason: u8) {
+    s.server.app_aborts = s.server.app_aborts.wrapping_add(1);
+    if s.server.abort_len == 0 {
+        let mut rec = [0u8; APP_HDR + 1];
+        if let Some(n) = app_write_abort(&id, reason, &mut rec) {
+            if write_out(s, &rec[..n]) {
+                return;
+            }
         }
-        None => {
+    }
+    let len = s.server.abort_len as usize;
+    if len < ABORT_QUEUE {
+        s.server.abort_queue[len] = (id, reason);
+        s.server.abort_len += 1;
+    }
+}
+
+/// Send waiting aborts, in order. True once none waits.
+pub(crate) unsafe fn flush_aborts(s: &mut HttpState) -> bool {
+    while s.server.abort_len > 0 {
+        let (id, reason) = s.server.abort_queue[0];
+        let mut rec = [0u8; APP_HDR + 1];
+        let Some(n) = app_write_abort(&id, reason, &mut rec) else {
+            return false;
+        };
+        if !write_out(s, &rec[..n]) {
+            return false;
+        }
+        let len = s.server.abort_len as usize;
+        s.server.abort_queue.copy_within(1..len, 0);
+        s.server.abort_len -= 1;
+    }
+    true
+}
+
+/// Read the application's records and hand each to the exchange it names.
+///
+/// One reader for every connection and generation, driven once per step:
+/// `resp_in` feeds them all, so a per-connection read would let whichever
+/// connection stepped first take a record addressed to another.
+pub(crate) unsafe fn drain_responses(s: &mut HttpState) {
+    flush_aborts(s);
+    if s.server.app_in_chan < 0 {
+        return;
+    }
+    let mut rec = [0u8; APP_RECORD_MAX];
+    for _ in 0..RECORDS_PER_STEP {
+        let sys = &*s.syscalls;
+        let chan = s.server.app_in_chan;
+        let poll = (sys.channel_poll)(chan, super::POLL_IN);
+        if poll <= 0 || (poll as u32 & super::POLL_IN) == 0 {
+            return;
+        }
+        let n = (sys.channel_read)(chan, rec.as_mut_ptr(), APP_RECORD_MAX);
+        if n <= 0 {
+            return;
+        }
+        let raw = &rec[..n as usize];
+        let Some(id) = record_id(raw) else {
+            // A record that does not parse is an application speaking a broken
+            // protocol, or one larger than a channel read on a port whose
+            // record size exceeds the reader's. Counted rather than dropped
+            // silently: the exchange it belonged to would otherwise surface as
+            // a 504, pointing at the application's speed rather than its bytes.
+            s.server.app_records_malformed = s.server.app_records_malformed.wrapping_add(1);
+            continue;
+        };
+        match id.origin {
+            app_origin::TCP => {
+                let Some(idx) = find_slot_by_conn_id(s, id.conn as u16) else {
+                    s.server.app_records_stale = s.server.app_records_stale.wrapping_add(1);
+                    continue;
+                };
+                #[cfg(feature = "h2")]
+                if !(*s.server.slots.as_ptr().add(idx)).h2.is_null() {
+                    super::h2::app_record(s, idx, &id, raw);
+                    continue;
+                }
+                h1_record(s, idx, &id, raw);
+            }
+            #[cfg(feature = "h3")]
+            app_origin::QUIC => super::h3::app_record(s, &id, raw),
+            _ => {
+                s.server.app_records_stale = s.server.app_records_stale.wrapping_add(1);
+            }
+        }
+    }
+}
+
+/// The id of a record the application wrote, when it parses.
+fn record_id(raw: &[u8]) -> Option<AppId> {
+    match app_parse_response(raw)? {
+        AppRecord::Head(h) => Some(h.id),
+        AppRecord::Body { id, .. }
+        | AppRecord::Abort { id, .. }
+        | AppRecord::Credit { id, .. }
+        | AppRecord::Datagram { id, .. } => Some(id),
+    }
+}
+
+// ── HTTP/1.1 ──────────────────────────────────────────────────────────────
+
+/// The id of the current h1 slot's exchange.
+pub(crate) unsafe fn h1_id(s: &HttpState) -> AppId {
+    let (conn, stream) = cur_slot(s)
+        .map(|c| (c.conn_id.max(0) as u32, c.app.stream))
+        .unwrap_or((0, 0));
+    AppId {
+        origin: app_origin::TCP,
+        conn,
+        stream,
+    }
+}
+
+/// Open the current h1 slot's exchange. `target` and `headers` are read from
+/// the request head still in `recv_buf`.
+pub(crate) unsafe fn h1_begin(
+    s: &mut HttpState,
+    target: &[u8],
+    headers: &[u8],
+    has_body: bool,
+    continue_first: bool,
+) -> Emit {
+    let (conn_id, verb) = match cur_slot(s) {
+        Some(c) => (c.conn_id.max(0) as u16, c.req_method),
+        None => return Emit::Unwired,
+    };
+    // A request generation, not a connection-scoped counter: the id must
+    // differ from any a previous holder of this connection id was given.
+    let stream = s.server.app_gen_next;
+    let peer: &[u8] = match super::peer_svid(s, conn_id) {
+        Some(p) => core::slice::from_raw_parts(p.as_ptr(), p.len()),
+        None => &[],
+    };
+    let head = AppRequestHead {
+        id: AppId {
+            origin: app_origin::TCP,
+            conn: conn_id as u32,
+            stream,
+        },
+        flags: if has_body { app_flag::MORE } else { 0 },
+        method: verb,
+        target,
+        headers,
+        peer,
+        resp_credit: RESP_WINDOW,
+    };
+    let r = emit_head(s, &head);
+    if r == Emit::Sent {
+        s.server.app_gen_next = stream.wrapping_add(1);
+        let now = s.server.now_ms;
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.app = opened(stream, now, has_body, continue_first);
+            cur.resp_started = 0;
+            cur.resp_length_known = 0;
+            cur.resp_remaining = 0;
+        }
+    }
+    r
+}
+
+/// Hand a record to the h1 exchange on slot `idx`, if it is the one the record
+/// names.
+unsafe fn h1_record(s: &mut HttpState, idx: usize, id: &AppId, raw: &[u8]) {
+    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+    if !slot.app.open() || slot.app.stream != id.stream {
+        s.server.app_records_stale = s.server.app_records_stale.wrapping_add(1);
+        return;
+    }
+    let mut x = slot.app;
+    let mut q = core::ptr::read(&slot.app_queue);
+    let outcome = admit(s, &mut x, &mut q, raw);
+    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+    slot.app = x;
+    core::ptr::write(&mut slot.app_queue, q);
+    match outcome {
+        Admit::Queued | Admit::Credit | Admit::Stale => {}
+        Admit::Abort | Admit::Violation => {
+            if outcome == Admit::Violation {
+                s.server.app_violations = s.server.app_violations.wrapping_add(1);
+            }
+            let saved = s.server.cur_slot;
+            s.server.cur_slot = idx as i32;
+            h1_fail(
+                s,
+                if outcome == Admit::Violation {
+                    Some(app_abort::CREDIT_OVERRUN)
+                } else {
+                    None
+                },
+            );
+            s.server.cur_slot = saved;
+        }
+    }
+}
+
+/// End the current h1 exchange because the application failed it. `reason` is
+/// what to tell the application, if it is still owed an abort. Before any of
+/// the response reached the peer, the server answers 502 for it; after, the
+/// connection closes, which the peer sees as the truncated response it is.
+unsafe fn h1_fail(s: &mut HttpState, reason: Option<u8>) {
+    let id = h1_id(s);
+    if let Some(r) = reason {
+        abort(s, id, r);
+    }
+    let started = cur_slot(s).map(|c| c.resp_started != 0).unwrap_or(true);
+    h1_close_exchange(s);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.keepalive = 0;
+    }
+    if started {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = super::Phase::CloseConn;
+        }
+    } else {
+        super::response::build_error(s, b"502 Bad Gateway", b"Bad Gateway\n");
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = super::Phase::DrainSend;
+        }
+    }
+}
+
+/// Forget the current slot's exchange and release what it holds.
+pub(crate) unsafe fn h1_close_exchange(s: &mut HttpState) {
+    let sys = s.syscalls;
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.app_queue.release(&*sys);
+        cur.app = Exchange::idle();
+        cur.resp_started = 0;
+        cur.resp_length_known = 0;
+        cur.resp_remaining = 0;
+    }
+}
+
+/// A connection is being released: its exchange, if the application still
+/// believes it open, is aborted.
+pub(crate) unsafe fn on_slot_release(s: &mut HttpState, idx: usize) {
+    let slot = &*s.server.slots.as_ptr().add(idx);
+    if !slot.app.open() || slot.app.finished() {
+        return;
+    }
+    let reason = if slot.peer_closed != 0 {
+        app_abort::PEER_GONE
+    } else if s.server.draining != 0 {
+        app_abort::DRAINING
+    } else {
+        app_abort::UNDELIVERABLE
+    };
+    let id = AppId {
+        origin: app_origin::TCP,
+        conn: slot.conn_id.max(0) as u32,
+        stream: slot.app.stream,
+    };
+    abort(s, id, reason);
+}
+
+/// `Phase::AppExchange`: move the request body to the application and its
+/// answer to the peer, as each side's credit and buffer allow.
+pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
+    // Bytes already composed go first.
+    let (send_len, send_off) = cur_slot(s)
+        .map(|c| (c.send_len, c.send_offset))
+        .unwrap_or((0, 0));
+    if send_off < send_len {
+        let sent = super::net_send(
+            s,
+            super::cur_send_buf_ptr(s).add(send_off as usize),
+            (send_len - send_off) as usize,
+        );
+        if sent > 0 {
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset += sent as u16;
+            }
+            super::mark_progress(s);
+        }
+    }
+    let drained = cur_slot(s)
+        .map(|c| c.send_offset >= c.send_len)
+        .unwrap_or(false);
+    if drained {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.send_len = 0;
+            cur.send_offset = 0;
+        }
+        h1_compose(s);
+        if cur_slot(s)
+            .map(|c| c.phase != super::Phase::AppExchange)
+            .unwrap_or(true)
+        {
+            return 2;
+        }
+    }
+
+    let x = cur_slot(s).map(|c| c.app).unwrap_or(Exchange::idle());
+
+    // The client is waiting for `100 Continue` before sending its body, and
+    // the application has now asked for it.
+    if x.is(ex::CONTINUE | ex::CREDITED) && !x.is(ex::RESP_HEAD) {
+        if cur_slot(s).map(|c| c.send_len == 0).unwrap_or(false) {
+            super::h1::stage_interim_continue(s);
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.app.state &= !ex::CONTINUE;
+            }
+        }
+        return 2;
+    }
+
+    // The request body, as far as credit goes.
+    if !x.is(ex::REQ_DONE) && !x.is(ex::CONTINUE) {
+        if let Some(r) = h1_forward(s) {
+            return r;
+        }
+    }
+
+    let x = cur_slot(s).map(|c| c.app).unwrap_or(Exchange::idle());
+    let queue_empty = cur_slot(s).map(|c| c.app_queue.is_empty()).unwrap_or(true);
+    let send_idle = cur_slot(s).map(|c| c.send_len == 0).unwrap_or(true);
+
+    // The response is over: on to the next request, or to the close if the
+    // request body was left unread.
+    if x.is(ex::RESP_DONE) && queue_empty && send_idle {
+        let short = cur_slot(s)
+            .map(|c| c.resp_length_known != 0 && c.resp_remaining != 0)
+            .unwrap_or(false);
+        if !x.is(ex::REQ_DONE) || short {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.keepalive = 0;
             }
-            super::response::build_app_header_open_ended(s, view.status, ct, view.headers);
         }
+        h1_close_exchange(s);
+        super::body::finish_response(s);
+        return 2;
     }
 
-    let cap = super::SEND_BUF_SIZE;
-    let off = cur_slot(s).map(|c| c.send_len as usize).unwrap_or(0);
-    let room = cap.saturating_sub(off);
-    let n = body.len().min(room);
-    if n > 0 {
-        let dst = super::cur_send_buf_mut_ptr(s).add(off);
-        core::ptr::copy_nonoverlapping(body.as_ptr(), dst, n);
+    // The peer has gone: nothing left to deliver to.
+    if cur_slot(s).map(|c| c.peer_closed != 0).unwrap_or(false) && send_idle {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = super::Phase::CloseConn;
+        }
+        return 2;
     }
-    let now = dev_millis(&*s.syscalls);
-    if let Some(cur) = cur_slot_mut(s) {
-        cur.send_len = (off + n) as u16;
-        cur.send_offset = 0;
-        cur.app_streaming = if streaming { 1 } else { 0 };
-        // While streaming, the request stays PENDING: more envelopes are
-        // expected for it, and clearing the flag would make the next chunk
-        // look like a response to a request nobody sent.
-        cur.app_pending = if streaming { 1 } else { 0 };
-        // Streaming is progress: the deadline restarts, and a HELD stream
-        // (`FLAG_HOLD`) runs under the long one from its first envelope.
-        cur.app_deadline_ms = if streaming {
-            now.saturating_add(progress_timeout_ms(view.flags))
+
+    // The application holds the turn and has let it lapse.
+    if x.deadline_ms != 0 && s.server.now_ms >= x.deadline_ms {
+        s.server.app_timeouts = s.server.app_timeouts.wrapping_add(1);
+        let id = h1_id(s);
+        abort(s, id, app_abort::STALLED);
+        let started = cur_slot(s).map(|c| c.resp_started != 0).unwrap_or(true);
+        h1_close_exchange(s);
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.keepalive = 0;
+        }
+        if started {
+            // Mid-response, a 504 would be read as body. Closing is the only
+            // honest signal left: the truncated transfer it is.
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = super::Phase::CloseConn;
+            }
         } else {
-            0
+            super::response::build_error(s, b"504 Gateway Timeout", b"Gateway Timeout\n");
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = super::Phase::DrainSend;
+            }
+        }
+        return 2;
+    }
+    0
+}
+
+/// Forward request-body bytes the application has credit for. `Some` ends the
+/// step with that return code.
+unsafe fn h1_forward(s: &mut HttpState) -> Option<i32> {
+    let id = h1_id(s);
+    let mut rec = [0u8; APP_RECORD_MAX];
+    // A few records per step: enough that framing between chunks costs no
+    // step of its own, bounded so one connection cannot hold the step.
+    let mut step = super::reqbody::BodyStep::Wait;
+    for _ in 0..FORWARDS_PER_STEP {
+        let credit = cur_slot(s).map(|c| c.app.req_credit).unwrap_or(0);
+        let cap = APP_HDR + (credit as usize).min(APP_BODY_MAX);
+        step = match super::reqbody::peek(s, &mut rec[..cap], APP_HDR) {
+            Ok(p) if p.produced == 0 && !p.done => super::reqbody::commit(s, p),
+            Ok(p) => {
+                if emit_body(s, &id, &mut rec[..cap], p.produced, p.done) {
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.app.req_credit -= p.produced as u32;
+                    }
+                    super::reqbody::commit(s, p)
+                } else {
+                    super::reqbody::BodyStep::Wait
+                }
+            }
+            Err(step) => step,
         };
-        // A single-envelope body that did not fit `send_buf` cannot be
-        // finished by a length-delimited response, so the connection closes
-        // after it and the truncation is visible to the client as a short read
-        // rather than as a corrupt next response. (An application with a body
-        // this large should be streaming it.)
-        if !streaming && n < body.len() {
-            cur.keepalive = 0;
-        }
-        cur.phase = super::Phase::DrainSend;
-    }
-}
-
-/// Append a continuation chunk of a streamed body to `send_buf`.
-///
-/// Only the body is read: status, content type and headers were settled by the
-/// first envelope, and honouring them again mid-body would put a second
-/// response head inside the first response.
-unsafe fn compose_stream_chunk(s: &mut HttpState, view: &RespView<'_>) {
-    let cap = super::SEND_BUF_SIZE;
-    let n = view.body.len().min(cap);
-    if n > 0 {
-        core::ptr::copy_nonoverlapping(view.body.as_ptr(), super::cur_send_buf_mut_ptr(s), n);
-    }
-    // A chunk larger than `send_buf` cannot be delivered whole, and the bytes
-    // past `n` are gone. Silently keeping the connection alive after that is
-    // the worst available outcome: the declared `Content-Length` can never be
-    // satisfied, so the client either hangs waiting for a body that has
-    // stopped coming or — on keep-alive — reads the NEXT response as the
-    // remainder of this one. Closing makes the loss a short read, which is
-    // detectable, and matches what the single-envelope path above already does
-    // when a body overruns the buffer.
-    let truncated = view.body.len() > n;
-    if truncated {
-        s.server.app_envelopes_oversize = s.server.app_envelopes_oversize.wrapping_add(1);
-    }
-    let last = (view.flags & FLAG_MORE_BODY) == 0 || truncated;
-    let now = dev_millis(&*s.syscalls);
-    if let Some(cur) = cur_slot_mut(s) {
-        cur.send_len = n as u16;
-        cur.send_offset = 0;
-        if truncated {
-            cur.keepalive = 0;
-        }
-        if last {
-            cur.app_streaming = 0;
-            cur.app_pending = 0;
-            cur.app_deadline_ms = 0;
-        } else {
-            // The deadline measures time since the last PROGRESS, not since
-            // the request. Without the refresh, any transfer longer than
-            // `APP_TIMEOUT_MS` is cut off mid-body no matter how steadily the
-            // application is feeding it — which is every large artefact.
-            cur.app_deadline_ms = now.saturating_add(progress_timeout_ms(view.flags));
-        }
-        cur.phase = super::Phase::DrainSend;
-    }
-}
-
-/// The `Content-Length` an application declared in its own header block, if
-/// any. Used only to frame a streamed response — for a single-envelope
-/// response the real body length is known and is always preferred.
-fn declared_length(headers: &[u8]) -> Option<u32> {
-    let mut line_start = 0usize;
-    let mut i = 0usize;
-    while i < headers.len() {
-        if i + 1 < headers.len() && headers[i] == b'\r' && headers[i + 1] == b'\n' {
-            if let Some(v) = content_length_of(&headers[line_start..i]) {
-                return Some(v);
-            }
-            i += 2;
-            line_start = i;
-            continue;
-        }
-        i += 1;
-    }
-    if line_start < headers.len() {
-        return content_length_of(&headers[line_start..]);
-    }
-    None
-}
-
-fn content_length_of(line: &[u8]) -> Option<u32> {
-    let colon = line.iter().position(|c| *c == b':')?;
-    if !line[..colon].eq_ignore_ascii_case(b"content-length") {
-        return None;
-    }
-    let mut v: u32 = 0;
-    let mut digits = 0usize;
-    for c in &line[colon + 1..] {
-        if *c == b' ' || *c == b'\t' {
-            if digits == 0 {
-                continue;
-            }
+        if step != super::reqbody::BodyStep::Progress {
             break;
         }
+        super::mark_progress(s);
+    }
+    match step {
+        super::reqbody::BodyStep::Progress => None,
+        super::reqbody::BodyStep::Done => {
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.app.state |= ex::REQ_DONE;
+            }
+            super::mark_progress(s);
+            None
+        }
+        super::reqbody::BodyStep::Wait => {
+            // A peer gone mid-body leaves a request that can never complete.
+            if cur_slot(s).map(|c| c.peer_closed != 0).unwrap_or(false) {
+                abort(s, id, app_abort::PEER_GONE);
+                h1_close_exchange(s);
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = super::Phase::CloseConn;
+                }
+                return Some(2);
+            }
+            None
+        }
+        super::reqbody::BodyStep::Bad | super::reqbody::BodyStep::TooLarge => {
+            let too_large = step == super::reqbody::BodyStep::TooLarge;
+            abort(
+                s,
+                id,
+                if too_large {
+                    app_abort::TOO_LARGE
+                } else {
+                    app_abort::MALFORMED
+                },
+            );
+            if too_large {
+                s.server.bodies_refused = s.server.bodies_refused.wrapping_add(1);
+            }
+            let started = cur_slot(s).map(|c| c.resp_started != 0).unwrap_or(true);
+            h1_close_exchange(s);
+            // The rest of the body is still arriving and nothing is reading
+            // it, so there is no next request boundary to find: close.
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.keepalive = 0;
+            }
+            if started {
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = super::Phase::CloseConn;
+                }
+            } else {
+                if too_large {
+                    super::response::build_error(
+                        s,
+                        b"413 Content Too Large",
+                        b"Content Too Large\n",
+                    );
+                } else {
+                    super::response::build_error(s, b"400 Bad Request", b"Bad Request\n");
+                }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = super::Phase::DrainSend;
+                }
+            }
+            Some(2)
+        }
+    }
+}
+
+/// Compose what the exchange's queue holds into the empty `send_buf`: the
+/// response head when it is next, then body bytes as far as they fit.
+unsafe fn h1_compose(s: &mut HttpState) {
+    let idx = s.server.cur_slot;
+    if idx < 0 || idx as usize >= MAX_CONCURRENT_CONNS {
+        return;
+    }
+    let slot: *mut super::ConnSlot = s.server.slots.as_mut_ptr().add(idx as usize);
+    let id = h1_id(s);
+    while let Some(rec) = (*slot).app_queue.front() {
+        let (body, is_head) = record_body(rec);
+        if is_head && !(*slot).app_queue.front_head_done() {
+            if !h1_compose_head(s, rec) {
+                // A head the connection buffer cannot hold. Nothing has gone
+                // out, so the server answers for the application.
+                s.server.app_violations = s.server.app_violations.wrapping_add(1);
+                h1_fail(s, Some(app_abort::UNDELIVERABLE));
+                return;
+            }
+            (*slot).app_queue.take_front_head();
+            (*slot).resp_started = 1;
+        }
+        let taken = (*slot).app_queue.front_taken();
+        let rest = &body[taken.min(body.len())..];
+        let carries = (*slot).resp_carries_body != 0;
+        let room = SEND_BUF_SIZE.saturating_sub((*slot).send_len as usize);
+        let n = if carries {
+            rest.len().min(room)
+        } else {
+            rest.len()
+        };
+        if carries && n > 0 {
+            // A declared length the application overruns is a response the
+            // peer would misframe: the extra bytes would read as the next
+            // response. Refused before a byte past it is sent.
+            if (*slot).resp_length_known != 0 && n as u64 > (*slot).resp_remaining {
+                s.server.app_violations = s.server.app_violations.wrapping_add(1);
+                h1_fail(s, Some(app_abort::CREDIT_OVERRUN));
+                return;
+            }
+            let dst = (*slot).send_buf.add((*slot).send_len as usize);
+            core::ptr::copy_nonoverlapping(rest.as_ptr(), dst, n);
+            (*slot).send_len += n as u16;
+            if (*slot).resp_length_known != 0 {
+                (*slot).resp_remaining -= n as u64;
+            }
+        }
+        (*slot).app_queue.take_front_body(n);
+        let whole = taken + n >= body.len();
+        if whole {
+            (*slot).app_queue.pop(&*s.syscalls);
+        }
+        let empty = (*slot).app_queue.is_empty();
+        let mut x = (*slot).app;
+        note_delivered(s, &id, &mut x, n, empty);
+        (*slot).app = x;
+        if !whole || (*slot).send_len as usize >= SEND_BUF_SIZE {
+            return;
+        }
+    }
+}
+
+/// Write a response HEAD's status line and headers into `send_buf`. False when
+/// they do not fit.
+unsafe fn h1_compose_head(s: &mut HttpState, rec: &[u8]) -> bool {
+    let Some(AppRecord::Head(h)) = app_parse_response(rec) else {
+        return false;
+    };
+    let verb = cur_slot(s).map(|c| c.req_method).unwrap_or(0);
+    let carries = status_allows_body(h.status, verb);
+    let streaming = h.flags & app_flag::MORE != 0;
+    let declared = declared_length(h.headers);
+    // The framing the peer reads the body by:
+    //  - no body (HEAD, 204, 304): the application's own `Content-Length`,
+    //    which for HEAD is the length the GET would carry;
+    //  - one record: its body's length;
+    //  - streamed: the application's declared length, or, without one, the
+    //    end of the connection.
+    let length: Option<u64> = if !carries {
+        if method::method_sends_response_body(verb) && !matches!(h.status, 304) {
+            None
+        } else {
+            declared
+        }
+    } else if !streaming {
+        Some(h.body.len() as u64)
+    } else {
+        declared
+    };
+    // A response with no declared end, or one composed while the request
+    // body is still unread, ends the connection — and its head says so.
+    let body_unread = cur_slot(s).map(|c| !c.app.is(ex::REQ_DONE)).unwrap_or(true);
+    if (carries && streaming && length.is_none()) || body_unread {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.keepalive = 0;
+        }
+    }
+    let ct: &[u8] = if h.content_type.is_empty() {
+        b"application/octet-stream"
+    } else {
+        h.content_type
+    };
+    let ok = super::response::build_app_header(s, h.status, ct, length, h.headers);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.resp_carries_body = carries as u8;
+        cur.resp_length_known = (carries && length.is_some()) as u8;
+        cur.resp_remaining = length.unwrap_or(0);
+    }
+    ok
+}
+
+/// The `Content-Length` an application declared in its own header block.
+pub(crate) fn declared_length(headers: &[u8]) -> Option<u64> {
+    let v = super::super::http_app::app_header(headers, b"content-length")?;
+    if v.is_empty() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &c in v {
         if !c.is_ascii_digit() {
             return None;
         }
-        v = v.checked_mul(10)?.checked_add((*c - b'0') as u32)?;
-        digits += 1;
+        n = n.checked_mul(10)?.checked_add((c - b'0') as u64)?;
     }
-    if digits == 0 {
-        None
-    } else {
-        Some(v)
-    }
-}
-
-/// Whether an h2 stream id fits the 16 bits the envelope carries.
-///
-/// h2 stream ids are u32 and strictly increasing, so a connection that serves
-/// enough requests eventually passes 65535. Truncating there would alias a new
-/// stream onto a live one's correlation key and deliver its response to the
-/// wrong request — silently, since both are valid HTTP. Refusing the dispatch
-/// instead costs one 503 on a connection that has already served 32k requests,
-/// and the client simply reconnects.
-pub fn stream_id_fits(stream_id: u32) -> bool {
-    stream_id <= u16::MAX as u32
+    Some(n)
 }
 
 /// Whether a status code is allowed to carry a body at all (RFC 9110 §6.4.1).

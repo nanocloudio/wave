@@ -62,7 +62,7 @@ limit_register_coverage = "fail"
 # there is simply no workspace left for it to have opted out of.
 
 [ci.test]
-# Nine project gates, run in order at CI phase 3.5 (after the strict module
+# Ten project gates, run in order at CI phase 3.5 (after the strict module
 # build):
 #
 #   1. dev_certs.sh — the TLS example graphs name a certificate and a key on
@@ -101,6 +101,12 @@ limit_register_coverage = "fail"
 #   9. http_app_reply.sh — the application fan-out's reply half. A forwarded
 #      request whose answer is never composed leaves the connection open and
 #      silent, which reaches a client as a timeout and names no component.
+#  10. s3_serve.sh — the `wave-s3` service bundle published, pinned, synced
+#      and run through `fluxor run`, then driven with real S3 traffic and by
+#      Wave's own `s3` connector. The guarantees it checks — acknowledged only
+#      at the provider's fence, refusals rather than clamps, one slow body
+#      never stalling another — only hold or fail with every module, the
+#      runtime's store and a real client in the loop.
 scripts = [
   "tools/ci/dev_certs.sh",
   "tools/ci/shadow_guard.sh",
@@ -111,6 +117,7 @@ scripts = [
   "tools/ci/fmod_pic_relocs.sh",
   "tools/e2e/http_exchange.sh",
   "tools/e2e/http_app_reply.sh",
+  "tools/e2e/s3_serve.sh",
 ]
 
 # Crate-root `#![allow(...)]` is banned by `../standards/lints.md` §4. Each row

@@ -8,12 +8,12 @@ surface as a port content type.
 | Surface | Meaning | Declared by |
 | --- | --- | --- |
 | `NetProto` | Network endpoint and framed transport commands/events | `http` (`net_in`/`net_out`), `rtp`, `websocket`, `s3` |
-| `OctetStream` | Unstructured application bytes | every module — HTTP bodies, `ws_stream` payloads, RTP PCMU audio, SIP datagrams, SMTP session bytes, S3 operation records |
+| `OctetStream` | Unstructured application bytes | every module — HTTP bodies, `ws_stream` payloads, RTP PCMU audio, SIP datagrams, SMTP session bytes |
 | `WsFrame` | Connection-addressed WebSocket frame envelope | `http` (`ws_in`/`ws_out`, and `ws2_in`/`ws2_out` for a standby session worker), `ws_stream`, `ws_echo_worker` (fixture) |
 | `FmpMessage` | Structured control records | `http` (`variables`), `sip` (`call`) |
 | `Telemetry` | Observability records | `ws_stream` |
 | `AudioEncoded` | Codec-domain audio access units | not consumed — see below |
-| `HttpRequest` / `HttpResponse` | The application fan-out envelopes | `http` (`req_out`/`resp_in`) |
+| `HttpRequest` / `HttpResponse` | The application exchange records (`modules/common/http_app.rs`) | `http` (`req_out`/`resp_in`), `s3` (`request_in`/`response_out`: the client side of the same records) |
 | `TextPlain` | Human-readable status lines | `s3` (`status_out`) |
 
 Two surfaces are carried over ports rather than declared as port
@@ -23,12 +23,11 @@ the same `net_in`/`net_out` it uses for h1 and h2. Datagram framing
 (`DG_AF_INET`) is how `rtp` and `sip` address UDP peers through
 their transport ports.
 
-The `S3Request` and `S3Response` operation records are Wave-local
-layouts, not fluxor content types: `s3`'s `request_in` and
-`response_out` ports declare `OctetStream` and document the record
-framing in the module manifest. The `SmtpRequest` and `SmtpResult`
-records on `smtp`'s `request_in` and `result_out` ports are the same
-kind of layout, and `smtp`'s `status_out` is likewise `OctetStream`.
+The `SmtpRequest` and `SmtpResult` records on `smtp`'s `request_in`
+and `result_out` ports are Wave-local layouts, not fluxor content
+types: the ports declare `OctetStream` and document the record framing
+in the module manifest, and `smtp`'s `status_out` is likewise
+`OctetStream`.
 
 `stun` speaks the datagram surface directly rather than a local
 record layout: a Binding request arrives as one datagram and is

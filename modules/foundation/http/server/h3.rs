@@ -75,8 +75,6 @@ use super::super::wire::h3::{
     H3_UNI_STREAM_PUSH, H3_UNI_STREAM_QPACK_DECODER, H3_UNI_STREAM_QPACK_ENCODER,
 };
 use super::super::wire::qpack;
-#[path = "../../../common/h3_app.rs"]
-mod h3_app;
 #[path = "../../../common/h3_datagram.rs"]
 mod h3_datagram;
 
@@ -98,21 +96,32 @@ pub enum H3StreamState {
     Idle,
     HeadersRecv,
     BodyRecv,
+    /// An application route's request, decoded and waiting for its HEAD to
+    /// go out on `req_out`.
+    AppPending,
+    /// An exchange with the application.
+    AppOpen,
+    /// The response is complete and the request body is not: what is still
+    /// arriving is read and dropped until the peer ends the stream.
+    Discarding,
     HeadersSent,
     BodySend,
     Complete,
     Reset,
 }
 
-/// Per-slot ingress accumulator. One HTTP/3 request head must fit whole: the
-/// QPACK field section is decoded in one pass, so a head split across QUIC
-/// stream chunks is buffered until complete.
+/// Per-slot ingress accumulator for a request stream's framing: frame heads
+/// and the HEADERS section, which is decoded in one pass and so must be
+/// whole. DATA payload never passes through it. Larger than one transport
+/// delivery (`MUX_QUIC_STREAM_RX_MAX`), so an empty accumulator always takes
+/// one; on hosts, large enough for a presigned request's header section.
 ///
 /// This is a PROTOCOL budget — how much request head this server will hold —
 /// and it is unrelated to how much the transport may hand over in one frame.
-/// Sizing a wire scratch from it is what silently truncated `MSG_MUX_STREAM_RX`;
-/// the assertion below the ingress copy keeps the two apart.
-pub const H3_RECV_BUF: usize = 1024;
+#[cfg(target_arch = "aarch64")]
+pub const H3_RECV_BUF: usize = 6144;
+#[cfg(not(target_arch = "aarch64"))]
+pub const H3_RECV_BUF: usize = 1536;
 
 /// Per-slot egress buffer. Holds one rendered response (HEADERS + DATA frames)
 /// awaiting the transport's willingness to take it.
@@ -145,8 +154,51 @@ pub struct H3StreamSlot {
     pub recv_hdr_len: usize,
     pub request: H3Request,
     pub have_request: bool,
-    pub body_buf: [u8; H3_RECV_BUF],
-    pub body_len: usize,
+    /// DATA payload bytes still due in the frame being read; they are body,
+    /// not framing, and bypass `recv_hdr_buf`.
+    pub data_rem: u64,
+    /// Request-body bytes held for the application until it has credit for
+    /// them, at most `H3_RX_HOLD`. Allocated once and kept across requests:
+    /// a slot is released where the allocator is out of reach.
+    pub rx_buf: *mut u8,
+    pub rx_len: usize,
+    pub rx_cap: usize,
+    /// Request-body bytes received, against `body_limit`.
+    pub body_total: u64,
+    pub body_limit: u64,
+    /// Stream bytes consumed and not yet acknowledged to the transport — the
+    /// credit `CMD_MUX_STREAM_ACK` returns. Bytes held for the application
+    /// are acknowledged only once forwarded, which is what makes the peer's
+    /// flow control the backpressure.
+    pub ack_owed: u32,
+    /// The peer has ended its side of the stream.
+    pub peer_fin: bool,
+    /// The request's header fields as `name: value\r\n` lines, for the
+    /// application. Allocated once and kept, like `rx_buf`.
+    pub fields: *mut u8,
+    pub fields_len: usize,
+    /// Request flags for the application (`app_flag::ROUTE_*`, `WEBSOCKET`,
+    /// `WEBTRANSPORT`).
+    pub app_flags: u8,
+    /// The response may carry a body (not HEAD, 204, 304).
+    pub resp_carries: bool,
+    /// The matched route hands the request to the application.
+    pub app_route: bool,
+    /// The body passed the route's ceiling; the rest is dropped and the
+    /// peer is answered 413.
+    pub too_large: bool,
+    /// The application must still be told the exchange is over, with this
+    /// reason; 0 when nothing is owed.
+    pub abort_due: u8,
+    /// The stream's own response is complete and its close has gone out.
+    pub closed_out: bool,
+    /// A STOP_SENDING is owed: the response is complete and the request
+    /// body is not wanted.
+    pub stop_owed: bool,
+    #[cfg(feature = "app")]
+    pub app: super::app::Exchange,
+    #[cfg(feature = "app")]
+    pub app_queue: super::app::RecordQueue,
     /// Egress: the rendered response and how much of it the transport has
     /// taken. Per slot, not per connection — that is the whole point of the
     /// multiplexed design.
@@ -183,10 +235,6 @@ pub struct H3StreamSlot {
     pub matched_route: i16,
     pub file_index: i16,
     pub tmpl_pos: usize,
-    /// An application request has been emitted and is awaiting `resp_in`.
-    pub app_pending: bool,
-    /// The application response is chunked and another envelope may follow.
-    pub app_more: bool,
     /// The tunnel's frames cross the `WsFrame` seam (a fan-out route) rather
     /// than being echoed here. See `ws_stream_in`.
     pub ws_fan_out: bool,
@@ -233,8 +281,27 @@ impl H3StreamSlot {
             recv_hdr_len: 0,
             request: H3Request::empty(),
             have_request: false,
-            body_buf: [0; H3_RECV_BUF],
-            body_len: 0,
+            data_rem: 0,
+            rx_buf: core::ptr::null_mut(),
+            rx_len: 0,
+            rx_cap: 0,
+            body_total: 0,
+            body_limit: 0,
+            ack_owed: 0,
+            peer_fin: false,
+            fields: core::ptr::null_mut(),
+            fields_len: 0,
+            app_flags: 0,
+            resp_carries: false,
+            app_route: false,
+            too_large: false,
+            abort_due: 0,
+            closed_out: false,
+            stop_owed: false,
+            #[cfg(feature = "app")]
+            app: super::app::Exchange::idle(),
+            #[cfg(feature = "app")]
+            app_queue: super::app::RecordQueue::empty(),
             ws_active: false,
             webtransport_active: false,
             ws_buf_len: 0,
@@ -247,8 +314,6 @@ impl H3StreamSlot {
             matched_route: -1,
             file_index: -1,
             tmpl_pos: 0,
-            app_pending: false,
-            app_more: false,
             ws_fan_out: false,
             conn_slot: -1,
             ws_pos: 0,
@@ -256,8 +321,9 @@ impl H3StreamSlot {
     }
 
     /// Release the slot for reuse. Buffers are left as they are — nothing reads
-    /// them while `allocated` is false, and zeroing 3 KiB per completed request
-    /// would be work with no observable effect.
+    /// them while `allocated` is false, and zeroing them per completed request
+    /// would be work with no observable effect. The heap buffers stay
+    /// allocated for the slot's next request.
     pub fn release(&mut self) {
         self.allocated = false;
         self.state = H3StreamState::Idle;
@@ -268,7 +334,25 @@ impl H3StreamSlot {
         self.recv_hdr_len = 0;
         self.request = H3Request::empty();
         self.have_request = false;
-        self.body_len = 0;
+        self.data_rem = 0;
+        self.rx_len = 0;
+        self.body_total = 0;
+        self.body_limit = 0;
+        self.ack_owed = 0;
+        self.peer_fin = false;
+        self.fields_len = 0;
+        self.app_flags = 0;
+        self.resp_carries = false;
+        self.app_route = false;
+        self.too_large = false;
+        self.abort_due = 0;
+        self.closed_out = false;
+        self.stop_owed = false;
+        #[cfg(feature = "app")]
+        {
+            self.app = super::app::Exchange::idle();
+            self.app_queue.clear();
+        }
         self.ws_active = false;
         self.webtransport_active = false;
         self.ws_buf_len = 0;
@@ -279,11 +363,20 @@ impl H3StreamSlot {
         self.body_done = false;
         self.matched_route = -1;
         self.tmpl_pos = 0;
-        self.app_pending = false;
-        self.app_more = false;
         self.ws_fan_out = false;
         self.conn_slot = -1;
         self.ws_pos = 0;
+    }
+
+    /// Whether the slot holds admitted work: anything but a stream whose
+    /// response is complete and closed, kept only to read and drop the rest
+    /// of a request the peer has not finished sending.
+    pub fn holds_work(&self) -> bool {
+        self.allocated
+            && !(self.state == H3StreamState::Discarding
+                && self.closed_out
+                && self.ack_owed == 0
+                && self.abort_due == 0)
     }
 
     pub fn pending_out(&self) -> usize {
@@ -1037,9 +1130,13 @@ pub fn classify_uni_stream_prefix(buf: &[u8]) -> Option<(u64, usize)> {
 // Request header decoding (RFC 9114 §4.1, RFC 9204 §4.5)
 // ----------------------------------------------------------------------
 
-/// Longest request target this module will accept on an h3 stream.
-/// Deliberately the same ceiling h2 uses (`server::MAX_PATH`), restated
-/// here rather than imported so the h3 build does not depend on h2.
+/// Longest request target this module will accept on an h3 stream: the
+/// application's request-target ceiling on hosts, where a presigned object
+/// URL is served; the route-path budget elsewhere. A longer one is refused,
+/// never clipped.
+#[cfg(target_arch = "aarch64")]
+pub const H3_MAX_PATH: usize = 2048;
+#[cfg(not(target_arch = "aarch64"))]
 pub const H3_MAX_PATH: usize = 200;
 
 /// Longest `:authority` retained. Only its presence and length are
@@ -1055,10 +1152,12 @@ pub const H3_WS_PAYLOAD_MAX: usize = 512;
 /// fit is refused, not truncated — see [`H3Dispatch::TooLarge`].
 pub const H3_TEMPLATE_BUF: usize = 1024;
 
-/// Scratch for one decoded field line (name + value). A field larger than
-/// this is refused rather than truncated — a truncated header is a
+/// Scratch for one decoded field line (name + value): the longest target plus
+/// room for its name, so a target at the ceiling decodes and one past it is
+/// refused by the message rules rather than by the decoder. A field larger
+/// than this is refused rather than truncated — a truncated header is a
 /// different request from the one the peer sent.
-const H3_FIELD_SCRATCH: usize = 512;
+const H3_FIELD_SCRATCH: usize = H3_MAX_PATH + 64;
 
 // ── RFC 9114 §8.1 / RFC 9204 §6 error codes ────────────────────────
 //
@@ -1130,8 +1229,11 @@ pub const H3_METHOD_BODY: u8 = 3;
 #[derive(Clone, Copy)]
 pub struct H3Request {
     pub method_kind: u8,
+    /// The method in the shared vocabulary (`wire::method`), as the
+    /// application reads it.
+    pub method: u8,
     pub path: [u8; H3_MAX_PATH],
-    pub path_len: u8,
+    pub path_len: u16,
     pub authority: [u8; H3_MAX_AUTHORITY],
     pub authority_len: u8,
     /// RFC 9220 extended CONNECT — `:protocol = websocket`.
@@ -1139,12 +1241,18 @@ pub struct H3Request {
     pub protocol_webtransport: bool,
     /// `content-length`, when the peer stated one.
     pub content_length: Option<u64>,
+    /// Bytes of field lines captured for the application.
+    pub fields_len: u16,
+    /// The field lines did not fit the capture buffer: the request is
+    /// refused rather than forwarded with fields missing.
+    pub fields_over: bool,
 }
 
 impl H3Request {
     pub const fn empty() -> Self {
         Self {
             method_kind: H3_METHOD_NONE,
+            method: 0,
             path: [0; H3_MAX_PATH],
             path_len: 0,
             authority: [0; H3_MAX_AUTHORITY],
@@ -1152,6 +1260,8 @@ impl H3Request {
             protocol_ws: false,
             protocol_webtransport: false,
             content_length: None,
+            fields_len: 0,
+            fields_over: false,
         }
     }
 
@@ -1182,7 +1292,25 @@ fn parse_u64(bytes: &[u8]) -> Option<u64> {
     Some(v)
 }
 
-/// Decode a HEADERS frame payload — a QPACK field section — into `out`.
+/// Append `name: value\r\n` to the capture buffer, or mark the request
+/// over when it does not fit.
+fn capture_field(fields: &mut [u8], out: &mut H3Request, name: &[u8], value: &[u8]) {
+    let at = out.fields_len as usize;
+    let need = name.len() + 2 + value.len() + 2;
+    if out.fields_over || at + need > fields.len() || at + need > u16::MAX as usize {
+        out.fields_over = true;
+        return;
+    }
+    let f = &mut fields[at..at + need];
+    f[..name.len()].copy_from_slice(name);
+    f[name.len()..name.len() + 2].copy_from_slice(b": ");
+    f[name.len() + 2..need - 2].copy_from_slice(value);
+    f[need - 2..].copy_from_slice(b"\r\n");
+    out.fields_len = (at + need) as u16;
+}
+
+/// Decode a HEADERS frame payload — a QPACK field section — into `out`,
+/// capturing its field lines into `fields` for an application route.
 ///
 /// This is the request path the module did not have. Every field line goes
 /// through [`qpack::qpack_decode_field_into`], so Huffman-coded names and
@@ -1199,7 +1327,11 @@ fn parse_u64(bytes: &[u8]) -> Option<u64> {
 /// * an unknown pseudo-header is a malformed request.
 ///
 /// Returns the number of field lines decoded.
-pub fn decode_request_headers(block: &[u8], out: &mut H3Request) -> Result<usize, H3Error> {
+pub fn decode_request_headers(
+    block: &[u8],
+    out: &mut H3Request,
+    capture: &mut [u8],
+) -> Result<usize, H3Error> {
     *out = H3Request::empty();
 
     let mut off = qpack::qpack_decode_block_prefix(block).ok_or(H3Error::QpackFailed)?;
@@ -1235,6 +1367,7 @@ pub fn decode_request_headers(block: &[u8], out: &mut H3Request) -> Result<usize
                         return Err(H3Error::MessageError);
                     }
                     seen_method = true;
+                    out.method = super::super::wire::method::method_from_token(value);
                     out.method_kind = if value == b"GET" || value == b"HEAD" {
                         H3_METHOD_GET
                     } else if value == b"CONNECT" {
@@ -1258,7 +1391,7 @@ pub fn decode_request_headers(block: &[u8], out: &mut H3Request) -> Result<usize
                         return Err(H3Error::MessageError);
                     }
                     out.path[..value.len()].copy_from_slice(value);
-                    out.path_len = value.len() as u8;
+                    out.path_len = value.len() as u16;
                 }
                 b":authority" => {
                     if seen_authority {
@@ -1268,6 +1401,8 @@ pub fn decode_request_headers(block: &[u8], out: &mut H3Request) -> Result<usize
                     let n = value.len().min(H3_MAX_AUTHORITY);
                     out.authority[..n].copy_from_slice(&value[..n]);
                     out.authority_len = n as u8;
+                    // The application reads the authority as h1's `host`.
+                    capture_field(capture, out, b"host", value);
                 }
                 b":scheme" => {
                     if seen_scheme {
@@ -1289,6 +1424,10 @@ pub fn decode_request_headers(block: &[u8], out: &mut H3Request) -> Result<usize
             // RFC 9114 §4.2: a field name must be lowercase on the wire.
             if name.iter().any(|c| c.is_ascii_uppercase()) {
                 return Err(H3Error::MessageError);
+            }
+            // A `host` beside the authority is the same fact twice.
+            if !(seen_authority && name == b"host") {
+                capture_field(capture, out, name, value);
             }
         }
 
@@ -1713,7 +1852,7 @@ pub fn ingest_request_frame(buf: &[u8], req: &mut H3Request) -> (H3Ingest, usize
     }
 
     match frame.frame_type {
-        H3_FRAME_HEADERS => match decode_request_headers(frame.payload, req) {
+        H3_FRAME_HEADERS => match decode_request_headers(frame.payload, req, &mut []) {
             Ok(_) => (H3Ingest::Headers, consumed),
             Err(e) => (H3Ingest::Error(e), consumed),
         },
@@ -1802,7 +1941,7 @@ pub unsafe fn test_decode_and_dispatch_limited(
 ) -> Result<H3Dispatch, H3Error> {
     let s = &*(state as *const super::super::HttpState);
     let mut req = H3Request::empty();
-    decode_request_headers(block, &mut req)?;
+    decode_request_headers(block, &mut req, &mut [])?;
     Ok(dispatch_request(s, &req, out, peer_limit))
 }
 
@@ -1817,13 +1956,6 @@ pub unsafe fn test_pump_stream_in(
     let s = &mut *(state as *mut super::super::HttpState);
     let st = &mut s.h3 as *mut H3State;
     pump_stream_in(&mut *st, &*s, session_id, stream_id, data, fin)
-}
-
-#[cfg(feature = "host-test")]
-pub unsafe fn test_queue_app_response(state: *mut u8, response: &[u8]) -> bool {
-    let s = &mut *(state as *mut super::super::HttpState);
-    let st = &mut s.h3 as *mut H3State;
-    queue_app_response(&mut *st, response, u32::MAX)
 }
 
 #[cfg(feature = "host-test")]
@@ -1913,62 +2045,474 @@ pub enum H3StreamOutcome {
     Ignored,
 }
 
-/// Queue one H3 application response for the exact session/stream that issued
-/// it. The response remains in the stream slot until `stage_next_out` commits
-/// the transport write, so a full `resp_in`/`net_out` channel cannot lose it.
-pub(crate) unsafe fn queue_app_response(
-    st: &mut H3State,
-    response: &[u8],
-    peer_limit: u32,
-) -> bool {
-    let Some(resp) = h3_app::parse_response(response) else {
-        return false;
-    };
-    if (resp.flags & h3_app::H3_APP_FLAG_WEBSOCKET) != 0
-        && (resp.status != 200 || (resp.flags & h3_app::H3_APP_FLAG_MORE_BODY) != 0)
-    {
-        return false;
+/// Each request stream's own work this step: a body past its ceiling
+/// answered, an exchange with the application moved on in both directions,
+/// an abort the application is owed delivered, and a stream with nothing
+/// left to do released.
+unsafe fn pump_streams(s: &mut super::super::HttpState) {
+    let st = &mut *(&mut s.h3 as *mut H3State);
+    for idx in 0..MAX_H3_STREAMS {
+        if !st.slots[idx].allocated {
+            continue;
+        }
+        #[cfg(feature = "app")]
+        {
+            let sl = &mut st.slots[idx];
+            if sl.state == H3StreamState::Reset
+                && sl.abort_due == 0
+                && sl.app.open()
+                && !sl.app.finished()
+            {
+                sl.abort_due = super::super::http_app::app_abort::MALFORMED;
+                sl.app = super::app::Exchange::idle();
+            }
+            if sl.abort_due != 0 {
+                let id = h3_id(sl);
+                let reason = sl.abort_due;
+                sl.abort_due = 0;
+                super::app::abort(s, id, reason);
+            }
+        }
+        if st.slots[idx].too_large {
+            refuse_too_large(s, st, idx);
+        }
+        #[cfg(feature = "app")]
+        match st.slots[idx].state {
+            H3StreamState::AppPending => open_exchange(s, st, idx),
+            H3StreamState::AppOpen => drive_exchange(s, st, idx),
+            _ => {}
+        }
+        let sl = &st.slots[idx];
+        if sl.state == H3StreamState::Discarding
+            && sl.closed_out
+            && sl.peer_fin
+            && sl.ack_owed == 0
+            && sl.abort_due == 0
+            && sl.pending_out() == 0
+        {
+            st.slots[idx].release();
+        }
     }
-    let Some(idx) = st.slots.iter().position(|slot| {
-        slot.allocated
-            && slot.session_id == resp.session_id
-            && slot.stream_id == resp.stream_id
-            && slot.app_pending
-            && !slot.ws_active
-            && slot.pending_out() == 0
-    }) else {
-        return false;
-    };
-    let mut status = [b'0'; 3];
-    let code = resp.status.min(999);
-    status[0] = b'0' + (code / 100) as u8;
-    status[1] = b'0' + ((code / 10) % 10) as u8;
-    status[2] = b'0' + (code % 10) as u8;
+}
+
+/// The exchange id of a stream.
+#[cfg(feature = "app")]
+fn h3_id(sl: &H3StreamSlot) -> super::super::http_app::AppId {
+    super::super::http_app::AppId {
+        origin: super::super::http_app::app_origin::QUIC,
+        conn: sl.session_id,
+        stream: sl.stream_id,
+    }
+}
+
+/// Queue a whole short response on stream `idx`, then read and drop what is
+/// left of its request. Only while nothing of a response has been queued.
+fn answer_whole(st: &mut H3State, idx: usize, status: &[u8], body: &[u8]) {
+    let sl = &mut st.slots[idx];
+    // The field pair is built at run time: a constant array of slices is a
+    // table of pointers the flat module image cannot relocate.
     let mut name = [0u8; 12];
     name.copy_from_slice(b"content-type");
-    let fields = [(&name[..], resp.content_type)];
-    if !fits_peer_field_limit(peer_limit, &status, &fields) {
-        return false;
-    }
-    let slot = &mut st.slots[idx];
-    let was_webtransport = slot.webtransport_active;
-    let n = build_response(&status, &fields, resp.body, &mut slot.send_buf);
+    let mut value = [0u8; 10];
+    value.copy_from_slice(b"text/plain");
+    let fields = [(&name[..], &value[..])];
+    let n = build_response(status, &fields, body, &mut sl.send_buf);
     if n == 0 {
-        return false;
+        sl.state = H3StreamState::Reset;
+        sl.reset_code = H3_INTERNAL_ERROR;
+        return;
     }
-    slot.send_len = n;
-    slot.send_off = 0;
-    slot.state = H3StreamState::HeadersSent;
-    slot.app_more = (resp.flags & h3_app::H3_APP_FLAG_MORE_BODY) != 0;
-    slot.webtransport_active =
-        was_webtransport || (resp.flags & h3_app::H3_APP_FLAG_WEBTRANSPORT) != 0;
-    slot.app_pending = slot.app_more;
-    slot.close_pending = !slot.app_more && !slot.webtransport_active;
-    slot.ws_active = (resp.flags & h3_app::H3_APP_FLAG_WEBSOCKET) != 0;
-    if slot.ws_active {
-        slot.ws_buf_len = 0;
+    sl.send_len = n;
+    sl.send_off = 0;
+    sl.headers_sent = true;
+    sl.state = H3StreamState::HeadersSent;
+    sl.ack_owed = sl.ack_owed.saturating_add(sl.rx_len as u32);
+    sl.rx_len = 0;
+    #[cfg(feature = "app")]
+    {
+        sl.app = super::app::Exchange::idle();
+        sl.app_queue.clear();
     }
-    true
+}
+
+/// A body passed its route's ceiling: 413 while nothing of a response has
+/// gone out, a reset after.
+unsafe fn refuse_too_large(s: &mut super::super::HttpState, st: &mut H3State, idx: usize) {
+    st.slots[idx].too_large = false;
+    s.server.bodies_refused = s.server.bodies_refused.wrapping_add(1);
+    #[cfg(feature = "app")]
+    {
+        let sl = &mut st.slots[idx];
+        if sl.app.open() && !sl.app.finished() {
+            let id = h3_id(sl);
+            super::app::abort(s, id, super::super::http_app::app_abort::TOO_LARGE);
+        }
+    }
+    let sl = &mut st.slots[idx];
+    if !sl.headers_sent && sl.pending_out() == 0 {
+        answer_whole(st, idx, b"413", b"Content Too Large\n");
+    } else {
+        sl.state = H3StreamState::Reset;
+        sl.reset_code = H3_REQUEST_CANCELLED;
+    }
+}
+
+/// Send stream `idx`'s HEAD, opening its exchange.
+#[cfg(feature = "app")]
+unsafe fn open_exchange(s: &mut super::super::HttpState, st: &mut H3State, idx: usize) {
+    let sl = &st.slots[idx];
+    let req = sl.request;
+    if req.fields_over {
+        answer_whole(st, idx, b"431", b"Request Header Fields Too Large\n");
+        return;
+    }
+    let has_body = !(sl.peer_fin && sl.rx_len == 0 && sl.data_rem == 0);
+    let fields: &[u8] = if sl.fields.is_null() {
+        &[]
+    } else {
+        core::slice::from_raw_parts(sl.fields, sl.fields_len)
+    };
+    let flags = sl.app_flags
+        | if has_body {
+            super::super::http_app::app_flag::MORE
+        } else {
+            0
+        };
+    let head = super::super::http_app::AppRequestHead {
+        id: h3_id(sl),
+        flags,
+        method: req.method,
+        target: req.path_bytes(),
+        headers: fields,
+        peer: &[],
+        resp_credit: super::app::RESP_WINDOW,
+    };
+    match super::app::emit_head(s, &head) {
+        super::app::Emit::Sent => {
+            let now = s.server.now_ms;
+            let sl = &mut st.slots[idx];
+            sl.app = super::app::opened(sl.stream_id, now, has_body, false);
+            sl.state = H3StreamState::AppOpen;
+        }
+        super::app::Emit::Full => {}
+        super::app::Emit::Unwired => {
+            answer_whole(st, idx, b"503", b"No application wired to req_out\n");
+        }
+        super::app::Emit::TooLarge => {
+            answer_whole(st, idx, b"431", b"Request Header Fields Too Large\n");
+        }
+    }
+}
+
+/// Move an open exchange on: request body to the application on credit,
+/// its response into the stream's send buffer, and its progress deadline.
+#[cfg(feature = "app")]
+unsafe fn drive_exchange(s: &mut super::super::HttpState, st: &mut H3State, idx: usize) {
+    use super::super::http_app::{app_abort, APP_BODY_MAX, APP_HDR, APP_RECORD_MAX};
+    let id = h3_id(&st.slots[idx]);
+    // Request body, as far as credit goes. Acknowledged to the transport as
+    // it leaves, which is what reopens the peer's window.
+    loop {
+        let sl = &st.slots[idx];
+        if sl.app.is(super::app::ex::REQ_DONE) {
+            break;
+        }
+        let body_ended = sl.peer_fin && sl.data_rem == 0;
+        let n = sl.rx_len.min(sl.app.req_credit as usize).min(APP_BODY_MAX);
+        let last = body_ended && n == sl.rx_len;
+        if n == 0 && !last {
+            break;
+        }
+        let mut rec = [0u8; APP_RECORD_MAX];
+        if n > 0 {
+            core::ptr::copy_nonoverlapping(sl.rx_buf, rec.as_mut_ptr().add(APP_HDR), n);
+        }
+        if !super::app::emit_body(s, &id, &mut rec, n, last) {
+            break;
+        }
+        let sl = &mut st.slots[idx];
+        if n < sl.rx_len {
+            core::ptr::copy(sl.rx_buf.add(n), sl.rx_buf, sl.rx_len - n);
+        }
+        sl.rx_len -= n;
+        sl.app.req_credit -= n as u32;
+        sl.ack_owed = sl.ack_owed.saturating_add(n as u32);
+        if last {
+            sl.app.state |= super::app::ex::REQ_DONE;
+        }
+    }
+    // The application's answer, when the send buffer is free.
+    if st.slots[idx].pending_out() == 0
+        && !st.slots[idx].close_pending
+        && !st.slots[idx].app_queue.is_empty()
+    {
+        compose_response(s, st, idx);
+        if st.slots[idx].state != H3StreamState::AppOpen {
+            return;
+        }
+    }
+    // The application holds the turn and has let it lapse.
+    let sl = &st.slots[idx];
+    if sl.app.deadline_ms != 0 && s.server.now_ms >= sl.app.deadline_ms {
+        s.server.app_timeouts = s.server.app_timeouts.wrapping_add(1);
+        super::app::abort(s, id, app_abort::STALLED);
+        fail_exchange(st, idx, b"504", b"Gateway Timeout\n");
+    }
+}
+
+/// End an exchange the application cannot finish: a whole short answer
+/// while nothing of its response has been queued, a reset after.
+#[cfg(feature = "app")]
+fn fail_exchange(st: &mut H3State, idx: usize, status: &[u8], body: &[u8]) {
+    let sl = &mut st.slots[idx];
+    if !sl.headers_sent && sl.pending_out() == 0 {
+        answer_whole(st, idx, status, body);
+    } else {
+        sl.app = super::app::Exchange::idle();
+        sl.app_queue.clear();
+        sl.state = H3StreamState::Reset;
+        sl.reset_code = H3_INTERNAL_ERROR;
+    }
+}
+
+/// Frame what stream `idx`'s queue holds into its empty send buffer: the
+/// HEADERS when next, then DATA as far as it fits.
+#[cfg(feature = "app")]
+unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, idx: usize) {
+    use super::super::http_app::{app_abort, app_flag, app_parse_response, AppRecord};
+    let id = h3_id(&st.slots[idx]);
+    let peer_limit = app_peer_limit(st, st.slots[idx].session_id);
+    let sl: *mut H3StreamSlot = &mut st.slots[idx];
+    let mut used = 0usize;
+    while let Some(rec) = (*sl).app_queue.front() {
+        let (body, is_head) = super::app::record_body(rec);
+        let ends = super::app::record_ends(rec);
+        if is_head && !(*sl).app_queue.front_head_done() {
+            let Some(AppRecord::Head(h)) = app_parse_response(rec) else {
+                break;
+            };
+            // An accepted WebSocket is this module's tunnel from here on; the
+            // application's part in it is done.
+            if h.flags & app_flag::WEBSOCKET != 0 {
+                if h.status != 200 || (*sl).request.method_kind != H3_METHOD_CONNECT {
+                    s.server.app_violations = s.server.app_violations.wrapping_add(1);
+                    super::app::abort(s, id, app_abort::CREDIT_OVERRUN);
+                    fail_exchange(st, idx, b"502", b"Bad Gateway\n");
+                    return;
+                }
+                let n = build_response(b"200", &[], &[], &mut (*sl).send_buf);
+                (*sl).send_len = n;
+                (*sl).send_off = 0;
+                (*sl).headers_sent = true;
+                (*sl).ws_active = true;
+                (*sl).ws_buf_len = 0;
+                (*sl).app = super::app::Exchange::idle();
+                (*sl).app_queue.clear();
+                (*sl).state = H3StreamState::HeadersSent;
+                return;
+            }
+            if h.flags & app_flag::WEBTRANSPORT != 0 {
+                (*sl).webtransport_active = true;
+            }
+            let carries = super::app::status_allows_body(h.status, (*sl).request.method);
+            (*sl).resp_carries = carries;
+            match encode_app_headers(&h, peer_limit, &mut (*sl).send_buf) {
+                Ok(n) => used = n,
+                Err(over_limit) => {
+                    if over_limit {
+                        s.server.h3_field_limit_refused =
+                            s.server.h3_field_limit_refused.wrapping_add(1);
+                    } else {
+                        s.server.app_violations = s.server.app_violations.wrapping_add(1);
+                    }
+                    super::app::abort(s, id, app_abort::UNDELIVERABLE);
+                    fail_exchange(st, idx, b"502", b"Bad Gateway\n");
+                    return;
+                }
+            }
+            (*sl).headers_sent = true;
+            (*sl).app_queue.take_front_head();
+        }
+        let taken = (*sl).app_queue.front_taken();
+        let rest = &body[taken.min(body.len())..];
+        let n = if (*sl).resp_carries {
+            let room = H3_SEND_BUF.saturating_sub(used + 9);
+            rest.len().min(room)
+        } else {
+            rest.len()
+        };
+        if (*sl).resp_carries && n > 0 {
+            let send = &mut (*sl).send_buf;
+            let fh = build_h3_frame_header(H3_FRAME_DATA, n, &mut send[used..]);
+            if fh == 0 {
+                break;
+            }
+            used += fh;
+            send[used..used + n].copy_from_slice(&rest[..n]);
+            used += n;
+        }
+        (*sl).app_queue.take_front_body(n);
+        let whole = n == rest.len();
+        if whole {
+            (*sl).app_queue.pop(&*s.syscalls);
+        }
+        let empty = (*sl).app_queue.is_empty();
+        let mut x = (*sl).app;
+        super::app::note_delivered(s, &id, &mut x, n, empty);
+        (*sl).app = x;
+        if whole && ends {
+            // The response is complete: the stream closes once its buffer
+            // drains, and a request still arriving is not wanted.
+            (*sl).close_pending = true;
+            if !(*sl).app.is(super::app::ex::REQ_DONE) {
+                // The exchange is over for the application: nothing more is
+                // sent for it, an abort included.
+                (*sl).ack_owed = (*sl).ack_owed.saturating_add((*sl).rx_len as u32);
+                (*sl).rx_len = 0;
+                (*sl).app = super::app::Exchange::idle();
+                (*sl).state = H3StreamState::Discarding;
+                (*sl).stop_owed = !(*sl).peer_fin;
+            }
+            break;
+        }
+        if !whole || used + 9 >= H3_SEND_BUF {
+            break;
+        }
+    }
+    (*sl).send_len = used;
+    (*sl).send_off = 0;
+}
+
+/// Encode a response HEAD as one HEADERS frame at the start of `out`:
+/// `:status`, `content-type`, then the application's own fields, lowercased,
+/// without the connection-specific ones HTTP/3 forbids (RFC 9114 §4.2).
+/// `Err(true)` when the peer's field-section limit refuses it, `Err(false)`
+/// when it does not fit.
+#[cfg(feature = "app")]
+fn encode_app_headers(
+    h: &super::super::http_app::AppResponseHead<'_>,
+    peer_limit: u32,
+    out: &mut [u8],
+) -> Result<usize, bool> {
+    let code = h.status.min(999);
+    let status = [
+        b'0' + (code / 100) as u8,
+        b'0' + ((code / 10) % 10) as u8,
+        b'0' + (code % 10) as u8,
+    ];
+    let ct: &[u8] = if h.content_type.is_empty() {
+        b"application/octet-stream"
+    } else {
+        h.content_type
+    };
+    let mut block = [0u8; H3_SEND_BUF];
+    let mut off = qpack::qpack_emit_block_prefix(&mut block);
+    if off == 0 {
+        return Err(false);
+    }
+    let mut size = b":status".len() + 3 + 32 + b"content-type".len() + ct.len() + 32;
+    let n = qpack::qpack_encode_field(b":status", &status, &mut block[off..]);
+    if n == 0 {
+        return Err(false);
+    }
+    off += n;
+    let n = qpack::qpack_encode_field(b"content-type", ct, &mut block[off..]);
+    if n == 0 {
+        return Err(false);
+    }
+    off += n;
+    let mut lower = [0u8; 64];
+    for (name, value) in super::super::http_app::app_header_lines(h.headers) {
+        if name.len() > lower.len() {
+            return Err(false);
+        }
+        for (d, c) in lower.iter_mut().zip(name) {
+            *d = c.to_ascii_lowercase();
+        }
+        let name = &lower[..name.len()];
+        if matches!(
+            name,
+            b"connection"
+                | b"keep-alive"
+                | b"proxy-connection"
+                | b"transfer-encoding"
+                | b"upgrade"
+                | b"te"
+                | b"content-type"
+        ) {
+            continue;
+        }
+        size += name.len() + value.len() + 32;
+        let n = qpack::qpack_encode_field(name, value, &mut block[off..]);
+        if n == 0 {
+            return Err(false);
+        }
+        off += n;
+    }
+    if peer_limit != u32::MAX && size > peer_limit as usize {
+        return Err(true);
+    }
+    let fh = build_h3_frame_header(H3_FRAME_HEADERS, off, out);
+    if fh == 0 || fh + off > out.len() {
+        return Err(false);
+    }
+    out[fh..fh + off].copy_from_slice(&block[..off]);
+    Ok(fh + off)
+}
+
+/// Hand a record from the application to the h3 stream or session it names.
+#[cfg(feature = "app")]
+pub(crate) unsafe fn app_record(
+    s: &mut super::super::HttpState,
+    id: &super::super::http_app::AppId,
+    raw: &[u8],
+) {
+    use super::super::http_app::{app_parse_response, AppRecord};
+    let st = &mut *(&mut s.h3 as *mut H3State);
+    if let Some(AppRecord::Datagram { context, data, .. }) = app_parse_response(raw) {
+        if data.len() > h3_datagram::H3_DATAGRAM_MAX_PAYLOAD {
+            s.server.app_violations = s.server.app_violations.wrapping_add(1);
+            return;
+        }
+        let slot = st
+            .datagrams
+            .iter()
+            .position(|d| d.occupied && d.session_id == id.conn)
+            .or_else(|| st.datagrams.iter().position(|d| !d.occupied));
+        if let Some(i) = slot {
+            let d = &mut st.datagrams[i];
+            d.session_id = id.conn;
+            d.context_id = context;
+            d.buf[..data.len()].copy_from_slice(data);
+            d.len = data.len() as u16;
+            d.occupied = true;
+        }
+        return;
+    }
+    let Some(idx) = st.slots.iter().position(|sl| {
+        sl.allocated
+            && sl.session_id == id.conn
+            && sl.stream_id == id.stream
+            && sl.state == H3StreamState::AppOpen
+    }) else {
+        s.server.app_records_stale = s.server.app_records_stale.wrapping_add(1);
+        return;
+    };
+    let sl: *mut H3StreamSlot = &mut st.slots[idx];
+    let outcome = super::app::admit(s, &mut (*sl).app, &mut (*sl).app_queue, raw);
+    match outcome {
+        super::app::Admit::Abort => {
+            (*sl).app = super::app::Exchange::idle();
+            fail_exchange(st, idx, b"502", b"Bad Gateway\n");
+        }
+        super::app::Admit::Violation => {
+            s.server.app_violations = s.server.app_violations.wrapping_add(1);
+            super::app::abort(s, *id, super::super::http_app::app_abort::CREDIT_OVERRUN);
+            (*sl).app = super::app::Exchange::idle();
+            fail_exchange(st, idx, b"502", b"Bad Gateway\n");
+        }
+        _ => {}
+    }
 }
 
 fn app_peer_limit(st: &H3State, session_id: u32) -> u32 {
@@ -1976,49 +2520,6 @@ fn app_peer_limit(st: &H3State, session_id: u32) -> u32 {
         .iter()
         .find(|session| session.allocated && session.session_id == session_id)
         .map_or(u32::MAX, |session| session.peer_max_field_section)
-}
-
-unsafe fn emit_h3_app_request(
-    s: &super::super::HttpState,
-    session_id: u32,
-    stream_id: u64,
-    req: &H3Request,
-    body: &[u8],
-    flags: u8,
-) -> bool {
-    if s.server.app_out_chan < 0
-        || req.content_length.unwrap_or(body.len() as u64) != body.len() as u64
-    {
-        return false;
-    }
-    let mut buf = [0u8; super::super::abi::CHANNEL_BUFFER_SIZE];
-    let mut headers = [0u8; 1 + 2 + 10 + H3_MAX_AUTHORITY];
-    let authority = req.authority_bytes();
-    let header_len = if authority.is_empty() {
-        0
-    } else {
-        headers[0] = 10;
-        headers[1..3].copy_from_slice(&(authority.len() as u16).to_le_bytes());
-        headers[3..13].copy_from_slice(b":authority");
-        headers[13..13 + authority.len()].copy_from_slice(authority);
-        13 + authority.len()
-    };
-    let Some(n) = h3_app::write_request(
-        &h3_app::H3AppRequest {
-            session_id,
-            stream_id,
-            method: req.method_kind,
-            flags,
-            path: req.path_bytes(),
-            headers: &headers[..header_len],
-            body,
-        },
-        &mut buf,
-    ) else {
-        return false;
-    };
-    let sys = &*s.syscalls;
-    (sys.channel_write)(s.server.app_out_chan, buf.as_ptr(), n) > 0
 }
 
 impl H3State {
@@ -2052,12 +2553,21 @@ impl H3State {
     }
 }
 
-/// Feed inbound bytes for one QUIC stream and serve the request if it is
-/// complete.
+/// Most request-body bytes held for the application on one h3 stream: the
+/// transport's per-stream receive window, which is what the peer may send
+/// before an acknowledgement returns credit. Bytes are acknowledged only as
+/// they are forwarded, so a stream never holds more than this.
+pub const H3_RX_HOLD: usize = 256 * 1024;
+
+/// Feed inbound bytes for one QUIC stream and serve the request once its
+/// head is complete.
 ///
 /// Streams are independent: bytes for stream 4 cannot disturb stream 0, and a
-/// request on one is served while another is still arriving. That is what
-/// distinguishes this from a single-request dispatcher.
+/// request on one is served while another is still arriving. Frame heads and
+/// the HEADERS section are assembled in `recv_hdr_buf`; DATA payload bypasses
+/// it — held for the application on an application route, read and dropped
+/// otherwise. Every byte consumed and not held is owed back to the transport
+/// as credit (`ack_owed`).
 ///
 /// # Safety
 ///
@@ -2082,40 +2592,285 @@ pub(crate) unsafe fn pump_stream_in(
             H3StreamOutcome::SlotsExhausted
         };
     };
+    if fin {
+        st.slots[idx].peer_fin = true;
+    }
 
     // An upgraded stream is a tunnel, not a request: its bytes are WebSocket
     // frames inside h3 DATA frames, and it is never released on drain.
     if st.slots[idx].ws_active {
+        st.slots[idx].ack_owed = st.slots[idx].ack_owed.saturating_add(data.len() as u32);
         return ws_stream_in(st, idx, data);
     }
 
-    if st.slots[idx].webtransport_active
-        && !st.slots[idx].app_pending
-        && st.slots[idx].pending_out() == 0
-        && !data.is_empty()
-    {
-        let req = st.slots[idx].request;
-        if emit_h3_app_request(
-            s,
-            session_id,
-            stream_id,
-            &req,
-            data,
-            h3_app::H3_APP_FLAG_WEBTRANSPORT,
-        ) {
-            st.slots[idx].app_pending = true;
-            return H3StreamOutcome::Buffered;
+    // A response is settled and the request is not wanted any more: what is
+    // still arriving is read and dropped, and returned to the peer as credit,
+    // until the peer ends its side.
+    if matches!(
+        st.slots[idx].state,
+        H3StreamState::Discarding | H3StreamState::HeadersSent | H3StreamState::Reset
+    ) {
+        st.slots[idx].ack_owed = st.slots[idx].ack_owed.saturating_add(data.len() as u32);
+        return H3StreamOutcome::Ignored;
+    }
+
+    let mut i = 0usize;
+    loop {
+        // DATA payload: body, not framing.
+        while st.slots[idx].data_rem > 0 && i < data.len() {
+            let take = (st.slots[idx].data_rem.min((data.len() - i) as u64)) as usize;
+            if let Some(o) = take_body(st, s, idx, &data[i..i + take]) {
+                return o;
+            }
+            i += take;
+            st.slots[idx].data_rem -= take as u64;
         }
-        return H3StreamOutcome::Ignored;
+        // Framing into the head accumulator.
+        if i < data.len() {
+            let slot = &mut st.slots[idx];
+            let room = H3_RECV_BUF - slot.recv_hdr_len;
+            let n = room.min(data.len() - i);
+            if n == 0 {
+                // A frame head or header section larger than this server
+                // holds: refused rather than parsed from a prefix.
+                slot.state = H3StreamState::Reset;
+                slot.reset_code = H3Error::MessageError.code();
+                return H3StreamOutcome::StreamError(H3Error::MessageError);
+            }
+            slot.recv_hdr_buf[slot.recv_hdr_len..slot.recv_hdr_len + n]
+                .copy_from_slice(&data[i..i + n]);
+            slot.recv_hdr_len += n;
+            i += n;
+        }
+        if let Some(o) = take_frames(st, s, idx) {
+            return o;
+        }
+        if i >= data.len() {
+            break;
+        }
     }
 
-    // A response is already queued: the exchange is over as far as we are
-    // concerned. Trailers or a pipelined second request on the same stream are
-    // not something this module answers, and dropping them is bounded.
-    if st.slots[idx].pending_out() > 0 || st.slots[idx].state == H3StreamState::HeadersSent {
-        return H3StreamOutcome::Ignored;
+    if !st.slots[idx].have_request
+        || !matches!(
+            st.slots[idx].state,
+            H3StreamState::HeadersRecv | H3StreamState::BodyRecv
+        )
+    {
+        return H3StreamOutcome::Buffered;
     }
+    dispatch_stream(st, s, idx)
+}
 
+/// Consume whole frames from the head accumulator: a frame head (and, for
+/// DATA, as much of its payload as the accumulator holds), a HEADERS section,
+/// or a grease frame. `Some` ends the pump with that outcome.
+unsafe fn take_frames(
+    st: &mut H3State,
+    s: &super::super::HttpState,
+    idx: usize,
+) -> Option<H3StreamOutcome> {
+    loop {
+        if st.slots[idx].data_rem > 0 {
+            // DATA payload already in the accumulator.
+            let avail = st.slots[idx].recv_hdr_len;
+            if avail == 0 {
+                return None;
+            }
+            let take = (st.slots[idx].data_rem.min(avail as u64)) as usize;
+            let mut chunk = [0u8; H3_RECV_BUF];
+            chunk[..take].copy_from_slice(&st.slots[idx].recv_hdr_buf[..take]);
+            consume_head(&mut st.slots[idx], take, false);
+            st.slots[idx].data_rem -= take as u64;
+            if let Some(o) = take_body(st, s, idx, &chunk[..take]) {
+                return Some(o);
+            }
+            continue;
+        }
+        let slot = &st.slots[idx];
+        let buf = &slot.recv_hdr_buf[..slot.recv_hdr_len];
+        let (ftype, length, head) = super::super::wire::h3::parse_h3_frame_head(buf)?;
+        if !is_request_stream_frame(ftype) {
+            let slot = &mut st.slots[idx];
+            slot.state = H3StreamState::Reset;
+            slot.reset_code = H3Error::FrameUnexpected.code();
+            return Some(H3StreamOutcome::StreamError(H3Error::FrameUnexpected));
+        }
+        if ftype == H3_FRAME_DATA {
+            if !st.slots[idx].have_request {
+                // DATA before the HEADERS that opens the request.
+                let slot = &mut st.slots[idx];
+                slot.state = H3StreamState::Reset;
+                slot.reset_code = H3_FRAME_UNEXPECTED;
+                return Some(H3StreamOutcome::StreamError(H3Error::FrameUnexpected));
+            }
+            consume_head(&mut st.slots[idx], head, true);
+            st.slots[idx].data_rem = length;
+            continue;
+        }
+        let Ok(length) = usize::try_from(length) else {
+            return None;
+        };
+        let end = head + length;
+        if end > H3_RECV_BUF {
+            let slot = &mut st.slots[idx];
+            slot.state = H3StreamState::Reset;
+            slot.reset_code = H3Error::MessageError.code();
+            return Some(H3StreamOutcome::StreamError(H3Error::MessageError));
+        }
+        if buf.len() < end {
+            return None;
+        }
+        if ftype == H3_FRAME_HEADERS {
+            if st.slots[idx].have_request {
+                // Trailers: read and dropped, as h1 drops a chunked trailer
+                // section — nothing served depends on them.
+                consume_head(&mut st.slots[idx], end, true);
+                continue;
+            }
+            let mut req = H3Request::empty();
+            let mut fields = [0u8; MAX_H3_FIELDS];
+            let decoded = decode_request_headers(
+                &st.slots[idx].recv_hdr_buf[head..end],
+                &mut req,
+                &mut fields,
+            );
+            consume_head(&mut st.slots[idx], end, true);
+            if let Err(e) = decoded {
+                let slot = &mut st.slots[idx];
+                slot.state = H3StreamState::Reset;
+                slot.reset_code = e.code();
+                return Some(H3StreamOutcome::StreamError(e));
+            }
+            let flen = req.fields_len as usize;
+            // The route decides where the body goes, and the body may follow
+            // in this same delivery.
+            let matched =
+                super::match_route_path(s, req.path_bytes().as_ptr(), req.path_bytes().len());
+            let limit = super::reqbody::route_limit(s, matched);
+            #[cfg(feature = "app")]
+            let app_route = matched >= 0 && delegated(s, matched);
+            #[cfg(not(feature = "app"))]
+            let app_route = false;
+            let slot = &mut st.slots[idx];
+            slot.request = req;
+            slot.have_request = true;
+            slot.body_limit = limit;
+            slot.app_route = app_route;
+            if !req.fields_over && flen > 0 {
+                if slot.fields.is_null() {
+                    slot.fields = super::heap_alloc(&*s.syscalls, MAX_H3_FIELDS as u32);
+                }
+                if slot.fields.is_null() {
+                    slot.request.fields_over = true;
+                } else {
+                    core::ptr::copy_nonoverlapping(fields.as_ptr(), slot.fields, flen);
+                    slot.fields_len = flen;
+                }
+            }
+            continue;
+        }
+        // A grease frame: legal, meaningless, skipped.
+        consume_head(&mut st.slots[idx], end, true);
+    }
+}
+
+/// Drop `n` bytes from the front of the head accumulator; `ack` when they are
+/// consumed for good rather than moved on as body.
+fn consume_head(slot: &mut H3StreamSlot, n: usize, ack: bool) {
+    slot.recv_hdr_buf.copy_within(n..slot.recv_hdr_len, 0);
+    slot.recv_hdr_len -= n;
+    if ack {
+        slot.ack_owed = slot.ack_owed.saturating_add(n as u32);
+    }
+}
+
+/// Whether route `ri` is served by the application on this generation: an
+/// application route, and — when an application is wired to take them — the
+/// file and proxy routes HTTP/3 does not serve itself.
+#[cfg(feature = "app")]
+unsafe fn delegated(s: &super::super::HttpState, ri: i8) -> bool {
+    match (*s.server.routes.as_ptr().add(ri as usize)).handler {
+        super::routes::HANDLER_APP => true,
+        super::routes::HANDLER_FILE | super::routes::HANDLER_PROXY => s.server.app_out_chan >= 0,
+        _ => false,
+    }
+}
+
+/// Longest header-field block captured for an application route: the
+/// application's own ceiling where it is built, so an h3 request is held to
+/// the bound an h1 or h2 one is.
+#[cfg(feature = "app")]
+const MAX_H3_FIELDS: usize = super::app::MAX_FWD_HEADERS;
+#[cfg(not(feature = "app"))]
+const MAX_H3_FIELDS: usize = 0;
+
+/// Account for request-body bytes on stream `idx`: held for the application
+/// on an application route, dropped and credited back otherwise, refused at
+/// the route's ceiling either way. `Some` ends the pump with that outcome.
+unsafe fn take_body(
+    st: &mut H3State,
+    s: &super::super::HttpState,
+    idx: usize,
+    bytes: &[u8],
+) -> Option<H3StreamOutcome> {
+    let slot = &mut st.slots[idx];
+    slot.body_total += bytes.len() as u64;
+    if slot.have_request && slot.body_limit != 0 && slot.body_total > slot.body_limit {
+        // Past the ceiling: the peer is told so once the response can be
+        // queued (`pump_app`), and the rest of the body is dropped.
+        slot.ack_owed = slot.ack_owed.saturating_add(bytes.len() as u32);
+        slot.too_large = true;
+        return None;
+    }
+    let held = matches!(
+        slot.state,
+        H3StreamState::AppPending | H3StreamState::AppOpen
+    ) || (slot.have_request && slot.app_route);
+    if !held {
+        slot.ack_owed = slot.ack_owed.saturating_add(bytes.len() as u32);
+        return None;
+    }
+    let want = slot.rx_len + bytes.len();
+    if want > H3_RX_HOLD {
+        // Past the window the transport granted.
+        slot.state = H3StreamState::Reset;
+        slot.reset_code = H3_EXCESSIVE_LOAD;
+        slot.too_large = false;
+        return Some(H3StreamOutcome::StreamError(H3Error::MessageError));
+    }
+    if want > slot.rx_cap {
+        let mut cap = if slot.rx_cap == 0 { 8192 } else { slot.rx_cap };
+        while cap < want {
+            cap *= 2;
+        }
+        let cap = cap.min(H3_RX_HOLD);
+        let fresh = super::heap_alloc(&*s.syscalls, cap as u32);
+        if fresh.is_null() {
+            slot.state = H3StreamState::Reset;
+            slot.reset_code = H3_EXCESSIVE_LOAD;
+            return Some(H3StreamOutcome::StreamError(H3Error::MessageError));
+        }
+        if !slot.rx_buf.is_null() {
+            core::ptr::copy_nonoverlapping(slot.rx_buf, fresh, slot.rx_len);
+            super::heap_free(&*s.syscalls, slot.rx_buf);
+        }
+        slot.rx_buf = fresh;
+        slot.rx_cap = cap;
+    }
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.rx_buf.add(slot.rx_len), bytes.len());
+    slot.rx_len = want;
+    None
+}
+
+/// Serve stream `idx`'s request, its head complete: an application route
+/// becomes an exchange (`pump_app` sends its HEAD), every other route is
+/// answered from this module.
+unsafe fn dispatch_stream(
+    st: &mut H3State,
+    s: &super::super::HttpState,
+    idx: usize,
+) -> H3StreamOutcome {
+    let session_id = st.slots[idx].session_id;
     // The peer's own limits, per session. Which session a stream belongs
     // to decides how its response may be encoded, so this is read here
     // rather than from anything module-scoped: two connections advertise
@@ -2130,82 +2885,6 @@ pub(crate) unsafe fn pump_stream_in(
         // so the RFC 9114 §7.2.4.1 default (unlimited) is what applies.
         None => (false, u32::MAX),
     };
-
-    // Accumulate. A head larger than the buffer is refused rather than
-    // silently parsed from a prefix.
-    {
-        let slot = &mut st.slots[idx];
-        let room = H3_RECV_BUF - slot.recv_hdr_len;
-        if data.len() > room {
-            slot.state = H3StreamState::Reset;
-            slot.reset_code = H3Error::MessageError.code();
-            return H3StreamOutcome::StreamError(H3Error::MessageError);
-        }
-        slot.recv_hdr_buf[slot.recv_hdr_len..slot.recv_hdr_len + data.len()].copy_from_slice(data);
-        slot.recv_hdr_len += data.len();
-    }
-
-    // Walk complete frames. HEADERS ends the request head for this module's
-    // purposes: bodies are not consumed by any handler h3 can serve yet, so a
-    // DATA frame is accounted for and dropped rather than buffered unbounded.
-    let mut req = st.slots[idx].request;
-    let mut app_body = st.slots[idx].body_buf;
-    let mut app_body_len = st.slots[idx].body_len;
-    let mut have_request = st.slots[idx].have_request;
-    let mut consumed_total = 0usize;
-    loop {
-        let (outcome, consumed) = {
-            let slot = &st.slots[idx];
-            ingest_request_frame(
-                &slot.recv_hdr_buf[consumed_total..slot.recv_hdr_len],
-                &mut req,
-            )
-        };
-        match outcome {
-            H3Ingest::NeedMore if consumed == 0 => break,
-            H3Ingest::NeedMore => {}
-            H3Ingest::Headers => have_request = true,
-            H3Ingest::Data(start, end) => {
-                let payload = &st.slots[idx].recv_hdr_buf[start..end];
-                if payload.len() > app_body.len().saturating_sub(app_body_len) {
-                    st.slots[idx].state = H3StreamState::Reset;
-                    st.slots[idx].reset_code = H3Error::MessageError.code();
-                    return H3StreamOutcome::ResponseTooLarge;
-                }
-                app_body[app_body_len..app_body_len + payload.len()].copy_from_slice(payload);
-                app_body_len += payload.len();
-            }
-            H3Ingest::Error(e) => {
-                st.slots[idx].state = H3StreamState::Reset;
-                st.slots[idx].reset_code = e.code();
-                return H3StreamOutcome::StreamError(e);
-            }
-        }
-        consumed_total += consumed;
-        if consumed_total >= st.slots[idx].recv_hdr_len {
-            break;
-        }
-    }
-
-    // Keep only an incomplete frame tail. Parsed HEADERS and DATA are now
-    // owned by the slot, so a request split across QUIC deliveries resumes
-    // without replaying or losing either part.
-    {
-        let slot = &mut st.slots[idx];
-        if consumed_total > 0 {
-            slot.recv_hdr_buf
-                .copy_within(consumed_total..slot.recv_hdr_len, 0);
-            slot.recv_hdr_len -= consumed_total;
-        }
-        slot.request = req;
-        slot.have_request = have_request;
-        slot.body_buf[..app_body_len].copy_from_slice(&app_body[..app_body_len]);
-        slot.body_len = app_body_len;
-    }
-    if !have_request {
-        return H3StreamOutcome::Buffered;
-    }
-
     // Hold the request until the peer's SETTINGS have arrived.
     //
     // The REQUEST is accepted early on purpose: cross-stream arrival order
@@ -2216,62 +2895,37 @@ pub(crate) unsafe fn pump_stream_in(
     // rejects, and it answers with a frame-size error that names a frame
     // rather than the setting that refused it.
     //
-    // The accumulated bytes stay in the slot; `retry_gated_streams` re-runs
-    // this the moment SETTINGS land.
+    // `retry_gated_streams` re-runs this the moment SETTINGS land.
     if gated {
         return H3StreamOutcome::Buffered;
     }
-
-    // Delegated routes wait until the stream-owned body is complete. This
-    // preserves request/body correlation across multiplexed streams and lets
-    // the downstream graph apply its own backpressure without dropping DATA.
+    let req = st.slots[idx].request;
     let matched = super::match_route_path(s, req.path_bytes().as_ptr(), req.path_bytes().len());
-    if matched >= 0
-        && matches!(
-            (*s.server.routes.as_ptr().add(matched as usize)).handler,
-            super::routes::HANDLER_APP | super::routes::HANDLER_FILE | super::routes::HANDLER_PROXY
-        )
-    {
-        let complete = if req.method_kind == H3_METHOD_CONNECT
-            && (req.protocol_ws || req.protocol_webtransport)
-        {
-            app_body_len == 0
-        } else {
-            match req.content_length {
-                Some(expected) => expected == app_body_len as u64 && fin,
-                None => fin,
-            }
-        };
-        if !complete {
-            return H3StreamOutcome::Buffered;
-        }
+
+    // A route this generation hands to the application, whole: application
+    // routes, and the file and proxy routes h3 does not serve itself.
+    #[cfg(feature = "app")]
+    if matched >= 0 && delegated(s, matched) {
+        use super::super::http_app::app_flag;
         let handler = (*s.server.routes.as_ptr().add(matched as usize)).handler;
-        let mut app_flags = 0u8;
+        let mut flags = 0u8;
         if handler == super::routes::HANDLER_FILE {
-            app_flags |= h3_app::H3_APP_FLAG_FILE;
+            flags |= app_flag::ROUTE_FILE;
         }
         if handler == super::routes::HANDLER_PROXY {
-            app_flags |= h3_app::H3_APP_FLAG_PROXY;
+            flags |= app_flag::ROUTE_PROXY;
         }
         if req.method_kind == H3_METHOD_CONNECT && req.protocol_ws {
-            app_flags |= h3_app::H3_APP_FLAG_WEBSOCKET;
+            flags |= app_flag::WEBSOCKET;
         }
         if req.method_kind == H3_METHOD_CONNECT && req.protocol_webtransport {
-            app_flags |= h3_app::H3_APP_FLAG_WEBTRANSPORT;
+            flags |= app_flag::WEBTRANSPORT;
         }
-        if emit_h3_app_request(
-            s,
-            session_id,
-            stream_id,
-            &req,
-            &app_body[..app_body_len],
-            app_flags,
-        ) {
-            st.slots[idx].app_pending = true;
-            st.slots[idx].state = H3StreamState::HeadersSent;
-            st.slots[idx].recv_hdr_len = 0;
-            return H3StreamOutcome::Buffered;
-        }
+        let slot = &mut st.slots[idx];
+        slot.app_flags = flags;
+        slot.state = H3StreamState::AppPending;
+        // Body bytes that arrived with the head are the application's.
+        return H3StreamOutcome::Buffered;
     }
 
     // Render into the slot's own send buffer — per stream, so two concurrent
@@ -2889,13 +3543,21 @@ pub(crate) unsafe fn pump_mux_frame(
                 return H3StreamOutcome::SessionEvent;
             }
             // The peer is done sending on a request stream. Any response
-            // already queued still drains; a stream with nothing queued is
-            // released.
+            // already queued still drains and an exchange still finishes; a
+            // stream that never became a request is released.
             if let Some(i) = st.slots.iter().position(|sl| {
                 sl.allocated && sl.session_id == session && sl.stream_id == u64::from(handle)
             }) {
-                if st.slots[i].pending_out() == 0 {
-                    st.slots[i].release();
+                let sl = &mut st.slots[i];
+                sl.peer_fin = true;
+                let idle = matches!(
+                    sl.state,
+                    H3StreamState::HeadersRecv | H3StreamState::BodyRecv
+                ) && !sl.have_request
+                    && sl.pending_out() == 0
+                    && sl.ack_owed == 0;
+                if idle {
+                    sl.release();
                 }
             }
             H3StreamOutcome::Ignored
@@ -2920,7 +3582,20 @@ pub(crate) unsafe fn pump_mux_frame(
             if let Some(i) = st.slots.iter().position(|sl| {
                 sl.allocated && sl.session_id == session && sl.stream_id == u64::from(handle)
             }) {
-                st.slots[i].release();
+                // Kept until its credit is returned and, for an exchange,
+                // until the application has been told (`pump_streams`).
+                let sl = &mut st.slots[i];
+                #[cfg(feature = "app")]
+                if sl.app.open() && !sl.app.finished() {
+                    sl.abort_due = super::super::http_app::app_abort::PEER_GONE;
+                }
+                sl.state = H3StreamState::Discarding;
+                sl.closed_out = true;
+                sl.peer_fin = true;
+                sl.close_pending = false;
+                sl.send_off = sl.send_len;
+                sl.ack_owed = sl.ack_owed.saturating_add(sl.rx_len as u32);
+                sl.rx_len = 0;
             }
             H3StreamOutcome::SessionEvent
         }
@@ -3012,7 +3687,10 @@ pub(crate) unsafe fn retry_gated_streams(
         let ready = st.slots[k].allocated
             && (st.slots[k].recv_hdr_len > 0 || st.slots[k].have_request)
             && st.slots[k].pending_out() == 0
-            && st.slots[k].state != H3StreamState::HeadersSent
+            && matches!(
+                st.slots[k].state,
+                H3StreamState::HeadersRecv | H3StreamState::BodyRecv
+            )
             && !st.slots[k].ws_active
             && match session_slot(st, st.slots[k].session_id) {
                 Some(si) => !st.sessions[si].responses_gated(),
@@ -3078,6 +3756,13 @@ pub enum H3Commit {
         last: bool,
     },
     DatagramSent(usize),
+    /// `bytes` of the slot's owed credit have gone back to the transport.
+    AckSent {
+        idx: usize,
+        bytes: u32,
+    },
+    /// The slot's STOP_SENDING has gone out.
+    StopSent(usize),
 }
 
 /// Apply a session commit once the transport has taken the frame whole.
@@ -3129,9 +3814,34 @@ pub fn commit_out(st: &mut H3State, what: H3Commit) {
             st.datagrams[idx].occupied = false;
             st.datagram_cursor = ((idx + 1) % MAX_H3_SESSIONS) as u8;
         }
-        H3Commit::ResetSent(idx) | H3Commit::CloseSent(idx) => {
+        H3Commit::ResetSent(idx) => {
             st.slots[idx].release();
             st.emit_cursor = ((idx + 1) % MAX_H3_STREAMS) as u8;
+        }
+        H3Commit::CloseSent(idx) => {
+            // The response is complete. A request still arriving is read and
+            // dropped until the peer ends it — releasing the slot now would
+            // let its late bytes open a new request on the same stream.
+            let slot = &mut st.slots[idx];
+            slot.close_pending = false;
+            if slot.peer_fin {
+                slot.release();
+            } else {
+                // A stream already discarding asked the peer to stop when its
+                // response completed; any other asks now.
+                if slot.state != H3StreamState::Discarding {
+                    slot.stop_owed = true;
+                }
+                slot.closed_out = true;
+                slot.state = H3StreamState::Discarding;
+            }
+            st.emit_cursor = ((idx + 1) % MAX_H3_STREAMS) as u8;
+        }
+        H3Commit::AckSent { idx, bytes } => {
+            st.slots[idx].ack_owed -= bytes;
+        }
+        H3Commit::StopSent(idx) => {
+            st.slots[idx].stop_owed = false;
         }
         H3Commit::DataSent { idx, take, last } => {
             st.slots[idx].send_off += take;
@@ -3144,10 +3854,12 @@ pub fn commit_out(st: &mut H3State, what: H3Commit) {
                     st.slots[idx].send_len = 0;
                     st.slots[idx].send_off = 0;
                 } else {
-                    // The whole response is handed over. The stream is NOT
-                    // released yet: it owes a close, which the next stage
-                    // emits.
-                    if st.slots[idx].app_more {
+                    // The whole buffer is handed over. An application's
+                    // response may have more to come, which the next compose
+                    // appends to an empty buffer; it decides the close. Any
+                    // other response is whole, and the stream now owes its
+                    // close, which the next stage emits.
+                    if st.slots[idx].state == H3StreamState::AppOpen {
                         st.slots[idx].send_len = 0;
                         st.slots[idx].send_off = 0;
                     } else {
@@ -3227,7 +3939,7 @@ pub(crate) fn session_has_live_stream(st: &H3State, si: usize) -> bool {
     let session = st.sessions[si].session_id;
     let mut k = 0;
     while k < MAX_H3_STREAMS {
-        if st.slots[k].allocated && st.slots[k].session_id == session {
+        if st.slots[k].holds_work() && st.slots[k].session_id == session {
             return true;
         }
         k += 1;
@@ -3495,6 +4207,33 @@ pub fn stage_next_out(st: &H3State, out: &mut [u8]) -> Option<(usize, H3Commit)>
         .min(mux::MUX_QUIC_STREAM_SEND_MAX)
         .min(u16::MAX as usize - mux::STREAM_DATA_PREFIX);
 
+    // Credit owed back to the transport goes first: it is what lets the peer
+    // send more, and a stream released with credit unreturned would shrink
+    // the connection's window for good.
+    for step in 0..MAX_H3_STREAMS {
+        let idx = (st.emit_cursor as usize + step) % MAX_H3_STREAMS;
+        let slot = &st.slots[idx];
+        if !slot.allocated || slot.ack_owed == 0 {
+            continue;
+        }
+        let plen = mux::STREAM_DATA_PREFIX + 4;
+        if out.len() < FRAME_HDR + plen {
+            return None;
+        }
+        out[0] = mux::CMD_MUX_STREAM_ACK;
+        out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
+        mux::put_session_id(&mut out[FRAME_HDR..], slot.session_id);
+        mux::put_stream_id(&mut out[FRAME_HDR..], slot.stream_id as u32);
+        out[FRAME_HDR + 8..FRAME_HDR + 12].copy_from_slice(&slot.ack_owed.to_le_bytes());
+        return Some((
+            FRAME_HDR + plen,
+            H3Commit::AckSent {
+                idx,
+                bytes: slot.ack_owed,
+            },
+        ));
+    }
+
     // A stream that broke a rule owes a RESET_STREAM before anything else:
     // whatever was queued on it is not going to be sent, and the peer needs
     // the reason rather than silence.
@@ -3517,6 +4256,26 @@ pub fn stage_next_out(st: &H3State, out: &mut [u8]) -> Option<(usize, H3Commit)>
         mux::put_stream_id(&mut out[FRAME_HDR..], stream);
         out[FRAME_HDR + 8..FRAME_HDR + 16].copy_from_slice(&code.to_le_bytes());
         return Some((FRAME_HDR + plen, H3Commit::ResetSent(idx)));
+    }
+
+    // A stream whose response is complete while its request is not asks the
+    // peer to stop sending the rest (RFC 9114 §4.1.1: H3_NO_ERROR).
+    for step in 0..MAX_H3_STREAMS {
+        let idx = (st.emit_cursor as usize + step) % MAX_H3_STREAMS;
+        let slot = &st.slots[idx];
+        if !slot.allocated || !slot.stop_owed {
+            continue;
+        }
+        let plen = mux::STREAM_DATA_PREFIX + mux::STREAM_APP_ERROR_BODY;
+        if out.len() < FRAME_HDR + plen {
+            return None;
+        }
+        out[0] = mux::CMD_MUX_STREAM_STOP_SENDING;
+        out[1..3].copy_from_slice(&(plen as u16).to_le_bytes());
+        mux::put_session_id(&mut out[FRAME_HDR..], slot.session_id);
+        mux::put_stream_id(&mut out[FRAME_HDR..], slot.stream_id as u32);
+        out[FRAME_HDR + 8..FRAME_HDR + 16].copy_from_slice(&H3_NO_ERROR.to_le_bytes());
+        return Some((FRAME_HDR + plen, H3Commit::StopSent(idx)));
     }
 
     // A stream whose response has drained still owes its close: RFC 9114 has
@@ -3613,7 +4372,7 @@ pub unsafe fn test_decode_and_dispatch_bounded(
 ) -> Result<H3Dispatch, H3Error> {
     let s = &*(state as *const super::super::HttpState);
     let mut req = H3Request::empty();
-    decode_request_headers(block, &mut req)?;
+    decode_request_headers(block, &mut req, &mut [])?;
     Ok(dispatch_request_bounded(s, &req, out, tmpl_cap, u32::MAX))
 }
 
@@ -3733,51 +4492,9 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
     }
     sweep_idle_sessions(s);
 
-    // Drain at most one application response per step. The response envelope
-    // carries the full session/stream identity, so unrelated H3 streams and
-    // stale replies are rejected without disturbing the mux pump.
-    if s.server.app_in_chan >= 0 {
-        let datagram_busy = (&s.h3 as *const H3State)
-            .as_ref()
-            .is_some_and(|st| st.datagrams.iter().all(|d| d.occupied));
-        let poll = (sys.channel_poll)(s.server.app_in_chan, super::super::POLL_IN);
-        if !datagram_busy && poll > 0 && (poll as u32 & super::super::POLL_IN) != 0 {
-            let mut response = [0u8; super::super::abi::CHANNEL_BUFFER_SIZE];
-            let n = (sys.channel_read)(s.server.app_in_chan, response.as_mut_ptr(), response.len());
-            if n > 0 {
-                let st = &mut *(&mut s.h3 as *mut H3State);
-                if let Some(resp) = h3_app::parse_response(&response[..n as usize]) {
-                    if resp.flags & h3_app::H3_APP_FLAG_DATAGRAM != 0 {
-                        if let Some(d) = h3_datagram::parse(resp.body) {
-                            if d.payload.len() <= h3_datagram::H3_DATAGRAM_MAX_PAYLOAD {
-                                let idx = st
-                                    .datagrams
-                                    .iter()
-                                    .position(|slot| {
-                                        slot.occupied && slot.session_id == d.session_id
-                                    })
-                                    .or_else(|| {
-                                        st.datagrams.iter().position(|slot| !slot.occupied)
-                                    });
-                                if let Some(idx) = idx {
-                                    let slot = &mut st.datagrams[idx];
-                                    slot.session_id = d.session_id;
-                                    slot.context_id = d.context_id;
-                                    slot.buf[..d.payload.len()].copy_from_slice(d.payload);
-                                    slot.len = d.payload.len() as u16;
-                                    slot.occupied = true;
-                                }
-                            }
-                        }
-                    } else {
-                        let limit = h3_app::parse_response(&response[..n as usize])
-                            .map_or(u32::MAX, |resp| app_peer_limit(st, resp.session_id));
-                        let _ = queue_app_response(st, &response[..n as usize], limit);
-                    }
-                }
-            }
-        }
-    }
+    // The application's records, for every stream at once.
+    #[cfg(feature = "app")]
+    super::app::drain_responses(s);
 
     // Ingress: drain everything available this step. A bounded loop, because
     // the channel is bounded — this cannot spin.
@@ -3825,30 +4542,26 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
         );
 
         // QUIC DATAGRAMs are unreliable by design, but they still need a
-        // typed Wave/application seam. Fluxor prefixes the payload with the
-        // full session id; preserve it and expose the capsule to the graph.
+        // typed seam to the application: a DATAGRAM record naming the session.
+        // Dropped when nothing is wired or `req_out` is full — the transport
+        // promised nothing more.
         if msg_type == mux::MSG_MUX_DATAGRAM_RX {
-            if n < 4 || s.server.app_out_chan < 0 {
-                continue;
+            #[cfg(feature = "app")]
+            if n >= 4 {
+                let session_id = mux::session_id(&frame[..n]);
+                if let Some((context_id, data)) = h3_datagram::parse_quic_payload(&frame[4..n]) {
+                    use super::super::http_app::{app_origin, app_write_datagram, AppId};
+                    let id = AppId {
+                        origin: app_origin::QUIC,
+                        conn: session_id,
+                        stream: 0,
+                    };
+                    let mut rec = [0u8; super::super::http_app::APP_RECORD_MAX];
+                    if let Some(len) = app_write_datagram(&id, context_id, data, &mut rec) {
+                        super::app::write_out(s, &rec[..len]);
+                    }
+                }
             }
-            let session_id = mux::session_id(&frame[..n]);
-            let Some((context_id, data)) = h3_datagram::parse_quic_payload(&frame[4..n]) else {
-                continue;
-            };
-            let mut capsule =
-                [0u8; h3_datagram::H3_DATAGRAM_HDR + h3_datagram::H3_DATAGRAM_MAX_PAYLOAD];
-            let Some(capsule_len) = h3_datagram::write(
-                &h3_datagram::H3Datagram {
-                    session_id,
-                    context_id,
-                    payload: data,
-                },
-                &mut capsule,
-            ) else {
-                continue;
-            };
-            let sys = &*s.syscalls;
-            let _ = (sys.channel_write)(s.server.app_out_chan, capsule.as_ptr(), capsule_len);
             continue;
         }
 
@@ -3907,6 +4620,9 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
     // onto streams.
     super::session::pump(s);
     tunnel_pump(s);
+    // Request streams: bodies past their ceiling answered, application
+    // exchanges moved on in both directions.
+    pump_streams(s);
 
     // Egress: hand back as much as the channel will take, all-or-nothing per
     // frame (a partial mux frame would desync the transport's reader).
@@ -3934,7 +4650,7 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
     }
 
     let st = &mut *(&mut s.h3 as *mut H3State);
-    if st.draining && drained(st) {
+    if st.draining && drained(st) && super::aborts_delivered(s) {
         return 1;
     }
     0
@@ -3985,7 +4701,7 @@ unsafe fn begin_drain(st: &mut H3State) {
 fn drained(st: &H3State) -> bool {
     let mut k = 0;
     while k < MAX_H3_STREAMS {
-        if st.slots[k].allocated {
+        if st.slots[k].holds_work() {
             return false;
         }
         k += 1;

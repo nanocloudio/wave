@@ -275,14 +275,14 @@ pub(crate) enum Phase {
     WaitAccept = 4,
     RecvRequest = 5,
     DispatchRoute = 6,
-    /// Reading a request body, between the head and dispatch. Entered only
-    /// when the framing headers say there is one; drains a staged
-    /// `100 Continue` first, then decodes until the body is whole.
+    /// Reading and dropping a request body the matched route does not use,
+    /// within the route's ceiling, before the route answers. Drains a staged
+    /// `100 Continue` first.
     RecvBody = 23,
-    /// `HANDLER_APP`: the request is out on `req_out` and this slot is
-    /// waiting for the matching `HttpResponse`. Leaves for `SendHeaders`
-    /// when one arrives, or for a 504 when `app::APP_TIMEOUT_MS` elapses.
-    AwaitApp = 24,
+    /// `HANDLER_APP`: the request is an exchange with the application. The
+    /// request body moves to it and its response to the peer, each as credit
+    /// and buffers allow, until both have ended (`app::h1_step`).
+    AppExchange = 24,
     SendHeaders = 7,
     SendBody = 8,
     DrainSend = 9,
@@ -456,44 +456,55 @@ pub(crate) struct ConnSlot {
     pub(crate) fs_total: u32,
     pub(crate) fs_sent: u32,
 
-    // ── Request body ingestion ─────────────────────────────────────
+    /// Where the request target (path and query) sits in `recv_buf`, and its
+    /// full length. `req_path` holds at most `MAX_PATH` of it; routing and
+    /// `HANDLER_APP` read the target here, whole.
+    pub(crate) req_target_at: u16,
+    pub(crate) req_target_len: u16,
+
+    // ── Request body ──────────────────────────────────────────────
     //
-    // Set from the framing headers when the head completes; driven by
-    // `Phase::RecvBody` until the body is whole. See `server::reqbody`.
-    /// `reqbody::BODY_MODE_*` — how this request's body is delimited.
-    pub(crate) body_mode: u8,
-    /// `reqbody::CHUNK_*` — sub-state within a chunked body.
-    pub(crate) chunk_state: u8,
+    // Planned from the head, armed once the route is matched, read from
+    // `recv_buf` a record at a time and never held whole. See
+    // `server::reqbody`.
+    /// 1 when the head says a body follows and it has not been consumed.
+    pub(crate) body_pending: u8,
+    /// 1 when the client asked for `100 Continue` and has not been sent it.
+    pub(crate) body_continue_wanted: u8,
+    /// The body's `Content-Length`; `u64::MAX` when it declared none.
+    pub(crate) body_declared: u64,
+    /// The body's framing, decoded as it arrives.
+    pub(crate) body_decoder: super::wire::h1::BodyDecoder,
+    /// 1 while a body is being read.
+    pub(crate) body_active: u8,
     /// 1 while a `100 Continue` is staged in `send_buf` and has not yet
     /// drained. The body must not be read until it has: the client is
     /// waiting for it before sending anything.
     pub(crate) body_continue: u8,
-    /// Bytes still expected in the current framing unit — the whole body
-    /// under `Content-Length`, or the current chunk under `chunked`.
-    pub(crate) body_remaining: u64,
-    /// Decoded body bytes accumulated so far. Checked against the cap on
-    /// every append, not just against the declared length, because a
-    /// chunked sender declares nothing up front.
-    pub(crate) body_len: u32,
-    /// Heap-allocated decoded body. Null until the first body byte is
-    /// accepted, so a connection serving only GETs never pays for it.
-    /// Freed by `free_slot` and at the end of each request.
-    pub(crate) body_buf: *mut u8,
-    pub(crate) body_cap: u32,
+    /// Body bytes read so far, against `body_limit`.
+    pub(crate) body_total: u64,
+    /// The matched route's body ceiling, in bytes.
+    pub(crate) body_limit: u64,
 
-    // ── HANDLER_APP correlation ────────────────────────────────────
-    /// 1 while this slot has a request out on `req_out` and is waiting for
-    /// the matching `HttpResponse`. Cleared when one arrives, on timeout,
-    /// and by `free_slot`.
-    pub(crate) app_pending: u8,
-    /// The stream this slot's pending request belongs to. Always 0 under
-    /// h1 — a connection carries one request at a time — and a real
-    /// stream id under h2, where it is the half of the correlation key
-    /// that `conn_id` cannot supply.
-    pub(crate) app_stream_id: u16,
-    /// `dev_millis` value past which the pending request is answered 504.
-    /// 0 when nothing is pending. See `app::APP_TIMEOUT_MS`.
-    pub(crate) app_deadline_ms: u64,
+    // ── HANDLER_APP exchange ───────────────────────────────────────
+    /// The exchange this connection's current request is, while it is one.
+    #[cfg(feature = "app")]
+    pub(crate) app: app::Exchange,
+    /// The application's records for it, held until `send_buf` takes them.
+    #[cfg(feature = "app")]
+    pub(crate) app_queue: app::RecordQueue,
+    /// 1 once any of the application's response has been composed.
+    #[cfg(feature = "app")]
+    pub(crate) resp_started: u8,
+    /// 1 when the response may carry a body (not HEAD, 204, 304).
+    #[cfg(feature = "app")]
+    pub(crate) resp_carries_body: u8,
+    /// 1 when the response declared its length; `resp_remaining` is then
+    /// what is left of it.
+    #[cfg(feature = "app")]
+    pub(crate) resp_length_known: u8,
+    #[cfg(feature = "app")]
+    pub(crate) resp_remaining: u64,
     /// `dev_millis` at the last observable progress on this connection: the
     /// accept, a byte the demux appended, a byte the transport took, a
     /// response completing. The idle and stall deadlines
@@ -530,27 +541,6 @@ pub(crate) struct ConnSlot {
     /// requests is on the keepalive clock, and only the second kind is a
     /// candidate for idle eviction.
     pub(crate) served: u8,
-    /// 1 while a multi-envelope application response is mid-flight: the head
-    /// has been sent and more body envelopes are expected.
-    ///
-    /// This is what lets a route serve a body larger than `send_buf`, which is
-    /// the difference between serving an API and serving artefacts — a
-    /// container layer does not fit in a connection buffer, and never will.
-    /// While it is set, `Phase::DrainSend` returns to `AwaitApp` for the next
-    /// chunk instead of finishing the response.
-    pub(crate) app_streaming: u8,
-    /// Application envelopes that arrived for this connection while its
-    /// `send_buf` was busy, held IN ORDER (`[u32 len][envelope]`…) and
-    /// delivered as it frees (`app::pump_stashes`). Per connection, so one
-    /// peer that stops reading holds up nobody else; null until first needed,
-    /// freed once drained and by `free_slot`. Past `app::STASH_MAX` the peer
-    /// is too slow to serve and the connection closes.
-    pub(crate) app_stash: *mut u8,
-    pub(crate) app_stash_cap: u32,
-    /// Bytes held, from `app_stash_at` (the next envelope to deliver).
-    pub(crate) app_stash_len: u32,
-    pub(crate) app_stash_at: u32,
-
     pub(crate) req_path: [u8; MAX_PATH],
     /// Heap-allocated request buffer. Allocated by
     /// `alloc_free_slot` on accept, freed by `free_slot` on close.
@@ -868,6 +858,12 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
     // An anchored session owes its workers a detach, for the same reason
     // the closure below is reported here: every close path converges.
     session::on_slot_close(s, idx);
+    // So does an application exchange the connection still had open: the
+    // application is told it is over, whichever path ended it.
+    #[cfg(feature = "app")]
+    app::on_slot_release(s, idx);
+    #[cfg(all(feature = "app", feature = "h2"))]
+    h2::on_conn_release(s, idx);
     // A connection that opened owes a committed closure. Reported here, where
     // every path that ends a connection converges, so it is reported once and
     // for exactly the connections that opened — not where a close was
@@ -947,19 +943,9 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
         slot.ws_frag_total = 0;
         slot.ws_frag_offset = 0;
     }
-    // Same hazard for a request body in flight when the peer hangs up
-    // mid-upload: the zero-fill below would clear the pointer and leak it.
-    if !slot.body_buf.is_null() {
-        heap_free(&*sys, slot.body_buf);
-        slot.body_buf = core::ptr::null_mut();
-        slot.body_cap = 0;
-        slot.body_len = 0;
-    }
-    // And for application envelopes held for a peer that was slow to read.
-    if !slot.app_stash.is_null() {
-        heap_free(&*sys, slot.app_stash);
-        slot.app_stash = core::ptr::null_mut();
-    }
+    // And for application records held for a connection slow to take them.
+    #[cfg(feature = "app")]
+    slot.app_queue.release(&*sys);
     // Zero the rest of the slot then re-set sentinels.
     let p = slot as *mut ConnSlot as *mut u8;
     core::ptr::write_bytes(p, 0, core::mem::size_of::<ConnSlot>());
@@ -1047,31 +1033,10 @@ pub(crate) struct ServerState {
     /// can grow past 64 KiB for hosts that configure many or
     /// large templates.
     pub(crate) body_pool_used: u32,
-    /// Largest request body this server will accept, in bytes. Configured by
-    /// the `max_body_kib` param; zero means the built-in default.
-    ///
-    /// A cap rather than a limit-free read is what "bounded body handling"
-    /// means: the buffer is heap-allocated per connection, so an uncapped
-    /// server lets any client decide how much of the device's memory to take.
-    /// Over the cap is 413, which is a refusal the client can act on — unlike
-    /// a truncation, which it cannot detect.
-    pub(crate) max_body: u32,
-    /// `body_ref_prefix` (param 120): where a request body past
-    /// `body_inline_max` is STAGED instead of forwarded — the store key
-    /// `<prefix>sha256/<hex>`, with its expiry at `<prefix>at/<hex>`. Empty:
-    /// never staged.
-    pub(crate) body_ref_prefix: [u8; 48],
-    pub(crate) body_ref_prefix_len: u8,
-    /// 1 when `body_ref_prefix` was longer than the 48 bytes held for it.
-    /// Recorded rather than truncated: a prefix of a prefix names a
-    /// different place in the store, and one that a `ttl` chain configured
-    /// for the real prefix would never collect. Construction refuses it.
-    pub(crate) body_ref_prefix_oversize: u8,
-    /// `body_inline_max` (param 121): the largest body forwarded in the
-    /// envelope when `body_ref_prefix` is set.
-    pub(crate) body_inline_max: u32,
-
     pub(crate) route_count: u8,
+    /// 1 when a `route_N_max_body_kib` was past the ceiling; construction
+    /// refuses it.
+    pub(crate) route_body_refused: u8,
     /// How a request is served when no route params were wired: 1 = the
     /// inline `body` answers `/`, 2 = the file channel answers everything,
     /// 0 = neither, and the route table decides. Settled at boot in
@@ -1222,30 +1187,20 @@ pub(crate) struct ServerState {
     /// Cumulative relay 5xx responses (`http.proxy.5xx`).
     pub(crate) proxy_5xx: u32,
 
-    /// Next request generation stamped into an HTTP/1.1 application request's
-    /// `stream_id`.
-    ///
-    /// Under h1 a connection carries one request at a time, so `stream_id` was
-    /// pinned to 0 and `(conn_id, stream_id)` reduced to the connection. That is
-    /// sound only while a connection id means one thing forever, and it does
-    /// not: the transport recycles ids, so a slot released with an application
-    /// request still outstanding is followed by a NEW peer holding the same id
-    /// and also awaiting an answer with `stream_id` 0. The late answer then
-    /// matched the new peer's request exactly, and one connection was served
-    /// another's response — a valid, well-framed, entirely wrong reply.
-    ///
-    /// A generation makes the pair mean what it claims. It lives on the server
-    /// rather than the slot because `slot_release_buffers` zeroes the slot, so
-    /// anything held there is reset precisely when a connection id is about to
-    /// be reused — which is the moment the discriminator has to survive.
-    ///
-    /// Applications echo `stream_id` back, which the fan-out contract already
-    /// requires of them, so this is transparent to any application that was
-    /// correct under h2. It wraps at 65_536 outstanding-request generations;
-    /// a stale answer surviving that long is not distinguishable by any scheme
-    /// this envelope can carry, and the request it would collide with has long
-    /// since timed out.
-    pub(crate) app_gen_next: u16,
+    /// The next h1 request generation: the stream half of an h1 exchange's
+    /// id. Connection ids are recycled by the transport, so a connection
+    /// released with an exchange still open can be followed by a new peer
+    /// holding the same id; the generation keeps a late answer to the first
+    /// from reaching the second. On the server rather than the slot because
+    /// `slot_release_buffers` zeroes the slot exactly when the id is about to
+    /// be reused.
+    #[cfg(feature = "app")]
+    pub(crate) app_gen_next: u64,
+    /// Aborts waiting for room on `req_out`, oldest first.
+    #[cfg(feature = "app")]
+    pub(crate) abort_queue: [(super::http_app::AppId, u8); app::ABORT_QUEUE],
+    #[cfg(feature = "app")]
+    pub(crate) abort_len: u32,
 
     /// The session anchor: SessionCtrlV1 to the fan-out workers.
     pub(crate) sc: session::SessionAnchor,
@@ -1274,18 +1229,25 @@ pub(crate) struct ServerState {
     /// Application requests answered 504 by the module because the
     /// application never replied (`http.app.timeouts`).
     pub(crate) app_timeouts: u32,
-    /// Application responses lost on the response path
-    /// (`http.app.envelopes.lost`). Structurally zero: an envelope a busy
-    /// connection cannot take is held for that connection
-    /// (`app::stash_push`), and one that holds more than `app::STASH_MAX`
-    /// closes instead (`conns_timeout_stall`), so no path reaches a response
-    /// that is neither delivered nor accounted for. The id is published so a
-    /// dashboard reads zero rather than a gap.
-    pub(crate) app_envelopes_lost: u32,
-    /// Envelopes discarded because they exceeded what one channel read
-    /// can carry (`http.app.envelopes.oversize`). A configuration error:
-    /// the port's declared record size is larger than the reader's.
-    pub(crate) app_envelopes_oversize: u32,
+    /// Application records naming an exchange that is not open — it ended,
+    /// timed out, or its connection went (`http.app.records.stale`). A
+    /// late answer, dropped because nothing is left to answer.
+    pub(crate) app_records_stale: u32,
+    /// Application records that do not parse (`http.app.records.malformed`):
+    /// an application speaking a broken protocol, or a record larger than one
+    /// channel read on a port declared wider than its reader.
+    pub(crate) app_records_malformed: u32,
+    /// Exchanges aborted because the application broke their rules — body
+    /// past its credit, a second head, a head that does not fit the
+    /// connection (`http.app.violations`).
+    pub(crate) app_violations: u32,
+    /// Exchanges this server aborted towards the application
+    /// (`http.app.aborts`): a peer gone, a body refused, a drain.
+    pub(crate) app_aborts: u32,
+    /// Exchanges opened towards the application (`http.app.exchanges`).
+    pub(crate) app_exchanges: u32,
+    /// Request bodies refused at a route's ceiling (`http.bodies.refused`).
+    pub(crate) bodies_refused: u32,
     /// WebSocket fan-out envelopes dropped — unknown conn, no fan-out
     /// slot active, or oversize (`http.ws.envelopes.dropped`).
     pub(crate) ws_envelopes_dropped: u32,
@@ -1628,7 +1590,21 @@ pub(crate) unsafe fn slot_deadline_limit(s: &HttpState) -> (u32, DeadlineKind) {
         | Phase::ProxyRelayBody
         | Phase::WsHandshake
         | Phase::WsClose => (s.server.stall_ms, DeadlineKind::Stall),
-        // Own timers: AwaitApp (APP_TIMEOUT_MS), AwaitFsStat, WsAwaitAdmit,
+        // An exchange waits on the peer while bytes it owes the peer are
+        // unsent, or while the application has granted body credit the peer
+        // has not filled; otherwise the application holds the turn and its own
+        // progress deadline governs (`app::h1_step`).
+        #[cfg(feature = "app")]
+        Phase::AppExchange => {
+            let owes_peer = cur.send_offset < cur.send_len;
+            let body_due = cur.app.req_credit > 0 && !cur.app.is(app::ex::REQ_DONE);
+            if owes_peer || body_due {
+                (s.server.stall_ms, DeadlineKind::Stall)
+            } else {
+                (0, DeadlineKind::None)
+            }
+        }
+        // Own timers: AwaitFsStat, WsAwaitAdmit,
         // ProxyConnect/ProxyWaitConnect. WsActive is the ping policy in
         // `ws::ws_idle_policy`; H2Active is `h2::step`'s own check, which
         // knows whether a stream is open.
@@ -2794,10 +2770,31 @@ pub(crate) unsafe fn pump_dyn_routes(s: &mut HttpState) {
     tc.step(sys, sink, prefix, scratch, dyn_routes);
 }
 
+/// Whether every abort owed to the application has been delivered: an
+/// exchange the application still believes open must be closed before this
+/// instance reports itself drained.
+pub(crate) fn aborts_delivered(s: &HttpState) -> bool {
+    #[cfg(feature = "app")]
+    {
+        s.server.abort_len == 0
+    }
+    #[cfg(not(feature = "app"))]
+    {
+        let _ = s;
+        true
+    }
+}
+
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // `now_ms` was sampled by `module_step` before dispatch — one clock read
     // per pass, shared by this path and the HTTP/3 mux path.
     demux_inbound(s);
+    // Application records are read once per step, before any connection
+    // runs: `resp_in` feeds every connection, so a per-connection read
+    // would let whichever stepped first take a record addressed to another.
+    // `drain_responses` hands each record to the exchange it names.
+    #[cfg(feature = "app")]
+    app::drain_responses(s);
     pump_dyn_routes(s);
     pump_listeners(s);
     // Re-offer lifecycle events a full `ws_event_out` refused earlier. Before
@@ -2822,6 +2819,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         && s.server.bound != 0
         && active_slot_count(s) == 0
         && s.server.ws_event_len == 0
+        && aborts_delivered(s)
     {
         return 1;
     }
@@ -2890,8 +2888,9 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 /// Snapshot of the load-shedding counters, in `[observability].metrics` id
 /// order (ids 5..13): backpressure steps, connections refused for want of a
 /// slot, connections refused for want of arena, demux stalls, application
-/// timeouts, application envelopes lost, application envelopes oversize,
-/// WebSocket envelopes dropped, HTTP/2 streams refused.
+/// timeouts, stale application records, malformed application records,
+/// WebSocket envelopes dropped, HTTP/2 streams refused — plus the application
+/// exchange counters and the lifetime counters.
 ///
 /// Exposed so a test can assert the counter its scenario should have moved.
 /// A counter with no test that moves it is a counter that will silently stop
@@ -2910,8 +2909,12 @@ pub unsafe fn test_shed_metrics(state: *mut u8) -> ShedMetrics {
         conns_refused_arena: s.server.conns_refused_arena,
         demux_stalls: s.server.demux_stalls,
         app_timeouts: s.server.app_timeouts,
-        app_envelopes_lost: s.server.app_envelopes_lost,
-        app_envelopes_oversize: s.server.app_envelopes_oversize,
+        app_records_stale: s.server.app_records_stale,
+        app_records_malformed: s.server.app_records_malformed,
+        app_violations: s.server.app_violations,
+        app_aborts: s.server.app_aborts,
+        app_exchanges: s.server.app_exchanges,
+        bodies_refused: s.server.bodies_refused,
         ws_envelopes_dropped: s.server.ws_envelopes_dropped,
         h2_streams_refused: s.server.h2_streams_refused,
         conns_timeout_header: s.server.conns_timeout_header,
@@ -2939,8 +2942,12 @@ pub struct ShedMetrics {
     pub conns_refused_arena: u32,
     pub demux_stalls: u32,
     pub app_timeouts: u32,
-    pub app_envelopes_lost: u32,
-    pub app_envelopes_oversize: u32,
+    pub app_records_stale: u32,
+    pub app_records_malformed: u32,
+    pub app_violations: u32,
+    pub app_aborts: u32,
+    pub app_exchanges: u32,
+    pub bodies_refused: u32,
     pub ws_envelopes_dropped: u32,
     pub h2_streams_refused: u32,
     /// Connections closed by a lifetime deadline, by reason.

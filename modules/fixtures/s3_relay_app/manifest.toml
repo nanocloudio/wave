@@ -1,0 +1,50 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# CONFORMANCE FIXTURE for the `s3` connector's driven mode — not a product
+# module, which is why it lives in `modules/fixtures/` rather than
+# `modules/foundation/`.
+#
+# The connector speaks the `HttpRequest` / `HttpResponse` records that `http`
+# speaks to its applications, in the same roles, so a graph can put plain
+# HTTP in front of it: `http` → this relay → `s3` → any S3 endpoint. Every
+# record passes unchanged except a request HEAD, which loses the inbound
+# connection's own header lines (`host`, framing, `expect`, a signature) and
+# its peer, since the connector writes those for the request it signs.
+# `tools/e2e/s3_serve.sh` drives the connector against `s3_serve` this way.
+#
+# Records are `modules/common/http_app.rs`. Every edge is a mailbox: wire each
+# with its own `buffer_group`.
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "HttpRequest"
+max_record = 8192
+buffer_size = 8192
+
+[[ports]]
+name = "upstream_in"
+index = 1
+direction = "input"
+content_type = "HttpResponse"
+max_record = 8192
+buffer_size = 8192
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "HttpResponse"
+max_record = 8192
+buffer_size = 8192
+
+[[ports]]
+name = "upstream_out"
+index = 1
+direction = "output"
+content_type = "HttpRequest"
+max_record = 8192
+buffer_size = 8192
+
+[observability]
+exempt = "conformance fixture: observed through the E2E assertions it exists to serve"

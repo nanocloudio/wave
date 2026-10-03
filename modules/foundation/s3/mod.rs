@@ -1,30 +1,32 @@
-//! S3 connector — a GENUINE per-protocol Fluxor foundation module that makes a
-//! point the others don't: even a STATELESS request/reply protocol needs a
-//! compiled module when each request must be cryptographically SIGNED. S3 GET is
-//! one round trip, but it carries an `Authorization: AWS4-HMAC-SHA256 …` header
-//! whose signature is HMAC-SHA256 over a canonical form of the request. It is not
-//! a multi-round-trip that forces a module here — it is the crypto, which a
-//! bytecode codec cannot compute.
+//! S3 connector — a per-protocol Fluxor foundation module that makes a point
+//! the others don't: even a STATELESS request/reply protocol needs a compiled
+//! module when each request must be cryptographically SIGNED. An S3 operation
+//! is one round trip, but it carries an `Authorization: AWS4-HMAC-SHA256 …`
+//! header whose signature is HMAC-SHA256 over a canonical form of the request,
+//! and a streamed body signs every chunk. It is the crypto, not the round-trip
+//! count, that a bytecode codec cannot compute.
 //!
 //! Two modes, chosen by whether `request_in` is wired:
 //!
-//! **Driven** (`request_in` wired) — the connector performs one S3 operation per
-//! `S3Request` record and answers with an `S3Response`: GET / PUT / HEAD /
-//! DELETE on `/bucket/key`, each signed with the payload hashed in. This is what
-//! lets a graph store what it computes — a pipeline that terminates HTTP on one
-//! side and blobs on the other needs a connector it can ASK, not one configured
-//! with a single request at build time.
+//! **Driven** (`request_in` wired) — the connector performs one exchange at a
+//! time, spoken in the HTTP application records of `http_app.rs`: a caller
+//! writes a request HEAD (`/bucket/key[?query]`), streams the body in BODY
+//! records against the credit the connector grants, and reads the endpoint's
+//! response HEAD and body back as records, paced by the credit it grants.
+//! Neither body is ever held whole: a request body crosses in signed
+//! `aws-chunked` chunks of [`S3_CHUNK`] bytes, a response body is forwarded as
+//! it arrives and the transport is not read past what the caller has room for.
 //!
-//! **Probe** (`request_in` unwired) — the original behaviour, unchanged: on boot
-//! it signs a `GET /` (ListBuckets) and reports the HTTP status (200 = signature
-//! accepted; 403 = SignatureDoesNotMatch). A probe graph is this mode,
-//! and it stays the cheapest way to prove credentials against a real endpoint.
+//! **Probe** (`request_in` unwired) — on boot it signs a `GET /` (ListBuckets)
+//! and reports the HTTP status on `status_out` (200 = signature accepted;
+//! 403 = SignatureDoesNotMatch): the cheapest way to prove credentials
+//! against a real endpoint.
 //!
-//! Protocol + crypto in the host-tested `s3_core.rs`; the record layouts in
-//! `s3_wire.rs`, with vectors in the consumer's host tests.
+//! Signing is `sigv4_core.rs`; request composition, `aws-chunked` framing and
+//! response framing are `s3_core.rs`; the records are `http_app.rs`.
 //!
-//! Ports:  net_in/net_out (transport), status_out (HTTP status),
-//!         request_in (S3Request), response_out (S3Response).
+//! Ports:  net_in/net_out (transport), status_out (probe status),
+//!         request_in (HttpRequest), response_out (HttpResponse).
 //! Params: `authority` (`host[:port]`, port 80 when it names none: where the
 //!         connector dials and, verbatim, the `Host` SigV4 signs),
 //!         `access_key`, `secret`, `region`.
@@ -57,20 +59,32 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+include!("../../common/sigv4_core.rs");
 include!("../../common/s3_core.rs");
 
-#[path = "../../common/s3_wire.rs"]
-mod s3_wire;
-use s3_wire::*;
+#[allow(
+    unused_imports,
+    dead_code,
+    reason = "the record contract is shared; this module uses the client half"
+)]
+#[path = "../../common/http_app.rs"]
+mod http_app;
+use http_app::{
+    app_abort, app_flag, app_parse_request, app_seal_body, app_write_abort, app_write_credit,
+    app_write_response_head, AppId, AppRecord, AppResponseHead, APP_HDR, APP_RECORD_MAX,
+};
 
 // The NetProto opcodes and identity accessors come from the owning contract,
 // never redeclared locally, so a change to the wire is a compile error here
-// rather than a wrong answer. A connection id read at a hand-rolled offset is
-// invisible to review and to the compiler the moment the field widens.
+// rather than a wrong answer.
 use abi::contracts::net::net_proto::{
     self, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO,
     CMD_SEND as NET_CMD_SEND, MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED,
     MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
+};
+// The method byte of a request HEAD is the shared `http_exchange` vocabulary.
+use abi::contracts::net::http_exchange::{
+    method_name, METHOD_DELETE, METHOD_GET, METHOD_HEAD, METHOD_POST, METHOD_PUT,
 };
 
 /// The port a dial takes when `authority` names none.
@@ -81,27 +95,69 @@ const DEFAULT_PORT: u16 = 80;
 /// against it, so an instance that cannot name it is refused rather than
 /// left to sign for nowhere.
 const E_BAD_AUTHORITY: i32 = -22;
+/// Construction refused: a credential parameter past its buffer.
+const E_BAD_PARAM: i32 = -22;
 
+/// One transport frame, read or written.
 const NET_BUF: usize = 2048;
-/// Signed request staging. Sized to hold the largest signed PUT: the head is a
-/// few hundred bytes of SigV4, the rest is payload.
-const REQ_BUF: usize = 20 * 1024;
-const ACC_BUF: usize = 20 * 1024;
-/// Largest object body this connector carries in one request, in or out.
-///
-/// Bounded because both directions stage through fixed state-owned arrays. A
-/// registry layer larger than this needs the chunked form the HTTP fan-out uses
-/// (a `MORE_BODY` flag across several records), which is a separate change —
-/// what exists here is refused explicitly rather than truncated.
-const MAX_OBJECT_BYTES: usize = 16 * 1024;
+/// Request bytes per `CMD_SEND` frame: one TCP segment's worth, which keeps
+/// every frame within `net_out`'s declared `max_record`.
+const SEND_MAX: usize = net_proto::MAX_DATA_FRAGMENT;
+/// Longest credential field or authority held.
 const NAME_BUF: usize = 128;
+/// Longest request target a caller may name. The canonical query is sorted in
+/// [`SV4_QUERY_SCRATCH`], which is sized for a target of this length; a
+/// longer one is refused with 400 rather than signed over a part of it.
+const MAX_TARGET: usize = 2048;
+/// Longest block of extra request header lines a caller may supply. Over it,
+/// 400.
+const MAX_CALLER_HEADERS: usize = 2048;
+/// The signed request head. The largest head is the request line with a
+/// [`MAX_TARGET`] target, [`MAX_CALLER_HEADERS`] of caller lines, a
+/// [`NAME_BUF`] host, access key and region, and the fixed SigV4 fields — all
+/// within this. It also stages one `aws-chunked` framing line.
+const TX_BUF: usize = 6144;
+/// Longest response head (status line and headers) read from the endpoint. A
+/// head that does not end within it is answered 502 and the connection
+/// closed, rather than parsed in part. Every head that fits also fits one
+/// response HEAD record.
+const RESP_HEAD_MAX: usize = 4096;
+/// Longest `Content-Type` forwarded in its own field; a longer one stays among
+/// the forwarded headers.
+const CT_MAX: usize = 255;
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
+/// The endpoint's progress deadline: no byte to or from it for this long
+/// while the connector waits on it ends the exchange (504 before any response
+/// record, ABORT(STALLED) after).
 const REPLY_TIMEOUT_MS: u64 = 15_000;
+/// The caller's progress deadline: no record from it, and none of the
+/// connector's taken by it, for this long while the exchange waits on the
+/// caller ends the exchange with ABORT(STALLED).
+const CALLER_TIMEOUT_MS: u64 = 30_000;
 
+// Transport phase.
 const DISCONNECTED: u8 = 0;
 const CONNECTING: u8 = 1;
-const AWAIT_RESPONSE: u8 = 2;
+const OPEN: u8 = 2;
+/// The probe's terminal state.
 const DONE: u8 = 3;
+
+// Exchange phase.
+const EX_IDLE: u8 = 0;
+/// Admitted; the dial is staged or in flight.
+const EX_DIAL: u8 = 1;
+/// Connected; the request is going out and the response coming back.
+const EX_OPEN: u8 = 2;
+/// The exchange's terminal record is owed; nothing else is done for it.
+const EX_ENDING: u8 = 3;
+
+// Response framing state.
+const RS_HEAD: u8 = 0;
+const RS_NONE: u8 = 1;
+const RS_LENGTH: u8 = 2;
+const RS_CHUNKED: u8 = 3;
+const RS_CLOSE: u8 = 4;
+const RS_DONE: u8 = 5;
 
 #[repr(C)]
 struct S3State {
@@ -109,10 +165,12 @@ struct S3State {
     net_in: i32,
     net_out: i32,
     status_out: i32,
+    /// Channel handles; `-1` when unwired. `request_in < 0` selects probe mode.
+    request_in: i32,
+    response_out: i32,
 
     /// `host[:port]`: where the connector dials and what SigV4 signs as the
-    /// `Host` header, one value. Parsed at construction, so a dial never
-    /// meets an authority it cannot carry.
+    /// `Host` header, one value.
     authority: [u8; NAME_BUF],
     authority_len: u16,
     /// The authority's port, or [`DEFAULT_PORT`] when it names none.
@@ -123,151 +181,219 @@ struct S3State {
     secret_len: u16,
     region: [u8; NAME_BUF],
     region_len: u16,
+    /// A credential parameter longer than its buffer: construction refuses
+    /// it rather than sign with a prefix of it.
+    credential_over: u8,
 
+    // ── Transport ───────────────────────────────────────────────────
     phase: u8,
     conn_id: u16,
+    /// 1 once `MSG_CONNECTED` established a connection. Separate from
+    /// `conn_id`'s value because the net stack can assign `conn_id == 0`.
+    conn_present: u8,
+    tag: u8,
+    draining: u8,
     /// The transport command staged for `net_out`, `0` when none is owed. A
-    /// command advances the connector's state only once `net_out` has taken the
-    /// whole frame, so a refused CONNECT or CLOSE is re-offered next step
-    /// instead of being skipped — a lost CONNECT would otherwise surface as a
-    /// reply timeout, naming the endpoint for a frame that never left.
-    ///
-    /// One slot is enough: a CLOSE is only ever staged for a connection a
-    /// CONNECT already established, and no record is admitted while a command
-    /// is staged, so two commands are never outstanding together.
+    /// command takes effect only once `net_out` has taken the whole frame, so
+    /// a refused CONNECT or CLOSE is re-offered next step.
     cmd: u8,
     cmd_payload: [u8; net_proto::CONNECT_TO_MAX],
     cmd_len: u16,
-    /// 1 once `MSG_CONNECTED` established a connection, 0 otherwise. Tracks
-    /// connection PRESENCE separately from `conn_id`'s value because the net
-    /// stack can legitimately assign `conn_id == 0`; keying "connected" off
-    /// `conn_id != 0` would skip the close on every connection that happened
-    /// to land in slot 0, leaking a transport slot per failure. Same split the
-    /// HTTP client carries for the same reason.
-    conn_present: u8,
-    tag: u8,
-    started_ms: u64,
-    draining: u8,
-
-    // ── Driven mode ────────────────────────────────────────────────
-    /// Channel handles; `-1` when unwired. `request_in < 0` selects probe mode.
-    request_in: i32,
-    response_out: i32,
-    /// The request being performed: op and correlation id are needed when the
-    /// response comes back, long after the record was consumed.
-    cur_op: u8,
-    cur_cid: u32,
-    /// 1 while a driven request is in flight, so the boot probe cannot fire and
-    /// a second record is not consumed until this one is answered. Cleared only
-    /// once the answering `S3Response` has been accepted by `response_out`, so
-    /// an admitted request is never displaced by the next one before its own
-    /// terminal outcome has left the module.
-    busy: u8,
-    /// Staging for inbound `S3Request` records. One `channel_read` on the byte
-    /// FIFO can return several whole records and end on a partial one, so this
-    /// holds everything read: the record being performed stays at the front and
-    /// a trailing fragment stays put until the reads behind it complete it.
-    rec: [u8; REQ_BUF],
-    /// Valid bytes in `rec`.
-    rec_len: u32,
-    /// Length of the record at the front of `rec` that is in flight. Its bytes
-    /// are retired only after it has been answered.
-    rec_taken: u32,
-    /// The encoded `S3Response` awaiting `response_out`. `resp_len == 0` means
-    /// nothing is owed. A full output channel parks the record here rather than
-    /// discarding it: the request was admitted, so the answer is owed until it
-    /// is delivered.
-    resp: [u8; REQ_BUF],
-    resp_len: u32,
-
-    req: [u8; REQ_BUF],
-    req_len: u16,
-    req_sent: u16,
-    acc: [u8; ACC_BUF],
-    acc_len: u32,
-
+    /// Last moment the exchange (or the probe) made progress: the base of
+    /// every deadline.
+    progress_ms: u64,
+    /// The endpoint closed the connection (`MSG_CLOSED`). Its id stays
+    /// reserved until this connector's CLOSE answers it.
+    eof: u8,
+    /// Scratch for every frame written to `net_out`.
     nbuf: [u8; NET_BUF],
-    ok: u32,
-    errors: u32,
-    /// Conservation counters for driven mode. `admitted` counts `S3Request`
-    /// records taken off `request_in` whose header arrived; `terminated` counts
-    /// the `S3Response` records delivered for them. `admitted == terminated`
-    /// holds whenever nothing is in flight.
-    ///
-    /// `refused_malformed` counts the admitted records refused from their
-    /// header alone, because what it declares can never be assembled here.
-    /// `dropped_unparsable` counts the only bytes that go without an outcome:
-    /// a fragment abandoned at the drain before its header — and so its
-    /// correlation id — had arrived, leaving nothing to answer on.
+    /// The last frame read from `net_in`. Response bytes not yet forwarded
+    /// stay here, between `rx_at` and `rx_end`, and nothing more is read
+    /// until they are gone — so a caller without credit holds the endpoint
+    /// back through the transport, not through a buffer here.
+    rxf: [u8; NET_BUF],
+    rx_at: u16,
+    rx_end: u16,
+
+    // ── Request side ────────────────────────────────────────────────
+    /// The record read from `request_in` and not yet taken: a HEAD that
+    /// found [`Self::pend`] occupied. Nothing more is read while it is held.
+    inrec: [u8; APP_RECORD_MAX],
+    inrec_len: u16,
+    /// The next exchange's HEAD, read while one was in flight. It waits here
+    /// until the exchange ahead of it ends.
+    pend: [u8; APP_RECORD_MAX],
+    pend_len: u16,
+    /// Response credit granted for the pending exchange before it began.
+    pend_credit: u64,
+    /// The pending exchange sent body bytes before any credit was granted.
+    pend_overrun: u8,
+
+    ex: u8,
+    id: AppId,
+    method: u8,
+    target: [u8; MAX_TARGET],
+    target_len: u16,
+    caller_hdrs: [u8; MAX_CALLER_HEADERS],
+    caller_hdrs_len: u16,
+    /// The request has a body (its HEAD carried MORE).
+    has_body: u8,
+    /// The body goes out `aws-chunked`.
+    streaming: u8,
+    /// Declared body length (`content-length`).
+    req_len: u64,
+    /// Body bytes taken from the caller.
+    req_got: u64,
+    /// Request-body credit granted and not yet used by the caller.
+    req_credit: u64,
+    /// Request-body credit owed to the caller, not yet written.
+    credit_owed: u32,
+    /// The request head is on (or queued for) the wire.
+    head_queued: u8,
+    /// The final `aws-chunked` chunk is queued.
+    final_queued: u8,
+    /// Every byte of the request has gone to `net_out`.
+    req_sent: u8,
+    /// Something was queued for `net_out` since the queue last drained.
+    in_queue: u8,
+
+    /// One chunk of request body: filled by the caller's BODY records within
+    /// the credit granted, then sent from here.
+    chunk: [u8; S3_CHUNK],
+    chunk_len: u16,
+    /// The bytes queued for `net_out`, sent in order: `tx` (a head or a chunk
+    /// framing line), then `chunk[..data_len]`, then `\r\n` when `sfx_len` is
+    /// 2. Each cursor advances only once a frame carrying its bytes has been
+    /// taken whole.
+    tx: [u8; TX_BUF],
+    tx_len: u16,
+    tx_sent: u16,
+    data_len: u16,
+    data_sent: u16,
+    sfx_len: u8,
+    sfx_sent: u8,
+
+    signing_key: [u8; 32],
+    amz_date: [u8; 16],
+    scope_date: [u8; 8],
+    /// The previous signature in the chunk chain (the head's for the first).
+    prev_sig: [u8; 64],
+    sv4_scratch: [u8; SV4_QUERY_SCRATCH],
+
+    // ── Response side ───────────────────────────────────────────────
+    /// Response-body credit the caller has granted and not yet used.
+    resp_credit: u64,
+    rs: u8,
+    resp_remaining: u64,
+    chunked: S3Chunked,
+    resp_head: [u8; RESP_HEAD_MAX],
+    resp_head_len: u16,
+    resp_status: u16,
+    /// The forwarded `Content-Type` (`fwd[..fwd_ct]`) and header lines
+    /// (`fwd[fwd_ct..fwd_ct + fwd_hdr]`).
+    fwd: [u8; CT_MAX + RESP_HEAD_MAX],
+    fwd_ct: u16,
+    fwd_hdr: u16,
+    /// The response HEAD record is owed.
+    head_owed: u8,
+    /// The response HEAD record has gone out: a failure from here on is an
+    /// ABORT, not a status.
+    head_sent: u8,
+    /// The terminal outcome owed once the exchange is ending: a status HEAD
+    /// (`status_owed`) or an ABORT (`abort_owed`).
+    status_owed: u16,
+    abort_owed: u8,
+
+    /// The record staged for `response_out`, `out_len == 0` when none. A
+    /// refused write leaves it staged for the next step.
+    out: [u8; APP_RECORD_MAX],
+    out_len: u16,
+    /// The staged record ends the exchange.
+    out_terminal: u8,
+
+    /// Conservation counters. `admitted` counts HEADs taken off
+    /// `request_in`; `terminated` counts their terminal outcomes — a final
+    /// response record or ABORT delivered, or the caller's own ABORT.
+    /// `admitted == terminated` whenever nothing is in flight or pending.
     admitted: u32,
     terminated: u32,
-    dropped_unparsable: u32,
-    refused_malformed: u32,
+    /// Records for no exchange this connector holds (dropped).
+    records_stale: u32,
+    /// Records that do not parse (dropped).
+    records_malformed: u32,
 }
 
-/// Driven-mode conservation snapshot: the admission and terminal-outcome
-/// counts, plus whether work is still owed.
+/// Driven-mode conservation snapshot.
 #[cfg(feature = "host-test")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct S3Conservation {
     pub admitted: u32,
     pub terminated: u32,
-    /// Records whose bytes were taken and discarded without any outcome: a
-    /// fragment abandoned at the drain before its correlation id had arrived.
-    pub dropped_unparsable: u32,
-    /// Admitted records refused from their header, because what it declares
-    /// can never be assembled in one record.
-    pub refused_malformed: u32,
-    /// 1 while an admitted request has not yet had its response delivered.
+    pub records_stale: u32,
+    pub records_malformed: u32,
+    /// 1 while an admitted exchange has not had its terminal outcome.
     pub in_flight: u8,
-    /// 1 while an encoded response is parked waiting for `response_out`.
-    pub response_owed: u8,
+    /// 1 while a record is staged for a `response_out` that has not taken it.
+    pub record_owed: u8,
     /// 1 while a transport command is staged for a `net_out` that refused it.
     pub command_owed: u8,
-    /// 1 while bytes taken off `request_in` are still buffered without an
-    /// outcome — the prefetch behind the record in flight, or a fragment
-    /// waiting for the read that completes it.
-    pub buffered: u8,
+    /// 1 while a HEAD read off `request_in` waits behind the exchange in
+    /// flight.
+    pub pending: u8,
+    /// Response bytes read from `net_in` and not yet forwarded.
+    pub rx_held: u16,
 }
 
 /// # Safety
 /// `state` must point to an `S3State` initialised by `module_new`.
 #[cfg(feature = "host-test")]
 pub unsafe fn test_conservation(state: *mut u8) -> S3Conservation {
-    let s = &*(state as *const S3State);
+    // SAFETY: the caller's contract above.
+    let s = unsafe { &*(state as *const S3State) };
     S3Conservation {
         admitted: s.admitted,
         terminated: s.terminated,
-        dropped_unparsable: s.dropped_unparsable,
-        refused_malformed: s.refused_malformed,
-        in_flight: s.busy,
-        response_owed: u8::from(s.resp_len != 0),
+        records_stale: s.records_stale,
+        records_malformed: s.records_malformed,
+        in_flight: u8::from(s.ex != EX_IDLE),
+        record_owed: u8::from(s.out_len != 0),
         command_owed: u8::from(s.cmd != 0),
-        buffered: u8::from(s.rec_len > s.rec_taken),
+        pending: u8::from(s.pend_len != 0 || s.inrec_len != 0),
+        rx_held: s.rx_end.saturating_sub(s.rx_at),
     }
+}
+
+/// Hold a string parameter whole, or flag it as too long. A default (empty)
+/// value holds nothing.
+///
+/// # Safety
+/// `d` is valid for `len` bytes.
+unsafe fn take_param(
+    buf: &mut [u8; NAME_BUF],
+    held: &mut u16,
+    over: &mut u8,
+    d: *const u8,
+    len: usize,
+) {
+    if len > NAME_BUF {
+        *over = 1;
+        return;
+    }
+    core::ptr::copy_nonoverlapping(d, buf.as_mut_ptr(), len);
+    *held = len as u16;
 }
 
 define_params! {
     S3State;
 
-    // 1: endpoint — retired. 2: host — retired. `authority` (6) is both.
     3, access_key, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.access_key_len as usize) < NAME_BUF {
-            s.access_key[s.access_key_len as usize] = *d.add(i); s.access_key_len += 1; i += 1;
-        }
+        take_param(&mut s.access_key, &mut s.access_key_len, &mut s.credential_over, d, len);
     };
     4, secret, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.secret_len as usize) < NAME_BUF {
-            s.secret[s.secret_len as usize] = *d.add(i); s.secret_len += 1; i += 1;
-        }
+        take_param(&mut s.secret, &mut s.secret_len, &mut s.credential_over, d, len);
     };
     5, region, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.region_len as usize) < NAME_BUF {
-            s.region[s.region_len as usize] = *d.add(i); s.region_len += 1; i += 1;
-        }
+        take_param(&mut s.region, &mut s.region_len, &mut s.credential_over, d, len);
     };
     6, authority, str, 0 => |s, d, len| {
         // Held whole or not at all: a prefix of an authority is a
@@ -298,10 +424,14 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_drain"]
 pub extern "C" fn module_drain(state: *mut u8) -> i32 {
+    if state.is_null() {
+        return -1;
+    }
+    // SAFETY: the kernel passes the state buffer `module_new` initialised.
     unsafe {
         (*(state as *mut S3State)).draining = 1;
-        0
     }
+    0
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -316,99 +446,164 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
+    if syscalls.is_null() || state.is_null() {
+        return -1;
+    }
+    if state_size < core::mem::size_of::<S3State>() {
+        return -2;
+    }
+    // SAFETY: `state` is non-null and at least `size_of::<S3State>()` bytes,
+    // zero-initialised by the kernel; every field of `S3State` is valid at
+    // all-zero bytes. `syscalls` is non-null and is this instance's table.
+    let (s, sys) = unsafe {
+        (
+            &mut *(state as *mut S3State),
+            &*(syscalls as *const SyscallTable),
+        )
+    };
+    s.syscalls = sys;
+    s.net_in = in_chan;
+    s.net_out = out_chan;
+    // SAFETY: syscall-table wrappers over a table that outlives the calls;
+    // each (direction, index) is declared in `manifest.toml`.
     unsafe {
-        if syscalls.is_null() || state.is_null() {
-            return -1;
-        }
-        if state_size < core::mem::size_of::<S3State>() {
-            return -2;
-        }
-        let s = &mut *(state as *mut S3State);
-        let sys = &*(syscalls as *const SyscallTable);
-        s.syscalls = sys;
-        s.net_in = in_chan;
-        s.net_out = out_chan;
         s.status_out = dev_channel_port(sys, 1, 1);
-        // in[1] / out[2]: the driven-mode pair. Unwired (`-1`) selects the boot
-        // probe, so `examples/s3_client/` keeps working untouched.
+        // in[1] / out[2]: the driven-mode pair. Unwired (`-1`) selects the
+        // boot probe.
         s.request_in = dev_channel_port(sys, 0, 1);
         s.response_out = dev_channel_port(sys, 1, 2);
-        s.authority_len = 0;
-        s.port = 0;
-        s.access_key_len = 0;
-        s.secret_len = 0;
-        s.region_len = 0;
-        s.phase = DISCONNECTED;
-        s.conn_id = 0;
-        s.conn_present = 0;
-        s.cmd = 0;
-        s.cmd_len = 0;
         s.tag = dev_requester_tag(sys);
-        s.started_ms = 0;
-        s.draining = 0;
-        s.req_len = 0;
-        s.req_sent = 0;
-        s.acc_len = 0;
-        s.ok = 0;
-        s.errors = 0;
-        s.busy = 0;
-        s.rec_len = 0;
-        s.rec_taken = 0;
-        s.resp_len = 0;
-        s.admitted = 0;
-        s.terminated = 0;
-        s.dropped_unparsable = 0;
-        s.refused_malformed = 0;
+    }
+    s.authority_len = 0;
+    s.port = 0;
+    s.access_key_len = 0;
+    s.secret_len = 0;
+    s.region_len = 0;
+    s.phase = DISCONNECTED;
+    s.conn_present = 0;
+    s.cmd = 0;
+    s.cmd_len = 0;
+    s.draining = 0;
+    s.ex = EX_IDLE;
+    s.out_len = 0;
+    s.inrec_len = 0;
+    s.pend_len = 0;
+    s.admitted = 0;
+    s.terminated = 0;
+    s.records_stale = 0;
+    s.records_malformed = 0;
+    reset_exchange(s);
+    // SAFETY: `params` spans `params_len` bytes per the module ABI.
+    unsafe {
         parse_tlv(s, params, params_len);
-        // The one address this connector has. Refused here rather than at
-        // the dial: a request performed against nowhere would time out and
-        // blame the endpoint for a fault in the graph.
-        match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
-            Some((_, port)) => s.port = port.unwrap_or(DEFAULT_PORT),
-            None => {
-                let m = b"[s3] authority must be host[:port], at most 256 bytes";
-                dev_log(sys, 2, m.as_ptr(), m.len());
-                return E_BAD_AUTHORITY;
-            }
-        }
-        // default region
-        if s.region_len == 0 {
-            s.region[..9].copy_from_slice(b"us-east-1");
-            s.region_len = 9;
-        }
-        dev_log(sys, 3, b"[s3] init".as_ptr(), 9);
-        0
     }
-}
-
-unsafe fn emit_status(s: &mut S3State, text: &[u8]) {
-    let sys = &*s.syscalls;
-    if s.status_out >= 0 {
-        let poll = (sys.channel_poll)(s.status_out, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
-            (sys.channel_write)(s.status_out, text.as_ptr(), text.len());
+    // The one address this connector has. Refused here rather than at the
+    // dial: a request performed against nowhere would time out and blame the
+    // endpoint for a fault in the graph.
+    let al = (s.authority_len as usize).min(NAME_BUF);
+    match net_proto::Target::parse(s.authority.get(..al).unwrap_or(&[])) {
+        Some((_, port)) => s.port = port.unwrap_or(DEFAULT_PORT),
+        None => {
+            let m = b"[s3] authority must be host[:port], at most 128 bytes";
+            // SAFETY: logging a static message through the syscall table.
+            unsafe { dev_log(sys, 2, m.as_ptr(), m.len()) };
+            return E_BAD_AUTHORITY;
         }
     }
+    if s.credential_over != 0 {
+        let m = b"[s3] access_key, secret and region are each at most 128 bytes";
+        // SAFETY: logging a static message through the syscall table.
+        unsafe { dev_log(sys, 2, m.as_ptr(), m.len()) };
+        return E_BAD_PARAM;
+    }
+    if s.region_len == 0 {
+        s.region[..9].copy_from_slice(b"us-east-1");
+        s.region_len = 9;
+    }
+    // SAFETY: as above.
+    unsafe { dev_log(sys, 3, b"[s3] init".as_ptr(), 9) };
+    0
 }
 
-/// Stage a transport command for `net_out` and offer it straight away.
-///
-/// The staged copy is what makes the command survive a refusal: `net_out` takes
-/// a frame whole or not at all, and the bytes stay here until it takes them.
-unsafe fn stage_command(s: &mut S3State, cmd: u8, payload: &[u8], now: u64) {
+// ── Small accessors ─────────────────────────────────────────────────────
+
+fn authority(s: &S3State) -> &[u8] {
+    s.authority.get(..s.authority_len as usize).unwrap_or(&[])
+}
+
+fn rx_empty(s: &S3State) -> bool {
+    s.rx_at >= s.rx_end
+}
+
+fn rx_discard(s: &mut S3State) {
+    s.rx_at = 0;
+    s.rx_end = 0;
+}
+
+/// Clear everything one exchange holds.
+fn reset_exchange(s: &mut S3State) {
+    s.ex = EX_IDLE;
+    s.id = AppId {
+        origin: 0,
+        conn: 0,
+        stream: 0,
+    };
+    s.method = 0;
+    s.target_len = 0;
+    s.caller_hdrs_len = 0;
+    s.has_body = 0;
+    s.streaming = 0;
+    s.req_len = 0;
+    s.req_got = 0;
+    s.req_credit = 0;
+    s.credit_owed = 0;
+    s.head_queued = 0;
+    s.final_queued = 0;
+    s.req_sent = 0;
+    s.in_queue = 0;
+    s.chunk_len = 0;
+    s.tx_len = 0;
+    s.tx_sent = 0;
+    s.data_len = 0;
+    s.data_sent = 0;
+    s.sfx_len = 0;
+    s.sfx_sent = 0;
+    s.resp_credit = 0;
+    s.rs = RS_HEAD;
+    s.resp_remaining = 0;
+    s.chunked = S3Chunked::new();
+    s.resp_head_len = 0;
+    s.resp_status = 0;
+    s.fwd_ct = 0;
+    s.fwd_hdr = 0;
+    s.head_owed = 0;
+    s.head_sent = 0;
+    s.status_owed = 0;
+    s.abort_owed = 0;
+    s.out_terminal = 0;
+    s.eof = 0;
+    rx_discard(s);
+}
+
+// ── Transport commands ──────────────────────────────────────────────────
+
+/// Stage a transport command for `net_out` and offer it straight away. The
+/// staged copy is what makes the command survive a refusal.
+fn stage_command(s: &mut S3State, cmd: u8, payload: &[u8], now: u64) {
     let len = payload.len().min(s.cmd_payload.len());
-    s.cmd_payload[..len].copy_from_slice(&payload[..len]);
+    if let (Some(dst), Some(src)) = (s.cmd_payload.get_mut(..len), payload.get(..len)) {
+        dst.copy_from_slice(src);
+    }
     s.cmd_len = len as u16;
     s.cmd = cmd;
     flush_command(s, now);
 }
 
-/// Stage the `CMD_CONNECT_TO` for this connector's authority, tagged with
-/// its requester tag. The authority was parsed at construction, so the
-/// payload always composes.
-unsafe fn stage_connect(s: &mut S3State, now: u64) {
+/// Stage the `CMD_CONNECT_TO` for this connector's authority, tagged with its
+/// requester tag. The authority was parsed at construction.
+fn stage_connect(s: &mut S3State, now: u64) {
     let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
-    let n = match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
+    let n = match net_proto::Target::parse(authority(s)) {
         Some((target, _)) => net_proto::write_connect_to(
             &mut payload,
             SOCK_TYPE_STREAM,
@@ -418,723 +613,1194 @@ unsafe fn stage_connect(s: &mut S3State, now: u64) {
         ),
         None => 0,
     };
-    // `CONNECTING` and the connect budget begin inside `stage_command`, once
-    // the frame is on the channel. A refused CONNECT leaves the connector
-    // DISCONNECTED with the record still in flight, so the identical frame is
-    // offered again next step.
-    stage_command(s, NET_CMD_CONNECT_TO, &payload[..n], now);
+    stage_command(s, NET_CMD_CONNECT_TO, payload.get(..n).unwrap_or(&[]), now);
 }
 
-/// Offer the staged transport command, keeping it staged while `net_out`
-/// refuses the frame.
-///
-/// A CONNECT starts the connect budget only once the frame is on the channel: a
-/// command that was never written must not age toward a timeout that would name
-/// the endpoint for a dial it never saw.
-unsafe fn flush_command(s: &mut S3State, now: u64) {
+/// Offer the staged transport command. A CONNECT starts the connect budget
+/// only once the frame is on the channel.
+fn flush_command(s: &mut S3State, now: u64) {
     if s.cmd == 0 {
         return;
     }
-    let sys = &*s.syscalls;
-    let len = s.cmd_len as usize;
-    let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
-    payload[..len].copy_from_slice(&s.cmd_payload[..len]);
-    let wrote = net_write_frame(
-        sys,
-        s.net_out,
-        s.cmd,
-        payload.as_ptr(),
-        len,
-        s.nbuf.as_mut_ptr(),
-        NET_BUF,
-    );
+    // SAFETY: set from a non-null pointer in `module_new`.
+    let sys = unsafe { &*s.syscalls };
+    let len = (s.cmd_len as usize).min(s.cmd_payload.len());
+    // SAFETY: `cmd_payload` holds `len` bytes and `nbuf` is `NET_BUF` long;
+    // `net_write_frame` refuses a frame larger than the scratch.
+    let wrote = unsafe {
+        net_write_frame(
+            sys,
+            s.net_out,
+            s.cmd,
+            s.cmd_payload.as_ptr(),
+            len,
+            s.nbuf.as_mut_ptr(),
+            NET_BUF,
+        )
+    };
     if wrote == 0 {
         return;
     }
     if s.cmd == NET_CMD_CONNECT_TO {
         s.phase = CONNECTING;
-        s.started_ms = now;
+        s.progress_ms = now;
     }
     s.cmd = 0;
     s.cmd_len = 0;
 }
 
-/// Abandon the transport. A driven request that was in flight is answered with
-/// `status` before the connector goes idle: the record was admitted, so it is
-/// owed exactly one outcome whether or not the endpoint ever replied.
-unsafe fn fail_driven(s: &mut S3State, status: u16, now: u64) {
-    if s.busy != 0 {
-        if s.conn_present != 0 {
-            let mut close = [0u8; 2];
-            net_proto::put_conn_id(&mut close, s.conn_id);
-            stage_command(s, NET_CMD_CLOSE, &close, now);
-        }
-        emit_response(s, status, 0, 0);
-        return;
+/// Let go of the transport: close an established connection, or withdraw a
+/// dial `net_out` has not yet taken.
+fn drop_connection(s: &mut S3State, now: u64) {
+    if s.cmd == NET_CMD_CONNECT_TO {
+        s.cmd = 0;
+        s.cmd_len = 0;
     }
-    fail(s, now);
-}
-
-unsafe fn fail(s: &mut S3State, now: u64) {
     if s.conn_present != 0 {
         let mut close = [0u8; 2];
         net_proto::put_conn_id(&mut close, s.conn_id);
         stage_command(s, NET_CMD_CLOSE, &close, now);
     }
-    s.conn_id = 0;
     s.conn_present = 0;
-    s.errors = s.errors.wrapping_add(1);
-    s.phase = DONE;
-}
-
-// ── Driven mode ───────────────────────────────────────────────────────────
-
-/// What the front of `rec` holds, once the bytes read so far are in.
-enum Front {
-    /// Fewer bytes than a record needs — either the fixed header has not all
-    /// arrived, or it has and the fields it declares have not. Both are the
-    /// caller mid-write, not a caller in error.
-    Partial,
-    /// A whole record, ready to perform.
-    Whole,
-    /// A header declaring a record longer than `REQ_BUF`. No later read
-    /// completes it, so it is decided now rather than waited on.
-    Impossible,
-}
-
-/// Total length the record at the front of `buf` declares, in `u64` so a
-/// declared body of up to `u32::MAX` cannot overflow the arithmetic on a 32-bit
-/// target. `None` while fewer than `S3_REQ_HDR` bytes have arrived.
-///
-/// The field offsets mirror `s3_wire.rs`'s `S3Request` layout, which is what
-/// `parse_s3_request` decodes; this reads the lengths alone, from a buffer that
-/// may not yet hold the record they describe.
-fn declared_len(buf: &[u8]) -> Option<u64> {
-    if buf.len() < S3_REQ_HDR {
-        return None;
-    }
-    let bucket_len = u16::from_le_bytes([buf[5], buf[6]]) as u64;
-    let key_len = u16::from_le_bytes([buf[7], buf[8]]) as u64;
-    let body_len = u32::from_le_bytes([buf[9], buf[10], buf[11], buf[12]]) as u64;
-    Some(S3_REQ_HDR as u64 + bucket_len + key_len + body_len)
-}
-
-/// Classify the front of the request buffer.
-///
-/// The `Impossible` arm is what keeps retention bounded: every record that is
-/// kept fits in `REQ_BUF`, so a fragment always has room to be completed and a
-/// full buffer can never mean a record that will not fit in it.
-fn front_status(buf: &[u8]) -> Front {
-    match declared_len(buf) {
-        None => Front::Partial,
-        Some(need) if need > REQ_BUF as u64 => Front::Impossible,
-        Some(need) if (buf.len() as u64) < need => Front::Partial,
-        Some(_) => Front::Whole,
+    s.conn_id = 0;
+    if s.phase != DONE {
+        s.phase = DISCONNECTED;
     }
 }
 
-/// Correlation id and op of the record at the front of `rec`. Only meaningful
-/// once at least `S3_REQ_HDR` bytes have arrived.
-fn front_ident(buf: &[u8]) -> (u8, u32) {
-    (buf[0], u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]))
-}
+// ── Exchange outcomes ───────────────────────────────────────────────────
 
-/// Take the record at the front of `request_in` and begin it, if this connector
-/// is idle. One at a time: the transport is a single connection and SigV4 signs
-/// a specific request, so overlapping two would interleave their bytes on the
-/// wire.
-///
-/// `request_in` is a byte FIFO, so one `channel_read` can return several whole
-/// records back to back and end part-way through the next. The buffer therefore
-/// holds everything the reads returned: the record being performed stays at the
-/// front of it (SigV4 signs out of `rec` long after the read), its bytes are
-/// retired only once it has been answered, and a trailing fragment is topped up
-/// by later reads until it is whole. Both are bytes the caller can no longer
-/// hand to anything else, so discarding either loses the request with no event
-/// to explain it.
-///
-/// A drain closes admission at the channel, not at the buffer: no further read
-/// is issued, while what the buffer already holds is still taken one record at a
-/// time and answered — with `503`, since the connector is going away rather than
-/// performing them. That is also the bound on how long a fragment is retained:
-/// while the graph is up its remainder may still arrive, and a deadline here
-/// would report a peer for a state that is entirely local. Bytes left on
-/// `request_in` were never taken and are owed nothing.
-unsafe fn pump_request(s: &mut S3State, now: u64) {
-    if s.busy != 0 || s.cmd != 0 || s.phase != DISCONNECTED {
+/// End the exchange in failure. Before any response record has gone out the
+/// caller is answered with `status`; after, with ABORT(`reason`).
+fn fail_exchange(s: &mut S3State, status: u16, reason: u8, now: u64) {
+    if s.ex == EX_IDLE || s.ex == EX_ENDING {
         return;
     }
-    let sys = &*s.syscalls;
-    // Retire the record just answered, exposing whatever arrived behind it.
-    if s.rec_taken > 0 {
-        let taken = (s.rec_taken as usize).min(s.rec_len as usize);
-        let remaining = s.rec_len as usize - taken;
-        if remaining > 0 {
-            core::ptr::copy(s.rec.as_ptr().add(taken), s.rec.as_mut_ptr(), remaining);
-        }
-        s.rec_len = remaining as u32;
-        s.rec_taken = 0;
+    if s.head_sent != 0 {
+        s.abort_owed = reason;
+    } else {
+        s.status_owed = status;
     }
-    // Top up while the front of the buffer is short of a whole record, keeping
-    // what is already there. Reading over the top of it would discard bytes the
-    // caller has handed over; reading only into an empty buffer would strand
-    // them.
-    while s.draining == 0 && matches!(front_status(&s.rec[..s.rec_len as usize]), Front::Partial) {
-        let at = s.rec_len as usize;
-        if at >= REQ_BUF {
-            break;
-        }
-        let poll = (sys.channel_poll)(s.request_in, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            break;
-        }
-        let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr().add(at), REQ_BUF - at);
-        if n <= 0 {
-            break;
-        }
-        s.rec_len = (at + n as usize) as u32;
-    }
-    let n = s.rec_len as usize;
+    end_work(s, now);
+}
 
-    let view = match front_status(&s.rec[..n]) {
-        // `front_status` has already measured the declared length against what
-        // is present, so the parse of a whole record agrees with it.
-        Front::Whole => match parse_s3_request(&s.rec[..n]) {
-            Some(v) => v,
-            None => return,
-        },
-        // The rest is still to come. The fragment stays exactly where it is,
-        // and the next read continues it.
-        Front::Partial if s.draining == 0 => return,
-        Front::Partial => {
-            if n == 0 {
+/// End the exchange with ABORT(`reason`) whether or not a response record has
+/// gone out: the caller broke the exchange's contract.
+fn abort_exchange(s: &mut S3State, reason: u8, now: u64) {
+    if s.ex == EX_IDLE || s.ex == EX_ENDING {
+        return;
+    }
+    s.abort_owed = reason;
+    end_work(s, now);
+}
+
+/// Stop all work on the exchange; only its terminal record remains owed.
+fn end_work(s: &mut S3State, now: u64) {
+    s.ex = EX_ENDING;
+    s.head_owed = 0;
+    s.credit_owed = 0;
+    s.rs = RS_DONE;
+    rx_discard(s);
+    drop_connection(s, now);
+}
+
+/// The terminal record has been delivered (or the caller aborted): the
+/// exchange is over.
+fn finish_exchange(s: &mut S3State, now: u64) {
+    s.terminated = s.terminated.wrapping_add(1);
+    drop_connection(s, now);
+    reset_exchange(s);
+}
+
+// ── Records to the caller ───────────────────────────────────────────────
+
+/// Hand the staged record to `response_out`. The channel takes a record whole
+/// or not at all, so a refused write leaves it intact for the next step.
+fn flush_out(s: &mut S3State, now: u64) {
+    if s.out_len == 0 {
+        return;
+    }
+    if s.response_out >= 0 {
+        // SAFETY: set from a non-null pointer in `module_new`.
+        let sys = unsafe { &*s.syscalls };
+        // SAFETY: syscalls on a channel this module owns; `out` holds
+        // `out_len` bytes.
+        let written = unsafe {
+            let poll = (sys.channel_poll)(s.response_out, POLL_OUT);
+            if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
                 return;
             }
-            // Going away with a fragment in hand. Nothing further will be read,
-            // so it cannot be completed. Its bytes are off the channel either
-            // way: if its header arrived it names a correlation id and is
-            // refused below like any other buffered record, and if it did not
-            // there is nothing to answer on and it is counted instead.
-            if n < S3_REQ_HDR {
-                // The counter is host-test surface; the log is what a running
-                // deployment gets, and silence is otherwise the only signal.
-                let m = b"[s3] partial S3Request header at drain - no cid to answer on";
-                dev_log(sys, 2, m.as_ptr(), m.len());
-                s.dropped_unparsable = s.dropped_unparsable.wrapping_add(1);
-                s.rec_len = 0;
-                return;
-            }
-            let (op, cid) = front_ident(&s.rec[..n]);
-            s.rec_taken = n as u32;
-            s.admitted = s.admitted.wrapping_add(1);
-            s.busy = 1;
-            s.cur_op = op;
-            s.cur_cid = cid;
-            emit_response(s, 503, 0, 0);
+            (sys.channel_write)(s.response_out, s.out.as_ptr(), s.out_len as usize)
+        };
+        if written <= 0 {
             return;
         }
-        Front::Impossible => {
-            // A header declaring more than one record can ever hold. It is
-            // answered rather than dropped — the bytes were taken and the
-            // header names a correlation id — and the buffer goes with it,
-            // since the record it described cannot be assembled and the bytes
-            // behind it cannot be located without its length.
-            let (op, cid) = front_ident(&s.rec[..n]);
-            let body_len = u32::from_le_bytes([s.rec[9], s.rec[10], s.rec[11], s.rec[12]]) as usize;
-            s.rec_len = 0;
-            s.rec_taken = 0;
-            s.admitted = s.admitted.wrapping_add(1);
-            s.busy = 1;
-            s.cur_op = op;
-            s.cur_cid = cid;
-            if body_len > MAX_OBJECT_BYTES {
-                // 413, the same answer an oversized object gets once assembled:
-                // the header is well formed and the object is too large.
-                emit_response(s, 413, 0, 0);
-            } else {
-                // 400: the record's own shape is wrong, which is a different
-                // fact from an object that is merely too big.
-                let m = b"[s3] S3Request header declares more than one record can hold";
-                dev_log(sys, 2, m.as_ptr(), m.len());
-                s.refused_malformed = s.refused_malformed.wrapping_add(1);
-                emit_response(s, 400, 0, 0);
+    }
+    s.out_len = 0;
+    s.progress_ms = now;
+    if s.out_terminal != 0 {
+        s.out_terminal = 0;
+        finish_exchange(s, now);
+    }
+}
+
+/// Move response body bytes from `rx` into `s.out[at..]`, at most `limit` of
+/// them (the caller's credit and the record's room). Returns the bytes
+/// written and whether the body is complete; `None` when the chunked framing
+/// is malformed.
+fn take_body(s: &mut S3State, at: usize, limit: usize) -> Option<(usize, bool)> {
+    let src_at = s.rx_at as usize;
+    let src_end = s.rx_end as usize;
+    let end = at.checked_add(limit)?.min(s.out.len());
+    match s.rs {
+        RS_NONE => {
+            rx_discard(s);
+            Some((0, true))
+        }
+        RS_LENGTH => {
+            let avail = src_end.saturating_sub(src_at);
+            let n = (s.resp_remaining.min(avail as u64) as usize).min(end.saturating_sub(at));
+            s.out
+                .get_mut(at..at + n)?
+                .copy_from_slice(s.rxf.get(src_at..src_at + n)?);
+            s.rx_at += n as u16;
+            s.resp_remaining -= n as u64;
+            if s.resp_remaining == 0 {
+                // Bytes past the declared length are not this response's.
+                rx_discard(s);
+                return Some((n, true));
             }
+            Some((n, false))
+        }
+        RS_CHUNKED => {
+            let input = s.rxf.get(src_at..src_end)?;
+            let dst = s.out.get_mut(at..end)?;
+            let (used, made) = s.chunked.feed(input, dst)?;
+            s.rx_at += used as u16;
+            if s.chunked.done() {
+                rx_discard(s);
+                return Some((made, true));
+            }
+            Some((made, false))
+        }
+        RS_CLOSE => {
+            let avail = src_end.saturating_sub(src_at);
+            let n = avail.min(end.saturating_sub(at));
+            s.out
+                .get_mut(at..at + n)?
+                .copy_from_slice(s.rxf.get(src_at..src_at + n)?);
+            s.rx_at += n as u16;
+            Some((n, s.eof != 0 && rx_empty(s)))
+        }
+        _ => Some((0, true)),
+    }
+}
+
+/// The response body has ended with the record just staged.
+fn response_complete(s: &mut S3State, now: u64) {
+    s.out_terminal = 1;
+    s.rs = RS_DONE;
+    s.ex = EX_ENDING;
+    s.credit_owed = 0;
+    rx_discard(s);
+    drop_connection(s, now);
+}
+
+/// Stage the next record the exchange owes the caller, if the slot is free.
+fn produce(s: &mut S3State, now: u64) {
+    if s.out_len != 0 {
+        return;
+    }
+    let id = s.id;
+    if s.ex == EX_ENDING {
+        let n = if s.abort_owed != 0 {
+            app_write_abort(&id, s.abort_owed, &mut s.out)
+        } else {
+            let head = AppResponseHead {
+                id,
+                flags: 0,
+                status: s.status_owed,
+                content_type: &[],
+                headers: &[],
+                body: &[],
+            };
+            app_write_response_head(&head, &mut s.out)
+        };
+        s.out_len = n.unwrap_or(0) as u16;
+        s.out_terminal = 1;
+        if s.out_len == 0 {
+            finish_exchange(s, now);
+        }
+        return;
+    }
+    if s.ex != EX_OPEN {
+        return;
+    }
+    if s.head_owed != 0 {
+        let ct_len = (s.fwd_ct as usize).min(CT_MAX);
+        let hdr_end = (ct_len + s.fwd_hdr as usize).min(s.fwd.len());
+        let head = AppResponseHead {
+            id,
+            flags: 0,
+            status: s.resp_status,
+            content_type: s.fwd.get(..ct_len).unwrap_or(&[]),
+            headers: s.fwd.get(ct_len..hdr_end).unwrap_or(&[]),
+            body: &[],
+        };
+        let Some(at) = app_write_response_head(&head, &mut s.out) else {
+            fail_exchange(s, 502, app_abort::FAILED, now);
+            return;
+        };
+        let limit = (s.resp_credit.min(APP_RECORD_MAX as u64) as usize)
+            .min(APP_RECORD_MAX.saturating_sub(at));
+        let Some((made, done)) = take_body(s, at, limit) else {
+            fail_exchange(s, 502, app_abort::MALFORMED, now);
+            return;
+        };
+        let Some(flags) = s.out.get_mut(1) else {
+            return;
+        };
+        *flags = if done { 0 } else { app_flag::MORE };
+        s.resp_credit -= made as u64;
+        s.out_len = (at + made) as u16;
+        s.head_owed = 0;
+        s.head_sent = 1;
+        if done {
+            response_complete(s, now);
+        }
+        return;
+    }
+    if s.credit_owed > 0 {
+        s.out_len = app_write_credit(&id, s.credit_owed, &mut s.out).unwrap_or(0) as u16;
+        s.req_credit += s.credit_owed as u64;
+        s.credit_owed = 0;
+        return;
+    }
+    if s.head_sent == 0 || s.rs == RS_DONE || s.rs == RS_HEAD {
+        return;
+    }
+    let limit = s.resp_credit.min((APP_RECORD_MAX - APP_HDR) as u64) as usize;
+    let Some((made, done)) = take_body(s, APP_HDR, limit) else {
+        fail_exchange(s, 502, app_abort::MALFORMED, now);
+        return;
+    };
+    if made == 0 && !done {
+        // Nothing to forward. An endpoint that has gone with the body
+        // unfinished has failed the exchange.
+        if s.eof != 0 && rx_empty(s) {
+            fail_exchange(s, 502, app_abort::PEER_GONE, now);
+        }
+        return;
+    }
+    let flags = if done { 0 } else { app_flag::MORE };
+    s.out_len = app_seal_body(&id, flags, made, &mut s.out).unwrap_or(0) as u16;
+    s.resp_credit -= made as u64;
+    s.progress_ms = now;
+    if done {
+        response_complete(s, now);
+    }
+}
+
+// ── Records from the caller ─────────────────────────────────────────────
+
+/// Read and take records from `request_in` while there is somewhere to put
+/// them. A drain closes the channel to new work: it is read only while an
+/// exchange is in flight, because that exchange may still need its caller's
+/// body and credit to finish.
+fn pump_requests(s: &mut S3State, now: u64) {
+    // SAFETY: set from a non-null pointer in `module_new`.
+    let sys = unsafe { &*s.syscalls };
+    for _ in 0..8 {
+        if s.inrec_len == 0 {
+            if s.draining != 0 && s.ex == EX_IDLE && s.pend_len == 0 {
+                return;
+            }
+            // SAFETY: syscalls on a channel this module owns; `inrec` is
+            // `APP_RECORD_MAX` bytes, and the channel is a mailbox, so one
+            // read is one whole record.
+            let n = unsafe {
+                let poll = (sys.channel_poll)(s.request_in, POLL_IN);
+                if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+                    return;
+                }
+                (sys.channel_read)(s.request_in, s.inrec.as_mut_ptr(), APP_RECORD_MAX)
+            };
+            if n <= 0 {
+                return;
+            }
+            s.inrec_len = n as u16;
+        }
+        if !take_record(s, now) {
+            return;
+        }
+        s.inrec_len = 0;
+        start_pending(s, now);
+    }
+}
+
+/// What a record read from `request_in` asks for, with its borrows dropped.
+enum Taken {
+    Head,
+    Body { id: AppId, n: usize, last: bool },
+    Credit { id: AppId, bytes: u32 },
+    Abort { id: AppId },
+    Other,
+}
+
+/// Take the record in `inrec`. False when it must stay held: a HEAD with the
+/// pending slot already full.
+fn take_record(s: &mut S3State, now: u64) -> bool {
+    let len = (s.inrec_len as usize).min(APP_RECORD_MAX);
+    let taken = match s.inrec.get(..len).and_then(app_parse_request) {
+        None => {
+            s.records_malformed = s.records_malformed.wrapping_add(1);
+            return true;
+        }
+        Some(AppRecord::Head(_)) => Taken::Head,
+        Some(AppRecord::Body { id, flags, data }) => Taken::Body {
+            id,
+            n: data.len(),
+            last: flags & app_flag::MORE == 0,
+        },
+        Some(AppRecord::Credit { id, bytes }) => Taken::Credit { id, bytes },
+        Some(AppRecord::Abort { id, .. }) => Taken::Abort { id },
+        Some(AppRecord::Datagram { .. }) => Taken::Other,
+    };
+    let current = |id: &AppId| s.ex != EX_IDLE && *id == s.id;
+    let pend_id = pending_id(s);
+    match taken {
+        Taken::Head => {
+            if s.pend_len != 0 {
+                return false;
+            }
+            let (Some(dst), Some(src)) = (s.pend.get_mut(..len), s.inrec.get(..len)) else {
+                return true;
+            };
+            dst.copy_from_slice(src);
+            s.pend_len = len as u16;
+            s.pend_credit = 0;
+            s.pend_overrun = 0;
+            s.admitted = s.admitted.wrapping_add(1);
+        }
+        Taken::Body { id, n, last } if current(&id) => take_body_record(s, n, last, now),
+        Taken::Credit { id, bytes } if current(&id) => {
+            if s.ex != EX_ENDING {
+                s.resp_credit = s.resp_credit.saturating_add(bytes as u64);
+                s.progress_ms = now;
+            }
+        }
+        Taken::Abort { id } if current(&id) => {
+            // The caller has ended the exchange: nothing further is sent for
+            // it, not even a record already staged.
+            s.out_len = 0;
+            s.out_terminal = 0;
+            finish_exchange(s, now);
+        }
+        Taken::Body { id, .. } if pend_id == Some(id) => s.pend_overrun = 1,
+        Taken::Credit { id, bytes } if pend_id == Some(id) => {
+            s.pend_credit = s.pend_credit.saturating_add(bytes as u64);
+        }
+        Taken::Abort { id } if pend_id == Some(id) => {
+            s.pend_len = 0;
+            s.terminated = s.terminated.wrapping_add(1);
+        }
+        _ => s.records_stale = s.records_stale.wrapping_add(1),
+    }
+    true
+}
+
+fn pending_id(s: &S3State) -> Option<AppId> {
+    if s.pend_len == 0 {
+        return None;
+    }
+    match app_parse_request(s.pend.get(..s.pend_len as usize)?)? {
+        AppRecord::Head(h) => Some(h.id),
+        _ => None,
+    }
+}
+
+/// Take one BODY record of the exchange in flight, held in `inrec`: its
+/// payload is the `n` bytes after the prefix.
+fn take_body_record(s: &mut S3State, n: usize, last: bool, now: u64) {
+    if s.ex == EX_ENDING {
+        return;
+    }
+    s.progress_ms = now;
+    let got = s.req_got.saturating_add(n as u64);
+    if got > s.req_len || (last && got < s.req_len) {
+        // The body must be exactly the length the head declared: the
+        // signature and the wire length already cover it.
+        abort_exchange(s, app_abort::MALFORMED, now);
+        return;
+    }
+    if n as u64 > s.req_credit {
+        abort_exchange(s, app_abort::CREDIT_OVERRUN, now);
+        return;
+    }
+    if n == 0 {
+        // An empty final record: the body's end, already known from its
+        // length.
+        return;
+    }
+    let at = s.chunk_len as usize;
+    let (Some(dst), Some(src)) = (
+        s.chunk.get_mut(at..at + n),
+        s.inrec.get(APP_HDR..APP_HDR + n),
+    ) else {
+        abort_exchange(s, app_abort::CREDIT_OVERRUN, now);
+        return;
+    };
+    dst.copy_from_slice(src);
+    s.chunk_len += n as u16;
+    s.req_got = got;
+    s.req_credit -= n as u64;
+    if s.streaming != 0 {
+        if s.chunk_len as usize == S3_CHUNK || s.req_got == s.req_len {
+            seal_chunk(s, now);
+        }
+    } else if s.req_got == s.req_len && !queue_signed_head(s) {
+        fail_exchange(s, 500, app_abort::FAILED, now);
+    }
+}
+
+/// Begin the pending exchange, if the connector is free for it.
+fn start_pending(s: &mut S3State, now: u64) {
+    if s.pend_len == 0 || s.ex != EX_IDLE || s.out_len != 0 || s.cmd != 0 {
+        return;
+    }
+    let len = (s.pend_len as usize).min(APP_RECORD_MAX);
+    let credit = s.pend_credit;
+    let overrun = s.pend_overrun;
+    s.pend_len = 0;
+    reset_exchange(s);
+    let Some(AppRecord::Head(h)) = s.pend.get(..len).and_then(app_parse_request) else {
+        s.terminated = s.terminated.wrapping_add(1);
+        return;
+    };
+    s.ex = EX_DIAL;
+    s.id = h.id;
+    s.method = h.method;
+    s.resp_credit = (h.resp_credit as u64).saturating_add(credit);
+    s.has_body = u8::from(h.flags & app_flag::MORE != 0);
+    s.progress_ms = now;
+
+    let refuse = |s: &mut S3State, status: u16| {
+        s.status_owed = status;
+        s.ex = EX_ENDING;
+    };
+    if s.draining != 0 {
+        // Taken before the drain closed the channel, so it is owed an
+        // outcome; 503 says the connector is going away without having
+        // attempted it.
+        refuse(s, 503);
+        return;
+    }
+    if !matches!(
+        h.method,
+        METHOD_GET | METHOD_PUT | METHOD_HEAD | METHOD_DELETE | METHOD_POST
+    ) {
+        refuse(s, 501);
+        return;
+    }
+    if h.target.len() > MAX_TARGET
+        || h.headers.len() > MAX_CALLER_HEADERS
+        || !s3_target_ok(h.target, &mut s.sv4_scratch)
+    {
+        refuse(s, 400);
+        return;
+    }
+    let length = match s3_caller_headers(h.headers) {
+        Ok(l) => l,
+        Err(_) => {
+            refuse(s, 400);
             return;
         }
     };
-    // The body is the last field, so its end is the record's end.
-    s.rec_taken = (view.body_at + view.body_len) as u32;
-    s.admitted = s.admitted.wrapping_add(1);
-    // In flight from the moment the record is understood, so a refusal below
-    // that back-pressures on `response_out` still blocks the next admission.
-    s.busy = 1;
-    s.cur_op = view.op;
-    s.cur_cid = view.cid;
-
-    if s.draining != 0 {
-        // Buffered before the drain began, so it is owed an outcome; 503 says
-        // the connector is going away without having attempted the operation,
-        // which is a different fact from an endpoint that refused it.
-        emit_response(s, 503, 0, 0);
+    if let Some(dst) = s.target.get_mut(..h.target.len()) {
+        dst.copy_from_slice(h.target);
+    }
+    s.target_len = h.target.len() as u16;
+    if let Some(dst) = s.caller_hdrs.get_mut(..h.headers.len()) {
+        dst.copy_from_slice(h.headers);
+    }
+    s.caller_hdrs_len = h.headers.len() as u16;
+    if overrun != 0 {
+        s.abort_owed = app_abort::CREDIT_OVERRUN;
+        s.ex = EX_ENDING;
         return;
     }
-    if !s3_op_is_known(view.op) {
-        // Well-formed, unsupported. Answered rather than dropped, so the caller
-        // learns its request was refused instead of waiting out a timeout.
-        emit_response(s, 501, 0, 0);
+    match length {
+        None if s.has_body != 0 => {
+            // S3 needs a body's length before its first byte.
+            refuse(s, 411);
+            return;
+        }
+        Some(n) if s.has_body == 0 && n > 0 => {
+            // A declared body that the head says will never come.
+            s.abort_owed = app_abort::MALFORMED;
+            s.ex = EX_ENDING;
+            return;
+        }
+        _ => {}
+    }
+    s.req_len = length.unwrap_or(0);
+    s.streaming = u8::from(s.has_body != 0 && s.req_len > S3_CHUNK as u64);
+    if s.streaming != 0 && s3_aws_chunked_len(s.req_len, S3_CHUNK as u64).is_none() {
+        refuse(s, 400);
         return;
     }
-    if view.body_len > MAX_OBJECT_BYTES {
-        // 413: the object exceeds what one record can carry. Explicit, because
-        // a truncated PUT would store bytes that are not the object and whose
-        // digest would not match.
-        emit_response(s, 413, 0, 0);
-        return;
-    }
-
-    // Build `/bucket/key` and the signed request into `req`, then connect. The
-    // signature covers the current wall-clock time, so it is built here rather
-    // than at connect time only because the payload is already in hand — the
-    // timestamp is re-taken on connect below.
-    s.acc_len = 0;
-    s.req_len = 0;
-    s.req_sent = 0;
-
     stage_connect(s, now);
 }
 
-/// Sign the pending driven request. Split from `pump_request` because SigV4
-/// binds the timestamp, and the request must be signed when the connection is
-/// UP rather than when it was queued — a signature minted before a slow connect
-/// can age past the endpoint's skew window.
-unsafe fn sign_pending(s: &mut S3State) -> bool {
-    let sys = &*s.syscalls;
-    let view = match parse_s3_request(&s.rec[..REQ_BUF]) {
-        Some(v) => v,
-        None => return false,
-    };
-    let mut ts = [0u8; 16];
-    let mut date = [0u8; 8];
-    sigv4_time(dev_unix_millis(sys), &mut ts, &mut date);
+// ── The request on the wire ─────────────────────────────────────────────
 
-    let mut path = [0u8; 512];
-    let plen = match s3_object_path(
-        &s.rec[view.bucket_at..view.bucket_at + view.bucket_len],
-        &s.rec[view.key_at..view.key_at + view.key_len],
-        &mut path,
-    ) {
-        Some(n) => n,
-        None => return false,
-    };
-
-    // The cores take slices, and `s.rec` is borrowed for the payload while
-    // `s.req` is written — distinct fields, so the copies below are only to
-    // satisfy the borrow checker on the credential arrays.
-    let hl = s.authority_len as usize;
-    let al = s.access_key_len as usize;
-    let sl = s.secret_len as usize;
-    let rl = s.region_len as usize;
-    let mut host = [0u8; NAME_BUF];
-    host[..hl].copy_from_slice(&s.authority[..hl]);
-    let mut ak = [0u8; NAME_BUF];
-    ak[..al].copy_from_slice(&s.access_key[..al]);
-    let mut sk = [0u8; NAME_BUF];
-    sk[..sl].copy_from_slice(&s.secret[..sl]);
-    let mut rg = [0u8; NAME_BUF];
-    rg[..rl].copy_from_slice(&s.region[..rl]);
-
-    let mut payload = [0u8; MAX_OBJECT_BYTES];
-    let blen = view.body_len.min(MAX_OBJECT_BYTES);
-    if blen > 0 {
-        payload[..blen].copy_from_slice(&s.rec[view.body_at..view.body_at + blen]);
-    }
-
-    let mut out = [0u8; REQ_BUF];
-    let n = s3_sign_request(
-        s3_op_method(s.cur_op),
-        &ak[..al],
-        &sk[..sl],
-        &rg[..rl],
-        &host[..hl],
-        &path[..plen],
-        &payload[..blen],
-        &ts,
-        &date,
-        &mut out,
+/// Sign and queue the request head. A streamed body's head goes out at once,
+/// its chunks behind it; any other body is already whole in `chunk` and goes
+/// out behind the head it is hashed into.
+fn queue_signed_head(s: &mut S3State) -> bool {
+    // SAFETY: set from a non-null pointer in `module_new`.
+    let sys = unsafe { &*s.syscalls };
+    // SAFETY: a syscall-table read of the wall clock.
+    let unix_ms = unsafe { dev_unix_millis(sys) };
+    let mut amz = [0u8; 16];
+    let mut day = [0u8; 8];
+    sv4_format_amz_date(unix_ms / 1000, &mut amz, &mut day);
+    let region_len = (s.region_len as usize).min(NAME_BUF);
+    let secret_len = (s.secret_len as usize).min(NAME_BUF);
+    let key = sv4_signing_key(
+        s.secret.get(..secret_len).unwrap_or(&[]),
+        &day,
+        s.region.get(..region_len).unwrap_or(&[]),
+        S3_SERVICE,
     );
-    match n {
-        Some(n) => {
-            s.req[..n].copy_from_slice(&out[..n]);
-            s.req_len = n as u16;
-            s.req_sent = 0;
+    s.signing_key = key;
+    s.amz_date = amz;
+    s.scope_date = day;
+
+    let body_len = (s.chunk_len as usize).min(S3_CHUNK);
+    let payload_hash = if s.streaming != 0 {
+        [0u8; 64]
+    } else if body_len == 0 {
+        *SV4_EMPTY_SHA256
+    } else {
+        sv4_sha256_hex(s.chunk.get(..body_len).unwrap_or(&[]))
+    };
+    let wire_len = if s.streaming != 0 {
+        s3_aws_chunked_len(s.req_len, S3_CHUNK as u64)
+    } else if s.has_body != 0 || s.method == METHOD_PUT || s.method == METHOD_POST {
+        Some(s.req_len)
+    } else {
+        None
+    };
+    let ak_len = (s.access_key_len as usize).min(NAME_BUF);
+    let host_len = (s.authority_len as usize).min(NAME_BUF);
+    let target_len = (s.target_len as usize).min(MAX_TARGET);
+    let hdrs_len = (s.caller_hdrs_len as usize).min(MAX_CALLER_HEADERS);
+    let params = S3HeadParams {
+        method: method_name(s.method),
+        target: s.target.get(..target_len).unwrap_or(&[]),
+        host: s.authority.get(..host_len).unwrap_or(&[]),
+        access_key: s.access_key.get(..ak_len).unwrap_or(&[]),
+        region: s.region.get(..region_len).unwrap_or(&[]),
+        signing_key: &key,
+        amz_date: &amz,
+        scope_date: &day,
+        payload_hash: if s.streaming != 0 {
+            SV4_STREAMING
+        } else {
+            &payload_hash
+        },
+        decoded_len: if s.streaming != 0 {
+            Some(s.req_len)
+        } else {
+            None
+        },
+        content_length: wire_len,
+        caller_headers: s.caller_hdrs.get(..hdrs_len).unwrap_or(&[]),
+    };
+    match s3_compose_head(&params, &mut s.tx, &mut s.sv4_scratch) {
+        Ok((n, sig)) => {
+            s.tx_len = n as u16;
+            s.tx_sent = 0;
+            s.prev_sig = sig;
+            s.head_queued = 1;
+            s.in_queue = 1;
+            if s.streaming == 0 {
+                s.data_len = body_len as u16;
+                s.data_sent = 0;
+            }
             true
         }
-        None => false,
+        // The request could not be built at all.
+        Err(_) => false,
     }
 }
 
-/// Emit an `S3Response` for the request in flight, and go idle.
-///
-/// `body_at`/`body_len` name a span inside `acc` (the accumulated HTTP
-/// response); `0,0` means no body, which is every op but GET and every failure.
-unsafe fn emit_response(s: &mut S3State, status: u16, body_at: usize, body_len: usize) {
-    if s.response_out >= 0 {
-        let len = body_len
-            .min(MAX_OBJECT_BYTES)
-            .min(REQ_BUF - S3_RESP_BODY_AT);
-        // Encode into the state-owned parking buffer rather than a local: the
-        // record must survive a back-pressured `response_out` across steps, and
-        // at REQ_BUF it has no business on the stack either way. Not cleared
-        // first — `write_s3_response` fills the header and the body span is
-        // copied below, so every byte under `resp_len` is written here.
-        if len > 0 {
-            s.resp[S3_RESP_BODY_AT..S3_RESP_BODY_AT + len]
-                .copy_from_slice(&s.acc[body_at..body_at + len]);
+/// Queue the filled chunk with its signed framing line.
+fn seal_chunk(s: &mut S3State, now: u64) {
+    let len = (s.chunk_len as usize).min(S3_CHUNK);
+    let hash = sha256(s.chunk.get(..len).unwrap_or(&[]));
+    let region_len = (s.region_len as usize).min(NAME_BUF);
+    let sig = sv4_chunk_signature(
+        &s.signing_key,
+        &s.amz_date,
+        &s.scope_date,
+        s.region.get(..region_len).unwrap_or(&[]),
+        S3_SERVICE,
+        &s.prev_sig,
+        &hash,
+    );
+    s.prev_sig = sig;
+    match s3_chunk_header(len as u64, &sig, &mut s.tx) {
+        Some(n) => {
+            s.tx_len = n as u16;
+            s.tx_sent = 0;
+            s.data_len = len as u16;
+            s.data_sent = 0;
+            s.sfx_len = 2;
+            s.sfx_sent = 0;
+            s.in_queue = 1;
         }
-        s.resp_len = match write_s3_response(s.cur_op, s.cur_cid, status, len, &mut s.resp) {
-            Some(total) => total as u32,
-            None => 0,
+        None => fail_exchange(s, 500, app_abort::FAILED, now),
+    }
+}
+
+/// Everything queued has gone to `net_out`: queue what follows, or grant the
+/// caller credit for the next chunk.
+fn queue_drained(s: &mut S3State, now: u64) {
+    s.tx_len = 0;
+    s.tx_sent = 0;
+    s.data_len = 0;
+    s.data_sent = 0;
+    s.sfx_len = 0;
+    s.sfx_sent = 0;
+    if s.streaming == 0 {
+        if s.head_queued != 0 {
+            s.chunk_len = 0;
+            s.req_sent = 1;
+        }
+        return;
+    }
+    if s.final_queued != 0 {
+        s.req_sent = 1;
+        return;
+    }
+    if s.req_got == s.req_len && s.chunk_len != 0 {
+        // The last data chunk is out; the empty chunk ends the body.
+        s.chunk_len = 0;
+        let region_len = (s.region_len as usize).min(NAME_BUF);
+        let sig = sv4_chunk_signature(
+            &s.signing_key,
+            &s.amz_date,
+            &s.scope_date,
+            s.region.get(..region_len).unwrap_or(&[]),
+            S3_SERVICE,
+            &s.prev_sig,
+            &sha256(&[]),
+        );
+        match s3_chunk_header(0, &sig, &mut s.tx) {
+            Some(n) => {
+                s.tx_len = n as u16;
+                s.final_queued = 1;
+                s.in_queue = 1;
+            }
+            None => fail_exchange(s, 500, app_abort::FAILED, now),
+        }
+        return;
+    }
+    // The chunk buffer is free again: the bytes it held have left for the
+    // transport, so the caller may send the next chunk's worth.
+    s.chunk_len = 0;
+    let rest = s.req_len - s.req_got;
+    s.credit_owed = rest.min(S3_CHUNK as u64) as u32;
+}
+
+/// Bytes queued for `net_out` and not yet taken.
+fn queued(s: &S3State) -> usize {
+    (s.tx_len.saturating_sub(s.tx_sent) as usize)
+        + (s.data_len.saturating_sub(s.data_sent) as usize)
+        + (s.sfx_len.saturating_sub(s.sfx_sent) as usize)
+}
+
+/// Copy up to `left` bytes of `src` into `dst` at `at`; the bytes copied.
+fn gather(dst: &mut [u8], at: usize, left: usize, src: Option<&[u8]>) -> usize {
+    let src = src.unwrap_or(&[]);
+    let k = src.len().min(left);
+    match (dst.get_mut(at..at + k), src.get(..k)) {
+        (Some(d), Some(s)) => {
+            d.copy_from_slice(s);
+            k
+        }
+        _ => 0,
+    }
+}
+
+/// The line end after an `aws-chunked` chunk's data.
+const CRLF: &[u8; 2] = b"\r\n";
+
+/// Send what is queued, one `CMD_SEND` frame at a time, gathering across the
+/// three segments. A frame `net_out` refuses moves no cursor.
+fn pump_send(s: &mut S3State, now: u64) {
+    if s.conn_present == 0 || s.cmd != 0 || s.eof != 0 {
+        return;
+    }
+    // SAFETY: set from a non-null pointer in `module_new`.
+    let sys = unsafe { &*s.syscalls };
+    let max = SEND_MAX.min(NET_BUF - NET_FRAME_HDR - 2);
+    for _ in 0..16 {
+        if queued(s) == 0 {
+            if s.in_queue == 0 {
+                return;
+            }
+            s.in_queue = 0;
+            queue_drained(s, now);
+            continue;
+        }
+        let mut w = NET_FRAME_HDR + 2;
+        let mut left = max;
+        let tx_take = gather(
+            &mut s.nbuf,
+            w,
+            left,
+            s.tx.get(s.tx_sent as usize..s.tx_len as usize),
+        );
+        w += tx_take;
+        left -= tx_take;
+        let data_take = gather(
+            &mut s.nbuf,
+            w,
+            left,
+            s.chunk.get(s.data_sent as usize..s.data_len as usize),
+        );
+        w += data_take;
+        left -= data_take;
+        let sfx_take = gather(
+            &mut s.nbuf,
+            w,
+            left,
+            CRLF.get(s.sfx_sent as usize..s.sfx_len as usize),
+        );
+        let payload = 2 + tx_take + data_take + sfx_take;
+        s.nbuf[0] = NET_CMD_SEND;
+        s.nbuf[1] = (payload & 0xff) as u8;
+        s.nbuf[2] = (payload >> 8) as u8;
+        net_proto::put_conn_id(&mut s.nbuf[NET_FRAME_HDR..], s.conn_id);
+        let frame = NET_FRAME_HDR + payload;
+        // SAFETY: a syscall on a channel this module owns; `nbuf` holds
+        // `frame` bytes.
+        let wrote = unsafe { (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), frame) };
+        if wrote != frame as i32 {
+            // Refused wholesale, so none of these bytes are on the wire.
+            return;
+        }
+        s.tx_sent += tx_take as u16;
+        s.data_sent += data_take as u16;
+        s.sfx_sent += sfx_take as u8;
+        s.progress_ms = now;
+    }
+}
+
+// ── The response off the wire ───────────────────────────────────────────
+
+/// Move response-head bytes from `rx` into `resp_head` until the head ends.
+/// True once a whole head is in.
+fn take_head_bytes(s: &mut S3State) -> Result<bool, ()> {
+    while !rx_empty(s) {
+        let at = s.resp_head_len as usize;
+        let Some(&c) = s.rxf.get(s.rx_at as usize) else {
+            return Err(());
         };
+        let Some(dst) = s.resp_head.get_mut(at) else {
+            // A head past the bound is refused, not parsed in part.
+            return Err(());
+        };
+        *dst = c;
+        s.rx_at += 1;
+        s.resp_head_len += 1;
+        if at >= 3 && s.resp_head.get(at - 3..=at) == Some(&b"\r\n\r\n"[..]) {
+            return Ok(true);
+        }
     }
-    if (200..400).contains(&status) {
-        s.ok = s.ok.wrapping_add(1);
-    } else {
-        s.errors = s.errors.wrapping_add(1);
-    }
-    // `busy` stays set while a response is parked, so `pump_request` cannot
-    // admit the next record over the top of an undelivered answer. Nothing is
-    // parked when `response_out` is unwired — no consumer asked for an answer,
-    // so the request finishes here — nor when the record could not be encoded,
-    // which the body caps above make unreachable.
-    if s.resp_len == 0 {
-        s.busy = 0;
-        s.terminated = s.terminated.wrapping_add(1);
-    }
-    s.cur_op = 0;
-    s.cur_cid = 0;
-    s.acc_len = 0;
-    s.req_len = 0;
-    s.req_sent = 0;
-    // Back to DISCONNECTED rather than DONE: DONE is the probe's terminal
-    // state, and a driven connector must be ready for the next request.
-    s.phase = DISCONNECTED;
-    s.conn_id = 0;
-    s.conn_present = 0;
+    Ok(false)
 }
 
-/// Hand the parked `S3Response` to `response_out`, retrying on a later step
-/// while the channel refuses it. The channel takes a record whole or not at
-/// all, so a rejected write leaves the record intact and nothing is owed twice.
-unsafe fn flush_response(s: &mut S3State) {
-    if s.resp_len == 0 {
+/// A whole response head is in `resp_head`: decide its framing and what the
+/// caller is handed. Interim 1xx heads are skipped.
+fn on_head(s: &mut S3State, now: u64) {
+    let len = (s.resp_head_len as usize).min(RESP_HEAD_MAX);
+    let head = s.resp_head.get(..len).unwrap_or(&[]);
+    let Some(status) = s3_status_code(head) else {
+        fail_exchange(s, 502, app_abort::FAILED, now);
+        return;
+    };
+    if (100..200).contains(&status) && status != 101 {
+        s.resp_head_len = 0;
         return;
     }
-    let sys = &*s.syscalls;
-    let poll = (sys.channel_poll)(s.response_out, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    let Some(body) = s3_response_body(head, status, s.method == METHOD_HEAD) else {
+        fail_exchange(s, 502, app_abort::FAILED, now);
         return;
-    }
-    let written = (sys.channel_write)(s.response_out, s.resp.as_ptr(), s.resp_len as usize);
-    if written <= 0 {
+    };
+    let (ct, hdrs) = s.fwd.split_at_mut(CT_MAX);
+    let Some((ct_len, hdr_len)) = s3_forward_headers(head, ct, hdrs) else {
+        fail_exchange(s, 502, app_abort::FAILED, now);
         return;
+    };
+    // The forwarded headers start right after the content type.
+    if ct_len < CT_MAX {
+        s.fwd.copy_within(CT_MAX..CT_MAX + hdr_len, ct_len);
     }
-    s.resp_len = 0;
-    s.busy = 0;
-    s.terminated = s.terminated.wrapping_add(1);
+    s.fwd_ct = ct_len as u16;
+    s.fwd_hdr = hdr_len as u16;
+    s.resp_status = status;
+    s.rs = match body {
+        S3Body::None => RS_NONE,
+        S3Body::Length(n) => {
+            s.resp_remaining = n;
+            if n == 0 {
+                RS_NONE
+            } else {
+                RS_LENGTH
+            }
+        }
+        S3Body::Chunked => RS_CHUNKED,
+        S3Body::Close => RS_CLOSE,
+    };
+    s.head_owed = 1;
 }
 
-/// Complete a driven request from the accumulated HTTP response.
-unsafe fn finish_driven(s: &mut S3State) {
-    let acc_len = s.acc_len as usize;
-    let status = http_status_code(&s.acc[..acc_len]).unwrap_or(0);
-    // Only GET returns bytes; a body after a HEAD would desynchronise the
-    // caller exactly as it would on the server side.
-    let (at, len) = if s3_op_expects_body(s.cur_op) && (200..300).contains(&status) {
-        match http_body_offset(&s.acc[..acc_len]) {
-            Some(at) => (at, acc_len - at),
-            None => (0, 0),
+/// Work `rx` for the exchange in flight: head bytes into the head buffer,
+/// body bytes out as records.
+fn process_rx(s: &mut S3State, now: u64) {
+    if s.ex != EX_OPEN {
+        rx_discard(s);
+        return;
+    }
+    if s.rs == RS_HEAD {
+        match take_head_bytes(s) {
+            Ok(true) => on_head(s, now),
+            Ok(false) => {}
+            Err(()) => fail_exchange(s, 502, app_abort::FAILED, now),
+        }
+    }
+}
+
+/// Read `net_in` while `rx` is empty, and act on each event.
+fn pump_net(s: &mut S3State, now: u64) {
+    if s.net_in < 0 {
+        return;
+    }
+    // SAFETY: set from a non-null pointer in `module_new`.
+    let sys = unsafe { &*s.syscalls };
+    for _ in 0..32 {
+        if s.request_in >= 0 {
+            process_rx(s, now);
+            produce(s, now);
+            flush_out(s, now);
+            start_pending(s, now);
+        } else {
+            probe_rx(s, now);
+        }
+        if !rx_empty(s) {
+            return;
+        }
+        // SAFETY: syscalls on a channel this module owns; `rxf` is `NET_BUF`
+        // bytes.
+        let (msg, plen) = unsafe {
+            let poll = (sys.channel_poll)(s.net_in, POLL_IN);
+            if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+                return;
+            }
+            net_read_frame(sys, s.net_in, s.rxf.as_mut_ptr(), NET_BUF)
+        };
+        if msg == 0 {
+            return;
+        }
+        let payload_end = (NET_FRAME_HDR + plen).min(NET_BUF);
+        let payload = s.rxf.get(NET_FRAME_HDR..payload_end).unwrap_or(&[]);
+        match msg {
+            NET_MSG_CONNECTED if plen >= 3 => {
+                let (cid, tag) = net_proto::connected_parts(payload);
+                if tag != s.tag {
+                    continue;
+                }
+                if s.phase != CONNECTING {
+                    // A dial this connector withdrew from completed anyway.
+                    if s.cmd == 0 {
+                        let mut close = [0u8; 2];
+                        net_proto::put_conn_id(&mut close, cid);
+                        stage_command(s, NET_CMD_CLOSE, &close, now);
+                    }
+                    continue;
+                }
+                s.conn_id = cid;
+                s.conn_present = 1;
+                s.phase = OPEN;
+                s.progress_ms = now;
+                on_connected(s, now);
+            }
+            NET_MSG_DATA if plen > 2 => {
+                if s.conn_present == 0 || net_proto::conn_id(payload) != s.conn_id {
+                    continue;
+                }
+                s.rx_at = (NET_FRAME_HDR + 2) as u16;
+                s.rx_end = payload_end as u16;
+                s.progress_ms = now;
+            }
+            NET_MSG_CLOSED if plen >= 2 => {
+                if s.conn_present == 0 || net_proto::conn_id(payload) != s.conn_id {
+                    continue;
+                }
+                // The id stays reserved for this connector's CLOSE, which the
+                // exchange's end sends; nothing more is sent on it meanwhile.
+                s.eof = 1;
+                on_closed(s, now);
+            }
+            NET_MSG_ERROR if plen >= 3 => {
+                // `[conn_id u16][errno i8][requester_tag u8]`. A connect-phase
+                // failure is matched on the tag alone (its conn_id is
+                // meaningless); an established connection's on an untagged
+                // error naming it.
+                let (cid, _errno, tag) = net_proto::error_parts(payload);
+                let ours = (s.phase == CONNECTING && tag == s.tag)
+                    || (s.conn_present != 0
+                        && tag == net_proto::REQUESTER_TAG_NONE
+                        && cid == s.conn_id);
+                if !ours {
+                    continue;
+                }
+                // The established connection is still the net stack's to
+                // release: the failure path closes it.
+                on_error(s, now);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn on_connected(s: &mut S3State, now: u64) {
+    if s.request_in < 0 {
+        probe_request(s, now);
+        return;
+    }
+    if s.ex != EX_DIAL {
+        drop_connection(s, now);
+        return;
+    }
+    s.ex = EX_OPEN;
+    if s.streaming != 0 || s.req_len == 0 {
+        // Signed now the connection is up, so the timestamp SigV4 binds is
+        // current rather than aged by a slow connect. A streamed body's
+        // first credit follows once the head has left.
+        if !queue_signed_head(s) {
+            fail_exchange(s, 500, app_abort::FAILED, now);
         }
     } else {
-        (0, 0)
-    };
-    emit_response(s, status, at, len);
+        // A body of at most one chunk is hashed into the head, so it is
+        // taken whole first: the credit is the empty chunk buffer.
+        s.credit_owed = s.req_len as u32;
+    }
 }
 
-/// Emit the response's HTTP status ("s3: <code>\n").
-unsafe fn finish_response(s: &mut S3State) {
-    match http_status_code(&s.acc[..s.acc_len as usize]) {
+fn on_closed(s: &mut S3State, now: u64) {
+    if s.request_in < 0 {
+        probe_finish(s, now);
+        return;
+    }
+    match s.ex {
+        EX_DIAL => fail_exchange(s, 502, app_abort::PEER_GONE, now),
+        EX_OPEN if s.rs == RS_HEAD => fail_exchange(s, 502, app_abort::PEER_GONE, now),
+        // A body framed by close ends here; any other is judged by `produce`
+        // once what was read before the close has gone out.
+        _ => {}
+    }
+}
+
+fn on_error(s: &mut S3State, now: u64) {
+    if s.request_in < 0 {
+        if s.resp_head_len > 0 {
+            probe_finish(s, now);
+        } else {
+            probe_fail(s, now);
+        }
+        return;
+    }
+    // 502: the transport failed, so the endpoint never got to answer for
+    // itself.
+    fail_exchange(s, 502, app_abort::PEER_GONE, now);
+}
+
+/// Who the exchange is waiting on: true for the caller (its body, its credit,
+/// or its reading of a staged record), false for the endpoint.
+fn waiting_on_caller(s: &S3State) -> bool {
+    if s.out_len != 0 {
+        return true;
+    }
+    if s.ex == EX_OPEN {
+        let body_owed = s.has_body != 0 && s.req_got < s.req_len && queued(s) == 0;
+        let credit_owed = !rx_empty(s) && s.rs != RS_HEAD && s.resp_credit == 0;
+        return body_owed || credit_owed;
+    }
+    false
+}
+
+fn check_deadlines(s: &mut S3State, now: u64) {
+    let idle = now.wrapping_sub(s.progress_ms);
+    if s.request_in < 0 {
+        let budget = if s.phase == CONNECTING {
+            CONNECT_TIMEOUT_MS
+        } else {
+            REPLY_TIMEOUT_MS
+        };
+        if matches!(s.phase, CONNECTING | OPEN) && idle > budget {
+            if s.resp_head_len > 0 {
+                probe_finish(s, now);
+            } else {
+                probe_fail(s, now);
+            }
+        }
+        return;
+    }
+    match s.ex {
+        EX_DIAL if s.phase == CONNECTING && idle > CONNECT_TIMEOUT_MS => {
+            // 504: the endpoint did not answer the dial in time.
+            fail_exchange(s, 504, app_abort::STALLED, now);
+        }
+        EX_OPEN => {
+            if waiting_on_caller(s) {
+                if idle > CALLER_TIMEOUT_MS {
+                    abort_exchange(s, app_abort::STALLED, now);
+                }
+            } else if idle > REPLY_TIMEOUT_MS {
+                // 504: reachable but silent past the budget, a different fact
+                // from a dead transport.
+                fail_exchange(s, 504, app_abort::STALLED, now);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── Probe mode ──────────────────────────────────────────────────────────
+
+/// Queue the signed `GET /` (ListBuckets).
+fn probe_request(s: &mut S3State, now: u64) {
+    s.method = METHOD_GET;
+    s.target[0] = b'/';
+    s.target_len = 1;
+    s.caller_hdrs_len = 0;
+    s.req_len = 0;
+    s.streaming = 0;
+    s.has_body = 0;
+    if !queue_signed_head(s) {
+        probe_fail(s, now);
+    }
+}
+
+fn probe_rx(s: &mut S3State, now: u64) {
+    if s.phase != OPEN {
+        rx_discard(s);
+        return;
+    }
+    match take_head_bytes(s) {
+        Ok(true) => probe_finish(s, now),
+        Ok(false) => {}
+        Err(()) => probe_finish(s, now),
+    }
+}
+
+/// Report the response's status ("s3: <code>\n") and go idle for good.
+fn probe_finish(s: &mut S3State, now: u64) {
+    let len = (s.resp_head_len as usize).min(RESP_HEAD_MAX);
+    match s3_status_code(s.resp_head.get(..len).unwrap_or(&[])) {
         Some(code) => {
             let mut out = [b's', b'3', b':', b' ', 0, 0, 0, b'\n'];
             out[4] = b'0' + ((code / 100) % 10) as u8;
             out[5] = b'0' + ((code / 10) % 10) as u8;
             out[6] = b'0' + (code % 10) as u8;
             emit_status(s, &out);
-            s.ok = s.ok.wrapping_add(1);
         }
         None => emit_status(s, b"s3: (no status)\n"),
     }
+    rx_discard(s);
+    drop_connection(s, now);
     s.phase = DONE;
-    s.conn_id = 0;
-    s.conn_present = 0;
+}
+
+fn probe_fail(s: &mut S3State, now: u64) {
+    rx_discard(s);
+    drop_connection(s, now);
+    s.phase = DONE;
+}
+
+fn emit_status(s: &S3State, text: &[u8]) {
+    if s.status_out < 0 {
+        return;
+    }
+    // SAFETY: set from a non-null pointer in `module_new`.
+    let sys = unsafe { &*s.syscalls };
+    // SAFETY: syscalls on a channel this module owns.
+    unsafe {
+        let poll = (sys.channel_poll)(s.status_out, POLL_OUT);
+        if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
+            (sys.channel_write)(s.status_out, text.as_ptr(), text.len());
+        }
+    }
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    unsafe {
-        let s = &mut *(state as *mut S3State);
-        let sys = &*s.syscalls;
-        let now = dev_millis(sys);
-
-        // Re-offer a transport command `net_out` refused earlier, before
-        // anything can stage another one over the top of it.
-        flush_command(s, now);
-
-        // Driven mode: take the next request, if any, and start it. Checked
-        // before the probe so a wired connector never fires the boot GET.
-        if s.request_in >= 0 {
-            pump_request(s, now);
-        }
-
-        // Connect on boot (one-shot: a signed GET / on connect). PROBE MODE
-        // ONLY — `request_in >= 0` means a caller decides what to request, and
-        // an unasked-for ListBuckets would answer a record nobody sent.
-        if s.request_in < 0
-            && s.phase == DISCONNECTED
-            && s.cmd == 0
-            && s.draining == 0
-            && s.access_key_len > 0
-        {
-            stage_connect(s, now);
-        }
-
-        if s.net_in >= 0 {
-            loop {
-                let poll = (sys.channel_poll)(s.net_in, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 {
-                    break;
-                }
-                let (msg, plen) = net_read_frame(sys, s.net_in, s.nbuf.as_mut_ptr(), NET_BUF);
-                if msg == 0 {
-                    break;
-                }
-                let payload = core::slice::from_raw_parts(s.nbuf.as_ptr().add(NET_FRAME_HDR), plen);
-                match msg {
-                    NET_MSG_CONNECTED if s.phase == CONNECTING => {
-                        let (cid, tag) = if plen >= 3 {
-                            net_proto::connected_parts(payload)
-                        } else {
-                            (0, net_proto::REQUESTER_TAG_NONE)
-                        };
-                        if plen >= 3 && tag == s.tag {
-                            s.conn_id = cid;
-                            s.conn_present = 1;
-                            if s.busy != 0 {
-                                // Driven: sign the caller's request now the
-                                // connection is up, so the timestamp SigV4
-                                // binds is current rather than aged by a slow
-                                // connect.
-                                if sign_pending(s) {
-                                    s.acc_len = 0;
-                                    s.phase = AWAIT_RESPONSE;
-                                    s.started_ms = now;
-                                } else {
-                                    // Could not build the request at all —
-                                    // a path or buffer bound. 500 names this
-                                    // connector as the failing party.
-                                    let mut close = [0u8; 2];
-                                    net_proto::put_conn_id(&mut close, s.conn_id);
-                                    stage_command(s, NET_CMD_CLOSE, &close, now);
-                                    emit_response(s, 500, 0, 0);
-                                }
-                                continue;
-                            }
-                            // Build the signed GET / with the current WALL-CLOCK time.
-                            // SigV4 needs Unix-epoch time (dev_unix_millis), not the
-                            // monotonic uptime `dev_millis` used for timeouts — a
-                            // 1970-relative stamp would be rejected RequestTimeTooSkewed.
-                            let mut ts = [0u8; 16];
-                            let mut date = [0u8; 8];
-                            sigv4_time(dev_unix_millis(sys), &mut ts, &mut date);
-                            let hl = s.authority_len as usize;
-                            let al = s.access_key_len as usize;
-                            let sl = s.secret_len as usize;
-                            let rl = s.region_len as usize;
-                            let mut host = [0u8; NAME_BUF];
-                            host[..hl].copy_from_slice(&s.authority[..hl]);
-                            let mut ak = [0u8; NAME_BUF];
-                            ak[..al].copy_from_slice(&s.access_key[..al]);
-                            let mut sk = [0u8; NAME_BUF];
-                            sk[..sl].copy_from_slice(&s.secret[..sl]);
-                            let mut rg = [0u8; NAME_BUF];
-                            rg[..rl].copy_from_slice(&s.region[..rl]);
-                            let mut out = [0u8; REQ_BUF];
-                            if let Some(n) = s3_sign_get(
-                                &ak[..al],
-                                &sk[..sl],
-                                &rg[..rl],
-                                &host[..hl],
-                                b"/",
-                                &ts,
-                                &date,
-                                &mut out,
-                            ) {
-                                s.req[..n].copy_from_slice(&out[..n]);
-                                s.req_len = n as u16;
-                                s.req_sent = 0;
-                                s.acc_len = 0;
-                                s.phase = AWAIT_RESPONSE;
-                                s.started_ms = now;
-                            } else {
-                                fail(s, now);
-                            }
-                        }
-                    }
-                    NET_MSG_DATA if s.phase == AWAIT_RESPONSE => {
-                        if plen > 2 && net_proto::conn_id(payload) == s.conn_id {
-                            let data_len = plen - 2;
-                            let space = ACC_BUF - s.acc_len as usize;
-                            let take = if data_len < space { data_len } else { space };
-                            core::ptr::copy_nonoverlapping(
-                                payload.as_ptr().add(2),
-                                s.acc.as_mut_ptr().add(s.acc_len as usize),
-                                take,
-                            );
-                            s.acc_len += take as u32;
-                        }
-                    }
-                    NET_MSG_CLOSED if s.phase == AWAIT_RESPONSE => {
-                        // Connection: close — the response is complete.
-                        if plen >= 2 && net_proto::conn_id(payload) == s.conn_id {
-                            if s.busy != 0 {
-                                finish_driven(s);
-                            } else {
-                                finish_response(s);
-                            }
-                        }
-                    }
-                    NET_MSG_ERROR => {
-                        // `[conn_id u16][errno i8][requester_tag u8]` — the tag
-                        // sits at offset 3, past the widened conn_id. A
-                        // connect-phase failure is matched on the TAG ALONE:
-                        // the contract states its `conn_id` is meaningless
-                        // (0 when the dial failed before a slot was allocated,
-                        // which is indistinguishable from a valid id 0). The
-                        // established-connection clause is therefore gated on
-                        // `conn_present`, or a peer's failed dial carrying
-                        // conn_id 0 would be claimed by this module while its
-                        // own `conn_id` is still zero-initialised.
-                        // The established clause additionally requires the
-                        // error to be UNTAGGED: a tagged error is some
-                        // module's connect failure, and its meaningless
-                        // conn_id colliding with ours must not read as our
-                        // established connection failing.
-                        let ours = if plen >= 3 {
-                            let (cid, _errno, tag) = net_proto::error_parts(payload);
-                            (s.phase == CONNECTING && tag == s.tag)
-                                || (s.conn_present != 0
-                                    && tag == net_proto::REQUESTER_TAG_NONE
-                                    && cid == s.conn_id)
-                        } else {
-                            false
-                        };
-                        if ours {
-                            if s.phase == AWAIT_RESPONSE && s.acc_len > 0 {
-                                if s.busy != 0 {
-                                    finish_driven(s);
-                                } else {
-                                    finish_response(s);
-                                }
-                            } else {
-                                // 502: the transport failed, so the endpoint
-                                // never got to answer for itself.
-                                fail_driven(s, 502, now);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Send pump.
-        if s.conn_present != 0 && s.req_sent < s.req_len {
-            let max_chunk = NET_BUF - NET_FRAME_HDR - 1;
-            while s.req_sent < s.req_len {
-                let poll = (sys.channel_poll)(s.net_out, 0x02);
-                if poll <= 0 || (poll as u32 & 0x02) == 0 {
-                    break;
-                }
-                let remaining = (s.req_len - s.req_sent) as usize;
-                let chunk = if remaining < max_chunk {
-                    remaining
-                } else {
-                    max_chunk
-                };
-                let total_payload = chunk + 2;
-                s.nbuf[0] = NET_CMD_SEND;
-                s.nbuf[1] = (total_payload & 0xff) as u8;
-                s.nbuf[2] = (total_payload >> 8) as u8;
-                net_proto::put_conn_id(&mut s.nbuf[NET_FRAME_HDR..], s.conn_id);
-                core::ptr::copy_nonoverlapping(
-                    s.req.as_ptr().add(s.req_sent as usize),
-                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 2),
-                    chunk,
-                );
-                let frame = NET_FRAME_HDR + total_payload;
-                let wrote = (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), frame);
-                if wrote != frame as i32 {
-                    // Refused wholesale, so none of this chunk is on the wire.
-                    // The offset stays put and the identical frame is rebuilt
-                    // from `req` next step; advancing here would skip these
-                    // bytes for good and send the endpoint a signed request
-                    // with a hole in it.
-                    break;
-                }
-                s.req_sent += chunk as u16;
-            }
-        }
-
-        if matches!(s.phase, CONNECTING | AWAIT_RESPONSE) {
-            let budget = if s.phase == CONNECTING {
-                CONNECT_TIMEOUT_MS
-            } else {
-                REPLY_TIMEOUT_MS
-            };
-            if now.wrapping_sub(s.started_ms) > budget {
-                if s.phase == AWAIT_RESPONSE && s.acc_len > 0 {
-                    if s.busy != 0 {
-                        finish_driven(s);
-                    } else {
-                        finish_response(s);
-                    }
-                } else {
-                    // 504: the endpoint was reachable but silent past the
-                    // budget, which is a different fact from a dead transport.
-                    fail_driven(s, 504, now);
-                }
-            }
-        }
-
-        // Retry a parked answer last, so a response produced this step reaches
-        // `response_out` without waiting for the next one.
-        if s.resp_len != 0 {
-            flush_response(s);
-        }
-
-        // Drain is complete only at genuine quiescence: no admitted request in
-        // flight, no answer still owed, no record left in the prefetch buffer,
-        // and no transport command `net_out` has yet to take. A request taken
-        // off `request_in` is never abandoned unreported, and the connection it
-        // was using is never left open.
-        if s.draining == 1
-            && s.busy == 0
-            && s.rec_len == 0
-            && s.cmd == 0
-            && matches!(s.phase, DISCONNECTED | DONE)
-        {
-            return 1;
-        }
-        0
+    if state.is_null() {
+        return -1;
     }
+    // SAFETY: the kernel passes the state buffer `module_new` initialised,
+    // and steps this module single-threaded.
+    let s = unsafe { &mut *(state as *mut S3State) };
+    if s.syscalls.is_null() {
+        return -1;
+    }
+    // SAFETY: set from a non-null pointer in `module_new`.
+    let now = unsafe { dev_millis(&*s.syscalls) };
+
+    // A transport command `net_out` refused earlier goes first, before
+    // anything can stage another over it.
+    flush_command(s, now);
+
+    if s.request_in >= 0 {
+        flush_out(s, now);
+        pump_requests(s, now);
+        start_pending(s, now);
+    } else if s.phase == DISCONNECTED && s.cmd == 0 && s.draining == 0 && s.access_key_len > 0 {
+        // The boot probe: one signed GET / on connect. Probe mode only — a
+        // wired `request_in` means a caller decides what to request.
+        stage_connect(s, now);
+    }
+
+    pump_net(s, now);
+    if s.request_in >= 0 {
+        produce(s, now);
+        flush_out(s, now);
+    }
+    pump_send(s, now);
+    check_deadlines(s, now);
+    if s.request_in >= 0 {
+        produce(s, now);
+        flush_out(s, now);
+        start_pending(s, now);
+    }
+
+    // Drained only at quiescence: no exchange in flight or waiting, no record
+    // owed to the caller, no transport command owed to the net stack.
+    if s.draining != 0
+        && s.ex == EX_IDLE
+        && s.pend_len == 0
+        && s.inrec_len == 0
+        && s.out_len == 0
+        && s.cmd == 0
+        && matches!(s.phase, DISCONNECTED | DONE)
+    {
+        return 1;
+    }
+    0
 }

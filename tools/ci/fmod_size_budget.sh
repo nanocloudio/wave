@@ -61,7 +61,7 @@ rp2350|http.fmod|203000|192959 (2026-09-10, +20.0K since the 2026-09-07 row: the
 rp2350|http-h2.fmod|157000|149495 (2026-09-10, +14.0K since the 2026-09-07 row: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
 rp2350|http-web.fmod|98000|90020 (2026-09-07, current ABI and readiness hardening)
 rp2350|http-app.fmod|103000|95004 (2026-09-07, current ABI and readiness hardening)
-rp2350|http-exchange.fmod|207000|196791 (2026-09-10, +19.7K since the 2026-09-07 row: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
+rp2350|http-exchange.fmod|220100|209638 (2026-10-03, +12.8K since the 2026-09-10 row: request and response bodies streamed in bounded records under credit on h1, h2 and h3; ceiling re-based 5% above measured)
 rp2350|rtp.fmod|26500|25200 (2026-09-24, +3.1K: the encoded-media record stream in, and the RFC 3551/7587/6184/7741 payload formats packetizing it; the private media record and its codec table are gone; ceiling re-based 5% above measured)
 rp2350|rtcp.fmod|14600|13501 (2026-09-08, +7.0K: SRTCP protection over the RFC 3550 §6 control plane (see `rtcp_core.rs`) — AES-GCM, the 31-bit SRTCP index and its replay window, plus RFC 4585 NACK and PLI feedback)
 bcm2712|rtp.fmod|32700|31096 (2026-09-24, +3.7K: the encoded-media record stream in, and the RFC 3551/7587/6184/7741 payload formats packetizing it; the private media record and its codec table are gone; ceiling re-based 5% above measured)
@@ -81,7 +81,8 @@ bcm2712|http-h2.fmod|301000|286423 (2026-09-10, +23.6K since the 2026-09-05 row:
 bcm2712|http-web.fmod|207000|191646 (2026-09-05, +9.1K since the 2026-08-16 row: request metrics and the connection lifetime deadlines with the WebSocket ping policy)
 bcm2712|http-app.fmod|212000|196158 (2026-09-05, +9.1K since the 2026-08-16 row: request metrics and the connection lifetime deadlines)
 bcm2712|http-exchange.fmod|367000|349111 (2026-09-10: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
-bcm2712|s3.fmod|22000|19647 (2026-08-16, first row; SigV4 signing connector)
+bcm2712|s3.fmod|44600|42478 (2026-10-03, +22.8K: bodies of any size streamed in the HTTP application records, aws-chunked chunk signing, response framing by length, chunks or close; ceiling re-based 5% above measured)
+bcm2712|s3_serve.fmod|122400|116568 (2026-10-03, first row; SigV4, the S3 operations over storage.object, multipart staging, listings; ceiling 5% above measured)
 bcm2712|smtp.fmod|16400|15208 (2026-09-19, +1208B over the previous ceiling; authority replaces the hex endpoint: Target::parse, write_connect_to and the 128-byte authority buffer)
 bcm2712|websocket.fmod|20700|19139 (2026-09-19, +1139B over the previous ceiling; authority replaces the hex endpoint and the separate Host parameter)
 '

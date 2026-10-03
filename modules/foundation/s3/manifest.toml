@@ -22,34 +22,38 @@ direction    = "output"
 content_type = "TextPlain"
 buffer_size  = 2048
 
-# Driven mode: one S3 operation per record, answered on `response_out`. The
-# client-side mirror of wave's HTTP application fan-out — there a graph node
-# ANSWERS requests a gateway hands it, here a graph node ISSUES requests a
-# connector performs. Both ports unwired = the boot ListBuckets probe, which is
-# what `examples/s3_client/` runs.
+# Driven mode: one exchange at a time in the HTTP application records of
+# modules/common/http_app.rs — the same records `http` speaks to its
+# applications, from the client side. A caller writes REQUEST-direction
+# records here: HEAD (method, `/bucket/key[?query]`, extra header lines,
+# response credit), BODY (MORE until the last), CREDIT (more response credit)
+# and ABORT. A body needs a `content-length` header (411 without one).
 #
-# `OctetStream` rather than a registered content type on purpose: a new entry in
-# Fluxor's CONTENT_TYPES moves the ABI surface digest and forces a coordinated
-# rebuild of every .fmod in every workspace member. Two modules that already
-# agree on a layout do not earn that cost — the same call `body_store` and
-# `object_index` made.
+# Mailbox channels: wire both edges with a `buffer_group`, one per direction,
+# so a write is one whole record and a read takes one whole record. A
+# byte-streaming FIFO would fragment them.
 #
-# Layouts in modules/common/s3_wire.rs:
-#   S3Request  [op][cid:u32][bucket_len:u16][key_len:u16][body_len:u32][…]
-#   S3Response [op][cid:u32][status:u16][body_len:u32][body]
+# Both ports unwired = the boot ListBuckets probe.
 [[ports]]
 name         = "request_in"
 index        = 1
 direction    = "input"
-content_type = "OctetStream"
-buffer_size  = 32768
+content_type = "HttpRequest"
+max_record   = 8192
+buffer_size  = 8192
 
+# RESPONSE-direction records: the endpoint's HEAD (status, content type,
+# headers minus the connection's framing, first body bytes), BODY (MORE until
+# the last) within the caller's response credit, CREDIT (request-body credit,
+# granted as the body's bytes leave for the transport), and ABORT when an
+# exchange fails after its response began.
 [[ports]]
 name         = "response_out"
 index        = 2
 direction    = "output"
-content_type = "OctetStream"
-buffer_size  = 32768
+content_type = "HttpResponse"
+max_record   = 8192
+buffer_size  = 8192
 
 [[resources]]
 requires_contract = "channel"

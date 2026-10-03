@@ -469,15 +469,18 @@ does not decide what to do with either.
 ### `s3`
 
 A SigV4-signed client for S3-compatible object endpoints: GET, PUT,
-HEAD and DELETE on `/bucket/key`, each signed with the payload
-hashed in. It earns a compiled module for a reason none of the
+HEAD, DELETE and POST on `/bucket/key`, each signed — a body that fits
+one chunk with its hash, a larger one streamed as signed
+`aws-chunked` chunks. It earns a compiled module for a reason none of the
 others share — not round-trip count, which is one, but crypto: the
 `Authorization` header is an HMAC chain over a canonical form of the
 request, and a bytecode codec cannot compute it. SHA-256 is
 SDK-owned, as `websocket`'s SHA-1 is.
 
 Two modes, chosen by whether `request_in` is wired: driven, one
-operation per `S3Request` record answered with an `S3Response`; and
+exchange at a time in the same HTTP application records `http` speaks
+to its applications — request and response bodies streamed under
+credit, so an object of any size crosses without being held whole; and
 probe, which signs a ListBuckets on boot and reports the status, as
 the cheapest proof that credentials work against a real endpoint.
 Which bucket backs which namespace, and what a key denotes, are the

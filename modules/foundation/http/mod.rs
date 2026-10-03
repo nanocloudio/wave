@@ -105,7 +105,7 @@
 //! | 90    | routes_prefix | str | (none) | Store prefix for dynamic routes                     |
 //! | 91    | listeners_prefix | str | (none) | Store prefix for dynamic listeners               |
 //! | 100   | h3          | u8   | 0       | Serve HTTP/3 over the `mux` contract                |
-//! | 101   | max_body_kib | u16 | 0       | Request-body cap in KiB (0 = 64 KiB default)        |
+//! | 101   | —           | —    | —       | retired                                             |
 //! | 102   | content_type | str | (none)  | `Content-Type` of a composed client request         |
 //! | 103   | surface_status | u8 | 0      | Exchange: answer 400+ as a typed refusal            |
 //! | 104   | header_timeout_ms | u32 | 10000 | Close a connection with no complete head (0 = off) |
@@ -124,8 +124,8 @@
 //! | 117   | session_drain_ms | u32 | 500 | Session anchor: the swap window and DRAIN deadline |
 //! | 118   | handoff_after_frames | u32 | 0 | Session anchor: swap workers every N envelopes (0 = never) |
 //! | 119   | sessions_prefix | str | (none) | Session anchor: store prefix whose `active` row picks the worker |
-//! | 120   | body_ref_prefix | str | (none) | App routes: stage a body past `body_inline_max` at `<prefix>sha256/<hex>`, forward `sha256:<hex>`. At most 48 bytes |
-//! | 121   | body_inline_max | u32 | 0 | App routes: the largest body forwarded inline when `body_ref_prefix` is set |
+//! | 120-121 | —         | —    | —       | retired                                             |
+//! | 122-129 | route_N_max_body_kib | u32 | 0 | Route N's request-body ceiling in KiB (0 = 64 KiB); at most 1 TiB |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 // PIC library code must not panic; surface errors through the ABI.
@@ -151,10 +151,14 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// The digest a staged request body is addressed by (server/app.rs).
-mod body_digest {
-    include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-}
+// The application records `HANDLER_APP` exchanges ride (`server/app.rs`):
+// one contract for every generation, shared with the modules that answer.
+#[cfg(not(feature = "host-test"))]
+#[path = "../../common/http_app.rs"]
+pub(crate) mod http_app;
+#[cfg(feature = "host-test")]
+#[path = "../../common/http_app.rs"]
+pub mod http_app;
 
 // The ordered-ack exchange surface. Mounted unconditionally, not behind the
 // `exchange` feature: the sizes it anchors (`PAYLOAD_MAX`) bound buffers in
@@ -349,18 +353,8 @@ mod params_def {
     100, h3, u8, 0
         => |s, d, len| { s.h3_mode = p_u8(d, len, 0, 0); };
 
-    // Largest request body accepted, in KiB. 0 (default) = the built-in
-    // `reqbody::DEFAULT_MAX_BODY`. Tag 101 because 0-9 are taken, 10-89 belong
-    // to the route block, 90/91 are the table prefixes, 92/93 must stay
-    // undefined for `bounds_saturation.rs`, and 100 is h3.
-    //
-    // KiB rather than bytes because the TLV element is length-prefixed and a
-    // one-byte value covering 1 KiB-255 KiB is more useful across that range
-    // than a one-byte byte-count covering 255 B.
-    101, max_body_kib, u16, 0
-        => |s, d, len| {
-            s.server.max_body = (p_u16(d, len, 0, 0) as u32).saturating_mul(1024);
-        };
+    // 101 is unassigned. The body ceiling is each route's own
+    // (`route_N_max_body_kib`, 122-129).
 
     // `Content-Type` for a composed client request; empty omits the header.
     102, content_type, str, 0 => |s, d, len| {
@@ -445,20 +439,28 @@ mod params_def {
     119, sessions_prefix, str, 0
         => |s, d, len| { server::session::set_sessions_prefix(s, d, len); };
 
-    // Request bodies by reference (server/app.rs `stage_body`).
-    120, body_ref_prefix, str, 0
-        => |s, d, len| {
-            // Held whole or not at all; an over-long one is marked here and
-            // refused at construction.
-            if len > 48 {
-                s.server.body_ref_prefix_oversize = 1;
-                return;
-            }
-            core::ptr::copy_nonoverlapping(d, s.server.body_ref_prefix.as_mut_ptr(), len);
-            s.server.body_ref_prefix_len = len as u8;
-        };
-    121, body_inline_max, u32, 0
-        => |s, d, len| { s.server.body_inline_max = p_u32(d, len, 0, 0); };
+    // 120 and 121 are unassigned. A request body reaches the application
+    // as a stream of records.
+
+    // Each route's request-body ceiling, in KiB; 0 is the 64 KiB default.
+    // Beside the route block rather than in it: route `n`'s ten tags are all
+    // taken. A body past the ceiling is refused with 413, never truncated.
+    122, route_0_max_body_kib, u32, 0
+        => |s, d, len| { server::params::set_route_max_body(s, 0, d, len); };
+    123, route_1_max_body_kib, u32, 0
+        => |s, d, len| { server::params::set_route_max_body(s, 1, d, len); };
+    124, route_2_max_body_kib, u32, 0
+        => |s, d, len| { server::params::set_route_max_body(s, 2, d, len); };
+    125, route_3_max_body_kib, u32, 0
+        => |s, d, len| { server::params::set_route_max_body(s, 3, d, len); };
+    126, route_4_max_body_kib, u32, 0
+        => |s, d, len| { server::params::set_route_max_body(s, 4, d, len); };
+    127, route_5_max_body_kib, u32, 0
+        => |s, d, len| { server::params::set_route_max_body(s, 5, d, len); };
+    128, route_6_max_body_kib, u32, 0
+        => |s, d, len| { server::params::set_route_max_body(s, 6, d, len); };
+    129, route_7_max_body_kib, u32, 0
+        => |s, d, len| { server::params::set_route_max_body(s, 7, d, len); };
 
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };
@@ -657,27 +659,18 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<HttpState>() as u32
 }
 
-/// Room for ONE request body held whole on its way to the application —
-/// `max_body_kib` is a runtime param, but the arena is sized before params
-/// are read, so the budget is the largest cap the profile supports: 4 MiB
-/// covers upstream Kubernetes' 3 MiB request ceiling (a 1 MiB ConfigMap,
-/// JSON-escaped) with the allocator's power-of-two growth. A body the arena
-/// cannot hold is 413, as one past the cap is. Only host-profile (aarch64)
-/// builds that forward bodies (`app`) reserve it; everywhere else a body is
-/// bounded by the body pool, as before.
+/// Room for what application exchanges hold while their connections cannot
+/// take it: each exchange's record queue (`server::app::QUEUE_LIMIT`), and the
+/// request bytes an h2 or h3 stream has received inside its flow-control
+/// window and not yet forwarded. Bodies are streamed, never held whole, so
+/// this bounds a working set rather than a body size. Past it, the exchange
+/// that cannot be given room is refused rather than any other slowed.
 #[cfg(all(feature = "app", target_arch = "aarch64"))]
-const REQUEST_BODY_BUDGET: u32 = 4 << 20;
-#[cfg(not(all(feature = "app", target_arch = "aarch64")))]
-const REQUEST_BODY_BUDGET: u32 = 0;
-
-/// Room for application answers held for connections slow to read them
-/// (`server::app::STASH_MAX` each): four at their limit at once on host
-/// builds that forward to an application. Past it a slow connection closes
-/// sooner, which is the same outcome as passing its own limit.
-#[cfg(all(feature = "app", target_arch = "aarch64"))]
-const STASH_BUDGET: u32 = 16 << 20;
-#[cfg(not(all(feature = "app", target_arch = "aarch64")))]
-const STASH_BUDGET: u32 = 0;
+const APP_BUFFER_BUDGET: u32 = 16 << 20;
+#[cfg(all(feature = "app", not(target_arch = "aarch64")))]
+const APP_BUFFER_BUDGET: u32 = server::app::QUEUE_LIMIT;
+#[cfg(not(feature = "app"))]
+const APP_BUFFER_BUDGET: u32 = 0;
 
 /// Heap arena size — sized for the **working set**, not the slot
 /// table ceiling. The slot table (`MAX_CONCURRENT_CONNS`) is the
@@ -720,8 +713,7 @@ pub extern "C" fn module_arena_size() -> u32 {
     // (recv_buf, send_buf, h2).
     let alloc_overhead = (16u32 * 3).saturating_mul(working_set);
     body_budget
-        .saturating_add(REQUEST_BODY_BUDGET)
-        .saturating_add(STASH_BUDGET)
+        .saturating_add(APP_BUFFER_BUDGET)
         .saturating_add(conns_buffers)
         .saturating_add(h2_buffers)
         .saturating_add(alloc_overhead)
@@ -801,8 +793,8 @@ pub unsafe extern "C" fn module_new(
             }
         } else {
             server::post_params(s);
-            if s.server.body_ref_prefix_oversize != 0 {
-                let m = b"[http] body_ref_prefix is longer than the 48 bytes held for it";
+            if s.server.route_body_refused != 0 {
+                let m = b"[http] a route_N_max_body_kib is past the 1 TiB ceiling";
                 dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
                 return -22;
             }
@@ -1081,9 +1073,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // id 8 = http.demux.stalls — head-of-line blocking, which does
                 // not show in throughput until it is already severe.
                 dev_telemetry_metric(sys, -1, midx, t, counter, 8, s.server.demux_stalls as u64);
-                // ids 9..11 = the application fan-out's shed paths. `lost` is
-                // never expected in a healthy graph: it means a response was
-                // dropped rather than delayed.
+                // ids 9..11 = the application fan-out: exchanges the
+                // application let lapse, its records for exchanges no longer
+                // open, and records that do not parse.
                 dev_telemetry_metric(sys, -1, midx, t, counter, 9, s.server.app_timeouts as u64);
                 dev_telemetry_metric(
                     sys,
@@ -1092,7 +1084,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     t,
                     counter,
                     10,
-                    s.server.app_envelopes_lost as u64,
+                    s.server.app_records_stale as u64,
                 );
                 dev_telemetry_metric(
                     sys,
@@ -1101,7 +1093,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     t,
                     counter,
                     11,
-                    s.server.app_envelopes_oversize as u64,
+                    s.server.app_records_malformed as u64,
                 );
                 // id 12 = http.ws.envelopes.dropped, id 13 =
                 // http.h2.streams.refused.
@@ -1213,6 +1205,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let sm = server::session::metrics(s);
                 for (k, v) in sm.iter().enumerate() {
                     dev_telemetry_metric(sys, -1, midx, t, counter, 24 + k as u16, *v as u64);
+                }
+                // ids 29-32: the application exchange surface — rule
+                // violations, aborts sent, exchanges opened — and bodies
+                // refused at a route's ceiling.
+                let ex = [
+                    s.server.app_violations,
+                    s.server.app_aborts,
+                    s.server.app_exchanges,
+                    s.server.bodies_refused,
+                ];
+                for (k, v) in ex.iter().enumerate() {
+                    dev_telemetry_metric(sys, -1, midx, t, counter, 29 + k as u16, *v as u64);
                 }
             }
         }

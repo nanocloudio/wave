@@ -114,6 +114,8 @@ pub(crate) const HANDLER_WEBSOCKET_ADMIT: u8 = 12;
 #[repr(C)]
 pub(crate) struct Route {
     pub(crate) proxy_ip: u32,
+    /// Request-body ceiling in KiB; 0 is `reqbody::DEFAULT_MAX_BODY`.
+    pub(crate) max_body_kib: u32,
     /// Byte offset of this route's body within `body_pool`. Widened
     /// to u32 so the pool can grow past 64 KB on aarch64 hosts that
     /// configure many or large templates.
@@ -143,6 +145,7 @@ impl Route {
     pub(crate) const fn new() -> Self {
         Self {
             proxy_ip: 0,
+            max_body_kib: 0,
             body_offset: 0,
             body_len: 0,
             proxy_port: 0,

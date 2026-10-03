@@ -184,29 +184,59 @@ pub unsafe fn find_header_end(buf: &[u8], len: usize) -> Option<usize> {
     None
 }
 
+/// The field lines of a request head: everything after the request line's
+/// CRLF, up to and including the CRLF of the last field line. Empty when the
+/// head has no fields.
+pub fn header_block(head: &[u8]) -> &[u8] {
+    let Some(eol) = head.windows(2).position(|w| w == b"\r\n") else {
+        return &[];
+    };
+    let start = eol + 2;
+    // The head ends with the blank line's CRLF; the block keeps each field
+    // line's own CRLF and drops only that last one.
+    let end = head.len().saturating_sub(2);
+    if end <= start {
+        return &[];
+    }
+    &head[start..end]
+}
+
+/// A parsed request line: the method and where the request target sits in
+/// the source.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RequestLine {
+    pub method: u8,
+    /// Offset of the target (path and query) in the source.
+    pub target_at: usize,
+    /// Its full length, whatever was copied.
+    pub target_len: usize,
+}
+
 /// Parse an HTTP/1 request line (`METHOD /path HTTP/1.x\r\n`) out of `src`
-/// and copy the path bytes into `dst`. Returns `(method, path_len)` on
-/// success or `None` if the line is malformed, truncated, or too short
-/// to contain the minimum viable request.
+/// and copy the request target into `dst`. `None` if the line is malformed,
+/// truncated, or too short to contain the minimum viable request.
 ///
 /// The method is returned rather than enforced. An unrecognised-but-well-formed
-/// token yields [`method::METHOD_NONE`] with the path still parsed, so the
+/// token yields [`method::METHOD_NONE`] with the target still parsed, so the
 /// caller can answer **501 Not Implemented** — which is what RFC 9110 §9.1 asks
 /// for — instead of the 400 that a parse failure would produce. Only a
-/// genuinely malformed line (no method token, no space-delimited path, a path
-/// that does not start with `/`) is `None`. The recognised tokens are
+/// genuinely malformed line (no method token, no space-delimited target, a
+/// target that does not start with `/`) is `None`. The recognised tokens are
 /// `wire::method`'s, the same table h2 and h3 resolve against.
+///
+/// The target's full length is reported even when it is longer than `dst`:
+/// the copy is bounded, and the caller decides whether a target longer than
+/// its buffer is refused or read from `src` in place.
 ///
 /// # Safety
 /// `src` must be valid for reads of `src_len` bytes; `dst` must be
-/// valid for writes of up to `dst_cap` bytes. The returned length is
-/// clamped to `dst_cap` so writes never overshoot.
+/// valid for writes of up to `dst_cap` bytes.
 pub unsafe fn parse_request_line(
     src: *const u8,
     src_len: usize,
     dst: *mut u8,
     dst_cap: usize,
-) -> Option<(u8, usize)> {
+) -> Option<RequestLine> {
     // Shortest viable line: `GET / HTTP/1.0\r\n` — 14 bytes before the CRLF.
     if src_len < 14 {
         return None;
@@ -246,13 +276,18 @@ pub unsafe fn parse_request_line(
         return None;
     }
 
-    let plen = (path_end - path_start).min(dst_cap);
+    let target_len = path_end - path_start;
+    let copy = target_len.min(dst_cap);
     let mut i = 0;
-    while i < plen {
+    while i < copy {
         *dst.add(i) = *src.add(path_start + i);
         i += 1;
     }
-    Some((verb, plen))
+    Some(RequestLine {
+        method: verb,
+        target_at: path_start,
+        target_len,
+    })
 }
 
 /// Write a minimal HTTP/1.1 response status line plus a
@@ -599,6 +634,151 @@ pub fn parse_chunk_header(buf: &[u8]) -> ChunkHeader {
     ChunkHeader::Ok {
         size,
         consumed: i + 2,
+    }
+}
+
+/// Where a chunked decoder is between two calls.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ChunkState {
+    /// Waiting for a chunk-size line.
+    Size,
+    /// Inside a chunk's data.
+    Data,
+    /// The CRLF after a chunk's data.
+    DataEnd,
+    /// After the zero-size chunk: trailer field lines up to a blank line.
+    Trailer,
+}
+
+/// A request body's framing, decoded incrementally.
+///
+/// `Copy` and free of I/O on purpose: a caller decodes into a record on a copy
+/// of the decoder, and commits the copy (and consumes the input) only once the
+/// record has been accepted downstream. Nothing is decoded twice and nothing
+/// is decoded and then lost to a full channel.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct BodyDecoder {
+    chunked: bool,
+    state: ChunkState,
+    /// Bytes left in the whole body (length framing) or the current chunk.
+    remaining: u64,
+    done: bool,
+}
+
+/// What one [`BodyDecoder::decode`] call did.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Decoded {
+    /// Input bytes consumed, framing included.
+    pub consumed: usize,
+    /// Body bytes written to the output.
+    pub produced: usize,
+    /// The framing is malformed: 400, and the connection closes.
+    pub bad: bool,
+}
+
+impl BodyDecoder {
+    /// A decoder for `framing`, or `None` when there is no body to decode
+    /// (`BodyFraming::None`, a zero length) or the framing is invalid.
+    pub fn new(framing: BodyFraming) -> Option<Self> {
+        match framing {
+            BodyFraming::Length(n) if n > 0 => Some(Self {
+                chunked: false,
+                state: ChunkState::Data,
+                remaining: n,
+                done: false,
+            }),
+            BodyFraming::Chunked => Some(Self {
+                chunked: true,
+                state: ChunkState::Size,
+                remaining: 0,
+                done: false,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether the body has been read to its end.
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Decode from `input` into `out`, as far as both allow. Stops at the end
+    /// of the body, at the end of `input`, or when `out` is full.
+    ///
+    /// A chunk-size or trailer line is consumed only once it is whole, so a
+    /// call can consume nothing while `input` holds a partial line. A caller
+    /// whose buffer is full and still gets no progress is facing a line longer
+    /// than it can hold, and refuses the body.
+    pub fn decode(&mut self, input: &[u8], out: &mut [u8]) -> Decoded {
+        let mut d = Decoded {
+            consumed: 0,
+            produced: 0,
+            bad: false,
+        };
+        while !self.done {
+            let rest = &input[d.consumed..];
+            match self.state {
+                ChunkState::Data => {
+                    if self.remaining == 0 {
+                        if self.chunked {
+                            self.state = ChunkState::DataEnd;
+                            continue;
+                        }
+                        self.done = true;
+                        break;
+                    }
+                    let room = out.len() - d.produced;
+                    let n = (rest.len() as u64).min(room as u64).min(self.remaining) as usize;
+                    if n == 0 {
+                        break;
+                    }
+                    out[d.produced..d.produced + n].copy_from_slice(&rest[..n]);
+                    d.produced += n;
+                    d.consumed += n;
+                    self.remaining -= n as u64;
+                }
+                ChunkState::Size => match parse_chunk_header(rest) {
+                    ChunkHeader::Need => break,
+                    ChunkHeader::Bad => {
+                        d.bad = true;
+                        break;
+                    }
+                    ChunkHeader::Ok { size, consumed } => {
+                        d.consumed += consumed;
+                        self.remaining = size;
+                        self.state = if size == 0 {
+                            ChunkState::Trailer
+                        } else {
+                            ChunkState::Data
+                        };
+                    }
+                },
+                ChunkState::DataEnd => {
+                    if rest.len() < 2 {
+                        break;
+                    }
+                    if rest[0] != b'\r' || rest[1] != b'\n' {
+                        d.bad = true;
+                        break;
+                    }
+                    d.consumed += 2;
+                    self.state = ChunkState::Size;
+                }
+                ChunkState::Trailer => {
+                    // Trailer fields are read and discarded: nothing the
+                    // server does with a request depends on them, and a
+                    // field arriving after the body cannot change it.
+                    let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else {
+                        break;
+                    };
+                    d.consumed += eol + 2;
+                    if eol == 0 {
+                        self.done = true;
+                    }
+                }
+            }
+        }
+        d
     }
 }
 

@@ -139,6 +139,22 @@ pub(crate) unsafe fn set_route_handler(s: &mut HttpState, idx: usize, d: *const 
     }
 }
 
+/// A route's request-body ceiling, in KiB. One past
+/// `reqbody::MAX_BODY_KIB_CEILING` is recorded and refused at construction,
+/// never clamped: a ceiling quietly lowered is a deployment that refuses
+/// uploads it was configured to take.
+#[inline]
+pub(crate) unsafe fn set_route_max_body(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
+    if idx < MAX_ROUTES {
+        let kib = p_u32(d, len, 0, 0);
+        if kib > super::reqbody::MAX_BODY_KIB_CEILING {
+            s.server.route_body_refused = 1;
+            return;
+        }
+        (*s.server.routes.as_mut_ptr().add(idx)).max_body_kib = kib;
+    }
+}
+
 #[inline]
 pub(crate) unsafe fn set_route_proxy_ip(s: &mut HttpState, idx: usize, d: *const u8, len: usize) {
     if idx < MAX_ROUTES {

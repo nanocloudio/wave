@@ -1,72 +1,134 @@
 # `s3` — SigV4-signed S3 connector
 
-A connector for S3-compatible object endpoints. The signing and canonical-form
-construction live in the shared `modules/common/s3_core.rs`, the
-request/response records in `modules/common/s3_wire.rs`; this module is the
-I/O pump around them. Object meaning — which bucket backs which namespace,
-what a key maps to — is the consumer's; the wire mechanics are Wave's.
+A client for S3-compatible object endpoints. Signing lives in the shared
+`modules/common/sigv4_core.rs`; the signed request head, `aws-chunked` body
+framing and response framing in `modules/common/s3_core.rs`; the records it
+speaks in `modules/common/http_app.rs`. This module is the I/O pump around
+them. Object meaning — which bucket backs which namespace, what a key maps to —
+is the consumer's; the wire mechanics are Wave's.
 
 ## Why it is a compiled module and not a codec
 
-S3 GET/PUT is a single round trip — but every request carries an
+An S3 operation is a single round trip — but every request carries an
 `Authorization: AWS4-HMAC-SHA256 …` header whose signature is an HMAC chain
 (`derive_key(secret, date, region, service)` over a canonical form of
-method/URI/headers/payload-hash). It is not the round-trip count that forces a
-module here, it is the crypto: a bytecode codec cannot compute an HMAC/SHA-256
-signature. SHA-256 itself is SDK-owned
-(`target/fluxor/fluxor-abi/sdk/crypto/sha256.rs`), per the same rule as
-`websocket`'s SHA-1.
+method/URI/headers/payload-hash), and a streamed body signs every chunk. It is
+not the round-trip count that forces a module here, it is the crypto: a
+bytecode codec cannot compute an HMAC/SHA-256 signature. SHA-256 itself is
+SDK-owned (`target/fluxor/fluxor-abi/sdk/crypto/sha256.rs`), per the same rule
+as `websocket`'s SHA-1.
 
 ## Two modes, chosen by whether `request_in` is wired
 
-- **Driven** — one S3 operation per `S3Request` record, answered with an
-  `S3Response`: GET / PUT / HEAD / DELETE on `/bucket/key`, each signed with
-  the payload hashed in. What lets a graph store what it computes.
+- **Driven** — one exchange at a time, in the HTTP application records `http`
+  speaks to its applications, from the client side: GET / PUT / HEAD / DELETE /
+  POST on `/bucket/key[?query]`, with request and response bodies of any size
+  streamed under credit.
 - **Probe** (`request_in` unwired) — on boot, sign a `GET /` (ListBuckets)
   and report the HTTP status on `status_out` (200 = signature accepted,
   403 = SignatureDoesNotMatch). The cheapest proof of credentials against a
   real endpoint.
 
+## Records
+
+Both record ports are mailbox channels: a graph wires each with its own
+`buffer_group`, so one write is one whole record and one read takes one.
+
+A caller writes, on `request_in`:
+
+- **HEAD** — `id` (caller-chosen, echoed verbatim on every record of the
+  exchange), `method` (the `http_exchange` vocabulary), `target`
+  (`/bucket/key[?query]`, percent-encoded as it goes on the wire), `headers`
+  (extra `name: value\r\n` lines to send, such as `range`, `content-type`,
+  `content-length`), `peer` empty, and `resp_credit`, the response-body
+  credit it grants up front. MORE says a body follows.
+- **BODY** — request body bytes, MORE on every record but the last, never
+  more than the credit the connector has granted.
+- **CREDIT** — more response-body credit.
+- **ABORT** — the caller ends the exchange: the connection is closed and no
+  further record is sent for it.
+
+The connector writes, on `response_out`:
+
+- **HEAD** — the endpoint's status, `Content-Type`, every other response
+  header line except the connection's own framing (`Connection`,
+  `Keep-Alive`, `Transfer-Encoding`; `Content-Length` is forwarded so a caller
+  sees an object's size), and the first body bytes. MORE while body follows.
+- **BODY** — response body bytes as they arrive, decoded from
+  `Content-Length`, chunked or close-delimited framing, never more than the
+  caller's credit. MORE on every record but the last.
+- **CREDIT** — request-body credit, granted as the body's bytes leave for the
+  transport.
+- **ABORT** — the exchange failed after its response began.
+
 ## What driven mode guarantees
 
-One record in, one record out. Every `S3Request` the connector understands is
-answered with exactly one `S3Response` carrying the same correlation id — the
-endpoint's status when it replied, `501` for an operation this connector does
-not perform, `413` for an object larger than one record can carry, `400` for a
-header declaring a record larger than the connector can ever hold, `500` when
-the request could not be built at all, `502` when the transport failed before
-the endpoint could answer, `503` when a drain arrived before the operation was
-attempted, and `504` when it stayed silent past the reply budget. The three 5xx
-name the failing party: `500` is this connector, `502` the
-path to the endpoint, `504` the endpoint itself.
+One HEAD in, one terminal outcome out. Every request HEAD the connector takes
+off `request_in` ends in exactly one terminal record: the endpoint's response
+ending (a HEAD or BODY without MORE), or an ABORT. A failure before any
+response record has gone out is answered with a HEAD carrying the connector's
+own status:
 
-The connector performs one operation at a time, and the answer is what releases
-it: a full `response_out` holds the finished record until the caller reads it,
-and no further request is taken until then. `net_out` is held to the same rule
-in the other direction: a dial, a request chunk or a close the transport refuses
-is offered again unchanged on a later step, so a signed request never goes out
-with a hole in it and a connection is never left open because its close could
-not be written.
+| Status | Meaning |
+| --- | --- |
+| `400` | the request is malformed: a target that cannot be signed (not absolute path form, a broken `%` escape, more than 2048 bytes or 64 query parameters), extra headers that are not `name: value\r\n` lines, over 2048 bytes, or name a header the connector writes itself (`host`, `authorization`, `connection`, `transfer-encoding`, `content-encoding`, `expect`, `x-amz-*` signing fields), or a `content-length` that is not one decimal number |
+| `411` | a body without a `content-length`: S3 needs a body's length before its first byte |
+| `500` | the request could not be built at all — this connector is the failing party |
+| `501` | a method other than GET, PUT, HEAD, DELETE or POST |
+| `502` | the path to the endpoint failed before it answered: a failed dial, a transport error, a close before the response head, or a response head that is malformed or larger than 4096 bytes |
+| `503` | a drain arrived before the exchange was attempted |
+| `504` | the endpoint stayed silent past its budget (10 s to connect, 15 s without progress) |
 
-One read of `request_in` can take several records at once, and all of them are
-the connector's from that moment. Draining follows: no further record is taken
-off the channel, every record already taken is answered — the one in flight by
-whatever the endpoint or the transport does, the rest with `503` — and the
-connector reports itself finished only once nothing it accepted is still
-unanswered and the transport has taken every command it owes.
+After the response has begun, a failure is an ABORT: `PEER_GONE` when the
+transport closes or fails mid-body, `MALFORMED` when the response's chunk
+framing is broken, `STALLED` when the endpoint goes silent. A caller that
+breaks the exchange's contract is answered with ABORT whether or not a
+response has begun: `MALFORMED` for a body longer or shorter than its
+`content-length` (or a declared body the HEAD says never comes),
+`CREDIT_OVERRUN` for body bytes past the credit granted, `STALLED` for a
+caller that neither sends the body nor reads the response for 30 s. Every
+ABORT closes the connection.
 
-`request_in` is a byte stream, so that same read can also end part-way through a
-record. A record split across any number of reads is assembled and performed
-once: the fragment is kept and the reads behind it continue it, because its
-bytes are already off the channel and nothing else can serve them. A header
-whose declared length has simply not all arrived is not a header in error — only
-one declaring more than a single record can ever hold is, and that is refused
-with a status rather than dropped, since the bytes were taken and the header
-names a correlation id. What bounds retention is the drain, not a clock: a
-deadline would report a caller for a state that is entirely local. At the drain
-a fragment is refused with `503` like any other record the connector will not
-perform, unless too little of it arrived to carry a correlation id — the one
-case with nothing to answer on, which is logged and counted instead.
+## Bodies, credit and signing
+
+A body of at most one chunk (8192 bytes) is taken whole into the chunk buffer
+— the credit for it is granted once the connection is up — and its SHA-256 is
+the payload hash, as `x-amz-content-sha256`. A larger body goes out
+`aws-chunked`: `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`,
+`Content-Encoding: aws-chunked`, `x-amz-decoded-content-length`, and a wire
+`Content-Length` that is the encoded length, computed before the first byte
+from the declared length and the fixed chunk size. Each 8192-byte chunk is
+signed in a chain from the head's own signature, and the connector holds at
+most one: the caller is granted one chunk's credit once the head has left, and
+the next only once that chunk's bytes have left for the transport. Signed
+headers are `host`, `x-amz-content-sha256`, `x-amz-date` and, when streaming,
+`x-amz-decoded-content-length`; the signature binds the wall-clock time at the
+moment the request is built, after the connection is up.
+
+The response body moves on the caller's credit in the same way. The connector
+holds at most one transport segment of it, and does not read `net_in` again
+until that segment has been forwarded — a caller that stops granting credit
+holds the endpoint back through TCP, not through a buffer here.
+
+## One at a time, and the drain
+
+The connector performs one exchange at a time on its own connection
+(`Connection: close`). A HEAD written while one is in flight is read and held;
+it begins when the exchange ahead of it has ended and its terminal record has
+been taken, and the caller may grant it credit or abort it while it waits.
+
+Every boundary is held to the same rule. A full `response_out` holds a record
+until the caller reads it, and no further exchange starts until then. A dial,
+a request frame or a close the transport refuses is offered again unchanged on
+a later step, so a signed request never goes out with a hole in it and a
+connection is never left open because its close could not be written.
+
+Draining closes the connector to new work without abandoning work it took:
+`request_in` is read only while an exchange is in flight (it may still need its
+caller's body and credit to finish); a HEAD taken behind it is answered `503`;
+and the connector reports itself finished only once nothing it took is
+unanswered and the transport has taken every command it owes. A HEAD still on
+the channel was never taken and is owed nothing.
 
 ## Ports
 
@@ -74,19 +136,16 @@ case with nothing to answer on, which is logged and counted instead.
 | --- | --- | --- | --- |
 | `net_in` | input | NetProto | transport events from `ip`/`linux_net` |
 | `net_out` | output | NetProto | transport commands |
-| `status_out` | output | OctetStream | HTTP status of the last operation |
-| `request_in` | input | OctetStream | `S3Request` records (driven mode) |
-| `response_out` | output | OctetStream | `S3Response` records |
+| `status_out` | output | TextPlain | probe mode: HTTP status of the ListBuckets probe |
+| `request_in` | input | HttpRequest | request-direction records (driven mode; mailbox) |
+| `response_out` | output | HttpResponse | response-direction records (mailbox) |
 
 ## Parameters
 
 `authority` (`host[:port]`, port 80 when it names none: where the connector
 dials — a name goes to the network provider as a name, for it to resolve —
 and, verbatim, the `Host` SigV4 signs), `access_key`, `secret`, `region` — see
-`define_params!` in `mod.rs`. The authority is at most 256 bytes; absent,
-longer, or not `host[:port]` refuses construction.
-
-The request/response records are deliberately `OctetStream`, not a registered
-content type: a `CONTENT_TYPES` entry moves the ABI-surface digest and
-re-stamps every fmod in every workspace member, which a two-party record
-layout does not earn.
+`define_params!` in `mod.rs`. The authority is at most 128 bytes; absent,
+longer, or not `host[:port]` refuses construction. `access_key`, `secret` and
+`region` are each at most 128 bytes, and a longer one refuses construction
+rather than signing with a prefix of it; `region` defaults to `us-east-1`.

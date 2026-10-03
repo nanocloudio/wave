@@ -72,11 +72,13 @@ what its deployment uses, and an unwired port is silent rather than an error.
 `mode` (0 server / 1 client), `port` (server: the listen port), `body`, `path`,
 `protocol`, `request_body`, `websocket`, `host_tcp`, `grpc`, then eight route blocks of
 `route_N_{path,body,handler,proxy_ip,proxy_port,source,content_type,fs_path,fs_list,fs_filter}`,
-and the high-tag set: `routes_prefix`, `listeners_prefix`, `max_body_kib`,
-`content_type`, `surface_status`, then the connection-lifetime set
+and the high-tag set: `routes_prefix`, `listeners_prefix`, `content_type`,
+`surface_status`, each route's body ceiling `route_N_max_body_kib`, then the
+connection-lifetime set
 `header_timeout_ms`, `keepalive_idle_ms`, `pressure_idle_ms`, `stall_ms`,
 `ws_idle_ms`, and the client's `authority`.
-Tags are wire positions: append, never renumber; tag 4 is retired.
+Tags are wire positions: append, never renumber; tags 4, 101, 120 and 121
+are retired.
 
 `authority` (parameter 112) is the client's one address: `host[:port]` — a
 DNS name, a dotted quad or a bracketed IPv6 literal, port 80 when it names
@@ -158,33 +160,84 @@ work already accepted keep flowing, because that work still has to finish.
 
 ## Methods and request bodies
 
-The server recognises `GET HEAD POST PUT PATCH DELETE OPTIONS CONNECT` on both
-h1 and h2, from one table (`wire/method.rs`). A well-formed request naming
+The server recognises `GET HEAD POST PUT PATCH DELETE OPTIONS CONNECT` on h1,
+h2 and h3, from one table (`wire/method.rs`). A well-formed request naming
 anything else is **501**, not 400 — the bytes were fine, the method is not
-implemented. One table for both generations is what makes a request mean the
+implemented. One table for every generation is what makes a request mean the
 same thing whichever carried it.
 
-Request bodies are read and bounded: `Content-Length`, `Transfer-Encoding:
-chunked`, and `Expect: 100-continue` (which `docker push` and `curl -T` send and
-then WAIT for). A message carrying BOTH framing headers is refused with 400
-rather than resolved in favour of one — RFC 9112 §6.3, and the reason is request
-smuggling, not tidiness. Over `max_body_kib` is 413 on h1 and RST_STREAM on h2.
+A request body is never held whole. It is framed by `Content-Length`, by
+`Transfer-Encoding: chunked`, or on h2 and h3 by the stream, and read only once
+the route is matched, because the route decides what happens to it:
 
-A body is consumed even when the matched route has no use for it: bytes left in
-the receive buffer are read as the beginning of the next request on a keep-alive
-connection.
+- an application route streams it to the application on credit (below);
+- a proxy route relays it to the upstream as it was framed;
+- every other route reads it and drops it, so the next request on a keep-alive
+  connection begins where this one ends.
+
+A message carrying both framing headers is refused with 400 rather than
+resolved in favour of one — RFC 9112 §6.3, and the reason is request
+smuggling, not tidiness. A method that must carry a body and states no length
+is 411.
+
+Every route has a body ceiling, `route_N_max_body_kib` (tags 122-129, KiB; 64
+KiB when a route declares none; at most 1 TiB, past which construction is
+refused). A declared length past it is **413** before a byte of the body is
+read and before `100 Continue` invites it. A body that grows past it — chunked,
+or on h2 and h3 — is refused at the byte that crosses it: 413 if nothing of a
+response has gone out, otherwise the connection or stream ends. A body is never
+truncated.
+
+`Expect: 100-continue`, which `docker push` and `curl -T` send and then wait
+on, is answered when the body is wanted: at once on a route that reads or drops
+it, and on an application route when the application first grants credit. An
+application that answers without granting any sends no 100; the connection
+closes after its response, because the body was never read.
 
 ## Application fan-out
 
-`HANDLER_APP` (route key `app: true`) forwards a matched request to a downstream
-graph node on `req_out` and serves its `resp_in` answer. The module keeps HTTP;
-the application keeps what the request means — the split
+`HANDLER_APP` (route key `app: true`) hands a matched request to a downstream
+graph node on `req_out` and serves what it answers on `resp_in`. The module
+keeps HTTP; the application keeps what the request means — the split
 `docs/specification.md` draws.
+
+One exchange is one request and its response, and both are streamed as records
+of the contract in `modules/common/http_app.rs`: a HEAD, then BODY records
+while a body continues, each record naming its exchange by an id the module
+chooses and the application echoes. Every connection on every generation
+shares the one channel pair, so each direction runs on credit rather than on
+channel backpressure:
+
+- the module forwards request-body bytes only as the application grants them
+  (CREDIT records), and stops reading the connection when the application
+  holds a body back — the transport's window closes on the client, and every
+  other exchange keeps moving;
+- the application sends response-body bytes only up to the credit in the
+  request HEAD plus the CREDIT records the module sends as bytes leave for the
+  peer.
+
+Either side ends an exchange early with an ABORT carrying a reason: the module
+when the peer goes, a body is refused, or the server drains; the application
+when it cannot finish. A response that ends before the request does ends the
+exchange: the module stops reading the body (h1 closes after the response, h2
+resets the stream with `NO_ERROR`, h3 asks the peer to stop sending).
+
+An application that goes silent for 30 seconds while it holds the turn —
+measured from its last record or credit, so a long upload it keeps crediting is
+never cut off — is answered 504 for it (or the stream ends, mid-response), and
+told so with an ABORT. A response flagged `HOLD`, a watch, runs under an hour
+instead.
+
+On h1 a response's length is the record's when it is whole, the application's
+own `Content-Length` when it streams one, and otherwise the connection's end.
+A HEAD response, or a 304, forwards the application's `Content-Length`, which
+is the length the GET would carry. On h2 and h3 END_STREAM ends the body and the
+application's header fields are sent lowercased, without the
+connection-specific ones those generations forbid.
 
 Envelope layouts, correlation, backpressure, streaming and the required
 `buffer_group:` on both edges are documented in
-[`docs/architecture/http_multiconn.md`](../../../docs/architecture/http_multiconn.md),
-which shows the two edges alongside them.
+[`docs/architecture/http_multiconn.md`](../../../docs/architecture/http_multiconn.md).
 
 Behind the `app` feature, so the `web` variant does not carry it — an rp2350
 serving h1 from config should not pay for a handler that forwards to a module it
@@ -198,14 +251,14 @@ different channels: the identity on `peer_identity`, the request on the
 transport. Joining them is this module's job.
 
 When `peer_identity` is wired and a handshake verified the peer, the request
-envelope sets flag bit 1 and carries the peer's key fingerprint as a trailer
-after the body — `[svid_len u16 LE][svid]`, past every length in the fixed
-head. A consumer that does not read the flag sees exactly what it saw before.
+HEAD carries the peer's key fingerprint in its `peer` field; it is empty for an
+anonymous connection.
 
-A trailer rather than a synthetic header such as `X-Forwarded-Client-Cert`: a
-header is forgeable by the client unless the server strips every copy of it
-first, and one missed strip promotes an anonymous caller to whoever it claims
-to be. A trailer sits in a structure the client cannot reach.
+A field of the record rather than a synthetic header such as
+`X-Forwarded-Client-Cert`: a header is forgeable by the client unless the
+server strips every copy of it first, and one missed strip promotes an
+anonymous caller to whoever it claims to be. The record sits in a structure the
+client cannot reach.
 
 An identity binds only for a handshake that succeeded, whose certificate chain
 validated, and whose peer proved possession of the key. A certificate that was
@@ -215,11 +268,11 @@ arrives once per handshake — often before the accept it belongs to — and it 
 released the moment the connection ends, since connection ids are recycled and
 a stale entry would authenticate the next holder as the previous one.
 
-Wire nothing and every request is anonymous, with no trailer and no flag. The
-`peers_unbound` counter is the signal that something in between is wrong:
-non-zero on a listener configured for mutual TLS means callers are reaching the
-application anonymous, which nothing at request level shows — the request
-succeeds, and the application simply never learns who made it.
+Wire nothing and every request is anonymous. The `peers_unbound` counter is the
+signal that something in between is wrong: non-zero on a listener configured
+for mutual TLS means callers are reaching the application anonymous, which
+nothing at request level shows — the request succeeds, and the application
+simply never learns who made it.
 
 ## Exchange delivery
 
@@ -351,13 +404,20 @@ piece of work: a request slot is released the moment its response drains, and a
 tunnel must outlive the 200 that opened it. Client frames must be masked
 (RFC 6455 §5.3), PING draws a PONG, and CLOSE ends the tunnel.
 
-**Not served over h3:** file and proxy routes. Those thread more than a cursor
-through `server::cur_slot_mut` — file handles, relay connection state — so
-dispatch answers **501** and names the handler: not a 404 (the route exists),
-not a 500 (nothing failed), not a stream reset (nothing is wrong with the
-connection), and not a path that happens to work for exactly one concurrent
-request. `http.h3.handler_unavailable` counts it, so the mismatch is visible to
-whoever configured the route and not only to the client that hit it.
+**File and proxy routes over h3** are handed to the application, flagged
+`ROUTE_FILE` or `ROUTE_PROXY`, when one is wired to `req_out`: those handlers
+thread more than a cursor through `server::cur_slot_mut` — file handles, relay
+connection state — and a graph that wants them over h3 serves them downstream.
+With no application wired, dispatch answers **501** and names the handler: not
+a 404 (the route exists), not a 500 (nothing failed), not a stream reset
+(nothing is wrong with the connection). `http.h3.handler_unavailable` counts
+it, so the mismatch is visible to whoever configured the route and not only to
+the client that hit it.
+
+**Application routes over h3** are exchanges like h1's and h2's. Request DATA
+is held per stream and acknowledged to the transport only as it is forwarded,
+so the peer's QUIC flow control is the backpressure; bytes on any other route
+are acknowledged as they are read and dropped.
 
 There is no second implementation to reconcile with: Fluxor's `quic` carries
 no QPACK and no HTTP/3 responder of its own, so QPACK exists once in the

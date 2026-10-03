@@ -12,7 +12,7 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 # policy, authorization, CDN policy, webhook meaning, or business handlers"
 # OUTSIDE Wave. A permanent application module here would contradict that. What
 # Wave does own is the port CONTRACT — the `HttpRequest` / `HttpResponse`
-# envelopes and their correlation rules — and a contract with nothing on the
+# records and their correlation rules — and a contract with nothing on the
 # far side of it is untested by construction.
 #
 # So this echoes: it reflects the method, path and body it was handed back as a
@@ -20,13 +20,8 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 # pair intact and its answer came back to the connection that asked. Anything
 # more would be a business handler.
 #
-# Wire layouts (mirroring `modules/foundation/http/server/app.rs`):
-#   HttpRequest   [conn_id u16][stream_id u16][method u8][flags u8]
-#                 [path_len u16][hdr_len u16][body_len u16]
-#                 [path][headers][body]
-#   HttpResponse  [conn_id u16][stream_id u16][status u16][flags u8]
-#                 [ct_len u8][hdr_len u16][body_len u16]
-#                 [content_type][headers][body]
+# Records are `modules/common/http_app.rs`, the contract `foundation/http`
+# speaks on `req_out` / `resp_in`.
 
 [[ports]]
 name = "request_in"

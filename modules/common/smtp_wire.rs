@@ -2,8 +2,7 @@
 //
 // A long-running mail connector submits many messages through one graph and
 // has to learn precisely what happened to each. These two records are that
-// seam, shaped like `s3_wire`'s request/result pair: a graph node ISSUES
-// submissions and a connector performs them.
+// seam: a graph node ISSUES submissions and a connector performs them.
 //
 // The result carries more than a status because SMTP failure is not one fact.
 // The phase says how far the conversation got, the reply code and its enhanced
@@ -34,11 +33,10 @@
 // with `SMTP_OP_BODY` records under the same `cid`. Neither this module nor its
 // caller assembles a whole large message in a fixed buffer.
 //
-// The ports are `OctetStream` rather than a registered content type, for the
-// reason `s3_wire` gives: a new entry in Fluxor's `CONTENT_TYPES` moves the ABI
-// surface digest and re-stamps every `.fmod` in every workspace member. A
-// request/result pair between two modules that already agree does not earn that
-// cost.
+// The ports are `OctetStream` rather than a registered content type: a new
+// entry in Fluxor's `CONTENT_TYPES` moves the ABI surface digest and re-stamps
+// every `.fmod` in every workspace member. A request/result pair between two
+// modules that already agree does not earn that cost.
 
 /// Begin a submission: `from` and `rcpt` are present, `chunk` is the first
 /// (possibly only, possibly empty) span of the message.
@@ -174,8 +172,9 @@ fn smtp_take_digits(text: &[u8], at: usize) -> Option<(u16, usize)> {
 
 /// A parsed `SmtpRequest`, as offsets into the caller's buffer.
 ///
-/// Offsets rather than slices, for `s3_wire`'s reason: the module reads into a
-/// fixed state-owned array and then builds commands out of that same array.
+/// Offsets rather than slices: the module reads into a fixed state-owned array
+/// and then builds commands out of that same array, so handing back borrows
+/// would pin it for the whole submission.
 #[derive(Clone, Copy)]
 pub struct SmtpReqView {
     pub op: u8,
