@@ -1,10 +1,13 @@
 //! WsFrame ↔ OctetStream adapter.
 //!
-//! Sits between `foundation/http`'s WebSocket fan-out ports and any
-//! transport-agnostic byte-stream carrier (e.g.
-//! `foundation/remote_channel`). The adapter strips/adds the 8-byte
-//! `WsFrame` header so the byte-stream layer above doesn't have to
-//! know about WebSocket framing.
+//! Sits between `foundation/http`'s WebSocket fan-out ports and a module
+//! that wants bytes: the adapter strips and adds the 8-byte `WsFrame` header
+//! so the layer above doesn't have to know about WebSocket framing.
+//!
+//! Bytes only. A consumer that needs CONNECTIONS — one binding a peer
+//! identity to a session, `foundation/remote_channel` above all — takes
+//! `net_proto` from `ws_net` instead. A byte stream says nothing about when a
+//! session begins or ends, and a carrier must not assume it.
 //!
 //! Wire layout (matches `modules/foundation/http/server/ws.rs` ::
 //! `ws_emit_fanout_frame`):

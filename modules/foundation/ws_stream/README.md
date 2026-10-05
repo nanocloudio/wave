@@ -1,9 +1,13 @@
 # `ws_stream` — `WsFrame` ⇄ `OctetStream` adapter
 
 Bridges the WebSocket-frame envelope used by `http`'s `ws_in` / `ws_out` ports
-and the raw byte stream expected by transport-agnostic carriers such as Fluxor's
-`remote_channel`. Any byte-stream module can ride a WebSocket without touching WS
-framing.
+and a raw byte stream, so an application module can ride a WebSocket without
+touching WS framing.
+
+Bytes only. A consumer that needs *connections* — one that binds a peer
+identity to a session, Fluxor's `remote_channel` above all — takes `net_proto`
+from [`ws_net`](../ws_net/README.md) instead: a byte stream says nothing about
+when a session begins or ends, and a carrier must not assume it.
 
 Wire layout (mirrors `http`'s `server::ws::ws_emit_fanout_frame`):
 

@@ -247,12 +247,26 @@ pub fn write_ws_event(
     Some(total)
 }
 
+/// The reason text's length, from a `WsEvent`'s fixed prefix alone.
+///
+/// [`parse_ws_event`] needs the whole record to hand back a view of it. A reader
+/// framing one off a byte-stream edge has only the header and has to learn from
+/// it how much more to take — same field, two callers, and one place that knows
+/// where it sits.
+///
+/// Callers bounds-check `buf.len() >= WS_EVENT_HDR` first.
+#[inline]
+#[must_use]
+pub fn ws_event_reason_len(buf: &[u8]) -> usize {
+    u16::from_le_bytes([buf[9], buf[10]]) as usize
+}
+
 /// Parse a `WsEvent`.
 pub fn parse_ws_event(buf: &[u8]) -> Option<WsEventView> {
     if buf.len() < WS_EVENT_HDR || buf[0] != WS_OP_EVENT {
         return None;
     }
-    let reason_len = u16::from_le_bytes([buf[9], buf[10]]) as usize;
+    let reason_len = ws_event_reason_len(buf);
     if buf.len() < WS_EVENT_HDR + reason_len {
         return None;
     }

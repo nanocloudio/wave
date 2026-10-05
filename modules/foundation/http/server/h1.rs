@@ -2269,6 +2269,22 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
                 log(s, b"[http] websocket upgraded");
+                // Release the buffer BEFORE anything is told the upgrade
+                // happened. `remaining == 0` already proves the 101 is fully
+                // sent, so these resets lose nothing — but announcing first
+                // does: a producer that greets its peer the moment it hears
+                // the connection opened can have its first frame queued into
+                // `send_buf` within this same tick, and zeroing afterwards
+                // discards it. The peer then waits out its handshake deadline
+                // for a greeting that was written and thrown away, and
+                // whether it happens at all depends on the step order inside
+                // the fan-out cycle.
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset = 0;
+                }
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_len = 0;
+                }
                 // The upgrade is committed: the frames on this connection are
                 // live from here. Reported once, and only for a connection
                 // that actually opened.
@@ -2282,12 +2298,6 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.ws_opened_sent = 1;
                     }
-                }
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.send_offset = 0;
-                }
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.send_len = 0;
                 }
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::WsActive;

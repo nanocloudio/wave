@@ -6,10 +6,13 @@ hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux", "wasm"]
 # WsFrame ↔ OctetStream adapter.
 #
 # Bridges between the WebSocket-frame envelope used by
-# `foundation/http`'s `ws_in` / `ws_out` ports and the raw byte stream
-# expected by transport-agnostic carriers such as
-# `foundation/remote_channel`. Lets any byte-stream module ride a
-# WebSocket without touching WS framing.
+# `foundation/http`'s `ws_in` / `ws_out` ports and a raw byte stream, so an
+# application module can ride a WebSocket without touching WS framing.
+#
+# Bytes only. A consumer that needs CONNECTIONS — one that binds a peer
+# identity to a session, `foundation/remote_channel` above all — takes
+# `net_proto` from `ws_net` instead: a byte stream says nothing about when a
+# session begins or ends, and a carrier must not assume it.
 #
 # Wire layout (mirrors `modules/foundation/http/server/ws.rs` ws_emit_fanout_frame):
 #   [conn_id u32 LE][opcode u8][fin u8][payload_len u16 LE][payload]

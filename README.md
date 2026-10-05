@@ -32,7 +32,7 @@ attributes here and ICE policy there.
         application bytes or records
                     |
                     v
-   Wave   http | websocket | ws_stream | rtp | sip | smtp | s3
+   Wave   http | websocket | ws_stream | ws_net | rtp | sip | smtp | s3
                     |
                     v
    fluxor  NetProto / mux  ->  IP/TCP/UDP · TLS · QUIC providers
@@ -50,6 +50,7 @@ and add no second ABI.
 | `http` | HTTP/1.1, HTTP/2 and HTTP/3 server and client; WebSocket upgrade; gRPC-over-HTTP/2 | rp2040 (H1 variants), rp2350, bcm2712 |
 | `websocket` | RFC 6455 HTTP/1.1 client: upgrade, verified accept, masked frames | bcm2712 |
 | `ws_stream` | `WsFrame` ⇄ `OctetStream` adapter for the server fan-out path | rp2350, bcm2712, linux, wasm |
+| `ws_net` | `net_proto` provider over the server fan-out path: connections, not just bytes | rp2350, bcm2712, linux, wasm |
 | `rtp` | RFC 3550 media endpoint, transmit and receive on one symmetric port; PCMU/G.711, H.264 and VP8 payloads, SRTP profiles, and a TURN relay path | rp2350, bcm2712 |
 | `sip` | RFC 3261 subset UAC/UAS for two-party PCMU voice — signalling only | rp2350, bcm2712 |
 | `jitter` | RTP reorder and loss-concealing playout adapter | rp2350, bcm2712 |
@@ -60,7 +61,7 @@ and add no second ABI.
 
 Roles are deliberately asymmetric: `http` is both server and client,
 `websocket`, `smtp` and `s3` are clients only, `ws_stream`,
-`mail` and `jitter` are adapters, `rtp`/`sip` are peer user agents,
+`mail` and `jitter` are adapters, `ws_net` is a transport provider, `rtp`/`sip` are peer user agents,
 and `stun` is a server. Nothing here promises a server for every protocol with a
 client. Targets are asymmetric too: the smallest silicon serves
 WebSocket without being able to dial one.

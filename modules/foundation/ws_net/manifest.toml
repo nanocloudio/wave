@@ -1,0 +1,82 @@
+version = "1.0.0"
+# timer_class: the closed-id grace interval reads wall-clock (dev_millis).
+timer_class = "wall_clock"
+hardware_targets = ["rp2350", "bcm2712", "linux", "wasm"]
+
+# `net_proto` over a server-side WebSocket.
+#
+# A WebSocket route is a place connections arrive, so this module is a
+# `net_proto` PROVIDER whose medium is `foundation/http`'s WebSocket fan-out:
+# the same contract `linux_net` implements for TCP and `tls` speaks on its
+# clear side. That is what lets a connection-bearing consumer —
+# `foundation/remote_channel` above all — ride a WebSocket with its session
+# semantics intact, rather than being handed a byte stream and having to
+# assume a session around it.
+#
+# `ws_stream` remains the adapter for consumers that want bytes and nothing
+# else. The difference is not framing, it is whether connections exist: this
+# module reports when one opens and closes, and that is precisely what a
+# carrier needs in order to bind a peer identity to a session.
+#
+# Flow:
+#   browser → http.ws_out → rx_in  (WsFrame)  → net_out (NetProto) → consumer
+#   consumer → net_in (NetProto) → tx_out (WsFrame) → http.ws_in  → browser
+#
+# Connection ids pass THROUGH. The `ws_frame` envelope's `conn` is the
+# transport connection id widened to u32, and `http` stamps it from the
+# `MSG_ACCEPTED` its own slot was opened with — so an id here is the same id
+# `tls` reported on `peer_identity` for that connection. Renumbering would
+# break exactly the join a consumer makes to bind an authenticated peer to a
+# session, which is the reason this module exists.
+#
+# What it does not do: dial. `CMD_CONNECT_TO` is answered `MSG_ERROR` ENOSYS
+# on the requester tag — a server-side WebSocket route has no outbound side,
+# and a provider that silently ignored a dial would leave its consumer
+# waiting out a deadline for a connection that was never attempted.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+
+[[ports]]
+name = "rx_in"
+index = 1
+direction = "input"
+content_type = "WsFrame"
+
+# `http.ws_event_out`: the committed lifecycle facts. A connection is
+# reported `MSG_ACCEPTED` when its upgrade is on the wire, not when it first
+# speaks — which is both what a `net_proto` provider does and the only order
+# that works. A consumer whose first act is to greet the peer would otherwise
+# wait for a frame while the peer waited for the greeting.
+[[ports]]
+name = "event_in"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+
+[[ports]]
+name = "tx_out"
+index = 1
+direction = "output"
+content_type = "WsFrame"
+
+# Module-scope observability. Optional 3rd output (out[2]); wired to
+# `observe.telemetry` when the debug stack's observe overlay is on. Emits
+# cumulative byte counters; no-op when unwired. See ../standards/observability.md.
+[[ports]]
+name = "telemetry"
+index = 2
+direction = "output"
+content_type = "Telemetry"
+
+[observability]
+# bytes_in  = payload delivered inbound as MSG_DATA (browser → consumer)
+# bytes_out = payload sent outbound from CMD_SEND (consumer → browser)
+metrics = ["bytes_in", "bytes_out"]
