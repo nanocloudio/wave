@@ -24,7 +24,8 @@ generations it serves:
 | Variant | Artefact | Features |
 | --- | --- | --- |
 | `full` (default) | `http.fmod` | h1, h2, ws, h3, app |
-| `exchange` | `http-exchange.fmod` | `full` plus the graph-driven client |
+| `exchange` | `http-exchange.fmod` | `full` plus the client as an exchange provider |
+| `h1_exchange` | `http-h1_exchange.fmod` | h1 and the client as an exchange provider, nothing else |
 | `h2` | `http-h2.fmod` | h1, h2, ws, app |
 | `app` | `http-app.fmod` | h1, app |
 | `web` | `http-web.fmod` | h1, ws |
@@ -56,11 +57,11 @@ shared request path — so it is worth doing against a specific flash target the
 | `ws_out` / `ws_in` | 2 / 3 | out / in | `WsFrame` | WebSocket fan-out (handler 5) |
 | `routes_sink` / `routes_changes` | 4 | out / in | `OctetStream` | Compiled-route subscription self-edge |
 | `listeners_sink` / `listeners_changes` | 5 | out / in | `OctetStream` | Dynamic-listener subscription self-edge |
-| `req_out` / `resp_in` | 6 | out / in | `HttpRequest` / `HttpResponse` | Application fan-out (handler 11) |
+| `request_out` / `response_in` | 6 | out / in | `ExchangeRequest` / `ExchangeResponse` | Application fan-out (handler 11): the server as exchange requester |
 | `ws_admit_out` / `ws_admit_in` | 7 | out / in | `OctetStream` | WebSocket admission request and decision |
 | `ws_event_out` | 8 | output | `OctetStream` | Committed WebSocket lifecycle facts |
-| `publish_in` | 8 | input | `OctetStream` | Graph-driven client requests (`exchange` variant) |
-| `reply_out` | 9 | output | `OctetStream` | Graph-driven client responses (`exchange` variant) |
+| `request_in` | 8 | input | `ExchangeRequest` | Requests for the client as exchange provider (`exchange`, `h1_exchange`) |
+| `response_out` | 9 | output | `ExchangeResponse` | Their answers, and LINK (`exchange`, `h1_exchange`) |
 | `peer_identity` | 9 | input | `OctetStream` | Verified peer from a mutual-TLS handshake |
 
 Indices are per direction, so an input and an output may share a number
@@ -72,13 +73,12 @@ what its deployment uses, and an unwired port is silent rather than an error.
 `mode` (0 server / 1 client), `port` (server: the listen port), `body`, `path`,
 `protocol`, `request_body`, `websocket`, `host_tcp`, `grpc`, then eight route blocks of
 `route_N_{path,body,handler,proxy_ip,proxy_port,source,content_type,fs_path,fs_list,fs_filter}`,
-and the high-tag set: `routes_prefix`, `listeners_prefix`, `content_type`,
-`surface_status`, each route's body ceiling `route_N_max_body_kib`, then the
-connection-lifetime set
+and the high-tag set: `routes_prefix`, `listeners_prefix`, each route's body
+ceiling `route_N_max_body_kib`, then the connection-lifetime set
 `header_timeout_ms`, `keepalive_idle_ms`, `pressure_idle_ms`, `stall_ms`,
 `ws_idle_ms`, and the client's `authority`.
-Tags are wire positions: append, never renumber; tags 4, 101, 120 and 121
-are retired.
+Tags are wire positions: append, never renumber; tags 4, 101, 102, 103, 120
+and 121 are unassigned.
 
 `authority` (parameter 112) is the client's one address: `host[:port]` — a
 DNS name, a dotted quad or a bracketed IPv6 literal, port 80 when it names
@@ -86,20 +86,7 @@ none. It is where the client connects (a name goes to the network provider
 as a name, for it to resolve), what a `tls` node in front verifies, and what
 every request carries verbatim as `Host:` / `:authority`. An authority that
 is not `host[:port]` refuses construction. Left empty, the client is OPEN:
-each exchange record names the authority it is for (below).
-
-Two shape the client's requests and its answers:
-
-- `content_type` labels a composed request body, or is left empty to send no
-  `Content-Type` at all. A server that accepts a typed body may refuse one that
-  arrives unlabelled.
-- `surface_status` decides what an upstream failure looks like on the exchange
-  surface. Left at zero, a response is a successful exchange whatever its
-  status, and an error body is the answer — which is what most consumers want.
-  Set, a status of 400 or above answers as a typed refusal carrying the code,
-  so a producer can retry a 503 and discard a 404 without parsing a payload
-  whose shape it does not know. A record that asked for the whole response
-  carries its own status, so it is answered with the response either way.
+each request's `host` header names the authority it is for (below).
 
 ## Connection lifetime
 
@@ -197,16 +184,21 @@ closes after its response, because the body was never read.
 ## Application fan-out
 
 `HANDLER_APP` (route key `app: true`) hands a matched request to a downstream
-graph node on `req_out` and serves what it answers on `resp_in`. The module
-keeps HTTP; the application keeps what the request means — the split
+graph node on `request_out` and serves what it answers on `response_in`. The
+module keeps HTTP; the application keeps what the request means — the split
 `docs/specification.md` draws.
 
-One exchange is one request and its response, and both are streamed as records
-of the contract in `modules/common/http_app.rs`: a HEAD, then BODY records
-while a body continues, each record naming its exchange by an id the module
-chooses and the application echoes. Every connection on every generation
-shares the one channel pair, so each direction runs on credit rather than on
-channel backpressure:
+The module is the REQUESTER of fluxor's exchange contract
+(`abi::contracts::exchange`) and the application its provider. One exchange is
+one request and its response, and both are streamed as records: a HEAD, then
+BODY records while a body continues, each record naming its exchange by a
+14-byte id the module packs (`[origin][0][conn u32][stream u64]`) and the
+application echoes. A request body already received whole that fits one record
+rides inline in the HEAD, which then ends the request; only a client waiting
+for `100 Continue`, or a body longer than a record, has its body follow on the
+application's credit. Every connection on every generation shares the one
+channel pair, so each direction runs on credit rather than on channel
+backpressure:
 
 - the module forwards request-body bytes only as the application grants them
   (CREDIT records), and stops reading the connection when the application
@@ -218,7 +210,9 @@ channel backpressure:
 
 Either side ends an exchange early with an ABORT carrying a reason: the module
 when the peer goes, a body is refused, or the server drains; the application
-when it cannot finish. A response that ends before the request does ends the
+when it cannot finish. An application whose own backend goes writes LINK DOWN,
+and every exchange it holds without a complete response is answered for it —
+502, or a cut-off response once one began. A response that ends before the request does ends the
 exchange: the module stops reading the body (h1 closes after the response, h2
 resets the stream with `NO_ERROR`, h3 asks the peer to stop sending).
 
@@ -235,9 +229,11 @@ is the length the GET would carry. On h2 and h3 END_STREAM ends the body and the
 application's header fields are sent lowercased, without the
 connection-specific ones those generations forbid.
 
-Envelope layouts, correlation, backpressure, streaming and the required
-`buffer_group:` on both edges are documented in
+Record layouts, correlation, backpressure and streaming are documented in
 [`docs/architecture/http_multiconn.md`](../../../docs/architecture/http_multiconn.md).
+The two edges are framed, so the build gives each a mailbox of its own; a graph
+wires `http.request_out -> app.request_in` and `app.response_out ->
+http.response_in` and nothing else.
 
 Behind the `app` feature, so the `web` variant does not carry it — an rp2350
 serving h1 from config should not pay for a handler that forwards to a module it
@@ -274,15 +270,58 @@ for mutual TLS means callers are reaching the application anonymous, which
 nothing at request level shows — the request succeeds, and the application
 simply never learns who made it.
 
-## Exchange delivery
+## The client as an exchange provider
 
-A terminal reply and its correlation remain resident until `reply_out` accepts
-that exact frame. Backpressure prevents the next request from being admitted.
-Drain refuses an in-flight request, preserves an already completed reply, closes
-the transport, and reports quiescence only after the reply is delivered. An
-unread reply holds a bounded amount of state; the module does not report a
-successful drain while discarding it. Applications still need idempotency for
-retries after transport or process failure.
+The `exchange` and `h1_exchange` variants make the client a PROVIDER of the
+exchange contract: a requester writes request records on `request_in`, the
+client performs each as an HTTP request, and answers on `response_out` under
+the requester's own exchange id. `client/provider.rs` states the conventions in
+full; in short:
+
+- **The request.** `method` is `METHOD_GET` … `METHOD_OPTIONS`; `CONNECT`,
+  `PUBLISH` and anything else are answered 400, as are the `BROADCAST`,
+  `WEBSOCKET` and `WEBTRANSPORT` flags. `target` is the request target,
+  `/path[?query]`, sent verbatim (empty means `/`). `headers` are `name:
+  value\r\n` lines sent as given — `content-type` among them — and must be
+  well-formed field lines naming no field this client frames the request with
+  (`connection`, `keep-alive`, `transfer-encoding`, `te`, `trailer`, `upgrade`,
+  `proxy-connection`, `expect`), or the request is answered 400 before any
+  connection opens. A `content-length` must equal the body's length; the
+  client writes its own. The body rides inline in the HEAD or follows in BODY
+  records under the credit the client grants at once for the rest of its
+  bound, and the request is performed once it is whole.
+- **Where it goes.** With `authority` set the client is PINNED: every request
+  is dialled there and sent with it as `Host` / `:authority`, and a request
+  whose `host` header names anything else (compared case-insensitively) is
+  answered 400. With `authority` empty the client is OPEN: each request's
+  `host` header names the `host[:port]` dialled and sent; a request without one
+  is 400, one past 128 bytes 413.
+- **The answer.** A response HEAD with the origin's status verbatim, its
+  `content-type` in the content-type field, and its header block without the
+  fields that framed it on the wire (`connection`, `keep-alive`,
+  `transfer-encoding`, `te`, `trailer`, `upgrade`, `proxy-connection`;
+  `content-length` stays). The body follows inline and in BODY records, never
+  past the requester's `resp_credit` plus its CREDIT grants; a response whole
+  in one read is answered in one HEAD.
+- **Refusals the client raises itself.** 400 for a request it will not perform,
+  413 past its bounds (path 1024, headers 1024, body 8192 bytes), 502 for an
+  origin that answers with something that does not parse or an open client's
+  failed connection, 503 while it holds as many requests as it takes or
+  drains, 504 for a deadline. After the HEAD has gone a failure is an ABORT.
+- **LINK.** A pinned client's origin is its backend link. A connection that
+  cannot be opened, or drops before a response completes, is reported LINK
+  DOWN instead of an answer: everything the client holds is unknowable, and
+  the requester issues it again after LINK UP. The client probes the origin
+  itself — 1 s, doubling to 30 s — and reports LINK UP once a connection opens.
+  Over HTTP/3 the link is the QUIC session the transport announces.
+- **Concurrency.** One request is performed at a time and one more collected
+  behind it; a third is answered 503. A requester ABORT closes the connection
+  under its exchange and nothing more is written for it. Drain answers what is
+  held 503 (or ABORTs a response under way) and reports done once nothing is
+  owed. Requests are never replayed automatically.
+
+The fluxor debug stack's OTLP export (`../fluxor/stacks/debug.toml`) is this provider
+behind `exchange_poster`, pinned to the collector's authority.
 
 ## HTTP/1 client response framing
 
@@ -301,17 +340,13 @@ limit. A trickled header does not restart its head deadline.
 
 ## HTTP/1 client connections
 
-The client speaks HTTP/1.1. `Host:` is the `authority` (parameter 112, up to
-128 bytes), verbatim. `method` (parameter 113) takes the same verb codes the
-request envelope carries, and defaults to GET.
+The client speaks HTTP/1.1. `Host:` is the authority of the connection in
+hand, verbatim. `method` (parameter 113) takes the exchange contract's method
+codes, and defaults to GET.
 
-An exchange record may end with the authority it is for. With `authority`
-set the client is pinned: a record naming nothing or the same bytes is
-performed there, and one naming anything else is refused as unroutable. With
-`authority` empty the client is open: it dials what each record names, keeps
-one connection, and a record for a different authority than the connection
-in hand closes that connection and dials the new one before the request goes
-out. A record naming nothing on an open client is refused.
+An open client keeps one connection and parks one more for the authority it
+was opened for, so alternating between two origins does not redial each time;
+a request for a third authority sets the one in hand aside and dials anew.
 
 `client_keep_alive` (parameter 114, default 0) lets one connection to an origin
 serve exchanges in sequence. Only a complete, reusable response returns its
@@ -323,8 +358,9 @@ closes at completion.
 
 ## HTTP/3 client requests
 
-An HTTP/3 request is composed from the same `path`, `body`, `content_type`,
-`authority` and `method` parameters, and the head/stall/total deadlines apply
+An HTTP/3 request is composed from the same `path`, `body`, `authority` and
+`method` parameters — or from a requester's request, its header lines sent as
+fields with lowercased names — and the head/stall/total deadlines apply
 unchanged. A configured field too large for its buffer fails the request rather
 than being truncated.
 
@@ -405,7 +441,7 @@ tunnel must outlive the 200 that opened it. Client frames must be masked
 (RFC 6455 §5.3), PING draws a PONG, and CLOSE ends the tunnel.
 
 **File and proxy routes over h3** are handed to the application, flagged
-`ROUTE_FILE` or `ROUTE_PROXY`, when one is wired to `req_out`: those handlers
+`ROUTE_FILE` or `ROUTE_PROXY`, when one is wired to `request_out`: those handlers
 thread more than a cursor through `server::cur_slot_mut` — file handles, relay
 connection state — and a graph that wants them over h3 serves them downstream.
 With no application wired, dispatch answers **501** and names the handler: not

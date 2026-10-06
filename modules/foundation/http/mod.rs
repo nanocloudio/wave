@@ -74,7 +74,7 @@
 //! | 8  | fs_list | List a directory as one-shot JSON, built at request time |
 //! | 9  | websocket_session | Fan-out with per-session isolation — no replay across sessions |
 //! | 10 | grpc | gRPC unary: length-prefixed message echo + `grpc-status: 0` trailer |
-//! | 11 | app | Hand the request to a downstream module via `req_out`/`resp_in` |
+//! | 11 | app | Hand the request to a downstream module via `request_out`/`response_in` |
 //!
 //! WebSocket and HTTP routes share the same TCP/TLS listen socket: the
 //! connection arrives, the request is parsed as HTTP/1, and routes
@@ -106,8 +106,7 @@
 //! | 91    | listeners_prefix | str | (none) | Store prefix for dynamic listeners               |
 //! | 100   | h3          | u8   | 0       | Serve HTTP/3 over the `mux` contract                |
 //! | 101   | —           | —    | —       | retired                                             |
-//! | 102   | content_type | str | (none)  | `Content-Type` of a composed client request         |
-//! | 103   | surface_status | u8 | 0      | Exchange: answer 400+ as a typed refusal            |
+//! | 102-103 | —         | —    | —       | unassigned                                          |
 //! | 104   | header_timeout_ms | u32 | 10000 | Close a connection with no complete head (0 = off) |
 //! | 105   | keepalive_idle_ms | u32 | 60000 | Close a keepalive with no next request (0 = off)   |
 //! | 106   | pressure_idle_ms | u32 | 2000  | Keepalive limit once the table is ¾ full (0 = off)  |
@@ -151,39 +150,12 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// The application records `HANDLER_APP` exchanges ride (`server/app.rs`):
-// one contract for every generation, shared with the modules that answer.
-#[cfg(not(feature = "host-test"))]
-#[path = "../../common/http_app.rs"]
-pub(crate) mod http_app;
-#[cfg(feature = "host-test")]
-#[path = "../../common/http_app.rs"]
-pub mod http_app;
-
-// The ordered-ack exchange surface. Mounted unconditionally, not behind the
-// `exchange` feature: the sizes it anchors (`PAYLOAD_MAX`) bound buffers in
-// every variant, and gating the definition would mean gating every consumer
-// of a shared size too. Unused items are dropped by `--gc-sections`.
-//
-// Spliced with `include!` rather than mounted with `#[path]`, for the same
-// reason `runtime.rs` above is: rustfmt follows a `#[path]` module into the
-// generated tree and reports it as unformatted, and `fluxor build` re-syncs
-// that file from the published pin on every build — so formatting it is a
-// change that cannot stick. `include!` is not followed, and the contract is
-// self-contained (it names nothing outside `core`).
-#[allow(dead_code, reason = "each variant consumes a subset of the surface")]
-mod exchange {
-    include!("../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs");
-}
-
-// What goes inside that surface's payload when the destination is this
-// connector: the request and reply records and the method vocabulary.
-// Mounted once here and re-exported where it is used, so the client and
-// the wire layer read one definition.
-#[allow(dead_code, reason = "each variant consumes a subset of the surface")]
-mod http_exchange {
-    include!("../../../target/fluxor/fluxor-abi/sdk/contracts/net/http_exchange.rs");
-}
+// The exchange contract: the records every request and its answer travel in.
+// This module speaks it in both roles — as the REQUESTER toward the application
+// behind a `HANDLER_APP` route (`server/app.rs`), and as the PROVIDER a graph
+// asks through the client (`client/provider.rs`). Mounted once by the SDK and
+// named here so the server, the client and the wire layer read one definition.
+pub(crate) use abi::contracts::exchange;
 
 // `pub` under host-test only, matching how `server` is exposed: the suites are
 // separate crates and need real `pub` to reach in, while the firmware links one
@@ -356,21 +328,9 @@ mod params_def {
     // 101 is unassigned. The body ceiling is each route's own
     // (`route_N_max_body_kib`, 122-129).
 
-    // `Content-Type` for a composed client request; empty omits the header.
-    102, content_type, str, 0 => |s, d, len| {
-        let n = len.min(s.client.content_type.len());
-        let mut i = 0usize;
-        while i < n {
-            s.client.content_type[i] = *d.add(i);
-            i += 1;
-        }
-        s.client.content_type_len = n as u16;
-    };
-
-    // Answer an exchange whose response is 400 or above as a typed refusal
-    // carrying the code, rather than as a success carrying the error body.
-    103, surface_status, u8, 0
-        => |s, d, len| { s.client.surface_status = p_u8(d, len, 0, 0); };
+    // 102 and 103 are unassigned. A graph-driven request carries its own
+    // `content-type` among its headers, and its answer carries the origin's
+    // status as it is.
 
     // ── Connection lifetime (server) ──
     //
@@ -409,7 +369,7 @@ mod params_def {
     // `host[:port]`: where the client connects, what the transport in front
     // verifies, and what goes on the wire as `Host:` / `:authority`, all one
     // value. Port 80 when it names none. Empty leaves the client OPEN to the
-    // authority each exchange record names.
+    // authority each request's `host` header names.
     112, authority, str, 0 => |s, d, len| {
         // Held whole or not at all. An over-long one is marked and refused at
         // construction rather than trimmed to fit: the trim would name a
@@ -864,17 +824,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         let rc = if s.mode == MODE_CLIENT {
-            // Graph-driven client: take the next request off `publish_in`
-            // before stepping, so an idle client picks work up promptly and a
-            // busy one is left alone until it has answered.
+            // Graph-driven client: read `request_in` and place what is owed on
+            // `response_out` every step, then start the next request when the
+            // phase machine is free, so an idle client picks work up promptly
+            // and a busy one still hears its requester's credit and aborts.
             #[cfg(feature = "exchange")]
-            if client::exchange::armed(s) {
-                client::exchange::flush_reply(s);
-                if client::exchange::pending(s) {
-                    return 0;
-                }
+            if client::provider::armed(s) {
+                client::provider::service(s);
                 if s.client.draining != 0 {
-                    client::exchange::fail(s);
+                    client::provider::drain(s);
                     #[cfg(feature = "h3")]
                     let closed = if s.h3_mode != 0 {
                         client::h3::close_session(s)
@@ -883,29 +841,44 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     };
                     #[cfg(not(feature = "h3"))]
                     let closed = client::send_close_frame(s);
-                    return if closed && !client::exchange::busy(s) {
+                    return if closed && client::provider::quiet(s) {
                         1
                     } else {
                         0
                     };
                 }
-                if s.h3_mode == 0 {
-                    if s.client.protocol == 0 {
-                        client::h1::idle(s);
-                    } else {
-                        // h2 has no idle step of its own, and an armed client
-                        // with nothing in flight returns below without ever
-                        // reaching one. Its share of a fanned lane still has
-                        // to be drained, so do the part that is true whatever
-                        // the protocol.
-                        client::drain_unowned(s);
+                if !client::provider::busy(s) && !client::provider::probing(s) {
+                    #[cfg(feature = "h3")]
+                    if s.h3_mode != 0 {
+                        client::h3::idle(s);
+                    }
+                    if s.h3_mode == 0 {
+                        if s.client.protocol == 0 {
+                            client::h1::idle(s);
+                        } else {
+                            // h2 has no idle step of its own, and an armed client
+                            // with nothing in flight returns below without ever
+                            // reaching one. Its share of a fanned lane still has
+                            // to be drained, so do the part that is true whatever
+                            // the protocol.
+                            client::drain_unowned(s);
+                        }
+                    }
+                    // A connection kept for reuse must be idle before another
+                    // request goes on it.
+                    let held = s.client.conn_present != 0
+                        && (s.client.keep_alive == 0
+                            || s.client.phase != client::Phase::Done
+                            || !s.client.response.reusable);
+                    if held || !client::provider::start(s) {
+                        tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
+                        return 0;
                     }
                 }
-                let _ = client::exchange::poll_request(s);
-                if client::exchange::pending(s) {
-                    return 0;
-                }
-                if !client::exchange::busy(s) {
+                // A probe of a lost link is a TCP connection and nothing more,
+                // whichever generation the requests then ride.
+                if client::provider::probing(s) {
+                    let _ = client::h1::step(s);
                     tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
                     return 0;
                 }
@@ -916,6 +889,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             #[cfg(feature = "h3")]
             if s.h3_mode != 0 {
                 let r = client::h3::step_mux_client(s);
+                #[cfg(feature = "exchange")]
+                let r = if client::provider::armed(s) {
+                    client::provider::flush_partial(s);
+                    0
+                } else {
+                    r
+                };
                 tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
                 return r;
             }
@@ -934,12 +914,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 client::h1::step(s)
             };
+            // Whatever the generation came to, the requester is answered: the
+            // response ends, or the failure is reported, and a record still
+            // composing goes out rather than waiting for a fuller one.
             #[cfg(feature = "exchange")]
-            let r = if client::exchange::armed(s) {
-                if r < 0 {
+            let r = if client::provider::armed(s) {
+                if r < 0 || s.client.phase == client::Phase::Error {
                     s.client.phase = client::Phase::Error;
-                    client::exchange::fail(s);
+                    client::provider::fail(s, s.client.fail_cause);
+                } else if s.client.phase == client::Phase::Done {
+                    let _ = client::provider::end(s);
                 }
+                client::provider::flush_partial(s);
                 0
             } else {
                 r

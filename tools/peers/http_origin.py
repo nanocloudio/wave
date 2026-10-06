@@ -9,7 +9,7 @@ back. Recording every line, not just the request line, is what lets a test
 assert on a header the graph sent.
 
 Binds the port it is given and serves until killed, so a graph that dials it
-more than once — a retry, a second publish — is answered every time rather
+more than once — a retry, a second request — is answered every time rather
 than seeing a closed port on the second attempt.
 
     http_origin.py <outfile> <port>

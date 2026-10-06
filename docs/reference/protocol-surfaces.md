@@ -13,7 +13,7 @@ surface as a port content type.
 | `FmpMessage` | Structured control records | `http` (`variables`), `sip` (`call`) |
 | `Telemetry` | Observability records | `ws_stream` |
 | `AudioEncoded` | Codec-domain audio access units | not consumed — see below |
-| `HttpRequest` / `HttpResponse` | The application exchange records (`modules/common/http_app.rs`) | `http` (`req_out`/`resp_in`), `s3` (`request_in`/`response_out`: the client side of the same records) |
+| `ExchangeRequest` / `ExchangeResponse` | The exchange records (`abi::contracts::exchange`): one request and its answer | `http` as requester (`request_out`/`response_in`) and as client provider (`request_in`/`response_out`), `s3`, `s3_serve`, `smtp` (`request_in`/`response_out`), `http_echo_app` and `s3_relay_app` (fixtures) |
 | `TextPlain` | Human-readable status lines | `s3` (`status_out`) |
 
 Two surfaces are carried over ports rather than declared as port
@@ -23,11 +23,10 @@ the same `net_in`/`net_out` it uses for h1 and h2. Datagram framing
 (`DG_AF_INET`) is how `rtp` and `sip` address UDP peers through
 their transport ports.
 
-The `SmtpRequest` and `SmtpResult` records on `smtp`'s `request_in`
-and `result_out` ports are Wave-local layouts, not fluxor content
-types: the ports declare `OctetStream` and document the record framing
-in the module manifest, and `smtp`'s `status_out` is likewise
-`OctetStream`.
+`smtp` answers its exchanges with an `SmtpResult` body
+(`modules/common/smtp_wire.rs`), a Wave-local layout carried inside the
+exchange records rather than a content type of its own; `smtp`'s
+`status_out` is `OctetStream`.
 
 `stun` speaks the datagram surface directly rather than a local
 record layout: a Binding request arrives as one datagram and is

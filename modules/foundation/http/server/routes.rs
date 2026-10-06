@@ -74,9 +74,9 @@ pub(crate) const HANDLER_GRPC: u8 = 10;
 /// Hand the request to a downstream module and serve whatever it returns.
 ///
 /// The counterpart to `HANDLER_WEBSOCKET_FANOUT` for ordinary request/response
-/// HTTP: the request goes out on `req_out` as an `HttpRequest` envelope and the
-/// answer comes back on `resp_in` as an `HttpResponse`, correlated by
-/// `(conn_id, stream_id)`. This module keeps owning HTTP; the application keeps
+/// HTTP: the request goes out on `request_out` as exchange request records and
+/// the answer comes back on `response_in` as exchange response records,
+/// correlated by an exchange id packing `(transport, conn_id, stream_id)`. This module keeps owning HTTP; the application keeps
 /// owning what the request means.
 ///
 /// Method-AGNOSTIC by design, and for the same reason `HANDLER_GRPC` is: the

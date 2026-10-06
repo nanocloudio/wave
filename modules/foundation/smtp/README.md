@@ -1,13 +1,14 @@
 # `smtp` — RFC 5321 mail submission client
 
 A connector for outbound mail **submission** only. The protocol logic lives in
-the host-tested `modules/common/smtp_core.rs` and the record layouts in
+the host-tested `modules/common/smtp_core.rs` and the result layout in
 `modules/common/smtp_wire.rs`; this module is the I/O pump around them. Message
 meaning — who sends, what is in the body, what a bounce means — is Conclave's;
 the wire mechanics are Wave's.
 
-Submissions arrive as records and are answered one for one, so a single
-long-running instance submits many messages without its graph being rebuilt.
+Submissions arrive as exchange requests and are answered one for one — the
+module is a PROVIDER of fluxor's exchange contract — so a single long-running
+instance submits many messages without its graph being rebuilt.
 
 ## Why it is a compiled module and not a codec
 
@@ -32,41 +33,77 @@ else: it must own the connection lifecycle and drive the transport itself.
 | `net_in` | 0 | input | `OctetStream` | `NET_MSG_*` transport events |
 | `net_out` | 0 | output | `OctetStream` | `NET_CMD_CONNECT_TO` / `SEND` / `CLOSE` |
 | `status_out` | 1 | output | `OctetStream` | One human-readable status line per submission |
-| `request_in` | 1 | input | `OctetStream` | `SmtpRequest` submissions |
-| `result_out` | 2 | output | `OctetStream` | Exactly one `SmtpResult` per submission |
+| `request_in` | 1 | input | `ExchangeRequest` | Submissions |
+| `response_out` | 2 | output | `ExchangeResponse` | Exactly one answer per submission, its body an `SmtpResult` |
 
 ### Submissions and results
 
-An `SmtpRequest` carries a caller-chosen correlation id, the envelope sender,
-one recipient, and a span of the message. A message larger than one record
-continues over further records under the same id, and neither this module nor
-its caller holds the whole message in a buffer. One request carries one
-recipient: a message to several recipients is several submissions, which keeps
-every result recipient-scoped, since a server refusing one recipient says
-nothing about another.
+A submission is an exchange request:
 
-Every accepted submission is answered with exactly one `SmtpResult`, carrying
-the correlation id, an outcome classification a retry policy can act on, the
-phase the conversation reached, the final reply code with its RFC 3463 enhanced
-status and bounded text, and the peer address the message was submitted to. A
-result the channel cannot take yet is retained and offered again, so transient
-output pressure never loses one.
+- **HEAD** — method `POST`; `target` the one recipient mailbox
+  (`rcpt@example.test`, at most 256 bytes); a `mail-from: <sender>` header
+  naming the envelope sender (at most 256 bytes); the message — its header
+  block and body, as they go after `DATA` — as the body. The body rides inline
+  when it fits; MORE says BODY records follow.
+- **BODY** — more of the message, never past the credit this module grants:
+  the rest of its 8176-byte chunk at once, then each chunk's worth again as it
+  reaches the wire. Neither this module nor its caller holds a whole message.
+- **CREDIT** — response credit for the answer's body.
+- **ABORT** — the caller gives up the submission: the conversation is closed
+  where it stands and nothing more is written for it.
 
-The outcome classification distinguishes acceptance, a permanent refusal (5xx),
-a transient refusal (4xx), a protocol error, a failed connect, a timeout, a
-connection lost mid-conversation, a cancelled submission, a request that could
-not be used, and credentials that were configured but could not be sent. It states what the protocol showed and stops there: none of
-those values claims a person received or read anything.
+One request carries one recipient: a message to several recipients is several
+submissions, which keeps every result recipient-scoped, since a server refusing
+one recipient says nothing about another. One submission is performed at a
+time; a second arriving meanwhile is answered `503`, and may be repeated.
+
+Every submission is answered exactly once, under the requester's exchange id.
+The answer's status says who decided: `200` when the relay gave its verdict —
+accepted, or refused permanently or for now, or a reply out of sequence, or
+credentials that could not be sent; `502` when the relay could not be reached
+or dropped the connection before deciding; `504` when it stopped answering. A
+request this module will not perform is answered `400` (not POST, no
+recipient or no `mail-from`) or `413` (a recipient or sender past 256 bytes)
+with no body, before any connection opens.
+
+The body of every other answer is an `SmtpResult` (multi-byte fields
+little-endian; offsets in bytes):
+
+| Offset | Width | Field |
+| --- | --- | --- |
+| 0 | 1 | `op`, always `0x6F` |
+| 1 | 1 | `outcome` (below) |
+| 2 | 1 | `phase`: how far the conversation got (`smtp_core::smtp_phase_code`) |
+| 3 | 2 | `code`: the final reply code |
+| 5 | 1 | enhanced status class (`0` when the reply carried none) |
+| 6 | 2 | enhanced status subject |
+| 8 | 2 | enhanced status detail |
+| 10 | 4 | `peer_ip`: the relay's v4 address, zero when the authority is a name |
+| 14 | 2 | `peer_port` |
+| 16 | 2 | `text_len` |
+| 18 | `text_len` | the reply text, at most 256 bytes |
+
+`outcome` is `0` accepted, `1` refused permanently (5xx), `2` refused for now
+(4xx), `3` a protocol error, `4` the connection could not be opened, `5` a
+deadline passed, `6` the connection closed before a terminal reply, `9`
+credentials configured but not sendable. The answer's body goes only as far
+as the requester's response credit: whole in the HEAD when the credit covers
+it, and otherwise the HEAD first with MORE and the result once credit arrives.
+An answer the channel cannot take yet is retained and offered again, so
+transient output pressure never loses one.
+
+The outcome classification states what the protocol showed and stops there:
+none of its values claims a person received or read anything.
 
 **The 250 answering end-of-data is the acceptance.** From that moment the server
 holds the message, and the QUIT that follows is graceful cleanup. A QUIT that
 fails, times out, or never completes does not un-accept it — reporting otherwise
 would have a caller submit the message again and deliver it twice.
 
-`status_out` carries a short human-readable line. It cannot express a
-correlation id, a reply code, or an enhanced status, so anything driving
-submissions consumes `result_out` instead; `status_out` suits a graph whose
-outcome a person reads.
+`status_out` carries a short human-readable line. It cannot express a reply
+code or an enhanced status, so anything driving submissions consumes
+`response_out` instead; `status_out` suits a graph whose outcome a person
+reads.
 
 ## Parameters
 
@@ -83,9 +120,10 @@ outcome a person reads.
 | 9 | `authority` | `host[:port]`, port 25 when it names none: the relay to dial. A name goes to the network provider as a name, for it to resolve. At most 128 bytes; absent, longer, or not `host[:port]` refuses construction |
 
 Params describe a single submission. When an envelope is configured, that
-submission is performed once at startup as if its record had arrived — which is
-all a graph whose only job is one message needs. A connector leaves them unset
-and drives `request_in` instead.
+submission is performed once at startup as if its request had arrived — with
+nobody to answer, so its outcome is the status line alone, which is all a
+graph whose only job is one message needs. A connector leaves them unset and
+drives `request_in` instead.
 
 ## Timing
 
@@ -144,8 +182,8 @@ failure modes a result has to describe, and nothing needs it yet.
 
 The module's behavioural contract: silence until the 220 greeting; the
 conversation advanced exactly once per reply however the bytes are split across
-transport reads; exactly one result per accepted submission, retained until the
-channel takes it; acceptance decided at end-of-data and never revisited;
+transport reads; exactly one answer per submission, retained until the channel
+takes it; acceptance decided at end-of-data and never revisited;
 transparency encoding correct across a record boundary; and commands that a real
 MTA (Exim) parses as byte-legal.
 

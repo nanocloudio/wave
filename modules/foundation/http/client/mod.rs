@@ -9,12 +9,10 @@
 // Per-generation front ends onto this core, one file each — the same shape as
 // `super::server`. `h3` rides Fluxor's `mux` contract rather than net_proto, so
 // it shares this core's shape but not its `ClientState`.
-#[cfg(feature = "exchange")]
-pub(crate) mod exchange;
 #[cfg(not(feature = "host-test"))]
 pub(crate) mod h1;
 // Exposed under host-test so the harness can unit-test the status-line
-// parser feeding `surface_status`; the firmware symbol surface is unchanged.
+// parser; the firmware symbol surface is unchanged.
 #[cfg(feature = "host-test")]
 pub mod h1;
 #[cfg(feature = "h2")]
@@ -23,6 +21,10 @@ pub(crate) mod h2;
 pub(crate) mod h3;
 #[cfg(all(feature = "h3", feature = "host-test"))]
 pub mod h3;
+// The client as an exchange provider: requests from `request_in`, answers on
+// `response_out`.
+#[cfg(feature = "exchange")]
+pub(crate) mod provider;
 
 use super::connection::{
     net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
@@ -55,63 +57,30 @@ pub(crate) const MAX_PATH_LEN: usize = 1024;
 /// Smallest default body-output ring declared in the module manifest.
 pub(crate) const OUTPUT_CHUNK: usize = 256;
 
-/// One framed chunk of an extended body. Larger than `OUTPUT_CHUNK`, which
-/// bounds the raw stream of the one-shot client, because a framed chunk
-/// carries its own length and the port it goes to was sized for it.
-pub(crate) const EXT_CHUNK: usize = 1024;
 pub(crate) const AUTHORITY_MAX: usize = 128;
 
 /// Headers a graph-driven request may carry. Bounded like everything else on
 /// this path: a caller that needs more than this is composing a different
-/// request, not a longer one. The block a RESPONSE is answered with is a
-/// separate bound, `wire::response::RESPONSE_HEAD_MAX`.
+/// request, not a longer one. Past it the request is answered 413.
 #[cfg(feature = "exchange")]
 pub(crate) const REQUEST_HEADERS_MAX: usize = 1024;
 #[cfg(not(feature = "exchange"))]
 pub(crate) const REQUEST_HEADERS_MAX: usize = 0;
 
 /// Scratch for the composed request HEAD. Derived from the bounds it has to
-/// hold — the path, the authority, the content type and a caller's own header
-/// block — never chosen independently: `write_request_head` fails closed when
-/// the head does not fit, so a buffer too small for the longest admissible
-/// request would refuse one this client had already accepted.
-pub(crate) const REQUEST_BUF_SIZE: usize =
-    MAX_PATH_LEN + AUTHORITY_MAX + CONTENT_TYPE_MAX + REQUEST_HEADERS_MAX + 192;
+/// hold — the path, the authority and a caller's own header block — never
+/// chosen independently: `write_request_head` fails closed when the head does
+/// not fit, so a buffer too small for the longest admissible request would
+/// refuse one this client had already accepted.
+pub(crate) const REQUEST_BUF_SIZE: usize = MAX_PATH_LEN + AUTHORITY_MAX + REQUEST_HEADERS_MAX + 192;
 
 /// One-shot param client: a small body configured at build time.
 #[cfg(not(feature = "exchange"))]
 pub(crate) const REQUEST_BODY_SIZE: usize = 256;
-
-/// Longest `Content-Type` a composed request will carry. Ample for the
-/// registered media types plus parameters; a longer value is truncated at this
-/// bound like every other string param here.
-pub(crate) const CONTENT_TYPE_MAX: usize = 64;
-/// Graph-driven client: a body the graph supplies, at the contract's ceiling.
+/// Graph-driven client: a body the graph supplies, at the contract's ceiling
+/// for a request collected whole.
 #[cfg(feature = "exchange")]
 pub(crate) const REQUEST_BODY_SIZE: usize = super::exchange::PAYLOAD_MAX;
-
-/// Exchange sizes come from the contract, not from numbers chosen here: the
-/// surface names one payload ceiling so a producer can stay under it, and a
-/// response above it is answered with a typed OVERSIZE refusal rather than
-/// truncated.
-#[cfg(feature = "exchange")]
-pub(crate) use super::exchange::{
-    KEY_MAX as EXCHANGE_KEY_MAX, PAYLOAD_MAX as EXCHANGE_REPLY_MAX, PUBLISH_FRAME_MAX,
-    REPLY_FRAME_MAX,
-};
-
-/// Staging for one frame in either direction, envelope included.
-///
-/// One buffer serves both: a publish is decoded out of it before a reply is
-/// composed into it, so the two are never live together. Sized to whichever
-/// frame is larger — they are equal today, and taking the max keeps that a
-/// fact the code checks rather than one a reader has to.
-#[cfg(feature = "exchange")]
-pub(crate) const EXCHANGE_STAGE_SIZE: usize = 3 + if PUBLISH_FRAME_MAX > REPLY_FRAME_MAX {
-    PUBLISH_FRAME_MAX
-} else {
-    REPLY_FRAME_MAX
-};
 
 pub(crate) const CONNECT_TIMEOUT_MS: u64 = 10_000;
 
@@ -124,6 +93,21 @@ pub(crate) const E_WRITE_FAILED: i32 = -34;
 /// Construction refused: the `authority` parameter is unusable — not
 /// `host[:port]`, or longer than [`AUTHORITY_MAX`].
 pub(crate) const E_BAD_AUTHORITY: i32 = -22;
+
+// ── Why an exchange failed ────────────────────────────────────────────────
+//
+// Set where a failure is seen, into `fail_cause`; the exchange provider reads
+// it to pick the answer a requester gets.
+
+/// The origin answered with something that does not parse, or the request
+/// could not be composed.
+pub(crate) const CAUSE_PEER: u8 = 0;
+/// No connection to the origin could be opened.
+pub(crate) const CAUSE_CONNECT: u8 = 1;
+/// The connection dropped before the response completed.
+pub(crate) const CAUSE_LINK: u8 = 2;
+/// A deadline passed.
+pub(crate) const CAUSE_TIMEOUT: u8 = 3;
 
 // ── Phase machine ─────────────────────────────────────────────────────────
 
@@ -193,13 +177,13 @@ pub(crate) struct ClientState {
     /// The `authority` parameter, `host[:port]`: where this client connects,
     /// what the transport in front verifies, and what every request carries
     /// verbatim as `Host:` / `:authority`. Empty means the client is OPEN:
-    /// each exchange record names the authority it is for.
+    /// each request's `host` header names the authority it is for.
     pub(crate) authority: [u8; AUTHORITY_MAX],
     pub(crate) authority_len: u16,
     /// The authority of the connection in hand — dialled, being dialled, or
     /// about to be. Equal to `authority` on a pinned client; on an open one
-    /// it is the record's, and a record naming another marks the connection
-    /// stale so the next dial goes where that record asked.
+    /// it is the request's `host`, and a request naming another marks the
+    /// connection stale so the next dial goes where that request asked.
     pub(crate) conn_authority: [u8; AUTHORITY_MAX],
     pub(crate) conn_authority_len: u16,
     pub(crate) request_invalid: u8,
@@ -210,24 +194,13 @@ pub(crate) struct ClientState {
     /// complete. Zero before that, and for a status line this parser will not
     /// read — a refusal is never minted from a guess. Cleared per exchange.
     pub(crate) last_status: u16,
-    /// `surface_status` (param 103): when non-zero, an exchange whose response
-    /// carries a status of 400 or above answers as `REFUSE_UPSTREAM` with the
-    /// code as its payload, rather than as a successful exchange carrying the
-    /// error body.
-    ///
-    /// Opt-in, because for most consumers an error body IS the answer. It is
-    /// worth arming where the producer must act on the class of failure —
-    /// retrying a 503 or a 429, discarding a permanent 4xx — which it cannot
-    /// decide from a payload whose shape it does not know.
-    pub(crate) surface_status: u8,
-    /// `Content-Type` for the composed request (param 102), or empty to omit
-    /// the header entirely.
-    ///
-    /// A server that accepts a typed body is entitled to refuse one that
-    /// arrives unlabelled, so a graph POSTing a concrete format — protobuf,
-    /// say — sets this and a graph POSTing nothing does not.
-    pub(crate) content_type: [u8; CONTENT_TYPE_MAX],
-    pub(crate) content_type_len: u16,
+    /// Why the exchange in flight failed, when it does: a `CAUSE_*`, set
+    /// where the failure is seen and read by the provider to pick the
+    /// answer. Cleared per exchange.
+    pub(crate) fail_cause: u8,
+    /// The peer closed the connection in hand (h2): nothing more arrives on
+    /// it, so a response still waiting for bytes has failed.
+    pub(crate) peer_closed: u8,
 
     pub(crate) phase: Phase,
     pub(crate) headers_done: u8,
@@ -298,68 +271,12 @@ pub(crate) struct ClientState {
     /// wire as. Empty for a request composed from params.
     pub(crate) request_headers: [u8; REQUEST_HEADERS_MAX],
     pub(crate) request_headers_len: u16,
-    /// Whether the request in flight asked to be answered with the whole
-    /// response -- its status and headers -- rather than with its body alone.
-    pub(crate) exchange_extended: u8,
-    /// Whether the head of that response has already been answered.
-    ///
-    /// An extended exchange answers as soon as the head is known, not when
-    /// the body ends: a consumer building a response needs the status before
-    /// it can decide what to do with the bytes, and one that waits for the
-    /// body before learning the status cannot stream at all -- it must hold
-    /// the whole of it first, which is the bound this exists to remove.
-    pub(crate) exchange_head_sent: u8,
-    /// Whether the zero-length chunk that ends the body has been written.
-    pub(crate) exchange_terminated: u8,
-    /// One framed chunk of an extended body, and how much of it has left.
-    ///
-    /// A channel may take part of a write, and the raw stream handles that by
-    /// advancing. A framed chunk cannot: rewriting it from the start after a
-    /// short write puts its prefix on the wire twice, and a reader counting
-    /// lengths then reads everything after it wrong. So the frame is composed
-    /// once and sent from where it got to.
-    pub(crate) ext_frame: [u8; EXT_CHUNK],
-    pub(crate) ext_len: u16,
-    pub(crate) ext_sent: u16,
 
-    // ── Exchange mode (`stream.ordered_ack` with `reply = "yes"`) ──
-    //
-    // An exchange serves many requests over time, each arriving on a channel
-    // and each answered by correlation id. These fields hold the request in
-    // flight; the phase machine that performs it is the same one a param
-    // client uses, re-armed per request rather than duplicated.
-    /// in[8]: `publish_in`, where requests arrive.
+    /// The exchange provider: `request_in` / `response_out` and the exchange
+    /// in flight. The phase machine that performs a request is the same one
+    /// a param client uses, re-armed per request rather than duplicated.
     #[cfg(feature = "exchange")]
-    pub(crate) exchange_in_chan: i32,
-    /// out[9]: `reply_out`, where answers leave.
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_out_chan: i32,
-    /// Correlation id of the request in flight; 0 when idle.
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_corr: u64,
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_pending: u16,
-    /// The request's `msg_key`, echoed unchanged on the reply so a downstream
-    /// stage can rejoin without holding state.
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_key: [u8; EXCHANGE_KEY_MAX],
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_key_len: u16,
-    /// Response body accumulated across `RecvBody` chunks. A reply is ONE
-    /// frame, so it cannot stream the way `file_ctrl` does.
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_reply: [u8; EXCHANGE_REPLY_MAX],
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_reply_len: u16,
-    /// Set when the response outgrew `EXCHANGE_REPLY_MAX`; the reply becomes
-    /// a typed refusal instead of a truncated body.
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_oversize: u8,
-    /// Staging for one frame in either direction. Its own buffer because a
-    /// frame at the ceiling does not fit in `recv_buf`, which is holding the
-    /// response while the reply is being composed.
-    #[cfg(feature = "exchange")]
-    pub(crate) exchange_stage: [u8; EXCHANGE_STAGE_SIZE],
+    pub(crate) ex: provider::Provider,
 }
 
 // ClientState lives inside HttpState, which the kernel allocates as a
@@ -393,10 +310,7 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.client.parked_authority_len = 0;
     s.client.authority_oversize = 0;
     s.client.request_invalid = 0;
-    s.client.content_type = [0; CONTENT_TYPE_MAX];
-    s.client.content_type_len = 0;
     s.client.last_status = 0;
-    s.client.surface_status = 0;
     s.client.phase = Phase::Init;
     s.client.client_header_ms = 15000;
     s.client.client_stall_ms = 15000;
@@ -448,7 +362,7 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) -> i32 {
     }
 
     #[cfg(feature = "exchange")]
-    exchange::init(s);
+    provider::init(s);
 
     log(s, b"[http] client configured");
     0
@@ -505,7 +419,6 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
         &wire::h1::RequestOptions {
             authority: &s.client.conn_authority[..s.client.conn_authority_len as usize],
             body_len: s.client.request_body_len as usize,
-            content_type: &s.client.content_type[..s.client.content_type_len as usize],
             http11: true,
             keep_alive: s.client.keep_alive != 0,
         },
@@ -513,10 +426,9 @@ pub(crate) unsafe fn build_request(s: &mut HttpState) -> bool {
     // A caller's own headers go in ahead of the blank line that ends the
     // head, which is the only place they can go and still be headers. Their
     // bytes therefore decide where the head ends and what the origin reads as
-    // framing, so a block is admitted only after the record parser
-    // (the `http_exchange` contract) has read it as field lines naming
-    // nothing this module writes itself. The param client sets no block, so
-    // its length here is structurally 0.
+    // framing, so a block is admitted only after the provider has read it as
+    // field lines naming nothing this module writes itself. The param client
+    // sets no block, so its length here is structurally 0.
     let extra = s.client.request_headers_len as usize;
     if len > 0 && extra > 0 {
         if len + extra > REQUEST_BUF_SIZE {

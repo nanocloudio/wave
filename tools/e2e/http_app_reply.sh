@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # THE APPLICATION FAN-OUT'S REPLY HALF, END TO END.
 #
-# `http` terminates the connection and hands the request to a module over
-# `req_out`; that module answers on `resp_in` and the gateway composes the
-# response. This is the shape every application graph is built on — an identity
+# `http` terminates the connection and hands the request to a module as an
+# exchange on `request_out`; that module answers on `response_in` and the
+# gateway composes the response. This is the shape every application graph is built on — an identity
 # provider answering `POST /oauth/token` is this path with a different module
 # behind it — and the half that matters is the REPLY: a request the gateway
 # forwards but whose answer never gets composed leaves the connection open and

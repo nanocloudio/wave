@@ -8,11 +8,12 @@
 //!
 //! Two modes, chosen by whether `request_in` is wired:
 //!
-//! **Driven** (`request_in` wired) — the connector performs one exchange at a
-//! time, spoken in the HTTP application records of `http_app.rs`: a caller
-//! writes a request HEAD (`/bucket/key[?query]`), streams the body in BODY
-//! records against the credit the connector grants, and reads the endpoint's
-//! response HEAD and body back as records, paced by the credit it grants.
+//! **Driven** (`request_in` wired) — the connector is an exchange provider
+//! and performs one exchange at a time: a requester writes a request HEAD
+//! (`/bucket/key[?query]`) carrying the body inline when it fits, or streams
+//! it in BODY records against the credit the connector grants, and reads the
+//! endpoint's response HEAD and body back as records, paced by the credit it
+//! grants.
 //! Neither body is ever held whole: a request body crosses in signed
 //! `aws-chunked` chunks of [`S3_CHUNK`] bytes, a response body is forwarded as
 //! it arrives and the transport is not read past what the caller has room for.
@@ -23,10 +24,11 @@
 //! against a real endpoint.
 //!
 //! Signing is `sigv4_core.rs`; request composition, `aws-chunked` framing and
-//! response framing are `s3_core.rs`; the records are `http_app.rs`.
+//! response framing are `s3_core.rs`; the records are the SDK's exchange
+//! contract (`abi::contracts::exchange`).
 //!
 //! Ports:  net_in/net_out (transport), status_out (probe status),
-//!         request_in (HttpRequest), response_out (HttpResponse).
+//!         request_in (ExchangeRequest), response_out (ExchangeResponse).
 //! Params: `authority` (`host[:port]`, port 80 when it names none: where the
 //!         connector dials and, verbatim, the `Host` SigV4 signs),
 //!         `access_key`, `secret`, `region`.
@@ -62,16 +64,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 include!("../../common/sigv4_core.rs");
 include!("../../common/s3_core.rs");
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "the record contract is shared; this module uses the client half"
-)]
-#[path = "../../common/http_app.rs"]
-mod http_app;
-use http_app::{
-    app_abort, app_flag, app_parse_request, app_seal_body, app_write_abort, app_write_credit,
-    app_write_response_head, AppId, AppRecord, AppResponseHead, APP_HDR, APP_RECORD_MAX,
+// The exchange records this connector answers, as a provider.
+use abi::contracts::exchange::{
+    abort, flag, parse_request, seal_body, write_abort, write_credit, write_response_head,
+    ExchangeId, Record, ResponseHead, HDR, METHOD_DELETE, METHOD_GET, METHOD_HEAD, METHOD_POST,
+    METHOD_PUT, RECORD_MAX,
 };
 
 // The NetProto opcodes and identity accessors come from the owning contract,
@@ -82,10 +79,8 @@ use abi::contracts::net::net_proto::{
     CMD_SEND as NET_CMD_SEND, MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED,
     MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
-// The method byte of a request HEAD is the shared `http_exchange` vocabulary.
-use abi::contracts::net::http_exchange::{
-    method_name, METHOD_DELETE, METHOD_GET, METHOD_HEAD, METHOD_POST, METHOD_PUT,
-};
+// The method byte of a request HEAD is the exchange contract's vocabulary.
+use abi::contracts::exchange::method_name;
 
 /// The port a dial takes when `authority` names none.
 const DEFAULT_PORT: u16 = 80;
@@ -218,11 +213,11 @@ struct S3State {
     // ── Request side ────────────────────────────────────────────────
     /// The record read from `request_in` and not yet taken: a HEAD that
     /// found [`Self::pend`] occupied. Nothing more is read while it is held.
-    inrec: [u8; APP_RECORD_MAX],
+    inrec: [u8; RECORD_MAX],
     inrec_len: u16,
     /// The next exchange's HEAD, read while one was in flight. It waits here
     /// until the exchange ahead of it ends.
-    pend: [u8; APP_RECORD_MAX],
+    pend: [u8; RECORD_MAX],
     pend_len: u16,
     /// Response credit granted for the pending exchange before it began.
     pend_credit: u64,
@@ -230,13 +225,13 @@ struct S3State {
     pend_overrun: u8,
 
     ex: u8,
-    id: AppId,
+    id: ExchangeId,
     method: u8,
     target: [u8; MAX_TARGET],
     target_len: u16,
     caller_hdrs: [u8; MAX_CALLER_HEADERS],
     caller_hdrs_len: u16,
-    /// The request has a body (its HEAD carried MORE).
+    /// The request has a body: inline in its HEAD, after it, or both.
     has_body: u8,
     /// The body goes out `aws-chunked`.
     streaming: u8,
@@ -306,7 +301,7 @@ struct S3State {
 
     /// The record staged for `response_out`, `out_len == 0` when none. A
     /// refused write leaves it staged for the next step.
-    out: [u8; APP_RECORD_MAX],
+    out: [u8; RECORD_MAX],
     out_len: u16,
     /// The staged record ends the exchange.
     out_terminal: u8,
@@ -543,11 +538,7 @@ fn rx_discard(s: &mut S3State) {
 /// Clear everything one exchange holds.
 fn reset_exchange(s: &mut S3State) {
     s.ex = EX_IDLE;
-    s.id = AppId {
-        origin: 0,
-        conn: 0,
-        stream: 0,
-    };
+    s.id = ExchangeId::NONE;
     s.method = 0;
     s.target_len = 0;
     s.caller_hdrs_len = 0;
@@ -814,9 +805,9 @@ fn produce(s: &mut S3State, now: u64) {
     let id = s.id;
     if s.ex == EX_ENDING {
         let n = if s.abort_owed != 0 {
-            app_write_abort(&id, s.abort_owed, &mut s.out)
+            write_abort(&id, s.abort_owed, &mut s.out)
         } else {
-            let head = AppResponseHead {
+            let head = ResponseHead {
                 id,
                 flags: 0,
                 status: s.status_owed,
@@ -824,7 +815,7 @@ fn produce(s: &mut S3State, now: u64) {
                 headers: &[],
                 body: &[],
             };
-            app_write_response_head(&head, &mut s.out)
+            write_response_head(&head, &mut s.out)
         };
         s.out_len = n.unwrap_or(0) as u16;
         s.out_terminal = 1;
@@ -839,7 +830,7 @@ fn produce(s: &mut S3State, now: u64) {
     if s.head_owed != 0 {
         let ct_len = (s.fwd_ct as usize).min(CT_MAX);
         let hdr_end = (ct_len + s.fwd_hdr as usize).min(s.fwd.len());
-        let head = AppResponseHead {
+        let head = ResponseHead {
             id,
             flags: 0,
             status: s.resp_status,
@@ -847,20 +838,20 @@ fn produce(s: &mut S3State, now: u64) {
             headers: s.fwd.get(ct_len..hdr_end).unwrap_or(&[]),
             body: &[],
         };
-        let Some(at) = app_write_response_head(&head, &mut s.out) else {
-            fail_exchange(s, 502, app_abort::FAILED, now);
+        let Some(at) = write_response_head(&head, &mut s.out) else {
+            fail_exchange(s, 502, abort::FAILED, now);
             return;
         };
-        let limit = (s.resp_credit.min(APP_RECORD_MAX as u64) as usize)
-            .min(APP_RECORD_MAX.saturating_sub(at));
+        let limit =
+            (s.resp_credit.min(RECORD_MAX as u64) as usize).min(RECORD_MAX.saturating_sub(at));
         let Some((made, done)) = take_body(s, at, limit) else {
-            fail_exchange(s, 502, app_abort::MALFORMED, now);
+            fail_exchange(s, 502, abort::MALFORMED, now);
             return;
         };
         let Some(flags) = s.out.get_mut(1) else {
             return;
         };
-        *flags = if done { 0 } else { app_flag::MORE };
+        *flags = if done { 0 } else { flag::MORE };
         s.resp_credit -= made as u64;
         s.out_len = (at + made) as u16;
         s.head_owed = 0;
@@ -871,7 +862,7 @@ fn produce(s: &mut S3State, now: u64) {
         return;
     }
     if s.credit_owed > 0 {
-        s.out_len = app_write_credit(&id, s.credit_owed, &mut s.out).unwrap_or(0) as u16;
+        s.out_len = write_credit(&id, s.credit_owed, &mut s.out).unwrap_or(0) as u16;
         s.req_credit += s.credit_owed as u64;
         s.credit_owed = 0;
         return;
@@ -879,21 +870,21 @@ fn produce(s: &mut S3State, now: u64) {
     if s.head_sent == 0 || s.rs == RS_DONE || s.rs == RS_HEAD {
         return;
     }
-    let limit = s.resp_credit.min((APP_RECORD_MAX - APP_HDR) as u64) as usize;
-    let Some((made, done)) = take_body(s, APP_HDR, limit) else {
-        fail_exchange(s, 502, app_abort::MALFORMED, now);
+    let limit = s.resp_credit.min((RECORD_MAX - HDR) as u64) as usize;
+    let Some((made, done)) = take_body(s, HDR, limit) else {
+        fail_exchange(s, 502, abort::MALFORMED, now);
         return;
     };
     if made == 0 && !done {
         // Nothing to forward. An endpoint that has gone with the body
         // unfinished has failed the exchange.
         if s.eof != 0 && rx_empty(s) {
-            fail_exchange(s, 502, app_abort::PEER_GONE, now);
+            fail_exchange(s, 502, abort::PEER_GONE, now);
         }
         return;
     }
-    let flags = if done { 0 } else { app_flag::MORE };
-    s.out_len = app_seal_body(&id, flags, made, &mut s.out).unwrap_or(0) as u16;
+    let flags = if done { 0 } else { flag::MORE };
+    s.out_len = seal_body(&id, flags, made, &mut s.out).unwrap_or(0) as u16;
     s.resp_credit -= made as u64;
     s.progress_ms = now;
     if done {
@@ -916,14 +907,14 @@ fn pump_requests(s: &mut S3State, now: u64) {
                 return;
             }
             // SAFETY: syscalls on a channel this module owns; `inrec` is
-            // `APP_RECORD_MAX` bytes, and the channel is a mailbox, so one
+            // `RECORD_MAX` bytes, and the channel is a mailbox, so one
             // read is one whole record.
             let n = unsafe {
                 let poll = (sys.channel_poll)(s.request_in, POLL_IN);
                 if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
                     return;
                 }
-                (sys.channel_read)(s.request_in, s.inrec.as_mut_ptr(), APP_RECORD_MAX)
+                (sys.channel_read)(s.request_in, s.inrec.as_mut_ptr(), RECORD_MAX)
             };
             if n <= 0 {
                 return;
@@ -941,32 +932,41 @@ fn pump_requests(s: &mut S3State, now: u64) {
 /// What a record read from `request_in` asks for, with its borrows dropped.
 enum Taken {
     Head,
-    Body { id: AppId, n: usize, last: bool },
-    Credit { id: AppId, bytes: u32 },
-    Abort { id: AppId },
+    Body {
+        id: ExchangeId,
+        n: usize,
+        last: bool,
+    },
+    Credit {
+        id: ExchangeId,
+        bytes: u32,
+    },
+    Abort {
+        id: ExchangeId,
+    },
     Other,
 }
 
 /// Take the record in `inrec`. False when it must stay held: a HEAD with the
 /// pending slot already full.
 fn take_record(s: &mut S3State, now: u64) -> bool {
-    let len = (s.inrec_len as usize).min(APP_RECORD_MAX);
-    let taken = match s.inrec.get(..len).and_then(app_parse_request) {
+    let len = (s.inrec_len as usize).min(RECORD_MAX);
+    let taken = match s.inrec.get(..len).and_then(parse_request) {
         None => {
             s.records_malformed = s.records_malformed.wrapping_add(1);
             return true;
         }
-        Some(AppRecord::Head(_)) => Taken::Head,
-        Some(AppRecord::Body { id, flags, data }) => Taken::Body {
+        Some(Record::Head(_)) => Taken::Head,
+        Some(Record::Body { id, flags, data }) => Taken::Body {
             id,
             n: data.len(),
-            last: flags & app_flag::MORE == 0,
+            last: flags & flag::MORE == 0,
         },
-        Some(AppRecord::Credit { id, bytes }) => Taken::Credit { id, bytes },
-        Some(AppRecord::Abort { id, .. }) => Taken::Abort { id },
-        Some(AppRecord::Datagram { .. }) => Taken::Other,
+        Some(Record::Credit { id, bytes }) => Taken::Credit { id, bytes },
+        Some(Record::Abort { id, .. }) => Taken::Abort { id },
+        Some(Record::Datagram { .. }) | Some(Record::Link { .. }) => Taken::Other,
     };
-    let current = |id: &AppId| s.ex != EX_IDLE && *id == s.id;
+    let current = |id: &ExchangeId| s.ex != EX_IDLE && *id == s.id;
     let pend_id = pending_id(s);
     match taken {
         Taken::Head => {
@@ -1009,12 +1009,12 @@ fn take_record(s: &mut S3State, now: u64) -> bool {
     true
 }
 
-fn pending_id(s: &S3State) -> Option<AppId> {
+fn pending_id(s: &S3State) -> Option<ExchangeId> {
     if s.pend_len == 0 {
         return None;
     }
-    match app_parse_request(s.pend.get(..s.pend_len as usize)?)? {
-        AppRecord::Head(h) => Some(h.id),
+    match parse_request(s.pend.get(..s.pend_len as usize)?)? {
+        Record::Head(h) => Some(h.id),
         _ => None,
     }
 }
@@ -1030,11 +1030,11 @@ fn take_body_record(s: &mut S3State, n: usize, last: bool, now: u64) {
     if got > s.req_len || (last && got < s.req_len) {
         // The body must be exactly the length the head declared: the
         // signature and the wire length already cover it.
-        abort_exchange(s, app_abort::MALFORMED, now);
+        abort_exchange(s, abort::MALFORMED, now);
         return;
     }
     if n as u64 > s.req_credit {
-        abort_exchange(s, app_abort::CREDIT_OVERRUN, now);
+        abort_exchange(s, abort::CREDIT_OVERRUN, now);
         return;
     }
     if n == 0 {
@@ -1043,11 +1043,8 @@ fn take_body_record(s: &mut S3State, n: usize, last: bool, now: u64) {
         return;
     }
     let at = s.chunk_len as usize;
-    let (Some(dst), Some(src)) = (
-        s.chunk.get_mut(at..at + n),
-        s.inrec.get(APP_HDR..APP_HDR + n),
-    ) else {
-        abort_exchange(s, app_abort::CREDIT_OVERRUN, now);
+    let (Some(dst), Some(src)) = (s.chunk.get_mut(at..at + n), s.inrec.get(HDR..HDR + n)) else {
+        abort_exchange(s, abort::CREDIT_OVERRUN, now);
         return;
     };
     dst.copy_from_slice(src);
@@ -1059,7 +1056,7 @@ fn take_body_record(s: &mut S3State, n: usize, last: bool, now: u64) {
             seal_chunk(s, now);
         }
     } else if s.req_got == s.req_len && !queue_signed_head(s) {
-        fail_exchange(s, 500, app_abort::FAILED, now);
+        fail_exchange(s, 500, abort::FAILED, now);
     }
 }
 
@@ -1068,12 +1065,12 @@ fn start_pending(s: &mut S3State, now: u64) {
     if s.pend_len == 0 || s.ex != EX_IDLE || s.out_len != 0 || s.cmd != 0 {
         return;
     }
-    let len = (s.pend_len as usize).min(APP_RECORD_MAX);
+    let len = (s.pend_len as usize).min(RECORD_MAX);
     let credit = s.pend_credit;
     let overrun = s.pend_overrun;
     s.pend_len = 0;
     reset_exchange(s);
-    let Some(AppRecord::Head(h)) = s.pend.get(..len).and_then(app_parse_request) else {
+    let Some(Record::Head(h)) = s.pend.get(..len).and_then(parse_request) else {
         s.terminated = s.terminated.wrapping_add(1);
         return;
     };
@@ -1081,7 +1078,8 @@ fn start_pending(s: &mut S3State, now: u64) {
     s.id = h.id;
     s.method = h.method;
     s.resp_credit = (h.resp_credit as u64).saturating_add(credit);
-    s.has_body = u8::from(h.flags & app_flag::MORE != 0);
+    // MORE: BODY records follow, under credit, after what the HEAD carried.
+    let more = h.flags & flag::MORE != 0;
     s.progress_ms = now;
 
     let refuse = |s: &mut S3State, status: u16| {
@@ -1099,19 +1097,39 @@ fn start_pending(s: &mut S3State, now: u64) {
         h.method,
         METHOD_GET | METHOD_PUT | METHOD_HEAD | METHOD_DELETE | METHOD_POST
     ) {
-        refuse(s, 501);
-        return;
-    }
-    if h.target.len() > MAX_TARGET
-        || h.headers.len() > MAX_CALLER_HEADERS
-        || !s3_target_ok(h.target, &mut s.sv4_scratch)
-    {
         refuse(s, 400);
         return;
     }
-    let length = match s3_caller_headers(h.headers) {
+    if h.target.len() > MAX_TARGET || h.headers.len() > MAX_CALLER_HEADERS {
+        refuse(s, 413);
+        return;
+    }
+    if !s3_target_ok(h.target, &mut s.sv4_scratch) {
+        refuse(s, 400);
+        return;
+    }
+    let declared = match s3_caller_headers(h.headers) {
         Ok(l) => l,
         Err(_) => {
+            refuse(s, 400);
+            return;
+        }
+    };
+    // The body's length, which S3 needs before its first byte: declared, or —
+    // when the HEAD carries the whole body — the bytes it carries.
+    let inline = h.body;
+    let length = match (declared, more) {
+        (Some(n), false) if n != inline.len() as u64 => {
+            refuse(s, 400);
+            return;
+        }
+        (Some(n), true) if n < inline.len() as u64 => {
+            refuse(s, 400);
+            return;
+        }
+        (Some(n), _) => n,
+        (None, false) => inline.len() as u64,
+        (None, true) => {
             refuse(s, 400);
             return;
         }
@@ -1125,25 +1143,20 @@ fn start_pending(s: &mut S3State, now: u64) {
     }
     s.caller_hdrs_len = h.headers.len() as u16;
     if overrun != 0 {
-        s.abort_owed = app_abort::CREDIT_OVERRUN;
+        s.abort_owed = abort::CREDIT_OVERRUN;
         s.ex = EX_ENDING;
         return;
     }
-    match length {
-        None if s.has_body != 0 => {
-            // S3 needs a body's length before its first byte.
-            refuse(s, 411);
-            return;
-        }
-        Some(n) if s.has_body == 0 && n > 0 => {
-            // A declared body that the head says will never come.
-            s.abort_owed = app_abort::MALFORMED;
-            s.ex = EX_ENDING;
-            return;
-        }
-        _ => {}
+    // The inline bytes open the first chunk; whatever follows them comes on
+    // credit. A record is never longer than a chunk, so they always fit.
+    let n = inline.len().min(S3_CHUNK);
+    if let Some(dst) = s.chunk.get_mut(..n) {
+        dst.copy_from_slice(&inline[..n]);
     }
-    s.req_len = length.unwrap_or(0);
+    s.chunk_len = n as u16;
+    s.req_got = n as u64;
+    s.has_body = u8::from(length > 0);
+    s.req_len = length;
     s.streaming = u8::from(s.has_body != 0 && s.req_len > S3_CHUNK as u64);
     if s.streaming != 0 && s3_aws_chunked_len(s.req_len, S3_CHUNK as u64).is_none() {
         refuse(s, 400);
@@ -1261,13 +1274,15 @@ fn seal_chunk(s: &mut S3State, now: u64) {
             s.sfx_sent = 0;
             s.in_queue = 1;
         }
-        None => fail_exchange(s, 500, app_abort::FAILED, now),
+        None => fail_exchange(s, 500, abort::FAILED, now),
     }
 }
 
 /// Everything queued has gone to `net_out`: queue what follows, or grant the
 /// caller credit for the next chunk.
 fn queue_drained(s: &mut S3State, now: u64) {
+    // Whether what left carried chunk data, rather than the head alone.
+    let carried_chunk = s.data_len != 0;
     s.tx_len = 0;
     s.tx_sent = 0;
     s.data_len = 0;
@@ -1304,15 +1319,18 @@ fn queue_drained(s: &mut S3State, now: u64) {
                 s.final_queued = 1;
                 s.in_queue = 1;
             }
-            None => fail_exchange(s, 500, app_abort::FAILED, now),
+            None => fail_exchange(s, 500, abort::FAILED, now),
         }
         return;
     }
-    // The chunk buffer is free again: the bytes it held have left for the
-    // transport, so the caller may send the next chunk's worth.
-    s.chunk_len = 0;
+    // The chunk buffer is free again once the bytes it held have left for
+    // the transport; after the head alone it still holds what the HEAD
+    // carried inline. Either way the caller may fill the rest of it.
+    if carried_chunk {
+        s.chunk_len = 0;
+    }
     let rest = s.req_len - s.req_got;
-    s.credit_owed = rest.min(S3_CHUNK as u64) as u32;
+    s.credit_owed = rest.min((S3_CHUNK - s.chunk_len as usize) as u64) as u32;
 }
 
 /// Bytes queued for `net_out` and not yet taken.
@@ -1430,7 +1448,7 @@ fn on_head(s: &mut S3State, now: u64) {
     let len = (s.resp_head_len as usize).min(RESP_HEAD_MAX);
     let head = s.resp_head.get(..len).unwrap_or(&[]);
     let Some(status) = s3_status_code(head) else {
-        fail_exchange(s, 502, app_abort::FAILED, now);
+        fail_exchange(s, 502, abort::FAILED, now);
         return;
     };
     if (100..200).contains(&status) && status != 101 {
@@ -1438,12 +1456,12 @@ fn on_head(s: &mut S3State, now: u64) {
         return;
     }
     let Some(body) = s3_response_body(head, status, s.method == METHOD_HEAD) else {
-        fail_exchange(s, 502, app_abort::FAILED, now);
+        fail_exchange(s, 502, abort::FAILED, now);
         return;
     };
     let (ct, hdrs) = s.fwd.split_at_mut(CT_MAX);
     let Some((ct_len, hdr_len)) = s3_forward_headers(head, ct, hdrs) else {
-        fail_exchange(s, 502, app_abort::FAILED, now);
+        fail_exchange(s, 502, abort::FAILED, now);
         return;
     };
     // The forwarded headers start right after the content type.
@@ -1480,7 +1498,7 @@ fn process_rx(s: &mut S3State, now: u64) {
         match take_head_bytes(s) {
             Ok(true) => on_head(s, now),
             Ok(false) => {}
-            Err(()) => fail_exchange(s, 502, app_abort::FAILED, now),
+            Err(()) => fail_exchange(s, 502, abort::FAILED, now),
         }
     }
 }
@@ -1588,17 +1606,18 @@ fn on_connected(s: &mut S3State, now: u64) {
         return;
     }
     s.ex = EX_OPEN;
-    if s.streaming != 0 || s.req_len == 0 {
+    if s.streaming != 0 || s.req_got == s.req_len {
         // Signed now the connection is up, so the timestamp SigV4 binds is
         // current rather than aged by a slow connect. A streamed body's
-        // first credit follows once the head has left.
+        // first credit follows once the head has left; a body the HEAD
+        // carried whole is already in the chunk the head hashes.
         if !queue_signed_head(s) {
-            fail_exchange(s, 500, app_abort::FAILED, now);
+            fail_exchange(s, 500, abort::FAILED, now);
         }
     } else {
         // A body of at most one chunk is hashed into the head, so it is
-        // taken whole first: the credit is the empty chunk buffer.
-        s.credit_owed = s.req_len as u32;
+        // taken whole first: the credit is the rest of the chunk buffer.
+        s.credit_owed = (s.req_len - s.req_got) as u32;
     }
 }
 
@@ -1608,8 +1627,8 @@ fn on_closed(s: &mut S3State, now: u64) {
         return;
     }
     match s.ex {
-        EX_DIAL => fail_exchange(s, 502, app_abort::PEER_GONE, now),
-        EX_OPEN if s.rs == RS_HEAD => fail_exchange(s, 502, app_abort::PEER_GONE, now),
+        EX_DIAL => fail_exchange(s, 502, abort::PEER_GONE, now),
+        EX_OPEN if s.rs == RS_HEAD => fail_exchange(s, 502, abort::PEER_GONE, now),
         // A body framed by close ends here; any other is judged by `produce`
         // once what was read before the close has gone out.
         _ => {}
@@ -1627,7 +1646,7 @@ fn on_error(s: &mut S3State, now: u64) {
     }
     // 502: the transport failed, so the endpoint never got to answer for
     // itself.
-    fail_exchange(s, 502, app_abort::PEER_GONE, now);
+    fail_exchange(s, 502, abort::PEER_GONE, now);
 }
 
 /// Who the exchange is waiting on: true for the caller (its body, its credit,
@@ -1664,17 +1683,17 @@ fn check_deadlines(s: &mut S3State, now: u64) {
     match s.ex {
         EX_DIAL if s.phase == CONNECTING && idle > CONNECT_TIMEOUT_MS => {
             // 504: the endpoint did not answer the dial in time.
-            fail_exchange(s, 504, app_abort::STALLED, now);
+            fail_exchange(s, 504, abort::STALLED, now);
         }
         EX_OPEN => {
             if waiting_on_caller(s) {
                 if idle > CALLER_TIMEOUT_MS {
-                    abort_exchange(s, app_abort::STALLED, now);
+                    abort_exchange(s, abort::STALLED, now);
                 }
             } else if idle > REPLY_TIMEOUT_MS {
                 // 504: reachable but silent past the budget, a different fact
                 // from a dead transport.
-                fail_exchange(s, 504, app_abort::STALLED, now);
+                fail_exchange(s, 504, abort::STALLED, now);
             }
         }
         _ => {}

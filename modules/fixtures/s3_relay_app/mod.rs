@@ -2,10 +2,11 @@
 //! connector.
 //!
 //! A conformance fixture, not a product module — see `manifest.toml` for why it
-//! sits in `modules/fixtures/`. Both sides speak the records of
-//! `modules/common/http_app.rs` with the same roles: `http` is the caller of an
-//! application, and the connector is an application to its caller. So every
-//! record passes through unchanged but one: a request HEAD loses the header
+//! sits in `modules/fixtures/`. Both sides speak the exchange contract: toward
+//! `http` the relay is a provider (`request_in` / `response_out`), toward the
+//! connector a requester (`request_out` / `response_in`), and the exchange id
+//! `http` chose is the one the connector echoes. So every record passes
+//! through unchanged but one: a request HEAD loses the header
 //! lines that belong to the inbound connection (`host`, its framing, its
 //! `expect`, any signature of its own) and its peer, because the connector
 //! writes those for the request it signs and refuses a caller that sends them.
@@ -32,10 +33,8 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-#[path = "../../common/http_app.rs"]
-mod http_app;
-use http_app::{
-    app_kind, app_parse_request, app_write_request_head, AppRecord, AppRequestHead, APP_RECORD_MAX,
+use abi::contracts::exchange::{
+    kind, parse_request, write_request_head, Record, RequestHead, RECORD_MAX,
 };
 
 /// `module_step` return code for "did work, step me again".
@@ -51,7 +50,7 @@ struct Lane {
     from: i32,
     to: i32,
     held_len: usize,
-    buf: [u8; APP_RECORD_MAX],
+    buf: [u8; RECORD_MAX],
 }
 
 #[repr(C)]
@@ -67,8 +66,8 @@ struct State {
 
 #[repr(C)]
 struct Scratch {
-    record: [u8; APP_RECORD_MAX],
-    kept: [u8; APP_RECORD_MAX],
+    record: [u8; RECORD_MAX],
+    kept: [u8; RECORD_MAX],
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -163,12 +162,12 @@ fn pump(sys: &SyscallTable, lane: &mut Lane, scratch: &mut Scratch, up: bool) ->
         // SAFETY: `buf` is a fixed array in module state and the read is
         // bounded by its length; the channel is a mailbox, so one read is one
         // whole record.
-        let n = unsafe { (sys.channel_read)(lane.from, lane.buf.as_mut_ptr(), APP_RECORD_MAX) };
+        let n = unsafe { (sys.channel_read)(lane.from, lane.buf.as_mut_ptr(), RECORD_MAX) };
         if n <= 0 {
             return false;
         }
         lane.held_len = n as usize;
-        if up && lane.buf[0] == app_kind::HEAD {
+        if up && lane.buf[0] == kind::HEAD {
             lane.held_len = strip_head(&lane.buf[..lane.held_len], scratch);
             lane.buf[..lane.held_len].copy_from_slice(&scratch.record[..lane.held_len]);
         }
@@ -204,7 +203,7 @@ fn pump(sys: &SyscallTable, lane: &mut Lane, scratch: &mut Scratch, up: bool) ->
 /// connection's own header lines and peer. Its length, 0 when it does not
 /// parse.
 fn strip_head(rec: &[u8], scratch: &mut Scratch) -> usize {
-    let Some(AppRecord::Head(h)) = app_parse_request(rec) else {
+    let Some(Record::Head(h)) = parse_request(rec) else {
         return 0;
     };
     let mut n = 0usize;
@@ -225,7 +224,8 @@ fn strip_head(rec: &[u8], scratch: &mut Scratch) -> usize {
         scratch.kept[n..n + line.len()].copy_from_slice(line);
         n += line.len();
     }
-    let head = AppRequestHead {
+    // The body the HEAD carried rides on with it: the HEAD only got shorter.
+    let head = RequestHead {
         id: h.id,
         flags: h.flags,
         method: h.method,
@@ -233,8 +233,9 @@ fn strip_head(rec: &[u8], scratch: &mut Scratch) -> usize {
         headers: &scratch.kept[..n],
         peer: &[],
         resp_credit: h.resp_credit,
+        body: h.body,
     };
-    app_write_request_head(&head, &mut scratch.record).unwrap_or(0)
+    write_request_head(&head, &mut scratch.record).unwrap_or(0)
 }
 
 /// A header that describes the inbound connection or its own signature, which

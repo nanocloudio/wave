@@ -15,8 +15,9 @@ use super::super::{
     net_read_frame_aligned, net_write_frame, NET_FRAME_HDR, POLL_IN, POLL_OUT,
 };
 use super::{
-    build_request, is_foreign_frame, log, send_close_frame, HttpState, Phase, CONNECT_TIMEOUT_MS,
-    E_AGAIN, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED, RECV_BUF_SIZE,
+    build_request, is_foreign_frame, log, send_close_frame, HttpState, Phase, CAUSE_CONNECT,
+    CAUSE_LINK, CAUSE_TIMEOUT, CONNECT_TIMEOUT_MS, E_AGAIN, E_CONNECT_FAILED, E_NET_FAILED,
+    E_SEND_FAILED, E_WRITE_FAILED, RECV_BUF_SIZE,
 };
 
 /// The numeric status of an HTTP/1.x status line — the three digits after the
@@ -39,55 +40,6 @@ pub fn parse_status_line(head: &[u8]) -> u16 {
     }
 }
 
-/// Write the zero-length chunk that ends an extended body, if one is owed.
-///
-/// Answers whether the body is ended — `false` when the channel took only part
-/// of the chunk, and the caller must come back rather than move on. Owed means
-/// the head has gone and the closing chunk has not: before the head there is
-/// no stream for a consumer to be reading, and an unwired `file_ctrl` carries
-/// nothing to end.
-///
-/// The flags stay set afterwards until `complete` has seen them: clearing them
-/// here would leave it looking at an ordinary exchange and answering a second
-/// time, with an empty reply, for a correlation already spent.
-#[cfg(feature = "exchange")]
-unsafe fn end_extended_body(s: &mut HttpState) -> bool {
-    if s.client.exchange_extended == 0
-        || s.client.exchange_head_sent == 0
-        || s.client.exchange_terminated != 0
-    {
-        return true;
-    }
-    if s.client.out_chan >= 0 {
-        let sys = &*s.syscalls;
-        if s.client.ext_len == 0 {
-            let Some(framed) = super::exchange::write_chunk(&[], &mut s.client.ext_frame) else {
-                return false;
-            };
-            s.client.ext_len = framed as u16;
-            s.client.ext_sent = 0;
-        }
-        let sent = s.client.ext_sent as usize;
-        let left = s.client.ext_len as usize - sent;
-        let wrote = (sys.channel_write)(
-            s.client.out_chan,
-            s.client.ext_frame.as_ptr().add(sent),
-            left,
-        );
-        if wrote <= 0 {
-            return false;
-        }
-        s.client.ext_sent += wrote as u16;
-        if s.client.ext_sent < s.client.ext_len {
-            return false;
-        }
-        s.client.ext_len = 0;
-        s.client.ext_sent = 0;
-    }
-    s.client.exchange_terminated = 1;
-    true
-}
-
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     let now = dev_millis(&*s.syscalls);
     if !matches!(s.client.phase, Phase::Init | Phase::Done | Phase::Error) {
@@ -103,6 +55,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             || (waiting_head && expired(s.client.response_start_ms, s.client.client_header_ms))
             || (moving && expired(s.client.progress_ms, s.client.client_stall_ms))
         {
+            s.client.fail_cause = CAUSE_TIMEOUT;
             s.client.phase = Phase::Error;
         }
     }
@@ -153,9 +106,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     continue;
                 }
                 if s.client.conn_authority_len == 0 {
-                    // An open client with no record in hand has nowhere to go;
-                    // a pinned one always has its authority here.
+                    // An open client with no request in hand has nowhere to
+                    // go; a pinned one always has its authority here.
                     log(s, b"[http] no authority to dial");
+                    s.client.fail_cause = CAUSE_CONNECT;
                     s.client.phase = Phase::Error;
                     return E_CONNECT_FAILED;
                 }
@@ -177,6 +131,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     Some(false) => return 0,
                     None => {
                         log(s, b"[http] authority cannot be dialled");
+                        s.client.fail_cause = CAUSE_CONNECT;
                         s.client.phase = Phase::Error;
                         return E_CONNECT_FAILED;
                     }
@@ -218,6 +173,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         s.client.conn_present = 1;
                         s.client.progress_ms = now;
                         log(s, b"[http] connected");
+                        // A probe of a lost link proves the link and goes no
+                        // further: there is no request behind it.
+                        #[cfg(feature = "exchange")]
+                        if super::provider::connected(s) {
+                            s.client.response.reusable = false;
+                            s.client.phase = Phase::Done;
+                            continue;
+                        }
                         if !build_request(s) {
                             // The head does not fit or names no verb. Failing
                             // here, before a byte goes out, is what keeps a
@@ -242,6 +205,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         };
                         if etag == 0 || etag == dev_requester_tag(sys) {
                             log(s, b"[http] connect error");
+                            s.client.fail_cause = CAUSE_CONNECT;
                             s.client.phase = Phase::Error;
                             return E_CONNECT_FAILED;
                         }
@@ -249,6 +213,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 }
                 if dev_millis(sys).wrapping_sub(s.client.connect_start_ms) >= CONNECT_TIMEOUT_MS {
                     log(s, b"[http] connect timeout");
+                    s.client.fail_cause = CAUSE_CONNECT;
                     s.client.phase = Phase::Error;
                     return E_CONNECT_FAILED;
                 }
@@ -345,6 +310,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         return 0;
                     }
                     if kind == NET_MSG_ERROR {
+                        s.client.fail_cause = CAUSE_LINK;
                         s.client.phase = Phase::Error;
                         continue;
                     }
@@ -352,6 +318,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         s.client.phase = if s.client.response.eof().is_ok() {
                             Phase::Done
                         } else {
+                            s.client.fail_cause = CAUSE_LINK;
                             Phase::Error
                         };
                         continue;
@@ -371,13 +338,18 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         }
                         s.client.h1_input_offset += used as u16;
                         s.client.last_status = s.client.response.status;
-                        // An extended exchange is answered as soon as there
-                        // is a head to answer with, so a consumer can read
-                        // the body as it arrives rather than after all of it
-                        // has.
+                        // The response HEAD goes as soon as there is a final
+                        // status to give, so a requester reads the body as
+                        // it arrives rather than after all of it has. An
+                        // interim (1xx) status is not the answer.
                         #[cfg(feature = "exchange")]
-                        if s.client.exchange_extended != 0 {
-                            super::exchange::send_head(s);
+                        if super::provider::answering(s)
+                            && !super::provider::head_given(s)
+                            && s.client.last_status >= 200
+                            && !super::provider::head_from_block(s, s.client.last_status)
+                        {
+                            s.client.phase = Phase::Error;
+                            continue;
                         }
                         s.client.bytes_received =
                             s.client.bytes_received.saturating_add(produced as u32);
@@ -407,23 +379,21 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             Phase::Writing => {
-                // Graph-driven, answering with the body alone: a reply is ONE
-                // frame, so the body is accumulated here rather than streamed.
-                //
-                // A caller that asked for the whole response takes the other
-                // path. Its body streams to `file_ctrl` as it arrives and its
-                // reply carries the head, because a response is not bounded by
-                // what one record may hold and this surface says a reply is
-                // exactly one of them.
+                // Graph-driven: the body goes to the requester as far as its
+                // credit reaches, and the rest waits here for more.
                 #[cfg(feature = "exchange")]
-                if super::exchange::busy(s) && s.client.exchange_extended == 0 {
+                if super::provider::busy(s) {
                     let off = s.client.pending_offset as usize;
                     let end = (s.client.recv_len as usize).max(off);
                     let src = s.client.recv_buf.as_ptr().add(off);
-                    super::exchange::accumulate(s, src, end - off);
-                    s.client.pending_offset = s.client.recv_len;
+                    let taken = super::provider::body(s, src, end - off);
+                    s.client.pending_offset += taken as u16;
+                    if s.client.pending_offset < s.client.recv_len {
+                        return 0;
+                    }
+                    s.client.progress_ms = now;
                     s.client.phase = Phase::RecvBody;
-                    return 0;
+                    continue;
                 }
 
                 if s.client.out_chan < 0 {
@@ -435,57 +405,6 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let out_chan = s.client.out_chan;
                 let offset = s.client.pending_offset as usize;
                 let remaining = (s.client.recv_len as usize) - offset;
-
-                // An extended body is written in length-framed chunks, and a
-                // zero-length one ends it. The reply has already gone, so
-                // nothing else says where the body stops: without a frame a
-                // consumer could not tell a pause from an ending.
-                #[cfg(feature = "exchange")]
-                if s.client.exchange_extended != 0 {
-                    // Compose the next chunk once, then send it from wherever
-                    // the last write got to.
-                    if s.client.ext_len == 0 {
-                        let take = remaining.min(super::EXT_CHUNK - super::exchange::CHUNK_HEAD);
-                        let bytes = core::slice::from_raw_parts(
-                            s.client.recv_buf.as_ptr().add(offset),
-                            take,
-                        );
-                        let Some(framed) =
-                            super::exchange::write_chunk(bytes, &mut s.client.ext_frame)
-                        else {
-                            s.client.phase = Phase::Error;
-                            return E_WRITE_FAILED;
-                        };
-                        s.client.ext_len = framed as u16;
-                        s.client.ext_sent = 0;
-                        s.client.pending_offset += take as u16;
-                    }
-                    let sent = s.client.ext_sent as usize;
-                    let left = s.client.ext_len as usize - sent;
-                    let wrote =
-                        (sys.channel_write)(out_chan, s.client.ext_frame.as_ptr().add(sent), left);
-                    if wrote < 0 {
-                        if wrote == E_AGAIN {
-                            return 0;
-                        }
-                        log(s, b"[http] write failed");
-                        s.client.phase = Phase::Error;
-                        return E_WRITE_FAILED;
-                    }
-                    if wrote > 0 {
-                        s.client.progress_ms = now;
-                    }
-                    s.client.ext_sent += wrote as u16;
-                    if s.client.ext_sent < s.client.ext_len {
-                        return 0;
-                    }
-                    s.client.ext_len = 0;
-                    s.client.ext_sent = 0;
-                    if s.client.pending_offset >= s.client.recv_len {
-                        s.client.phase = Phase::RecvBody;
-                    }
-                    return 0;
-                }
 
                 let written = (sys.channel_write)(
                     out_chan,
@@ -513,38 +432,30 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             Phase::Done => {
-                // The chunk that ends an extended body, before anything else
-                // here: a consumer reading the stream has no other way to
-                // learn the response is whole.
+                // The response ends for the requester before the connection
+                // is disposed of; an outbox still placing the record before
+                // it holds the ending back a step.
                 #[cfg(feature = "exchange")]
-                if !end_extended_body(s) {
+                if !super::provider::end(s) {
                     return 0;
                 }
                 #[cfg(not(feature = "exchange"))]
                 let reuse = false;
                 #[cfg(feature = "exchange")]
-                let reuse = super::exchange::armed(s)
+                let reuse = super::provider::armed(s)
                     && s.client.keep_alive != 0
                     && s.client.response.reusable
                     && s.client.draining == 0;
                 if !reuse && !send_close_frame(s) {
                     return 0;
                 }
-                // Answer the request that produced this response, then go
-                // idle so the next one on `publish_in` can be taken.
                 #[cfg(feature = "exchange")]
-                {
+                if super::provider::armed(s) {
+                    // A graph-driven client is RESIDENT: `Done` ends one
+                    // exchange, not the module. Retiring here would answer
+                    // the first request and strand every one after it.
                     s.client.idle_since_ms = now;
-                    super::exchange::complete(s);
-                    if super::exchange::armed(s) {
-                        // A graph-driven client is RESIDENT: `Done` ends one
-                        // exchange, not the module. Retiring here would answer
-                        // the first request and strand every one after it.
-                        // The step dispatch idles an armed client with nothing
-                        // in flight, and the next publish re-arms the phase
-                        // machine.
-                        return 0;
-                    }
+                    return 0;
                 }
                 return 1;
             }
@@ -553,27 +464,16 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 if !send_close_frame(s) {
                     return 0;
                 }
-                // A failed exchange is still an answer: the contract admits
-                // no silent drops, so the producer gets a typed refusal
-                // rather than waiting out its own timeout.
-                //
-                // A body that started has to end the same way a whole one
-                // does. Without the closing chunk a consumer cannot tell a
-                // response that failed from one still arriving, and it is the
-                // only thing left to tell it with — the one reply this
-                // exchange had was spent on the head.
+                // A failed exchange is still answered: the requester gets a
+                // status, an ABORT, or LINK DOWN rather than waiting out its
+                // own timeout.
                 #[cfg(feature = "exchange")]
-                {
-                    if !end_extended_body(s) {
-                        return 0;
-                    }
-                    super::exchange::fail(s);
-                    if super::exchange::armed(s) {
-                        // The same rule on the failure path: the refusal
-                        // answered THIS exchange. Faulting the module instead
-                        // would let one refused request end every later one.
-                        return 0;
-                    }
+                if super::provider::armed(s) {
+                    super::provider::fail(s, s.client.fail_cause);
+                    // The same rule on the failure path: the answer ended
+                    // THIS exchange. Faulting the module instead would let
+                    // one refused request end every later one.
+                    return 0;
                 }
                 return -1;
             }

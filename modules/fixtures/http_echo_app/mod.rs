@@ -43,11 +43,10 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-#[path = "../../common/http_app.rs"]
-mod http_app;
-use http_app::{
-    app_flag, app_parse_request, app_write_body, app_write_credit, app_write_response_head, AppId,
-    AppRecord, AppResponseHead, APP_RECORD_MAX,
+// The exchange records the gateway speaks; this fixture is their provider.
+use abi::contracts::exchange::{
+    flag, parse_request, write_body, write_credit, write_response_head, ExchangeId, Record,
+    ResponseHead, RECORD_MAX,
 };
 
 /// `module_step` return code for "did work, step me again".
@@ -81,7 +80,7 @@ const STREAM_CHUNK_BYTES: usize = 2048;
 #[derive(Clone, Copy)]
 struct Exchange {
     used: bool,
-    id: AppId,
+    id: ExchangeId,
     method: u8,
     path: [u8; PATH_MAX],
     path_len: usize,
@@ -100,11 +99,7 @@ struct Exchange {
 
 const IDLE: Exchange = Exchange {
     used: false,
-    id: AppId {
-        origin: 0,
-        conn: 0,
-        stream: 0,
-    },
+    id: ExchangeId::NONE,
     method: 0,
     path: [0; PATH_MAX],
     path_len: 0,
@@ -127,8 +122,8 @@ struct State {
     held: bool,
     held_len: usize,
     ex: [Exchange; EXCHANGES],
-    buf: [u8; APP_RECORD_MAX],
-    out: [u8; APP_RECORD_MAX],
+    buf: [u8; RECORD_MAX],
+    out: [u8; RECORD_MAX],
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -206,7 +201,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // SAFETY: `buf` is a fixed array in module state and the read is
             // bounded by its length; the channel is a mailbox, so one read is
             // one whole record.
-            let n = unsafe { (sys.channel_read)(s.request_in, s.buf.as_mut_ptr(), APP_RECORD_MAX) };
+            let n = unsafe { (sys.channel_read)(s.request_in, s.buf.as_mut_ptr(), RECORD_MAX) };
             if n > 0 {
                 s.held = true;
                 s.held_len = n as usize;
@@ -229,14 +224,14 @@ impl State {
     fn take(&mut self, sys: &SyscallTable) -> bool {
         let mut touched = None;
         let raw = &self.buf[..self.held_len];
-        let Some(rec) = app_parse_request(raw) else {
+        let Some(rec) = parse_request(raw) else {
             // A record that does not parse is dropped: the gateway's own
             // deadline answers the exchange, which is the honest outcome for
             // a broken contract.
             return true;
         };
         match rec {
-            AppRecord::Head(h) => {
+            Record::Head(h) => {
                 let Some(i) = self.ex.iter().position(|e| !e.used) else {
                     return false;
                 };
@@ -246,14 +241,20 @@ impl State {
                 e.method = h.method;
                 e.path_len = h.target.len().min(PATH_MAX);
                 e.path[..e.path_len].copy_from_slice(&h.target[..e.path_len]);
-                e.req_done = h.flags & app_flag::MORE == 0;
+                // The body the HEAD carried inline, then BODY records while
+                // MORE says they follow.
+                let n = h.body.len().min(ECHO_MAX);
+                e.body[..n].copy_from_slice(&h.body[..n]);
+                e.body_len = n;
+                e.total = h.body.len() as u64;
+                e.req_done = h.flags & flag::MORE == 0;
                 e.resp_credit = h.resp_credit;
                 e.credit_owed = !e.req_done;
                 e.streaming = contains(&e.path[..e.path_len], b"/stream");
                 self.ex[i] = e;
                 touched = Some(i);
             }
-            AppRecord::Body { id, flags, data } => {
+            Record::Body { id, flags, data } => {
                 if let Some(i) = self.find(&id) {
                     let e = &mut self.ex[i];
                     let room = ECHO_MAX - e.body_len;
@@ -261,23 +262,23 @@ impl State {
                     e.body[e.body_len..e.body_len + n].copy_from_slice(&data[..n]);
                     e.body_len += n;
                     e.total += data.len() as u64;
-                    e.req_done = flags & app_flag::MORE == 0;
+                    e.req_done = flags & flag::MORE == 0;
                     touched = Some(i);
                 }
             }
-            AppRecord::Credit { id, bytes } => {
+            Record::Credit { id, bytes } => {
                 if let Some(i) = self.find(&id) {
                     let e = &mut self.ex[i];
                     e.resp_credit = e.resp_credit.saturating_add(bytes);
                     touched = Some(i);
                 }
             }
-            AppRecord::Abort { id, .. } => {
+            Record::Abort { id, .. } => {
                 if let Some(i) = self.find(&id) {
                     self.ex[i] = IDLE;
                 }
             }
-            AppRecord::Datagram { .. } => {}
+            Record::Datagram { .. } | Record::Link { .. } => {}
         }
         if let Some(i) = touched {
             self.advance(sys, i);
@@ -285,7 +286,7 @@ impl State {
         true
     }
 
-    fn find(&self, id: &AppId) -> Option<usize> {
+    fn find(&self, id: &ExchangeId) -> Option<usize> {
         self.ex.iter().position(|e| e.used && e.id == *id)
     }
 
@@ -296,7 +297,7 @@ impl State {
         }
         let mut worked = false;
         if self.ex[i].credit_owed {
-            let n = app_write_credit(&self.ex[i].id, BODY_CREDIT, &mut self.out).unwrap_or(0);
+            let n = write_credit(&self.ex[i].id, BODY_CREDIT, &mut self.out).unwrap_or(0);
             if !self.write(sys, n) {
                 return false;
             }
@@ -339,7 +340,7 @@ impl State {
         let mut digits = [0u8; 20];
         let dn = decimal(e.total, &mut digits);
         o = put(&mut body, o, &digits[..dn]);
-        let head = AppResponseHead {
+        let head = ResponseHead {
             id: e.id,
             flags: 0,
             status,
@@ -347,7 +348,7 @@ impl State {
             headers: &[],
             body: &body[..o],
         };
-        let n = app_write_response_head(&head, &mut self.out).unwrap_or(0);
+        let n = write_response_head(&head, &mut self.out).unwrap_or(0);
         self.write(sys, n)
     }
 
@@ -363,11 +364,11 @@ impl State {
         let fill = b'a' + e.stream_sent;
         let chunk = [fill; STREAM_CHUNK_BYTES];
         let last = e.stream_sent + 1 >= STREAM_CHUNKS;
-        let flags = if last { 0 } else { app_flag::MORE };
+        let flags = if last { 0 } else { flag::MORE };
         let n = if e.stream_sent == 0 {
             // The first record is the head; it carries the content type and
             // the first chunk.
-            let head = AppResponseHead {
+            let head = ResponseHead {
                 id: e.id,
                 flags,
                 status: 200,
@@ -375,9 +376,9 @@ impl State {
                 headers: &[],
                 body: &chunk,
             };
-            app_write_response_head(&head, &mut self.out).unwrap_or(0)
+            write_response_head(&head, &mut self.out).unwrap_or(0)
         } else {
-            app_write_body(&e.id, flags, &chunk, &mut self.out).unwrap_or(0)
+            write_body(&e.id, flags, &chunk, &mut self.out).unwrap_or(0)
         };
         if !self.write(sys, n) {
             return false;

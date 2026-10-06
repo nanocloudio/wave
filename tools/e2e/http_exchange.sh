@@ -1,34 +1,32 @@
 #!/usr/bin/env bash
-# THE EXCHANGE CLIENT, END TO END: a request record in, a correlated reply out.
+# THE EXCHANGE CLIENT, END TO END: a request record in, its answer out.
 #
 # `http`'s `exchange` variant takes its request from the graph rather than from
-# params: a `Publish` on `publish_in` carries the record, the client performs
-# it against a real origin, and the answer leaves on `reply_out` under the same
-# `corr`, echoing the request's `msg_key`.
+# params: an exchange request HEAD on `request_in` carries the method, target,
+# headers and body, the client performs it against a real origin, and the
+# answer leaves on `response_out` under the requester's exchange id.
 #
 # What each block here is for:
 #
-#   * the plain record — the runtime survives composing a request head, the
-#     ORIGIN sees the line the graph built, and the reply is the body alone
-#     under the right correlation. The first of those is not ceremony: the
-#     head is composed from the shared method table, which is the kind of
-#     constant a flat `.fmod` image cannot hold as pointers
+#   * the plain request — the runtime survives composing a request head, the
+#     ORIGIN sees the line the graph built, and the answer carries the origin's
+#     status, content type, headers and body under the right id. The first of
+#     those is not ceremony: the head is composed from the shared method table,
+#     which is the kind of constant a flat `.fmod` image cannot hold as pointers
 #     (`tools/ci/fmod_pic_relocs.sh`), and a fault there lands between the
 #     connection opening and the first byte out, where every HTTP-level check
 #     sees silence rather than an error. Two verbs, because the method token
 #     is a span of one literal indexed by the verb;
-#   * the extended record — the caller's headers reach the origin beside the
-#     ones this client frames the request with, and the reply leads with the
-#     status and the response's own headers;
-#   * the blocks that are refused — a header block decides where the request
-#     head ends and what the origin reads as framing, so one carrying a blank
-#     line, a bare LF, or a field this client frames with is refused before a
-#     connection is opened.
+#   * the requester's headers — they reach the origin beside the ones this
+#     client frames the request with, each once;
+#   * the header blocks that are refused — a header block decides where the
+#     request head ends and what the origin reads as framing, so one carrying a
+#     blank line, a bare LF, or a field this client frames with is answered 400
+#     before a connection is opened.
 #
-# Replies are decoded rather than searched. A substring match on the hex would
-# accept a status, a key or a body landing anywhere in the frame, including in
-# a length field, and would not notice a plain record answered in the extended
-# shape.
+# Answers are decoded rather than searched. A substring match on the hex would
+# accept a status or a body landing anywhere in the record, including in a
+# length field.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -74,23 +72,19 @@ ORIGIN=$!
 for _ in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done
 ss -ltn 2>/dev/null | grep -q ":$PORT " || fail "origin never bound :$PORT"
 
-# One publish frame:
-#   [0xED][len:u16][corr:u64][flags][klen:u16][plen:u16][key][record]
-# record = [method(|0x80)][path_len:u16][body_len:u16]([hdr_len:u16])
-#          [path…][headers…][body…]
-publish() {
-  VERB="$1" REQ_PATH="$2" HDRS="$3" KEY="$4" CORR="$5" python3 - <<'INNER'
+# One exchange request HEAD, its body inline:
+#   [kind=1][flags=0][id:14][method][target_len:u16][hdr_len:u16][peer_len:u16]
+#   [resp_credit:u32][target…][headers…][body…]
+request() {
+  VERB="$1" REQ_PATH="$2" HDRS="$3" BODY="$4" XID="$5" python3 - <<'INNER'
 import os, struct
 verb = int(os.environ["VERB"])
 path = os.environ["REQ_PATH"].encode()
 hdrs = os.environ["HDRS"].encode().decode("unicode_escape").encode("latin1")
-key  = os.environ["KEY"].encode()
-head = struct.pack('<HH', len(path), 0)
-if verb & 0x80:
-    head += struct.pack('<H', len(hdrs))
-rec = bytes([verb]) + head + path + hdrs
-pub = struct.pack('<QBHH', int(os.environ["CORR"]), 0, len(key), len(rec)) + key + rec
-print((bytes([0xED]) + struct.pack('<H', len(pub)) + pub).hex())
+body = os.environ["BODY"].encode()
+xid = struct.pack('<Q', int(os.environ["XID"])) + bytes(6)
+head = bytes([1, 0]) + xid + bytes([verb]) + struct.pack('<HHHI', len(path), len(hdrs), 0, 65536)
+print((head + path + hdrs + body).hex())
 INNER
 }
 
@@ -117,36 +111,38 @@ run_one() {
   fi
 }
 
-# Decode the reply frame and assert its envelope, then hand the payload to the
-# caller's own checks on stdin.
-#   decode_reply <corr> <status> <key> [python-assertions-on-`payload`]
-decode_reply() {
-  CORR="$1" STATUS="$2" KEY="$3" EXTRA="${4:-}" python3 - "$WORK/reply.bin" <<'INNER'
+# Decode the answer — one response HEAD carrying the whole body — and assert
+# its id and status, then hand it to the caller's own checks.
+#   decode_answer <id> <status> [python-assertions-on-`ct`,`headers`,`body`]
+decode_answer() {
+  XID="$1" STATUS="$2" EXTRA="${3:-}" python3 - "$WORK/reply.bin" <<'INNER'
 import os, struct, sys
 raw = open(sys.argv[1], "rb").read()
-assert raw[:1] == b"\xef", f"not MSG_REPLY: {raw[:1]!r}"
-corr, status, klen, plen = struct.unpack_from('<QBHH', raw, 3)
-assert corr == int(os.environ["CORR"]), f"corr {corr}"
-assert status == int(os.environ["STATUS"]), f"reply status {status}"
-key = raw[16:16 + klen]
-assert key == os.environ["KEY"].encode(), f"msg_key {key!r}"
-payload = raw[16 + klen:]
-assert len(payload) == plen, f"plen {plen} but {len(payload)} bytes follow"
+assert raw[:1] == b"\x01", f"not a response HEAD: {raw[:16]!r}"
+assert raw[1] == 0, f"the answer is not whole in one record: flags {raw[1]}"
+xid = struct.unpack_from('<Q', raw, 2)[0]
+assert xid == int(os.environ["XID"]) and raw[10:16] == bytes(6), f"id {raw[2:16]!r}"
+status, ct_len, hdr_len = struct.unpack_from('<HBH', raw, 16)
+assert status == int(os.environ["STATUS"]), f"status {status}"
+at = 21
+ct = raw[at:at + ct_len]
+headers = raw[at + ct_len:at + ct_len + hdr_len]
+body = raw[at + ct_len + hdr_len:]
 extra = os.environ["EXTRA"]
 if extra:
     exec(extra)
 INNER
 }
 
-# METHOD_GET = 1, METHOD_POST = 3 (modules/foundation/http/wire/method.rs).
+# METHOD_GET = 1, METHOD_POST = 3 (the exchange contract's method vocabulary).
 i=0
-for case in "1 GET /hello job-42" "3 POST /submit job-43"; do
+for case in "1 GET /hello" "3 POST /submit"; do
   set -- $case
-  verb="$1" name="$2" path="$3" key="$4"
+  verb="$1" name="$2" path="$3"
   i=$((i + 1))
 
   echo "── $name $path ──"
-  rec="$(publish "$verb" "$path" '' "$key" "$i")"
+  rec="$(request "$verb" "$path" 'Content-Type: text/plain\r\n' 'payload' "$i")"
   run_one "$rec" "$name"
   echo "   ok  the module composed and sent the request without faulting"
 
@@ -157,21 +153,23 @@ for case in "1 GET /hello job-42" "3 POST /submit job-43"; do
     *)   fail "$name: origin saw '$saw', wanted '$name $path HTTP/1.1'" ;;
   esac
 
-  # The payload is the body and nothing else: a plain record answered in the
-  # extended shape would carry four bytes of head in front of it.
-  decode_reply "$i" 0 "$key" \
-    "assert payload == b'echo:$path', f'payload {payload!r}'" \
-    || fail "$name: the reply was not the body alone"
-  echo "   ok  reply is the body alone, under corr $i and msg_key '$key'"
+  decode_answer "$i" 200 "$(cat <<INNER
+assert ct == b'text/plain', f'content type {ct!r}'
+assert b'X-Origin-Note: seen\r\n' in headers, f'headers {headers!r}'
+assert b'Connection' not in headers, f'a framing field was forwarded {headers!r}'
+assert body == b'echo:$path', f'body {body!r}'
+INNER
+)" || fail "$name: the answer did not decode"
+  echo "   ok  the answer is the origin's status, content type, headers and body, under id $i"
 done
 
-echo "── GET /typed, asking for the whole response ──"
-rec="$(publish $((1 | 0x80)) /typed 'X-Wave-Test: present\r\nAccept: text/plain\r\n' job-44 9)"
-run_one "$rec" extended
+echo "── GET /typed, with the requester's own headers ──"
+rec="$(request 1 /typed 'X-Wave-Test: present\r\nAccept: text/plain\r\n' '' 9)"
+run_one "$rec" headers
 
-# The caller's fields sit in a head that still carries the ones this client
+# The requester's fields sit in a head that still carries the ones this client
 # frames the request with, each exactly once.
-python3 - "$WORK/req.txt" <<'INNER' || fail "extended: the request head is not what it should be"
+python3 - "$WORK/req.txt" <<'INNER' || fail "headers: the request head is not what it should be"
 import sys
 head = open(sys.argv[1], "rb").read()
 lines = head.split(b"\r\n")
@@ -179,73 +177,40 @@ assert lines[0] == b"GET /typed HTTP/1.1", f"request line {lines[0]!r}"
 fields = [l for l in lines[1:] if l]
 def count(name):
     return sum(1 for f in fields if f.lower().startswith(name + b":"))
-assert count(b"x-wave-test") == 1, f"caller field not once: {fields}"
-assert count(b"accept") == 1, f"caller field not once: {fields}"
+assert count(b"x-wave-test") == 1, f"requester field not once: {fields}"
+assert count(b"accept") == 1, f"requester field not once: {fields}"
 assert count(b"host") == 1, f"host not once: {fields}"
 assert count(b"connection") == 1, f"connection not once: {fields}"
 assert b"X-Wave-Test: present" in fields, f"verbatim bytes not kept: {fields}"
 INNER
-echo "   ok  the caller's fields reached the origin, beside the client's own, each once"
+echo "   ok  the requester's fields reached the origin, beside the client's own, each once"
+decode_answer 9 200 "assert body == b'echo:/typed', f'body {body!r}'" \
+  || fail "headers: the answer did not decode"
+echo "   ok  answered"
 
-decode_reply 9 0 job-44 "$(cat <<'INNER'
-code, hdr_len = struct.unpack_from('<HH', payload, 0)
-assert code == 200, f"status {code}"
-headers = payload[4:4 + hdr_len]
-body = payload[4 + hdr_len:]
-assert headers.endswith(b"\r\n"), f"block does not end CRLF: {headers!r}"
-assert b"X-Origin-Note: seen\r\n" in headers, f"headers {headers!r}"
-# The body is not here. A reply is one record on a surface whose ceiling
-# every provider sizes its buffers from, so a response of any length cannot
-# be one: the head comes back on this frame and the body on its own stream.
-assert body == b"", f"body in the reply {body!r}"
-INNER
-)" || fail "extended: the reply did not decode"
-echo "   ok  reply is the status and the header block it describes, and no body"
-
-# And the body arrived on `file_ctrl`, in length-framed chunks ended by a
-# zero-length one. This is what makes the response unbounded: nothing about it
-# has to fit a record, and the head went first so a consumer can read the body
-# as it comes rather than after all of it has.
-python3 - "$WORK/runtime.log" <<'INNER' || fail "extended: the body did not stream whole"
-import sys
-raw = open(sys.argv[1], "rb").read()
-at = raw.find(b"\x0b\x00echo:/typed")
-assert at >= 0, f"no framed chunk carrying the body: {raw[-200:]!r}"
-body, at = b"", at
-while True:
-    n = int.from_bytes(raw[at:at + 2], "little")
-    at += 2
-    if n == 0:
-        break
-    body += raw[at:at + n]
-    at += n
-assert body == b"echo:/typed", f"body {body!r}"
-INNER
-echo "   ok  the body streamed in framed chunks, ended by a zero-length one"
-
-# Every way a block can reach into the request head. Each is refused
-# UNROUTABLE — the record is not one this provider will perform, as against
-# OVERSIZE, which is one it cannot fit — and refused before a connection, so
+# Every way a block can reach into the request head. Each is answered 400 —
+# not a request this provider will perform — and before a connection, so
 # nothing of it reaches the origin.
 refused() {
-  local label="$1" hdrs="$2" corr="$3"
+  local label="$1" hdrs="$2" xid="$3"
   echo "── $label ──"
   local rec
-  rec="$(publish $((1 | 0x80)) /refused "$hdrs" job-45 "$corr")"
+  rec="$(request 1 /refused "$hdrs" '' "$xid")"
   run_one "$rec" "$label"
   [ ! -s "$WORK/req.txt" ] || fail "$label: a request reached the origin: $(cat "$WORK/req.txt")"
-  # REFUSE_UNROUTABLE = 2 in fluxor's exchange contract.
-  decode_reply "$corr" 2 job-45 "assert plen == 0, f'payload {payload!r}'" \
-    || fail "$label: not refused UNROUTABLE"
-  echo "   ok  refused UNROUTABLE, the producer answered, no request on the wire"
+  decode_answer "$xid" 400 "assert body == b'', f'body {body!r}'" \
+    || fail "$label: not answered 400"
+  echo "   ok  answered 400, no request on the wire"
 }
 
 refused "a block whose blank line would end the head" \
         'X-A: 1\r\n\r\nGET /evil HTTP/1.1\r\nHost: x\r\n' 11
 refused "a block naming a field the client frames with" \
-        'Content-Length: 99\r\n' 12
+        'Transfer-Encoding: chunked\r\n' 12
 refused "a block splitting a line on a bare LF" \
         'X-A: 1\nX-B: 2\r\n' 13
+refused "a host other than the pinned authority" \
+        'Host: elsewhere.example\r\n' 14
 
 echo
-echo "PASS: exchange client end to end — record in, request on the wire, correlated reply out."
+echo "PASS: exchange client end to end — request in, request on the wire, answer out."

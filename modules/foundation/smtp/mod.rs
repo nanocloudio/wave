@@ -12,10 +12,13 @@
 //! take a submission -> connect -> walk the command sequence -> report exactly
 //! one result.
 //!
-//! **Driven.** A submission arrives as an `SmtpRequest` on `request_in` and is
-//! answered with exactly one `SmtpResult` on `result_out`, correlated by the
-//! caller's `cid`. One long-running instance performs many submissions without
-//! its graph being rebuilt.
+//! **Driven.** The module is an exchange provider (`abi::contracts::exchange`).
+//! A submission arrives as a request on `request_in` — method POST, `target`
+//! the one recipient, a `mail-from` header naming the envelope sender, the
+//! message as the body — and is answered exactly once on `response_out` under
+//! the requester's exchange id, the answer's body an `SmtpResult`. One
+//! long-running instance performs many submissions without its graph being
+//! rebuilt.
 //!
 //! **Configured.** Params may instead describe a single submission, which is
 //! performed once at startup as if its record had arrived on `request_in`. A
@@ -31,7 +34,7 @@
 //! belongs above this module.
 //!
 //! Ports:  net_in/net_out (transport), status_out (human-readable status),
-//!         request_in (submissions), result_out (one result each).
+//!         request_in (ExchangeRequest), response_out (ExchangeResponse).
 //! Params: `authority` (`host[:port]`, port 25 when it names none), `helo`
 //!         (EHLO domain),
 //!         `mail_from`, `rcpt_to`, `body` (message headers+body),
@@ -108,11 +111,16 @@ mod smtp_wire;
 #[path = "../../common/smtp_wire.rs"]
 pub mod smtp_wire;
 use smtp_wire::{
-    parse_smtp_request, smtp_classify_code, smtp_enhanced_status, smtp_op_is_known,
-    write_smtp_result, SmtpResultHead, SMTP_FLAG_MORE_BODY, SMTP_OP_BODY, SMTP_OP_CANCEL,
-    SMTP_OP_SUBMIT, SMTP_OUT_ACCEPTED, SMTP_OUT_AUTH_UNAVAILABLE, SMTP_OUT_CANCELLED,
-    SMTP_OUT_CLOSED, SMTP_OUT_CONNECT_FAILED, SMTP_OUT_MALFORMED, SMTP_OUT_PROTOCOL_ERROR,
-    SMTP_OUT_TIMEOUT, SMTP_REQ_HDR, SMTP_RES_HDR,
+    smtp_classify_code, smtp_enhanced_status, write_smtp_result, SmtpResultHead, SMTP_OUT_ACCEPTED,
+    SMTP_OUT_AUTH_UNAVAILABLE, SMTP_OUT_CLOSED, SMTP_OUT_CONNECT_FAILED, SMTP_OUT_PROTOCOL_ERROR,
+    SMTP_OUT_REJECTED_PERM, SMTP_OUT_REJECTED_TEMP, SMTP_OUT_TIMEOUT, SMTP_RES_HDR,
+};
+
+// The exchange records submissions arrive in and are answered with.
+use abi::contracts::exchange::{
+    abort, flag, header, parse_request, status, write_abort, write_body, write_credit,
+    write_response, write_response_head, ExchangeId, Record, ResponseHead, BODY_MAX, METHOD_POST,
+    RECORD_MAX,
 };
 
 // The NetProto opcodes and identity accessors come from the owning contract,
@@ -136,9 +144,10 @@ const E_BAD_AUTHORITY: i32 = -22;
 
 const NET_BUF: usize = 2048;
 /// Raw body bytes held between arriving on `request_in` and reaching the wire.
-/// One record's worth: the next body record is not read until this one has been
-/// sent, which is what bounds the module's memory against a message of any size.
-const CHUNK_BUF: usize = 4096;
+/// One record's worth: the credit granted never passes what is free here, so
+/// the next body bytes come only once these have been sent, which is what
+/// bounds the module's memory against a message of any size.
+const CHUNK_BUF: usize = BODY_MAX;
 /// Staged outbound bytes. Sized for a dot-stuffed `CHUNK_BUF`: transparency can
 /// double a chunk in the worst case (every line a lone `.`), and a staged
 /// command that did not fit would be sent truncated.
@@ -158,9 +167,10 @@ const CRED_BUF: usize = 120;
 /// more words than this has its explanation truncated, not the module's buffers
 /// grown by whatever it chose to send.
 const TEXT_BUF: usize = 256;
-/// Inbound `SmtpRequest` staging. Holds a whole record plus whatever arrived
-/// behind it on the byte FIFO.
-const REC_BUF: usize = 2 * (SMTP_REQ_HDR + 2 * NAME_BUF + CHUNK_BUF);
+/// One request record, read whole.
+const REC_BUF: usize = RECORD_MAX;
+/// The answer record: a response HEAD carrying an `SmtpResult` and its text.
+const ANSWER_BUF: usize = 32 + SMTP_RES_HDR + TEXT_BUF;
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 const REPLY_TIMEOUT_MS: u64 = 15_000;
 
@@ -171,7 +181,7 @@ struct SmtpState {
     net_out: i32,
     status_out: i32,
     request_in: i32,
-    result_out: i32,
+    response_out: i32,
 
     /// `host[:port]`: where every submission is dialled. Parsed at
     /// construction, so a dial never meets an authority it cannot carry.
@@ -211,7 +221,22 @@ struct SmtpState {
     /// single connection and SMTP is lockstep, so overlapping two would
     /// interleave their commands on the wire.
     op_active: u8,
-    cid: u32,
+    /// The exchange the submission in flight answers; meaningful while
+    /// `answerable` is set. A params-described submission has none.
+    id: ExchangeId,
+    answerable: u8,
+    /// The requester aborted the exchange: the conversation is ended and
+    /// nothing is written for it.
+    abandoned: u8,
+    /// Request-body credit granted and not yet used, and credit owed back as
+    /// the chunk in hand reaches the wire.
+    credit_out: u32,
+    credit_owed: u32,
+    /// Response-body credit the requester has granted.
+    resp_credit: u32,
+    /// 1 once the answer's HEAD has gone with MORE, its body waiting on
+    /// response credit.
+    head_sent: u8,
     mail_from: [u8; NAME_BUF],
     mail_from_len: u16,
     rcpt_to: [u8; NAME_BUF],
@@ -259,7 +284,7 @@ struct SmtpState {
     /// 1 once a result has been decided for this submission. Exactly one is
     /// owed per submission, so the first decision is the only one.
     res_produced: u8,
-    /// 1 while the decided result still has to be handed to `result_out`.
+    /// 1 while the decided result still has to be handed to `response_out`.
     res_owed: u8,
     res_outcome: u8,
     res_phase: u8,
@@ -279,10 +304,18 @@ struct SmtpState {
     /// submission once the first had flushed.
     status_produced: u8,
 
-    /// Inbound record staging, and how much of its front has been consumed.
+    /// The request record read and not yet taken: a HEAD that must wait for
+    /// the answer in hand to leave.
     rec: [u8; REC_BUF],
     rec_len: u32,
-    rec_taken: u32,
+    /// A status the module answers on its own — a refusal — with the
+    /// exchange it answers, while `response_out` cannot take it yet.
+    refusal_id: ExchangeId,
+    refusal: u16,
+    /// A CREDIT record waiting for `response_out`.
+    ctl: [u8; 32],
+    ctl_len: u8,
+    answer: [u8; ANSWER_BUF],
 
     delivered: u32,
     errors: u32,
@@ -392,7 +425,7 @@ pub extern "C" fn module_new(
         s.net_out = out_chan;
         s.status_out = dev_channel_port(sys, 1, 1);
         s.request_in = dev_channel_port(sys, 0, 1);
-        s.result_out = dev_channel_port(sys, 1, 2);
+        s.response_out = dev_channel_port(sys, 1, 2);
         s.authority_len = 0;
         s.port = 0;
         s.peer_ip = [0u8; 4];
@@ -401,7 +434,13 @@ pub extern "C" fn module_new(
         s.auth_pass_len = 0;
         s.saw_auth_plain = 0;
         s.op_active = 0;
-        s.cid = 0;
+        s.id = ExchangeId::NONE;
+        s.answerable = 0;
+        s.abandoned = 0;
+        s.credit_out = 0;
+        s.credit_owed = 0;
+        s.resp_credit = 0;
+        s.head_sent = 0;
         s.mail_from_len = 0;
         s.rcpt_to_len = 0;
         s.chunk_len = 0;
@@ -431,7 +470,8 @@ pub extern "C" fn module_new(
         s.status_len = 0;
         s.status_produced = 0;
         s.rec_len = 0;
-        s.rec_taken = 0;
+        s.refusal = 0;
+        s.ctl_len = 0;
         s.delivered = 0;
         s.errors = 0;
         s.admitted = 0;
@@ -462,9 +502,10 @@ pub extern "C" fn module_new(
             s.helo[..def.len()].copy_from_slice(def);
             s.helo_len = def.len() as u16;
         }
-        // A params-described submission is performed once, as if its record had
-        // arrived on `request_in`. A statically configured graph keeps working
-        // and there is only one path through the pump.
+        // A params-described submission is performed once, as if its request
+        // had arrived on `request_in` — with nobody to answer, so its outcome
+        // is the status line alone. A statically configured graph keeps
+        // working and there is only one path through the pump.
         if s.mail_from_len > 0 && s.rcpt_to_len > 0 {
             s.op_active = 1;
             s.more_body = 0;
@@ -531,21 +572,40 @@ unsafe fn emit_result(s: &mut SmtpState, outcome: u8, reached: SmtpPhase) {
     s.res_phase = smtp_phase_code(reached);
 }
 
-/// Hand the decided result to `result_out`, retrying while the channel refuses
-/// it. Built afresh each attempt from the fields already in state, so a refused
-/// write costs nothing but the rebuild.
+/// The status an outcome is answered with. The conversation's own verdict —
+/// accepted, refused permanently or for now, a reply out of sequence,
+/// credentials that could not be sent — is the answer: 200, with the result
+/// saying which. A relay that could not be reached, or that dropped the
+/// connection before deciding, is the provider's 502; one that stopped
+/// answering, its 504. Either way the result body says how far it got.
+fn answer_status(outcome: u8) -> u16 {
+    match outcome {
+        SMTP_OUT_CONNECT_FAILED | SMTP_OUT_CLOSED => status::BAD_GATEWAY,
+        SMTP_OUT_TIMEOUT => status::TIMEOUT,
+        _ => status::OK,
+    }
+}
+
+/// Hand the decided result to `response_out` as the submission's answer,
+/// retrying while the channel refuses it. Built afresh each attempt from the
+/// fields already in state, so a refused write costs nothing but the rebuild.
+///
+/// The result is the answer's body, so it goes only as far as the requester's
+/// response credit allows: whole in the HEAD when the credit covers it, and
+/// otherwise the HEAD first with MORE and the body once credit arrives.
 unsafe fn flush_result(s: &mut SmtpState) {
-    if s.res_owed == 0 || s.result_out < 0 {
+    if s.res_owed == 0 {
+        return;
+    }
+    // A params-described submission has no requester, and an aborted one has
+    // nobody waiting: the outcome is the status line alone.
+    if s.answerable == 0 || s.abandoned != 0 || s.response_out < 0 {
+        s.res_owed = 0;
         return;
     }
     let sys = &*s.syscalls;
-    let poll = (sys.channel_poll)(s.result_out, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
-        return;
-    }
     let text_len = s.res_text_len as usize;
     let head = SmtpResultHead {
-        cid: s.cid,
         outcome: s.res_outcome,
         phase: s.res_phase,
         code: s.res_code,
@@ -564,19 +624,47 @@ unsafe fn flush_result(s: &mut SmtpState) {
         peer_port: s.port,
         text_len,
     };
-    let mut out = [0u8; SMTP_RES_HDR + TEXT_BUF];
-    let total = match write_smtp_result(&head, &mut out) {
-        Some(n) => n,
-        None => {
-            s.res_owed = 0;
-            return;
-        }
+    let mut res = [0u8; SMTP_RES_HDR + TEXT_BUF];
+    let Some(total) = write_smtp_result(&head, &mut res) else {
+        s.res_owed = 0;
+        return;
     };
-    out[SMTP_RES_HDR..SMTP_RES_HDR + text_len].copy_from_slice(&s.res_text[..text_len]);
-    if (sys.channel_write)(s.result_out, out.as_ptr(), total) != total as i32 {
+    res[SMTP_RES_HDR..SMTP_RES_HDR + text_len].copy_from_slice(&s.res_text[..text_len]);
+    let body = &res[..total];
+    let code = answer_status(s.res_outcome);
+    let fits = s.resp_credit as usize >= total;
+    let (n, done) = if s.head_sent == 0 {
+        let flags = if fits { 0 } else { flag::MORE };
+        let carried: &[u8] = if fits { body } else { &[] };
+        let n = write_response_head(
+            &ResponseHead {
+                id: s.id,
+                flags,
+                status: code,
+                content_type: &[],
+                headers: &[],
+                body: carried,
+            },
+            &mut s.answer,
+        );
+        (n, fits)
+    } else if fits {
+        (write_body(&s.id, 0, body, &mut s.answer), true)
+    } else {
+        return;
+    };
+    let Some(n) = n else {
+        s.res_owed = 0;
+        return;
+    };
+    if (sys.channel_write)(s.response_out, s.answer.as_ptr(), n) <= 0 {
         return;
     }
-    s.res_owed = 0;
+    if done {
+        s.res_owed = 0;
+    } else {
+        s.head_sent = 1;
+    }
 }
 
 /// Keep the reply code, its enhanced status and its bounded text for the
@@ -700,6 +788,10 @@ unsafe fn pump_body(s: &mut SmtpState, now: u64) {
                 chunk_len >= 2 && raw[chunk_len - 2] == b'\r' && raw[chunk_len - 1] == b'\n',
             );
             s.chunk_len = 0;
+            // The chunk's room is free again, and the requester may fill it.
+            if s.more_body != 0 && s.answerable != 0 {
+                s.credit_owed = s.credit_owed.saturating_add(chunk_len as u32);
+            }
             stage_req(s, &out[..n], now);
         }
         return;
@@ -855,7 +947,13 @@ unsafe fn finish_op(s: &mut SmtpState) {
     }
     close_connection(s);
     s.op_active = 0;
-    s.cid = 0;
+    s.id = ExchangeId::NONE;
+    s.answerable = 0;
+    s.abandoned = 0;
+    s.credit_out = 0;
+    s.credit_owed = 0;
+    s.resp_credit = 0;
+    s.head_sent = 0;
     s.mail_from_len = 0;
     s.rcpt_to_len = 0;
     s.chunk_len = 0;
@@ -886,207 +984,167 @@ unsafe fn finish_op(s: &mut SmtpState) {
 
 // ── inbound records ───────────────────────────────────────────────────────
 
-/// What the front of `rec` holds, once the bytes read so far are in.
-enum Front {
-    /// Fewer bytes than a record needs — either the fixed header has not all
-    /// arrived, or it has and the fields it declares have not. Both are the
-    /// caller mid-write, not a caller in error.
-    Partial,
-    /// A whole record, ready to perform.
-    Whole,
-    /// A header declaring a record longer than `REC_BUF`. No later read
-    /// completes it, so it is decided now rather than waited on.
-    Impossible,
-}
-
-/// Total length the record at the front of `buf` declares, in `u64` so a
-/// declared chunk of up to `u32::MAX` cannot overflow the arithmetic on a
-/// 32-bit target.
-fn declared_len(buf: &[u8]) -> Option<u64> {
-    if buf.len() < SMTP_REQ_HDR {
-        return None;
-    }
-    let from_len = u16::from_le_bytes([buf[6], buf[7]]) as u64;
-    let rcpt_len = u16::from_le_bytes([buf[8], buf[9]]) as u64;
-    let chunk_len = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]) as u64;
-    Some(SMTP_REQ_HDR as u64 + from_len + rcpt_len + chunk_len)
-}
-
-/// Classify the front of the request buffer.
-fn front_status(buf: &[u8]) -> Front {
-    match declared_len(buf) {
-        None => Front::Partial,
-        Some(need) if need > REC_BUF as u64 => Front::Impossible,
-        Some(need) if (buf.len() as u64) < need => Front::Partial,
-        Some(_) => Front::Whole,
-    }
-}
-
-/// Correlation id of the record at the front of `rec`.
-fn front_cid(buf: &[u8]) -> u32 {
-    u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]])
-}
-
-/// Answer a record this connector will not perform, so a caller learns its
-/// request was refused instead of waiting out a timeout.
-unsafe fn refuse_record(s: &mut SmtpState, cid: u32, outcome: u8) {
-    // Only safe to borrow the result fields when nothing else owes one.
-    if s.res_owed != 0 {
-        return;
-    }
-    s.cid = cid;
-    s.res_text_len = 0;
-    s.res_code = 0;
-    s.res_enh_class = 0;
-    s.res_produced = 0;
-    emit_result(s, outcome, SmtpPhase::Disconnected);
-    // Nothing was started, so nothing is retired by `finish_op`.
-    s.res_produced = 0;
-}
-
-/// Take at most one record off `request_in`.
-///
-/// One per step, deliberately: every record either starts a submission, feeds
-/// the one in flight, ends it, or is refused, and each of those needs the rest
-/// of the step to act on it before another is taken.
-///
-/// `request_in` is a byte FIFO, so one `channel_read` can return several whole
-/// records back to back and end part-way through the next. The buffer holds
-/// everything the reads returned; the record being performed stays at the front
-/// until it has been consumed, and a trailing fragment is topped up by later
-/// reads until it is whole. Both are bytes the caller can no longer hand to
-/// anything else, so discarding either loses the request with no event to
-/// explain it.
-unsafe fn pump_requests(s: &mut SmtpState, now: u64) {
+/// Place a record this module owes on `response_out` beside the answer: a
+/// CREDIT grant or an ABORT, then a refusal. False while one still waits.
+unsafe fn flush_owed(s: &mut SmtpState) -> bool {
     let sys = &*s.syscalls;
-    if s.request_in < 0 {
+    if s.ctl_len == 0 && s.credit_owed != 0 && s.answerable != 0 && s.abandoned == 0 {
+        if let Some(n) = write_credit(&s.id, s.credit_owed, &mut s.ctl) {
+            s.credit_out = s.credit_out.saturating_add(s.credit_owed);
+            s.credit_owed = 0;
+            s.ctl_len = n as u8;
+        }
+    }
+    if s.ctl_len != 0 {
+        let n = s.ctl_len as usize;
+        if (sys.channel_write)(s.response_out, s.ctl.as_ptr(), n) <= 0 {
+            return false;
+        }
+        s.ctl_len = 0;
+    }
+    if s.refusal != 0 {
+        let mut rec = [0u8; 32];
+        if let Some(n) = write_response(&s.refusal_id, s.refusal, &[], &[], &mut rec) {
+            if (sys.channel_write)(s.response_out, rec.as_ptr(), n) <= 0 {
+                return false;
+            }
+        }
+        s.refusal = 0;
+    }
+    true
+}
+
+/// Answer `id` with `code` and nothing else.
+unsafe fn refuse(s: &mut SmtpState, id: ExchangeId, code: u16) {
+    s.refusal_id = id;
+    s.refusal = code;
+    s.dropped_unparsable = s.dropped_unparsable.wrapping_add(1);
+    flush_owed(s);
+}
+
+/// Take the request records `request_in` holds, as far as there is somewhere
+/// to put what they ask for.
+unsafe fn pump_requests(s: &mut SmtpState, now: u64) {
+    if s.request_in < 0 || s.response_out < 0 {
         return;
     }
-    // Retire the record just consumed, exposing whatever arrived behind it.
-    if s.rec_taken > 0 {
-        let taken = (s.rec_taken as usize).min(s.rec_len as usize);
-        let remaining = s.rec_len as usize - taken;
-        if remaining > 0 {
-            core::ptr::copy(s.rec.as_ptr().add(taken), s.rec.as_mut_ptr(), remaining);
-        }
-        s.rec_len = remaining as u32;
-        s.rec_taken = 0;
-    }
-    // Whether the record at the front can be taken is decided per record,
-    // below: a cancel must be readable while a submission is in flight,
-    // which a gate on "is this connector idle" would prevent. A record
-    // that cannot be taken yet stays at the front until it can.
-    //
-    // A submission queued behind another is not reachable until the one in
-    // front is taken, which is what a FIFO means; a caller that needs a
-    // cancel honoured promptly sends it before queueing more work.
-    let wants_submit = s.op_active == 0 && s.draining == 0;
-    let wants_body = s.op_active != 0 && s.more_body != 0 && s.chunk_len == 0;
-    while s.draining == 0 && matches!(front_status(&s.rec[..s.rec_len as usize]), Front::Partial) {
-        let at = s.rec_len as usize;
-        if at >= REC_BUF {
-            break;
-        }
-        let poll = (sys.channel_poll)(s.request_in, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            break;
-        }
-        let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr().add(at), REC_BUF - at);
-        if n <= 0 {
-            break;
-        }
-        s.rec_len = (at + n as usize) as u32;
-    }
-    let n = s.rec_len as usize;
-    match front_status(&s.rec[..n]) {
-        Front::Whole => {}
-        Front::Partial => return,
-        Front::Impossible => {
-            // Nothing later completes it. It names a correlation id, so it
-            // is refused rather than dropped, and the buffer is cleared:
-            // its remaining bytes belong to a record that cannot be read.
-            let cid = front_cid(&s.rec[..n]);
-            refuse_record(s, cid, SMTP_OUT_MALFORMED);
-            s.dropped_unparsable = s.dropped_unparsable.wrapping_add(1);
-            s.rec_len = 0;
+    let sys = &*s.syscalls;
+    for _ in 0..4 {
+        if !flush_owed(s) {
             return;
         }
-    }
-    let view = match parse_smtp_request(&s.rec[..n]) {
-        Some(v) => v,
-        None => return,
-    };
-    let total = SMTP_REQ_HDR + view.from_len + view.rcpt_len + view.chunk_len;
-
-    if !smtp_op_is_known(view.op) {
-        refuse_record(s, view.cid, SMTP_OUT_MALFORMED);
-        s.rec_taken = total as u32;
-        s.dropped_unparsable = s.dropped_unparsable.wrapping_add(1);
-        return;
-    }
-
-    match view.op {
-        SMTP_OP_SUBMIT if wants_submit => {
-            if view.from_len == 0
-                || view.rcpt_len == 0
-                || view.from_len > NAME_BUF
-                || view.rcpt_len > NAME_BUF
-                || view.chunk_len > CHUNK_BUF
-            {
-                refuse_record(s, view.cid, SMTP_OUT_MALFORMED);
-                s.rec_taken = total as u32;
+        if s.rec_len == 0 {
+            let poll = (sys.channel_poll)(s.request_in, 0x01);
+            if poll <= 0 || (poll as u32 & 0x01) == 0 {
                 return;
             }
-            s.cid = view.cid;
-            s.mail_from_len = view.from_len as u16;
-            s.mail_from[..view.from_len]
-                .copy_from_slice(&s.rec[view.from_at..view.from_at + view.from_len]);
-            s.rcpt_to_len = view.rcpt_len as u16;
-            s.rcpt_to[..view.rcpt_len]
-                .copy_from_slice(&s.rec[view.rcpt_at..view.rcpt_at + view.rcpt_len]);
-            s.chunk_len = view.chunk_len as u32;
-            s.chunk[..view.chunk_len]
-                .copy_from_slice(&s.rec[view.chunk_at..view.chunk_at + view.chunk_len]);
-            s.more_body = u8::from(view.more_body());
+            let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr(), REC_BUF);
+            if n <= 0 {
+                return;
+            }
+            s.rec_len = n as u32;
+        }
+        take_record(s, now);
+        s.rec_len = 0;
+    }
+}
+
+/// Take the record in `rec`.
+unsafe fn take_record(s: &mut SmtpState, now: u64) {
+    let rec: &[u8] = core::slice::from_raw_parts(s.rec.as_ptr(), s.rec_len as usize);
+    let Some(record) = parse_request(rec) else {
+        // Without a parse there is no id, and so nobody to answer.
+        s.dropped_unparsable = s.dropped_unparsable.wrapping_add(1);
+        return;
+    };
+    let live = |id: &ExchangeId| s.op_active != 0 && s.answerable != 0 && *id == s.id;
+    match record {
+        Record::Head(h) if live(&h.id) => {}
+        Record::Head(h) => {
+            // One submission at a time: the transport is a single
+            // connection and SMTP is lockstep, so a second is answered busy
+            // rather than queued, and a requester may repeat it.
+            if s.draining != 0 || s.op_active != 0 {
+                refuse(s, h.id, status::BUSY);
+                return;
+            }
+            let from = header(h.headers, b"mail-from").unwrap_or(&[]);
+            if h.method != METHOD_POST
+                || h.flags & (flag::BROADCAST | flag::WEBSOCKET | flag::WEBTRANSPORT) != 0
+                || from.is_empty()
+                || h.target.is_empty()
+            {
+                refuse(s, h.id, status::BAD_REQUEST);
+                return;
+            }
+            if from.len() > NAME_BUF || h.target.len() > NAME_BUF || h.body.len() > CHUNK_BUF {
+                refuse(s, h.id, status::TOO_LARGE);
+                return;
+            }
+            s.id = h.id;
+            s.answerable = 1;
+            s.abandoned = 0;
+            s.resp_credit = h.resp_credit;
+            s.head_sent = 0;
+            s.mail_from_len = from.len() as u16;
+            s.mail_from[..from.len()].copy_from_slice(from);
+            s.rcpt_to_len = h.target.len() as u16;
+            s.rcpt_to[..h.target.len()].copy_from_slice(h.target);
+            s.chunk_len = h.body.len() as u32;
+            s.chunk[..h.body.len()].copy_from_slice(h.body);
+            s.more_body = u8::from(h.flags & flag::MORE != 0);
+            // The rest of the chunk's room is granted at once; what follows
+            // is granted back as each chunk reaches the wire.
+            s.credit_out = 0;
+            s.credit_owed = if s.more_body != 0 {
+                (CHUNK_BUF - h.body.len()) as u32
+            } else {
+                0
+            };
             s.at_line_start = 1;
             s.ends_crlf = 0;
             s.body_terminated = 0;
             s.op_active = 1;
             s.admitted = s.admitted.wrapping_add(1);
-            s.rec_taken = total as u32;
             let _ = now;
         }
-        SMTP_OP_BODY if wants_body && view.cid == s.cid => {
-            if view.chunk_len > CHUNK_BUF {
-                refuse_record(s, view.cid, SMTP_OUT_MALFORMED);
-                s.rec_taken = total as u32;
+        Record::Body { id, flags, data } if live(&id) => {
+            if s.more_body == 0 || data.len() > s.credit_out as usize {
+                // Body past the credit granted, or past the end the requester
+                // already declared: the exchange is over, and it says so.
+                if let Some(n) = write_abort(&s.id, abort::CREDIT_OVERRUN, &mut s.ctl) {
+                    s.ctl_len = n as u8;
+                }
+                end_abandoned(s);
                 return;
             }
-            s.chunk_len = view.chunk_len as u32;
-            s.chunk[..view.chunk_len]
-                .copy_from_slice(&s.rec[view.chunk_at..view.chunk_at + view.chunk_len]);
-            s.more_body = u8::from(view.more_body());
-            s.rec_taken = total as u32;
+            let at = s.chunk_len as usize;
+            s.chunk[at..at + data.len()].copy_from_slice(data);
+            s.chunk_len += data.len() as u32;
+            s.credit_out -= data.len() as u32;
+            s.more_body = u8::from(flags & flag::MORE != 0);
         }
-        SMTP_OP_CANCEL if s.op_active != 0 && view.cid == s.cid => {
-            emit_result(s, SMTP_OUT_CANCELLED, s.phase);
+        Record::Credit { id, bytes } if live(&id) => {
+            s.resp_credit = s.resp_credit.saturating_add(bytes);
+        }
+        Record::Abort { id, .. } if live(&id) => {
+            // The requester gave up the submission: the conversation ends
+            // here and nothing is written for it.
             emit_status(s, b"smtp: cancelled\n");
-            close_connection(s);
-            s.phase = SmtpPhase::Failed;
-            s.rec_taken = total as u32;
+            end_abandoned(s);
         }
-        _ => {
-            // A body or cancel for a submission this connector is not
-            // performing, or a submission while one is in flight. Leave it
-            // where it is when it may yet become current; refuse it when it
-            // never can.
-            if view.op == SMTP_OP_SUBMIT {
-                return;
-            }
-            refuse_record(s, view.cid, SMTP_OUT_MALFORMED);
-            s.rec_taken = total as u32;
-        }
+        _ => {}
     }
+}
+
+/// End the submission in flight without an answer.
+unsafe fn end_abandoned(s: &mut SmtpState) {
+    s.abandoned = 1;
+    s.res_owed = 0;
+    s.res_produced = 1;
+    s.credit_owed = 0;
+    close_connection(s);
+    s.phase = SmtpPhase::Failed;
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -1314,7 +1372,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Reporting earlier tears the instance down with the one outcome it
         // promised still in its own buffer, and with a CLOSE the peer never
         // receives.
-        if s.draining == 1 && s.res_owed == 0 && s.status_len == 0 && s.op_active == 0 {
+        if s.draining == 1
+            && s.res_owed == 0
+            && s.status_len == 0
+            && s.op_active == 0
+            && s.refusal == 0
+            && s.ctl_len == 0
+        {
             if s.conn_present != 0 {
                 let mut close = [0u8; 2];
                 net_proto::put_conn_id(&mut close, s.conn_id);

@@ -49,19 +49,19 @@ MODE="${1:-}"
 # silently omits an artefact is worse than no budget, because the omission
 # reads as coverage.
 BUDGETS='
-rp2040|http.fmod|208000|197887 (2026-09-10, +15.6K: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
+rp2040|http.fmod|218700|208228 (2026-10-06: request bodies whole in the application HEAD and the exchange id the server packs itself; ceiling re-based 5% above measured)
 rp2040|http-h2.fmod|161000|153463 (2026-09-10, +15.2K: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
 rp2040|http-web.fmod|102000|93780 (2026-09-07, first RP2040 qualification)
 rp2040|http-app.fmod|108000|99476 (2026-09-07, first RP2040 qualification)
-rp2040|http-exchange.fmod|212000|201847 (2026-09-10, +15.5K: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
+rp2040|http-exchange.fmod|237100|225772 (2026-10-06: the client as an exchange provider: request collection, streamed answers under credit, LINK, and request headers over h1, h2 and h3; ceiling re-based 5% above measured)
 rp2040|http-h1_exchange.fmod|105000|97108 (2026-09-07, first RP2040 qualification)
 rp2350|http-h1_exchange.fmod|100000|92572 (2026-09-08, first row; HTTP/1.1 plus the graph-driven exchange client and nothing else)
 bcm2712|http-h1_exchange.fmod|217000|201220 (2026-09-08, first row; HTTP/1.1 plus the graph-driven exchange client and nothing else)
-rp2350|http.fmod|203000|192959 (2026-09-10, +20.0K since the 2026-09-07 row: the session anchor and the h2 tunnel seam on top of the lifetime deadlines; ceiling re-based 5% above measured)
+rp2350|http.fmod|216900|206508 (2026-10-06: request bodies whole in the application HEAD and the exchange id the server packs itself; ceiling re-based 5% above measured)
 rp2350|http-h2.fmod|157000|149495 (2026-09-10, +14.0K since the 2026-09-07 row: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
 rp2350|http-web.fmod|98000|90020 (2026-09-07, current ABI and readiness hardening)
 rp2350|http-app.fmod|103000|95004 (2026-09-07, current ABI and readiness hardening)
-rp2350|http-exchange.fmod|220100|209638 (2026-10-03, +12.8K since the 2026-09-10 row: request and response bodies streamed in bounded records under credit on h1, h2 and h3; ceiling re-based 5% above measured)
+rp2350|http-exchange.fmod|234700|223508 (2026-10-06: the client as an exchange provider: request collection, streamed answers under credit, LINK, and request headers over h1, h2 and h3; ceiling re-based 5% above measured)
 rp2350|rtp.fmod|26500|25200 (2026-09-24, +3.1K: the encoded-media record stream in, and the RFC 3551/7587/6184/7741 payload formats packetizing it; the private media record and its codec table are gone; ceiling re-based 5% above measured)
 rp2350|rtcp.fmod|14600|13501 (2026-09-08, +7.0K: SRTCP protection over the RFC 3550 §6 control plane (see `rtcp_core.rs`) — AES-GCM, the 31-bit SRTCP index and its replay window, plus RFC 4585 NACK and PLI feedback)
 bcm2712|rtp.fmod|32700|31096 (2026-09-24, +3.7K: the encoded-media record stream in, and the RFC 3551/7587/6184/7741 payload formats packetizing it; the private media record and its codec table are gone; ceiling re-based 5% above measured)
@@ -83,7 +83,7 @@ bcm2712|http-app.fmod|212000|196158 (2026-09-05, +9.1K since the 2026-08-16 row:
 bcm2712|http-exchange.fmod|367000|349111 (2026-09-10: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
 bcm2712|s3.fmod|44600|42478 (2026-10-03, +22.8K: bodies of any size streamed in the HTTP application records, aws-chunked chunk signing, response framing by length, chunks or close; ceiling re-based 5% above measured)
 bcm2712|s3_serve.fmod|122400|116568 (2026-10-03, first row; SigV4, the S3 operations over storage.object, multipart staging, listings; ceiling 5% above measured)
-bcm2712|smtp.fmod|16400|15208 (2026-09-19, +1208B over the previous ceiling; authority replaces the hex endpoint: Target::parse, write_connect_to and the 128-byte authority buffer)
+bcm2712|smtp.fmod|19700|18682 (2026-10-06: submissions as exchanges: request records, credit for streamed bodies, the answer under response credit; ceiling re-based 5% above measured)
 bcm2712|websocket.fmod|20700|19139 (2026-09-19, +1139B over the previous ceiling; authority replaces the hex endpoint and the separate Host parameter)
 '
 

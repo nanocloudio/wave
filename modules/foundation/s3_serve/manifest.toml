@@ -2,10 +2,9 @@ version          = "0.1.0"
 hardware_targets = ["bcm2712"]
 timer_class      = "wall_clock"
 
-# An S3 server behind `http`'s application routes. `request_in` takes the
-# `http_app` records `http` writes on `req_out`; `response_out` answers them on
-# `resp_in`. Both edges need a non-zero `buffer_group`, which makes each write
-# one whole record.
+# An S3 server behind `http`'s application routes: a PROVIDER of the exchange
+# contract. `request_in` takes the request records `http` writes on
+# `request_out`; `response_out` answers them on `http`'s `response_in`.
 #
 # Objects are stored through any `storage.object` provider, under the grant the
 # provider answered for each access key's capability. The credentials file is
@@ -13,14 +12,14 @@ timer_class      = "wall_clock"
 [[ports]]
 name         = "request_in"
 direction    = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 max_record   = 8192
 buffer_size  = 65536
 
 [[ports]]
 name         = "response_out"
 direction    = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 max_record   = 8192
 buffer_size  = 65536
 

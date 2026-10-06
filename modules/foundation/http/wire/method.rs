@@ -1,11 +1,10 @@
 //! HTTP request methods — one vocabulary, shared by every generation.
 //!
 //! h1, h2 and h3 all resolve a method against one table, so a request means
-//! the same thing whichever generation carried it. That table is the
-//! `http_exchange` contract's: a request record carries its method as one
-//! byte, and every reader of that byte — this server, an application module
-//! decoding `HttpRequest`, and each connector that performs a request — must
-//! decode it identically. The values are STABLE and PUBLIC; appending a
+//! the same thing whichever generation carried it. That table is the exchange
+//! contract's: a request record carries its method as one byte, and every
+//! reader of that byte — this server, an application answering its requests,
+//! and each connector that performs a request — must decode it identically. The values are STABLE and PUBLIC; appending a
 //! method is safe, renumbering one is a wire-format break.
 //!
 //! What stays here is what only a server needs: how far a request-line
@@ -16,9 +15,9 @@
 //! `#[repr(u8)]` enum would make every decode a fallible transmute at the
 //! receiver for no gain over a `u8` plus these constants.
 
-/// The method vocabulary and its lookups are the `http_exchange` contract's,
+/// The method vocabulary and its lookups are the exchange contract's,
 /// re-exported here so every generation resolves a method through one name.
-pub use super::super::http_exchange::{
+pub use super::super::exchange::{
     method_from_token, method_name, METHOD_CONNECT, METHOD_DELETE, METHOD_GET, METHOD_HEAD,
     METHOD_NONE, METHOD_OPTIONS, METHOD_PATCH, METHOD_POST, METHOD_PUT,
 };

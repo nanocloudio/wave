@@ -17,7 +17,6 @@ direct fixture in `tests/harness` and never presented as a deployable role.
 | `ws_frame_core` | RFC 6455 frame-header decode + validation | `websocket`, `http` (`wire::ws`) |
 | `ws_core` | RFC 6455 upgrade request/verify and the masked frame codec | `websocket` |
 | `ws_admit` | The server-side WS admission records (upgrade report, decision, events) | `http` |
-| `http_app` | The HTTP application records (`HttpRequest` / `HttpResponse`): HEAD, BODY, ABORT, CREDIT and DATAGRAM, each naming its exchange | `http`, `s3`, `s3_serve`, `http_echo_app` and `s3_relay_app` (fixtures) |
 | `ws_session_worker` | The worker's half of session continuity for a `WsFrame` consumer: SessionCtrlV1 attach/drain/export/import/resume, the connection-to-session map, the delivery cursors, export gated on a message boundary | `ws_echo_worker` (fixture); a product worker outside Wave mounts it the same way |
 | `huffman_core` | RFC 7541 Appendix B Huffman table + decoder. RFC 9204 §4.1.2 specifies the SAME table for QPACK, so h2 and h3 share one transcription | `http` (`wire::hpack`, `wire::qpack`) |
 | `sip_core` | RFC 3261 PCMU-dialog message formatters + response/SDP parsers | `sip` |
@@ -26,7 +25,7 @@ direct fixture in `tests/harness` and never presented as a deployable role.
 | `jitter_core` | Bounded RTP reorder window + loss-concealing playout | `jitter` |
 | `rtp_core` | RFC 3550 header decode — fixed header, CSRC list, §5.3.1 extension, §5.1 padding — and therefore which bytes of a packet are payload | `rtp`, `sip` |
 | `smtp_core` | RFC 5321 reply-line parsing, dot-stuffed command builders, lockstep submission phase machine | `smtp` |
-| `smtp_wire` | The submission-record and result-record layouts (`SmtpRequest`/`SmtpResult`) | `smtp` |
+| `smtp_wire` | The `SmtpResult` layout an answer's body carries, and the outcome classification | `smtp` |
 | `rfc5322` | RFC 5322 header-block parsing: addresses, identifiers, date, subject | `mail` |
 | `mime` | MIME structure walking: multipart boundaries, part headers, encodings | `mail` |
 | `mail_wire` | The inbound-message span and facts/body record layouts | `mail` |

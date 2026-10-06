@@ -918,8 +918,6 @@ pub struct RequestOptions<'a> {
     /// Length of the body that follows this head. Non-zero writes a
     /// `Content-Length`.
     pub body_len: usize,
-    /// `Content-Type` for that body. Empty omits the header.
-    pub content_type: &'a [u8],
     /// HTTP/1.1 rather than HTTP/1.0 on the request line.
     pub http11: bool,
     /// `Connection: keep-alive` rather than `close`.
@@ -962,11 +960,9 @@ pub unsafe fn write_request_head(
         return 0;
     }
     let path_bytes = core::slice::from_raw_parts(path, path_len);
-    let type_bytes = options.content_type;
     if !path_bytes.starts_with(b"/")
         || path_bytes.iter().any(|b| *b <= 32 || *b == 127)
         || options.authority.iter().any(|b| *b <= 32 || *b == 127)
-        || type_bytes.iter().any(|b| *b < 32 || *b == 127)
         || method == method::METHOD_CONNECT
     {
         return 0;
@@ -1006,14 +1002,6 @@ pub unsafe fn write_request_head(
         put!(b" HTTP/1.0\r\nHost: ");
     }
     put!(options.authority);
-
-    // `Content-Type` precedes `Content-Length`, so a typed body reads as one
-    // description of what follows. Omitted entirely when unset: a header with
-    // an empty value is a different claim from no header at all.
-    if !type_bytes.is_empty() {
-        put!(b"\r\nContent-Type: ");
-        put!(type_bytes);
-    }
 
     if options.body_len > 0 {
         put!(b"\r\nContent-Length: ");

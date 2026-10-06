@@ -14,11 +14,17 @@ listings, part lists), `../../common/sigv4_core.rs` (signatures).
 
 | Port | Direction | Content type | Edge |
 |---|---|---|---|
-| `request_in` | input | `HttpRequest` | from `http.req_out`, `buffer_group` set |
-| `response_out` | output | `HttpResponse` | to `http.resp_in`, `buffer_group` set |
+| `request_in` | input | `ExchangeRequest` | from `http.request_out` |
+| `response_out` | output | `ExchangeResponse` | to `http.response_in` |
 
-`http` routes the S3 namespace to the application with an `app: true` route
-whose ceiling covers the largest object (`route_N_max_body_kib`).
+The module is a PROVIDER of the exchange contract (`abi::contracts::exchange`)
+and `http` its requester. `http` routes the S3 namespace to the application
+with an `app: true` route whose ceiling covers the largest object
+(`route_N_max_body_kib`). A body `http` already holds whole rides inline in the
+request HEAD and is taken as the first body record, owing no credit; a longer
+one follows in BODY records under the credit this module grants. Every
+answer is an S3 response: its status and error documents are S3's, and the
+exchange id `http` chose is echoed on every record.
 
 Resources: `storage.object` (write), `fs` (read, for the credentials file).
 

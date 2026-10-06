@@ -85,7 +85,7 @@ pub fn s3_resource(target: &[u8]) -> S3Resource<'_> {
     S3Resource { bucket, key, query }
 }
 
-/// Classify a request by method (the `http_exchange` vocabulary's names, as
+/// Classify a request by method (the exchange contract vocabulary's names, as
 /// bytes) and resource.
 pub fn s3_classify(method: &[u8], r: &S3Resource<'_>) -> S3Op {
     let q = r.query;

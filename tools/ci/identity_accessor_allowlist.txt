@@ -38,14 +38,8 @@ modules/foundation/http/server/h1.rs|let mut seek_arg = (start as i32).to_le_byt
 modules/foundation/http/server/h1.rs|let r_len = u16::from_le_bytes([*buf.add(2), *buf.add(3)]) as usize;|record length field of a Wave-local layout
 modules/foundation/http/client/h3.rs|open[1..3].copy_from_slice(&(plen as u16).to_le_bytes());|TLV frame length field, not an identity
 modules/foundation/stun/mod.rs|let port = s.port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
-modules/foundation/smtp/mod.rs|let from_len = u16::from_le_bytes([buf[6], buf[7]]) as u64;|Wave-local operation-record length field; this module owns the layout
-modules/foundation/smtp/mod.rs|let rcpt_len = u16::from_le_bytes([buf[8], buf[9]]) as u64;|Wave-local operation-record length field; this module owns the layout
-modules/foundation/smtp/mod.rs|let chunk_len = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]) as u64;|Wave-local operation-record length field; this module owns the layout
-modules/foundation/smtp/mod.rs|u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]])|caller-chosen correlation id of a Wave-local record; this module owns the layout
 modules/foundation/http/server/h3.rs|out[FRAME_HDR + 5..FRAME_HDR + 13].copy_from_slice(&0x10Bu64.to_le_bytes());|H3_REQUEST_REJECTED close-reason code on the refused-session close, not an identity
-modules/foundation/http/client/exchange.rs|s.client.exchange_stage[1..ENVELOPE].copy_from_slice(&(n as u16).to_le_bytes());|TLV envelope length field, not an identity; the payload is composed in this same buffer, so net_write_frame's copy into a separate scratch would overlap itself
 modules/foundation/rtcp/mod.rs|let port = s.port.to_le_bytes();|UDP port in a CMD_DG_BIND payload — transport addressing, not a connection identity (same site and reason as stun/mod.rs)
-modules/foundation/http/client/exchange.rs|let code = s.client.last_status.to_le_bytes();|HTTP status code as a refusal payload — a protocol result, not a connection identity, and this file is the owning serialiser of the exchange reply
 modules/foundation/rtp/mod.rs|ssrc: u32::from_le_bytes([d[34], d[35], d[36], d[37]]),|SSRC of a negotiated route in rtp's own control record; this module owns the layout
 modules/foundation/rtp/mod.rs|u16::from_le_bytes([*buf.add(NET_FRAME_HDR + 6), *buf.add(NET_FRAME_HDR + 7)]);|source UDP port from the datagram prefix — transport addressing, not a connection identity
 modules/foundation/rtp/mod.rs|let port_bytes = dest_port.to_le_bytes();|TCP/UDP port — transport addressing, not a connection identity
@@ -56,6 +50,10 @@ modules/foundation/http/client/h3.rs|close[1..3].copy_from_slice(&(plen as u16).
 
 modules/foundation/http/server/app.rs|core::ptr::copy_nonoverlapping((rec.len() as u32).to_le_bytes().as_ptr(), p, 4);|length prefix of a queued record in an exchange record queue, a layout private to this file; not an identity
 modules/foundation/http/server/app.rs|let n = u32::from_le_bytes(lb);|length prefix of a queued record in an exchange record queue, a layout private to this file; not an identity
+modules/foundation/http/server/app.rs|b[2..6].copy_from_slice(&self.conn.to_le_bytes());|the server's own packing of its exchange id (transport, connection, stream); this file owns that layout and the application treats the id as opaque
+modules/foundation/http/server/app.rs|b[6..14].copy_from_slice(&self.stream.to_le_bytes());|the server's own packing of its exchange id (transport, connection, stream); this file owns that layout and the application treats the id as opaque
+modules/foundation/http/server/app.rs|conn: u32::from_le_bytes([b[2], b[3], b[4], b[5]]),|the owning parser of the server's exchange-id packing; this file owns that layout
+modules/foundation/http/server/app.rs|stream: u64::from_le_bytes([b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13]]),|the owning parser of the server's exchange-id packing; this file owns that layout
 modules/foundation/http/server/h3.rs|out[FRAME_HDR + 8..FRAME_HDR + 12].copy_from_slice(&slot.ack_owed.to_le_bytes());|credit count of CMD_MUX_STREAM_ACK after the session+stream ids, which go through mux::put_session_id/put_stream_id; not an identity
 modules/foundation/http/server/h3.rs|out[FRAME_HDR + 8..FRAME_HDR + 16].copy_from_slice(&H3_NO_ERROR.to_le_bytes());|application error code of CMD_MUX_STREAM_STOP_SENDING after the session+stream ids, which go through mux::put_session_id/put_stream_id; not an identity
 modules/foundation/s3_serve/mod.rs|arg[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());|storage.object argument block (lengths, offsets, buffer pointers, fence capacity) for an op whose contract ships no encoder (PUT, HEAD, DELETE, RANGE_GET, PUT_STREAMED_*); LIST and PRESENT use the contract encoders; not an identity

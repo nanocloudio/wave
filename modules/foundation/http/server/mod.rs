@@ -471,6 +471,9 @@ pub(crate) struct ConnSlot {
     pub(crate) body_pending: u8,
     /// 1 when the client asked for `100 Continue` and has not been sent it.
     pub(crate) body_continue_wanted: u8,
+    /// 1 while dispatch waits for the rest of a body that will ride whole in
+    /// an application exchange's HEAD: the next move is the peer's.
+    pub(crate) body_awaited: u8,
     /// The body's `Content-Length`; `u64::MAX` when it declared none.
     pub(crate) body_declared: u64,
     /// The body's framing, decoded as it arrives.
@@ -1020,12 +1023,12 @@ pub(crate) struct ServerState {
     /// `WsFrame` records to be queued back as outbound WS frames.
     /// `-1` if the port is unwired.
     pub(crate) ws_in_chan: i32,
-    /// Output channel for `req_out` (manifest port out[6]). Carries
-    /// `HttpRequest` envelopes when a route uses `HANDLER_APP`.
+    /// Output channel for `request_out` (manifest port out[6]). Carries
+    /// exchange request records when a route uses `HANDLER_APP`.
     /// `-1` if the port is unwired.
     pub(crate) app_out_chan: i32,
-    /// Input channel for `resp_in` (manifest port in[6]). Carries the
-    /// `HttpResponse` envelopes that answer them. `-1` if unwired.
+    /// Input channel for `response_in` (manifest port in[6]). Carries the
+    /// exchange response records that answer them. `-1` if unwired.
     pub(crate) app_in_chan: i32,
 
     pub(crate) port: u16,
@@ -1196,9 +1199,9 @@ pub(crate) struct ServerState {
     /// be reused.
     #[cfg(feature = "app")]
     pub(crate) app_gen_next: u64,
-    /// Aborts waiting for room on `req_out`, oldest first.
+    /// Aborts waiting for room on `request_out`, oldest first.
     #[cfg(feature = "app")]
-    pub(crate) abort_queue: [(super::http_app::AppId, u8); app::ABORT_QUEUE],
+    pub(crate) abort_queue: [(app::AppId, u8); app::ABORT_QUEUE],
     #[cfg(feature = "app")]
     pub(crate) abort_len: u32,
 
@@ -1590,6 +1593,10 @@ pub(crate) unsafe fn slot_deadline_limit(s: &HttpState) -> (u32, DeadlineKind) {
         | Phase::ProxyRelayBody
         | Phase::WsHandshake
         | Phase::WsClose => (s.server.stall_ms, DeadlineKind::Stall),
+        // Dispatch waits on the peer while a body that will ride in an
+        // application's HEAD is still arriving; otherwise on this server.
+        #[cfg(feature = "app")]
+        Phase::DispatchRoute if cur.body_awaited != 0 => (s.server.stall_ms, DeadlineKind::Stall),
         // An exchange waits on the peer while bytes it owes the peer are
         // unsent, or while the application has granted body credit the peer
         // has not filled; otherwise the application holds the turn and its own
@@ -1680,6 +1687,15 @@ pub(crate) unsafe fn enforce_slot_deadline(s: &mut HttpState) -> bool {
     }
     let (limit, kind) = slot_deadline_limit(s);
     if limit == 0 {
+        // An application exchange owing the peer nothing is the application's
+        // turn, however long it takes — a held response between records is
+        // that. The peer's clock starts when there is something for it to
+        // take, not from the last byte it took before the wait.
+        if let Some(cur) = cur_slot_mut(s) {
+            if cur.phase == Phase::AppExchange {
+                cur.progress_ms = now;
+            }
+        }
         return false;
     }
     let since = match cur_slot(s) {
@@ -2049,8 +2065,8 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     s.server.ws_admit_in_chan = dev_channel_port(sys, 0, 7);
     s.server.ws_admit_out_chan = dev_channel_port(sys, 1, 7);
     s.server.ws_event_out_chan = dev_channel_port(sys, 1, 8);
-    //   in[6]  = resp_in           (HttpResponse, HANDLER_APP only)
-    //   out[6] = req_out           (HttpRequest, HANDLER_APP only)
+    //   in[6]  = response_in       (ExchangeResponse, HANDLER_APP only)
+    //   out[6] = request_out       (ExchangeRequest, HANDLER_APP only)
     #[cfg(feature = "app")]
     {
         s.server.app_in_chan = dev_channel_port(sys, 0, 6);
@@ -2790,7 +2806,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // per pass, shared by this path and the HTTP/3 mux path.
     demux_inbound(s);
     // Application records are read once per step, before any connection
-    // runs: `resp_in` feeds every connection, so a per-connection read
+    // runs: `response_in` feeds every connection, so a per-connection read
     // would let whichever stepped first take a record addressed to another.
     // `drain_responses` hands each record to the exchange it names.
     #[cfg(feature = "app")]

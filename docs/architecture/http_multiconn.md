@@ -185,23 +185,26 @@ envelope and something else owns the protocol inside it; here it
 owns HTTP framing, connection state and bounded bodies, and
 something else owns what the request means.
 
-Source: `modules/foundation/http/server/app.rs`; the records are
-`modules/common/http_app.rs`.
+Source: `modules/foundation/http/server/app.rs`. The records are fluxor's
+exchange contract (`abi::contracts::exchange`), in which this server is the
+REQUESTER and the application the provider; its port pair is `request_out`
+(`ExchangeRequest`) and `response_in` (`ExchangeResponse`).
 
 ### Records
 
-Every record is `[kind u8][flags u8][origin u8][0][conn u32][stream u64]`
-then its payload. The 14 bytes after `kind` and `flags` name the exchange;
-the application treats them as opaque and echoes them.
+Every record is `[kind u8][flags u8][id: 14 bytes]` then its payload. The id
+names the exchange; this server packs it as `[origin u8][0][conn u32 LE]
+[stream u64 LE]`, and the application treats it as opaque and echoes it.
 
 | Direction | Kind | Payload |
 |---|---|---|
-| `req_out` | HEAD | `[method u8][target_len u16][hdr_len u16][peer_len u16][resp_credit u32]` target, header lines, peer fingerprint |
+| `request_out` | HEAD | `[method u8][target_len u16][hdr_len u16][peer_len u16][resp_credit u32]` target, header lines, peer fingerprint, then the first body bytes |
 | both | BODY | body bytes; `MORE` unless it ends the body |
 | both | ABORT | `[reason u8]` |
-| both | CREDIT | `[bytes u32]` — response credit on `req_out`, request credit on `resp_in` |
+| both | CREDIT | `[bytes u32]` — response credit on `request_out`, request credit on `response_in` |
 | both | DATAGRAM | `[context u64]` payload, an HTTP/3 datagram |
-| `resp_in` | HEAD | `[status u16][ct_len u8][hdr_len u16]` content type, header lines, body |
+| `response_in` | HEAD | `[status u16][ct_len u8][hdr_len u16]` content type, header lines, body |
+| `response_in` | LINK | `[state u8]`, id all zero — the application's link to whatever backs it |
 
 `origin` is 1 for a TCP connection (h1, whose `stream` is a request
 generation, and h2, whose `stream` is the stream id) and 2 for a QUIC session
@@ -212,9 +215,20 @@ verbatim rather than filtered — an application's API is defined in terms of
 headers a gateway cannot know in advance — and a block past
 `MAX_FWD_HEADERS` is refused 431 rather than forwarded short.
 
+### Bodies in the HEAD
+
+A request body already received whole that fits the record rides inline in
+the HEAD, with no `MORE`, and the application grants nothing for it. One whose
+declared length (`Content-Length`) fits the record and `recv_buf` but which is
+still arriving is waited for — under the stall deadline — and then sent the
+same way; a chunked body goes inline only if it is already whole. A client
+that asked for `100 Continue`, a tunnel (`CONNECT`), and a body longer than
+one record get a HEAD with `MORE` at once, and their body follows on the
+application's credit.
+
 ### Correlation
 
-`drain_responses` reads `resp_in` once per step and hands each record to the
+`drain_responses` reads `response_in` once per step and hands each record to the
 exchange its id names — never by connection alone, because h2 multiplexes
 many requests over one connection and an application may answer them in any
 order. Under h1 the `stream` half is a request generation: a connection
@@ -248,30 +262,26 @@ An exchange ends when both directions have, or when either side sends ABORT.
 The module aborts toward the application when the peer goes, a body passes its
 route ceiling or does not parse, the application lets its progress deadline
 lapse (`APP_TIMEOUT_MS`, `HOLD_TIMEOUT_MS` for a held stream), or the server
-drains; aborts that `req_out` cannot take yet are queued, no new exchange is
+drains; aborts that `request_out` cannot take yet are queued, no new exchange is
 opened while one waits, and a drain is not complete until they are delivered.
 A response that ends before the request ends the exchange, and the module
 stops reading the request body.
 
-**Graph wiring.** Both edges need a non-zero `buffer_group:`, which
-puts the channel in mailbox mode so one write is one whole record.
-The default is a byte-streaming FIFO, which fragments structured
-records — so omitting the group does not fail loudly, it delivers
-half a record.
+A LINK DOWN from the application says every exchange it holds without a
+complete response is unknowable. The server cannot issue a request whose body
+it has already streamed a second time, so it answers each for the application:
+502 before the response began, a cut-off response after.
+
+**Graph wiring.** The two edges are framed, and the build gives each a mailbox
+of its own, so one write is one whole record; a graph names the ports and
+nothing else.
 
 ```yaml
-- from: http.req_out
+- from: http.request_out
   to: app.request_in
-  buffer_group: 1
 - from: app.response_out
-  to: http.resp_in
-  buffer_group: 2
+  to: http.response_in
 ```
-
-The groups differ because the two directions are independent channels
-carrying different types; sharing a group would alias their buffers.
-The auto-assign pass cannot infer either group, because "this edge
-needs transport atomicity" is not visible from the graph shape.
 
 ## Limitations
 

@@ -23,8 +23,8 @@
 //! parsing, bounded dispatch, response emission, and stream closure. The
 //! independent aioquic suite exercises that path end to end.
 //!
-//! Application, file and proxy routes are forwarded through the bounded,
-//! stream-correlated `req_out`/`resp_in` envelope. Static and template routes
+//! Application, file and proxy routes are forwarded as bounded,
+//! stream-correlated exchanges on `request_out`/`response_in`. Static and template routes
 //! render locally. A 501 is retained only when a graph declares one of those
 //! delegated handlers without wiring an application response channel; this is
 //! an explicit configuration failure rather than a silent stream reset.
@@ -97,7 +97,7 @@ pub enum H3StreamState {
     HeadersRecv,
     BodyRecv,
     /// An application route's request, decoded and waiting for its HEAD to
-    /// go out on `req_out`.
+    /// go out on `request_out`.
     AppPending,
     /// An exchange with the application.
     AppOpen,
@@ -177,7 +177,7 @@ pub struct H3StreamSlot {
     /// application. Allocated once and kept, like `rx_buf`.
     pub fields: *mut u8,
     pub fields_len: usize,
-    /// Request flags for the application (`app_flag::ROUTE_*`, `WEBSOCKET`,
+    /// Request flags for the application (`exchange::flag::ROUTE_*`, `WEBSOCKET`,
     /// `WEBTRANSPORT`).
     pub app_flags: u8,
     /// The response may carry a body (not HEAD, 204, 304).
@@ -2063,7 +2063,7 @@ unsafe fn pump_streams(s: &mut super::super::HttpState) {
                 && sl.app.open()
                 && !sl.app.finished()
             {
-                sl.abort_due = super::super::http_app::app_abort::MALFORMED;
+                sl.abort_due = super::super::exchange::abort::MALFORMED;
                 sl.app = super::app::Exchange::idle();
             }
             if sl.abort_due != 0 {
@@ -2097,9 +2097,9 @@ unsafe fn pump_streams(s: &mut super::super::HttpState) {
 
 /// The exchange id of a stream.
 #[cfg(feature = "app")]
-fn h3_id(sl: &H3StreamSlot) -> super::super::http_app::AppId {
-    super::super::http_app::AppId {
-        origin: super::super::http_app::app_origin::QUIC,
+fn h3_id(sl: &H3StreamSlot) -> super::app::AppId {
+    super::app::AppId {
+        origin: super::app::app_origin::QUIC,
         conn: sl.session_id,
         stream: sl.stream_id,
     }
@@ -2145,7 +2145,7 @@ unsafe fn refuse_too_large(s: &mut super::super::HttpState, st: &mut H3State, id
         let sl = &mut st.slots[idx];
         if sl.app.open() && !sl.app.finished() {
             let id = h3_id(sl);
-            super::app::abort(s, id, super::super::http_app::app_abort::TOO_LARGE);
+            super::app::abort(s, id, super::super::exchange::abort::TOO_LARGE);
         }
     }
     let sl = &mut st.slots[idx];
@@ -2158,48 +2158,98 @@ unsafe fn refuse_too_large(s: &mut super::super::HttpState, st: &mut H3State, id
 }
 
 /// Send stream `idx`'s HEAD, opening its exchange.
+///
+/// A body that has arrived whole and fits the record rides inline; one still
+/// arriving that may fit is waited for. A session (`CONNECT`), a client
+/// waiting for `100 Continue`, or a body past the record streams after the
+/// HEAD on credit.
 #[cfg(feature = "app")]
 unsafe fn open_exchange(s: &mut super::super::HttpState, st: &mut H3State, idx: usize) {
+    use super::app::{BodyPlan, Emit};
     let sl = &st.slots[idx];
     let req = sl.request;
     if req.fields_over {
         answer_whole(st, idx, b"431", b"Request Header Fields Too Large\n");
         return;
     }
-    let has_body = !(sl.peer_fin && sl.rx_len == 0 && sl.data_rem == 0);
     let fields: &[u8] = if sl.fields.is_null() {
         &[]
     } else {
         core::slice::from_raw_parts(sl.fields, sl.fields_len)
     };
+    let plan = super::app::plan_buffered(
+        sl.rx_len,
+        sl.peer_fin && sl.data_rem == 0,
+        super::app::declared_request_length(fields),
+        super::app::inline_room(req.path_bytes(), fields, &[]),
+        req.method_kind == H3_METHOD_CONNECT || super::app::wants_continue(fields),
+    );
+    if plan == BodyPlan::Wait {
+        return;
+    }
+    let body: &[u8] = if plan == BodyPlan::Inline {
+        core::slice::from_raw_parts(sl.rx_buf, sl.rx_len)
+    } else {
+        &[]
+    };
     let flags = sl.app_flags
-        | if has_body {
-            super::super::http_app::app_flag::MORE
+        | if plan == BodyPlan::Stream {
+            super::super::exchange::flag::MORE
         } else {
             0
         };
-    let head = super::super::http_app::AppRequestHead {
-        id: h3_id(sl),
+    let head = super::super::exchange::RequestHead {
+        id: h3_id(sl).exchange_id(),
         flags,
         method: req.method,
         target: req.path_bytes(),
         headers: fields,
         peer: &[],
         resp_credit: super::app::RESP_WINDOW,
+        body,
     };
     match super::app::emit_head(s, &head) {
-        super::app::Emit::Sent => {
+        Emit::Sent => {
             let now = s.server.now_ms;
             let sl = &mut st.slots[idx];
-            sl.app = super::app::opened(sl.stream_id, now, has_body, false);
+            if plan == BodyPlan::Inline {
+                // Acknowledged to the transport as it leaves, which is what
+                // reopens the peer's window.
+                sl.ack_owed = sl.ack_owed.saturating_add(sl.rx_len as u32);
+                sl.rx_len = 0;
+            }
+            sl.app = super::app::opened(sl.stream_id, now, plan == BodyPlan::Stream, false);
             sl.state = H3StreamState::AppOpen;
         }
-        super::app::Emit::Full => {}
-        super::app::Emit::Unwired => {
-            answer_whole(st, idx, b"503", b"No application wired to req_out\n");
+        Emit::Full | Emit::Waiting => {}
+        Emit::Unwired => {
+            answer_whole(st, idx, b"503", b"No application wired to request_out\n");
         }
-        super::app::Emit::TooLarge => {
+        Emit::TooLarge => {
             answer_whole(st, idx, b"431", b"Request Header Fields Too Large\n");
+        }
+        // h3 holds a request body itself and bounds it as DATA arrives; these
+        // come from the h1 body reader alone.
+        Emit::BodyTooLarge | Emit::BodyBad => {
+            answer_whole(st, idx, b"400", b"Bad Request\n");
+        }
+    }
+}
+
+/// Answer for every application exchange whose response has not completed:
+/// the application lost what backs it, and nothing it was sending will
+/// arrive.
+#[cfg(feature = "app")]
+pub(crate) unsafe fn fail_app_streams(s: &mut super::super::HttpState) {
+    let st = &mut *(&mut s.h3 as *mut H3State);
+    for idx in 0..MAX_H3_STREAMS {
+        let sl = &st.slots[idx];
+        if sl.allocated
+            && sl.state == H3StreamState::AppOpen
+            && sl.app.open()
+            && !sl.app.is(super::app::ex::RESP_DONE)
+        {
+            fail_exchange(st, idx, b"502", b"Bad Gateway\n");
         }
     }
 }
@@ -2208,7 +2258,7 @@ unsafe fn open_exchange(s: &mut super::super::HttpState, st: &mut H3State, idx: 
 /// its response into the stream's send buffer, and its progress deadline.
 #[cfg(feature = "app")]
 unsafe fn drive_exchange(s: &mut super::super::HttpState, st: &mut H3State, idx: usize) {
-    use super::super::http_app::{app_abort, APP_BODY_MAX, APP_HDR, APP_RECORD_MAX};
+    use super::super::exchange::{abort as abort_reason, BODY_MAX, HDR, RECORD_MAX};
     let id = h3_id(&st.slots[idx]);
     // Request body, as far as credit goes. Acknowledged to the transport as
     // it leaves, which is what reopens the peer's window.
@@ -2218,14 +2268,14 @@ unsafe fn drive_exchange(s: &mut super::super::HttpState, st: &mut H3State, idx:
             break;
         }
         let body_ended = sl.peer_fin && sl.data_rem == 0;
-        let n = sl.rx_len.min(sl.app.req_credit as usize).min(APP_BODY_MAX);
+        let n = sl.rx_len.min(sl.app.req_credit as usize).min(BODY_MAX);
         let last = body_ended && n == sl.rx_len;
         if n == 0 && !last {
             break;
         }
-        let mut rec = [0u8; APP_RECORD_MAX];
+        let mut rec = [0u8; RECORD_MAX];
         if n > 0 {
-            core::ptr::copy_nonoverlapping(sl.rx_buf, rec.as_mut_ptr().add(APP_HDR), n);
+            core::ptr::copy_nonoverlapping(sl.rx_buf, rec.as_mut_ptr().add(HDR), n);
         }
         if !super::app::emit_body(s, &id, &mut rec, n, last) {
             break;
@@ -2255,7 +2305,7 @@ unsafe fn drive_exchange(s: &mut super::super::HttpState, st: &mut H3State, idx:
     let sl = &st.slots[idx];
     if sl.app.deadline_ms != 0 && s.server.now_ms >= sl.app.deadline_ms {
         s.server.app_timeouts = s.server.app_timeouts.wrapping_add(1);
-        super::app::abort(s, id, app_abort::STALLED);
+        super::app::abort(s, id, abort_reason::STALLED);
         fail_exchange(st, idx, b"504", b"Gateway Timeout\n");
     }
 }
@@ -2279,7 +2329,7 @@ fn fail_exchange(st: &mut H3State, idx: usize, status: &[u8], body: &[u8]) {
 /// HEADERS when next, then DATA as far as it fits.
 #[cfg(feature = "app")]
 unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, idx: usize) {
-    use super::super::http_app::{app_abort, app_flag, app_parse_response, AppRecord};
+    use super::super::exchange::{abort as abort_reason, flag, parse_response, Record};
     let id = h3_id(&st.slots[idx]);
     let peer_limit = app_peer_limit(st, st.slots[idx].session_id);
     let sl: *mut H3StreamSlot = &mut st.slots[idx];
@@ -2288,15 +2338,15 @@ unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, id
         let (body, is_head) = super::app::record_body(rec);
         let ends = super::app::record_ends(rec);
         if is_head && !(*sl).app_queue.front_head_done() {
-            let Some(AppRecord::Head(h)) = app_parse_response(rec) else {
+            let Some(Record::Head(h)) = parse_response(rec) else {
                 break;
             };
             // An accepted WebSocket is this module's tunnel from here on; the
             // application's part in it is done.
-            if h.flags & app_flag::WEBSOCKET != 0 {
+            if h.flags & flag::WEBSOCKET != 0 {
                 if h.status != 200 || (*sl).request.method_kind != H3_METHOD_CONNECT {
                     s.server.app_violations = s.server.app_violations.wrapping_add(1);
-                    super::app::abort(s, id, app_abort::CREDIT_OVERRUN);
+                    super::app::abort(s, id, abort_reason::CREDIT_OVERRUN);
                     fail_exchange(st, idx, b"502", b"Bad Gateway\n");
                     return;
                 }
@@ -2311,7 +2361,7 @@ unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, id
                 (*sl).state = H3StreamState::HeadersSent;
                 return;
             }
-            if h.flags & app_flag::WEBTRANSPORT != 0 {
+            if h.flags & flag::WEBTRANSPORT != 0 {
                 (*sl).webtransport_active = true;
             }
             let carries = super::app::status_allows_body(h.status, (*sl).request.method);
@@ -2325,7 +2375,7 @@ unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, id
                     } else {
                         s.server.app_violations = s.server.app_violations.wrapping_add(1);
                     }
-                    super::app::abort(s, id, app_abort::UNDELIVERABLE);
+                    super::app::abort(s, id, abort_reason::UNDELIVERABLE);
                     fail_exchange(st, idx, b"502", b"Bad Gateway\n");
                     return;
                 }
@@ -2390,7 +2440,7 @@ unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, id
 /// when it does not fit.
 #[cfg(feature = "app")]
 fn encode_app_headers(
-    h: &super::super::http_app::AppResponseHead<'_>,
+    h: &super::super::exchange::ResponseHead<'_>,
     peer_limit: u32,
     out: &mut [u8],
 ) -> Result<usize, bool> {
@@ -2422,7 +2472,7 @@ fn encode_app_headers(
     }
     off += n;
     let mut lower = [0u8; 64];
-    for (name, value) in super::super::http_app::app_header_lines(h.headers) {
+    for (name, value) in super::super::exchange::header_lines(h.headers) {
         if name.len() > lower.len() {
             return Err(false);
         }
@@ -2464,12 +2514,12 @@ fn encode_app_headers(
 #[cfg(feature = "app")]
 pub(crate) unsafe fn app_record(
     s: &mut super::super::HttpState,
-    id: &super::super::http_app::AppId,
+    id: &super::app::AppId,
     raw: &[u8],
 ) {
-    use super::super::http_app::{app_parse_response, AppRecord};
+    use super::super::exchange::{parse_response, Record};
     let st = &mut *(&mut s.h3 as *mut H3State);
-    if let Some(AppRecord::Datagram { context, data, .. }) = app_parse_response(raw) {
+    if let Some(Record::Datagram { context, data, .. }) = parse_response(raw) {
         if data.len() > h3_datagram::H3_DATAGRAM_MAX_PAYLOAD {
             s.server.app_violations = s.server.app_violations.wrapping_add(1);
             return;
@@ -2507,7 +2557,7 @@ pub(crate) unsafe fn app_record(
         }
         super::app::Admit::Violation => {
             s.server.app_violations = s.server.app_violations.wrapping_add(1);
-            super::app::abort(s, *id, super::super::http_app::app_abort::CREDIT_OVERRUN);
+            super::app::abort(s, *id, super::super::exchange::abort::CREDIT_OVERRUN);
             (*sl).app = super::app::Exchange::idle();
             fail_exchange(st, idx, b"502", b"Bad Gateway\n");
         }
@@ -2906,20 +2956,20 @@ unsafe fn dispatch_stream(
     // routes, and the file and proxy routes h3 does not serve itself.
     #[cfg(feature = "app")]
     if matched >= 0 && delegated(s, matched) {
-        use super::super::http_app::app_flag;
+        use super::super::exchange::flag;
         let handler = (*s.server.routes.as_ptr().add(matched as usize)).handler;
         let mut flags = 0u8;
         if handler == super::routes::HANDLER_FILE {
-            flags |= app_flag::ROUTE_FILE;
+            flags |= flag::ROUTE_FILE;
         }
         if handler == super::routes::HANDLER_PROXY {
-            flags |= app_flag::ROUTE_PROXY;
+            flags |= flag::ROUTE_PROXY;
         }
         if req.method_kind == H3_METHOD_CONNECT && req.protocol_ws {
-            flags |= app_flag::WEBSOCKET;
+            flags |= flag::WEBSOCKET;
         }
         if req.method_kind == H3_METHOD_CONNECT && req.protocol_webtransport {
-            flags |= app_flag::WEBTRANSPORT;
+            flags |= flag::WEBTRANSPORT;
         }
         let slot = &mut st.slots[idx];
         slot.app_flags = flags;
@@ -3587,7 +3637,7 @@ pub(crate) unsafe fn pump_mux_frame(
                 let sl = &mut st.slots[i];
                 #[cfg(feature = "app")]
                 if sl.app.open() && !sl.app.finished() {
-                    sl.abort_due = super::super::http_app::app_abort::PEER_GONE;
+                    sl.abort_due = super::super::exchange::abort::PEER_GONE;
                 }
                 sl.state = H3StreamState::Discarding;
                 sl.closed_out = true;
@@ -4543,21 +4593,26 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
 
         // QUIC DATAGRAMs are unreliable by design, but they still need a
         // typed seam to the application: a DATAGRAM record naming the session.
-        // Dropped when nothing is wired or `req_out` is full — the transport
+        // Dropped when nothing is wired or `request_out` is full — the transport
         // promised nothing more.
         if msg_type == mux::MSG_MUX_DATAGRAM_RX {
             #[cfg(feature = "app")]
             if n >= 4 {
                 let session_id = mux::session_id(&frame[..n]);
                 if let Some((context_id, data)) = h3_datagram::parse_quic_payload(&frame[4..n]) {
-                    use super::super::http_app::{app_origin, app_write_datagram, AppId};
+                    use super::app::{app_origin, AppId};
                     let id = AppId {
                         origin: app_origin::QUIC,
                         conn: session_id,
                         stream: 0,
                     };
-                    let mut rec = [0u8; super::super::http_app::APP_RECORD_MAX];
-                    if let Some(len) = app_write_datagram(&id, context_id, data, &mut rec) {
+                    let mut rec = [0u8; super::super::exchange::RECORD_MAX];
+                    if let Some(len) = super::super::exchange::write_datagram(
+                        &id.exchange_id(),
+                        context_id,
+                        data,
+                        &mut rec,
+                    ) {
                         super::app::write_out(s, &rec[..len]);
                     }
                 }

@@ -208,12 +208,10 @@ TUNNEL_FRAME_MAX | modules/foundation/http/server/h3.rs | H3_SEND_BUF - 24
 MAX_FWD_HEADERS | modules/foundation/http/server/app.rs | 4096
 MAX_TARGET | modules/foundation/http/server/app.rs | 2048
 MAX_EXCHANGES | modules/foundation/http/server/app.rs | MAX_CONCURRENT_CONNS + H2_EXCHANGES + H3_EXCHANGES
-QUEUE_LIMIT | modules/foundation/http/server/app.rs | RESP_WINDOW + 2 * (APP_RECORD_MAX as u32 + 4)
+QUEUE_LIMIT | modules/foundation/http/server/app.rs | RESP_WINDOW + 2 * (RECORD_MAX as u32 + 4)
 MAX_H3_FIELDS | modules/foundation/http/server/h3.rs | super::app::MAX_FWD_HEADERS
 MAX_H3_FIELDS | modules/foundation/http/server/h3.rs | 0
 H3_RX_HOLD | modules/foundation/http/server/h3.rs | 256 * 1024
-APP_RECORD_MAX | modules/common/http_app.rs | 8192
-APP_BODY_MAX | modules/common/http_app.rs | APP_RECORD_MAX - APP_HDR
 DEFAULT_MAX_BODY | modules/foundation/http/server/reqbody.rs | 64 * 1024
 MAX_BODY_KIB_CEILING | modules/foundation/http/server/reqbody.rs | 1 << 30
 SV4_EXPIRES_MAX | modules/common/sigv4_core.rs | 7 * 24 * 3600

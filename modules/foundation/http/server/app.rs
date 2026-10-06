@@ -8,12 +8,13 @@
 //! and bounded bodies; the application keeps method dispatch, authorisation and
 //! what a path denotes.
 //!
-//! The records are `modules/common/http_app.rs`. One exchange is one request and
-//! its response; every connection on every generation shares the one
-//! `req_out` / `resp_in` pair, and every record names its exchange. This file
+//! The records are the SDK's exchange contract (`abi::contracts::exchange`), in
+//! which this server is the requester. One exchange is one request and its
+//! response; every connection on every generation shares the one
+//! `request_out` / `response_in` pair, and every record names its exchange. This file
 //! owns what all three generations share: the per-exchange state and credit,
 //! the queue that holds an application's records until its connection can take
-//! them, the abort queue, and the one reader of `resp_in`. It also drives the
+//! them, the abort queue, and the one reader of `response_in`. It also drives the
 //! HTTP/1.1 exchange, which lives on the `ConnSlot`; HTTP/2 and HTTP/3 drive
 //! theirs from their own stream tables through the same pieces.
 //!
@@ -32,11 +33,17 @@
 //! them in any order. Under h1 the id's stream is a request generation:
 //! connection ids are recycled by the transport, and a late answer to a
 //! connection's previous holder must not reach the next one.
+//!
+//! **A body that is already here travels in the HEAD.** When the whole request
+//! body has arrived and fits one record, it rides inline in the request HEAD
+//! with no MORE, and the application needs grant nothing. Only a client that
+//! asked for `100 Continue`, or a body longer than one record, waits on the
+//! application's credit.
 
-use super::super::http_app::{
-    app_abort, app_flag, app_kind, app_origin, app_parse_response, app_seal_body, app_write_abort,
-    app_write_credit, app_write_request_head, AppId, AppRecord, AppRequestHead, APP_BODY_MAX,
-    APP_HDR, APP_RECORD_MAX,
+use super::super::exchange::{
+    abort as abort_reason, flag, header, link, parse_response, seal_body, write_abort,
+    write_credit, write_request_head, ExchangeId, Record, RequestHead, BODY_MAX, HDR, RECORD_MAX,
+    REQ_HEAD_FIXED,
 };
 use super::super::wire::method;
 use super::{
@@ -77,24 +84,24 @@ pub(crate) const HOLD_TIMEOUT_MS: u64 = 3_600_000;
 /// hosts, so an application can run ahead of the peer by a few round trips;
 /// one record on embedded targets.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const RESP_WINDOW: u32 = 4 * APP_BODY_MAX as u32;
+pub(crate) const RESP_WINDOW: u32 = 4 * BODY_MAX as u32;
 #[cfg(not(target_arch = "aarch64"))]
-pub(crate) const RESP_WINDOW: u32 = APP_BODY_MAX as u32;
+pub(crate) const RESP_WINDOW: u32 = BODY_MAX as u32;
 
 /// Most bytes one exchange's record queue holds: its credit window, plus the
 /// head record and one record of slack for the prefixes the window does not
 /// count. An application inside its credit never reaches it.
-pub(crate) const QUEUE_LIMIT: u32 = RESP_WINDOW + 2 * (APP_RECORD_MAX as u32 + 4);
+pub(crate) const QUEUE_LIMIT: u32 = RESP_WINDOW + 2 * (RECORD_MAX as u32 + 4);
 
 /// Response credit is granted back once this much has left for the peer, or
 /// when the exchange's queue runs empty, whichever comes first — one CREDIT
 /// record per record's worth of body rather than one per frame.
-const GRANT_MIN: u32 = APP_BODY_MAX as u32;
+const GRANT_MIN: u32 = BODY_MAX as u32;
 
 /// Request-body records one h1 connection forwards per step.
 const FORWARDS_PER_STEP: usize = 4;
 
-/// Records read from `resp_in` per step: enough that one busy exchange does
+/// Records read from `response_in` per step: enough that one busy exchange does
 /// not starve the rest, few enough that a step stays bounded.
 const RECORDS_PER_STEP: usize = 16;
 
@@ -111,10 +118,54 @@ const H3_EXCHANGES: usize = 0;
 /// connection, and the h3 stream table.
 pub(crate) const MAX_EXCHANGES: usize = MAX_CONCURRENT_CONNS + H2_EXCHANGES + H3_EXCHANGES;
 
-/// Aborts waiting for room on `req_out`. No HEAD is sent while one waits, so
+/// Aborts waiting for room on `request_out`. No HEAD is sent while one waits, so
 /// every waiting abort belongs to an exchange that was open when it was
 /// queued, and the queue can never hold more than `MAX_EXCHANGES`.
 pub(crate) const ABORT_QUEUE: usize = MAX_EXCHANGES;
+
+/// Which transport an exchange arrived on. Part of the id: a TCP connection
+/// and a QUIC session may hold the same number.
+pub(crate) mod app_origin {
+    pub(crate) const TCP: u8 = 1;
+    pub(crate) const QUIC: u8 = 2;
+}
+
+/// What this server packs into an exchange id: the transport, the connection
+/// (or QUIC session) and the stream (an h1 request generation, an h2 stream
+/// id, an h3 stream handle). The layout is this module's own — the contract
+/// makes the id opaque to the application, which only echoes it — and fills
+/// all 14 bytes: `[origin u8][0 u8][conn u32][stream u64]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AppId {
+    pub(crate) origin: u8,
+    pub(crate) conn: u32,
+    pub(crate) stream: u64,
+}
+
+impl AppId {
+    /// The 14 bytes this id travels as.
+    pub(crate) fn exchange_id(&self) -> ExchangeId {
+        let mut b = [0u8; 14];
+        b[0] = self.origin;
+        b[2..6].copy_from_slice(&self.conn.to_le_bytes());
+        b[6..14].copy_from_slice(&self.stream.to_le_bytes());
+        ExchangeId(b)
+    }
+
+    /// The id an application echoed, when it is one this server could have
+    /// minted.
+    pub(crate) fn from_exchange_id(id: &ExchangeId) -> Option<Self> {
+        let b = &id.0;
+        if b[1] != 0 {
+            return None;
+        }
+        Some(Self {
+            origin: b[0],
+            conn: u32::from_le_bytes([b[2], b[3], b[4], b[5]]),
+            stream: u64::from_le_bytes([b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13]]),
+        })
+    }
+}
 
 /// Exchange state bits.
 pub(crate) mod ex {
@@ -237,7 +288,7 @@ impl RecordQueue {
         }
         if want > self.cap {
             let mut cap = if self.cap == 0 {
-                APP_RECORD_MAX as u32 + 4
+                RECORD_MAX as u32 + 4
             } else {
                 self.cap
             };
@@ -333,21 +384,21 @@ impl RecordQueue {
 
 /// The body bytes a response record carries, and whether it is a HEAD.
 pub(crate) fn record_body(rec: &[u8]) -> (&[u8], bool) {
-    match app_parse_response(rec) {
-        Some(AppRecord::Head(h)) => (h.body, true),
-        Some(AppRecord::Body { data, .. }) => (data, false),
+    match parse_response(rec) {
+        Some(Record::Head(h)) => (h.body, true),
+        Some(Record::Body { data, .. }) => (data, false),
         _ => (&[], false),
     }
 }
 
 /// Whether a record (HEAD or BODY) ends the response.
 pub(crate) fn record_ends(rec: &[u8]) -> bool {
-    rec.len() > 1 && rec[1] & app_flag::MORE == 0
+    rec.len() > 1 && rec[1] & flag::MORE == 0
 }
 
 /// The progress deadline a response runs under, from its HEAD's flags.
 pub(crate) fn progress_timeout_ms(flags: u8) -> u64 {
-    if flags & app_flag::HOLD != 0 {
+    if flags & flag::HOLD != 0 {
         HOLD_TIMEOUT_MS
     } else {
         APP_TIMEOUT_MS
@@ -382,12 +433,12 @@ pub(crate) unsafe fn admit(
     if !x.open() {
         return Admit::Stale;
     }
-    let Some(parsed) = app_parse_response(rec) else {
+    let Some(parsed) = parse_response(rec) else {
         return Admit::Violation;
     };
     let now = s.server.now_ms;
     match parsed {
-        AppRecord::Credit { bytes, .. } => {
+        Record::Credit { bytes, .. } => {
             if x.is(ex::REQ_DONE) {
                 return Admit::Stale;
             }
@@ -398,9 +449,9 @@ pub(crate) unsafe fn admit(
             }
             Admit::Credit
         }
-        AppRecord::Abort { .. } => Admit::Abort,
-        AppRecord::Datagram { .. } => Admit::Stale,
-        AppRecord::Head(h) => {
+        Record::Abort { .. } => Admit::Abort,
+        Record::Datagram { .. } | Record::Link { .. } => Admit::Stale,
+        Record::Head(h) => {
             if x.is(ex::RESP_HEAD) || h.body.len() as u32 > x.resp_credit {
                 return Admit::Violation;
             }
@@ -410,7 +461,7 @@ pub(crate) unsafe fn admit(
             x.resp_credit -= h.body.len() as u32;
             x.resp_flags = h.flags;
             x.state |= ex::RESP_HEAD;
-            if h.flags & app_flag::MORE == 0 {
+            if h.flags & flag::MORE == 0 {
                 x.state |= ex::RESP_DONE;
                 x.deadline_ms = 0;
             } else {
@@ -418,7 +469,7 @@ pub(crate) unsafe fn admit(
             }
             Admit::Queued
         }
-        AppRecord::Body { flags, data, .. } => {
+        Record::Body { flags, data, .. } => {
             if !x.is(ex::RESP_HEAD) || x.is(ex::RESP_DONE) || data.len() as u32 > x.resp_credit {
                 return Admit::Violation;
             }
@@ -426,7 +477,7 @@ pub(crate) unsafe fn admit(
                 return Admit::Violation;
             }
             x.resp_credit -= data.len() as u32;
-            if flags & app_flag::MORE == 0 {
+            if flags & flag::MORE == 0 {
                 x.state |= ex::RESP_DONE;
                 x.deadline_ms = 0;
             } else {
@@ -458,8 +509,8 @@ pub(crate) unsafe fn grant(s: &mut HttpState, id: &AppId, x: &mut Exchange, queu
     if x.resp_owed < GRANT_MIN && !queue_empty {
         return;
     }
-    let mut rec = [0u8; APP_HDR + 4];
-    let Some(n) = app_write_credit(id, x.resp_owed, &mut rec) else {
+    let mut rec = [0u8; HDR + 4];
+    let Some(n) = write_credit(&id.exchange_id(), x.resp_owed, &mut rec) else {
         return;
     };
     if write_out(s, &rec[..n]) {
@@ -468,7 +519,7 @@ pub(crate) unsafe fn grant(s: &mut HttpState, id: &AppId, x: &mut Exchange, queu
     }
 }
 
-/// Write one record to `req_out`.
+/// Write one record to `request_out`.
 pub(crate) unsafe fn write_out(s: &mut HttpState, rec: &[u8]) -> bool {
     if s.server.app_out_chan < 0 {
         return false;
@@ -481,22 +532,45 @@ pub(crate) unsafe fn write_out(s: &mut HttpState, rec: &[u8]) -> bool {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Emit {
     Sent,
-    /// `req_out` is full, or aborts are waiting ahead of it; try again.
+    /// `request_out` is full, or aborts are waiting ahead of it; try again.
     Full,
-    /// Nothing is wired to `req_out`: a route declares HANDLER_APP with no
+    /// The request body is still arriving and may yet fit the HEAD whole; try
+    /// again once more of it is here.
+    Waiting,
+    /// Nothing is wired to `request_out`: a route declares HANDLER_APP with no
     /// application behind it. 503.
     Unwired,
     /// The head does not fit one record. 431.
     TooLarge,
+    /// The request body passed the route's ceiling before the HEAD went. 413.
+    BodyTooLarge,
+    /// The request body's framing is malformed. 400.
+    BodyBad,
 }
 
-/// Send a request HEAD, opening an exchange the application then answers.
-pub(crate) unsafe fn emit_head(s: &mut HttpState, head: &AppRequestHead<'_>) -> Emit {
+/// Request-body bytes a HEAD carrying these fields has room for inline.
+pub(crate) fn inline_room(target: &[u8], headers: &[u8], peer: &[u8]) -> usize {
+    RECORD_MAX.saturating_sub(HDR + REQ_HEAD_FIXED + target.len() + headers.len() + peer.len())
+}
+
+/// Whether a request's header block asks for `100 Continue` before its body.
+pub(crate) fn wants_continue(headers: &[u8]) -> bool {
+    header(headers, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"))
+}
+
+/// Compose a request HEAD into `rec`, its length or the refusal it earns.
+pub(crate) fn compose_head(head: &RequestHead<'_>, rec: &mut [u8]) -> Result<usize, Emit> {
+    if head.headers.len() > MAX_FWD_HEADERS || head.target.len() > MAX_TARGET {
+        return Err(Emit::TooLarge);
+    }
+    write_request_head(head, rec).ok_or(Emit::TooLarge)
+}
+
+/// Send a composed request HEAD, opening an exchange the application then
+/// answers.
+pub(crate) unsafe fn send_head(s: &mut HttpState, rec: &[u8]) -> Emit {
     if s.server.app_out_chan < 0 {
         return Emit::Unwired;
-    }
-    if head.headers.len() > MAX_FWD_HEADERS || head.target.len() > MAX_TARGET {
-        return Emit::TooLarge;
     }
     // Aborts first: an exchange the application still believes open must be
     // closed before another is opened, and holding heads back is what bounds
@@ -504,16 +578,73 @@ pub(crate) unsafe fn emit_head(s: &mut HttpState, head: &AppRequestHead<'_>) -> 
     if !flush_aborts(s) {
         return Emit::Full;
     }
-    let mut rec = [0u8; APP_RECORD_MAX];
-    let Some(n) = app_write_request_head(head, &mut rec) else {
-        return Emit::TooLarge;
-    };
-    if write_out(s, &rec[..n]) {
+    if write_out(s, rec) {
         s.server.app_exchanges = s.server.app_exchanges.wrapping_add(1);
         Emit::Sent
     } else {
         Emit::Full
     }
+}
+
+/// Compose and send a request HEAD whose inline body, if any, is in hand.
+pub(crate) unsafe fn emit_head(s: &mut HttpState, head: &RequestHead<'_>) -> Emit {
+    if s.server.app_out_chan < 0 {
+        return Emit::Unwired;
+    }
+    let mut rec = [0u8; RECORD_MAX];
+    match compose_head(head, &mut rec) {
+        Ok(n) => send_head(s, &rec[..n]),
+        Err(e) => e,
+    }
+}
+
+/// How a generation that holds a request body in a buffer of its own sends
+/// it: whole in the HEAD, or after it on credit. `held` is what has arrived,
+/// `ended` whether that is all of it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum BodyPlan {
+    /// No body at all.
+    None,
+    /// All of it, inline in the HEAD.
+    Inline,
+    /// After the HEAD, as BODY records the application grants credit for.
+    Stream,
+    /// Not decided yet: the body may still fit the HEAD once it has arrived.
+    Wait,
+}
+
+/// Decide [`BodyPlan`] for a buffered body: `held` bytes of it here, `ended`
+/// when that is all of it, `declared` its `content-length` if the request
+/// names one. A tunnel (`CONNECT`) and a client waiting for `100 Continue`
+/// stream at once: neither sends its body until answered. A body still
+/// arriving is waited for only when its declared length fits the record, so
+/// it is certain to come whole; one of no declared length cannot be known to
+/// fit until it ends, and streams.
+pub(crate) fn plan_buffered(
+    held: usize,
+    ended: bool,
+    declared: Option<u64>,
+    room: usize,
+    stream_now: bool,
+) -> BodyPlan {
+    if ended && held == 0 {
+        return BodyPlan::None;
+    }
+    if stream_now || held > room {
+        return BodyPlan::Stream;
+    }
+    if ended {
+        return BodyPlan::Inline;
+    }
+    match declared {
+        Some(n) if n <= room as u64 => BodyPlan::Wait,
+        _ => BodyPlan::Stream,
+    }
+}
+
+/// The `content-length` a request's header block declares, when it parses.
+pub(crate) fn declared_request_length(headers: &[u8]) -> Option<u64> {
+    declared_length(headers)
 }
 
 /// A fresh exchange, as its HEAD goes out.
@@ -532,7 +663,7 @@ pub(crate) fn opened(stream: u64, now: u64, has_body: bool, continue_first: bool
 }
 
 /// Send one request-body record sealed in `rec`. `data_len` bytes are in place
-/// at `rec[APP_HDR..]`; `last` ends the request.
+/// at `rec[HDR..]`; `last` ends the request.
 pub(crate) unsafe fn emit_body(
     s: &mut HttpState,
     id: &AppId,
@@ -540,20 +671,20 @@ pub(crate) unsafe fn emit_body(
     data_len: usize,
     last: bool,
 ) -> bool {
-    let flags = if last { 0 } else { app_flag::MORE };
-    let Some(n) = app_seal_body(id, flags, data_len, rec) else {
+    let flags = if last { 0 } else { flag::MORE };
+    let Some(n) = seal_body(&id.exchange_id(), flags, data_len, rec) else {
         return false;
     };
     write_out(s, &rec[..n])
 }
 
 /// Tell the application an exchange is over from this side. Queued when
-/// `req_out` is full; nothing is lost.
+/// `request_out` is full; nothing is lost.
 pub(crate) unsafe fn abort(s: &mut HttpState, id: AppId, reason: u8) {
     s.server.app_aborts = s.server.app_aborts.wrapping_add(1);
     if s.server.abort_len == 0 {
-        let mut rec = [0u8; APP_HDR + 1];
-        if let Some(n) = app_write_abort(&id, reason, &mut rec) {
+        let mut rec = [0u8; HDR + 1];
+        if let Some(n) = write_abort(&id.exchange_id(), reason, &mut rec) {
             if write_out(s, &rec[..n]) {
                 return;
             }
@@ -570,8 +701,8 @@ pub(crate) unsafe fn abort(s: &mut HttpState, id: AppId, reason: u8) {
 pub(crate) unsafe fn flush_aborts(s: &mut HttpState) -> bool {
     while s.server.abort_len > 0 {
         let (id, reason) = s.server.abort_queue[0];
-        let mut rec = [0u8; APP_HDR + 1];
-        let Some(n) = app_write_abort(&id, reason, &mut rec) else {
+        let mut rec = [0u8; HDR + 1];
+        let Some(n) = write_abort(&id.exchange_id(), reason, &mut rec) else {
             return false;
         };
         if !write_out(s, &rec[..n]) {
@@ -587,14 +718,14 @@ pub(crate) unsafe fn flush_aborts(s: &mut HttpState) -> bool {
 /// Read the application's records and hand each to the exchange it names.
 ///
 /// One reader for every connection and generation, driven once per step:
-/// `resp_in` feeds them all, so a per-connection read would let whichever
+/// `response_in` feeds them all, so a per-connection read would let whichever
 /// connection stepped first take a record addressed to another.
 pub(crate) unsafe fn drain_responses(s: &mut HttpState) {
     flush_aborts(s);
     if s.server.app_in_chan < 0 {
         return;
     }
-    let mut rec = [0u8; APP_RECORD_MAX];
+    let mut rec = [0u8; RECORD_MAX];
     for _ in 0..RECORDS_PER_STEP {
         let sys = &*s.syscalls;
         let chan = s.server.app_in_chan;
@@ -602,11 +733,21 @@ pub(crate) unsafe fn drain_responses(s: &mut HttpState) {
         if poll <= 0 || (poll as u32 & super::POLL_IN) == 0 {
             return;
         }
-        let n = (sys.channel_read)(chan, rec.as_mut_ptr(), APP_RECORD_MAX);
+        let n = (sys.channel_read)(chan, rec.as_mut_ptr(), RECORD_MAX);
         if n <= 0 {
             return;
         }
         let raw = &rec[..n as usize];
+        // The application's own backend went away: every exchange it holds
+        // without an answer is unknowable. A request already streamed to it
+        // cannot be issued again from here, so each is answered for — 502
+        // before its response began, a cut-off response after.
+        if let Some(Record::Link { state }) = parse_response(raw) {
+            if state == link::DOWN {
+                fail_all(s);
+            }
+            continue;
+        }
         let Some(id) = record_id(raw) else {
             // A record that does not parse is an application speaking a broken
             // protocol, or one larger than a channel read on a port whose
@@ -638,15 +779,39 @@ pub(crate) unsafe fn drain_responses(s: &mut HttpState) {
     }
 }
 
-/// The id of a record the application wrote, when it parses.
+/// The id of a record the application wrote, when it parses and names an
+/// exchange this server could have opened.
 fn record_id(raw: &[u8]) -> Option<AppId> {
-    match app_parse_response(raw)? {
-        AppRecord::Head(h) => Some(h.id),
-        AppRecord::Body { id, .. }
-        | AppRecord::Abort { id, .. }
-        | AppRecord::Credit { id, .. }
-        | AppRecord::Datagram { id, .. } => Some(id),
+    let id = match parse_response(raw)? {
+        Record::Head(h) => h.id,
+        Record::Body { id, .. }
+        | Record::Abort { id, .. }
+        | Record::Credit { id, .. }
+        | Record::Datagram { id, .. } => id,
+        Record::Link { .. } => return None,
+    };
+    AppId::from_exchange_id(&id)
+}
+
+/// Answer for every exchange the application holds open without a complete
+/// response, on every connection and generation.
+unsafe fn fail_all(s: &mut HttpState) {
+    let saved = s.server.cur_slot;
+    for idx in 0..MAX_CONCURRENT_CONNS {
+        let slot = &*s.server.slots.as_ptr().add(idx);
+        #[cfg(feature = "h2")]
+        if !slot.h2.is_null() {
+            super::h2::fail_app_streams(s, idx);
+            continue;
+        }
+        if slot.app.open() && !slot.app.is(ex::RESP_DONE) {
+            s.server.cur_slot = idx as i32;
+            h1_fail(s, None);
+        }
     }
+    s.server.cur_slot = saved;
+    #[cfg(feature = "h3")]
+    super::h3::fail_app_streams(s);
 }
 
 // ── HTTP/1.1 ──────────────────────────────────────────────────────────────
@@ -664,7 +829,14 @@ pub(crate) unsafe fn h1_id(s: &HttpState) -> AppId {
 }
 
 /// Open the current h1 slot's exchange. `target` and `headers` are read from
-/// the request head still in `recv_buf`.
+/// the request head still in `recv_buf`; a body, when `has_body`, has been
+/// armed on the slot's reader.
+///
+/// A body already received whole that fits the record goes inline in the
+/// HEAD, and the exchange opens with its request direction ended. One whose
+/// declared length fits but which is still arriving is waited for
+/// ([`Emit::Waiting`]). A client waiting for `100 Continue`, or a body longer
+/// than the record, is sent after the HEAD on the application's credit.
 pub(crate) unsafe fn h1_begin(
     s: &mut HttpState,
     target: &[u8],
@@ -672,10 +844,20 @@ pub(crate) unsafe fn h1_begin(
     has_body: bool,
     continue_first: bool,
 ) -> Emit {
-    let (conn_id, verb) = match cur_slot(s) {
-        Some(c) => (c.conn_id.max(0) as u16, c.req_method),
+    // Room `recv_buf` has for the body behind the head, and the body's
+    // declared length (`u64::MAX` when it declares none).
+    let (conn_id, verb, recv_room, declared) = match cur_slot(s) {
+        Some(c) => (
+            c.conn_id.max(0) as u16,
+            c.req_method,
+            (c.recv_cap as u64).saturating_sub(c.header_end_off as u64),
+            c.body_declared,
+        ),
         None => return Emit::Unwired,
     };
+    if s.server.app_out_chan < 0 {
+        return Emit::Unwired;
+    }
     // A request generation, not a connection-scoped counter: the id must
     // differ from any a previous holder of this connection id was given.
     let stream = s.server.app_gen_next;
@@ -683,25 +865,62 @@ pub(crate) unsafe fn h1_begin(
         Some(p) => core::slice::from_raw_parts(p.as_ptr(), p.len()),
         None => &[],
     };
-    let head = AppRequestHead {
-        id: AppId {
-            origin: app_origin::TCP,
-            conn: conn_id as u32,
-            stream,
-        },
-        flags: if has_body { app_flag::MORE } else { 0 },
+    let id = AppId {
+        origin: app_origin::TCP,
+        conn: conn_id as u32,
+        stream,
+    };
+    let head = RequestHead {
+        id: id.exchange_id(),
+        flags: 0,
         method: verb,
         target,
         headers,
         peer,
         resp_credit: RESP_WINDOW,
+        body: &[],
     };
-    let r = emit_head(s, &head);
+    let mut rec = [0u8; RECORD_MAX];
+    let n = match compose_head(&head, &mut rec) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    // The body is decoded straight into the record behind the head, which is
+    // where an inline body sits; nothing is committed unless it goes.
+    //
+    // A body is waited for only when its declared length fits both the record
+    // and `recv_buf`, so it is certain to arrive whole where it can be read.
+    // A chunked body goes inline only if it is already here whole: its length
+    // is not known until it ends.
+    let mut inline = None;
+    if has_body {
+        rec[1] = flag::MORE;
+        let fits = declared <= (RECORD_MAX - n) as u64 && declared <= recv_room;
+        if !continue_first {
+            match super::reqbody::peek(s, &mut rec, n) {
+                Ok(p) if p.done => {
+                    rec[1] = 0;
+                    inline = Some(p);
+                }
+                Ok(_) | Err(super::reqbody::BodyStep::Wait) if fits => return Emit::Waiting,
+                Err(super::reqbody::BodyStep::TooLarge) => return Emit::BodyTooLarge,
+                Err(super::reqbody::BodyStep::Bad) => return Emit::BodyBad,
+                // Longer than the record or `recv_buf`, or of no declared
+                // length: the HEAD goes alone and the body follows on credit.
+                _ => {}
+            }
+        }
+    }
+    let len = n + inline.map_or(0, |p| p.produced);
+    let r = send_head(s, &rec[..len]);
     if r == Emit::Sent {
+        if let Some(p) = inline {
+            super::reqbody::commit(s, p);
+        }
         s.server.app_gen_next = stream.wrapping_add(1);
         let now = s.server.now_ms;
         if let Some(cur) = cur_slot_mut(s) {
-            cur.app = opened(stream, now, has_body, continue_first);
+            cur.app = opened(stream, now, has_body && inline.is_none(), continue_first);
             cur.resp_started = 0;
             cur.resp_length_known = 0;
             cur.resp_remaining = 0;
@@ -735,7 +954,7 @@ unsafe fn h1_record(s: &mut HttpState, idx: usize, id: &AppId, raw: &[u8]) {
             h1_fail(
                 s,
                 if outcome == Admit::Violation {
-                    Some(app_abort::CREDIT_OVERRUN)
+                    Some(abort_reason::CREDIT_OVERRUN)
                 } else {
                     None
                 },
@@ -791,11 +1010,11 @@ pub(crate) unsafe fn on_slot_release(s: &mut HttpState, idx: usize) {
         return;
     }
     let reason = if slot.peer_closed != 0 {
-        app_abort::PEER_GONE
+        abort_reason::PEER_GONE
     } else if s.server.draining != 0 {
-        app_abort::DRAINING
+        abort_reason::DRAINING
     } else {
-        app_abort::UNDELIVERABLE
+        abort_reason::UNDELIVERABLE
     };
     let id = AppId {
         origin: app_origin::TCP,
@@ -895,7 +1114,7 @@ pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
     if x.deadline_ms != 0 && s.server.now_ms >= x.deadline_ms {
         s.server.app_timeouts = s.server.app_timeouts.wrapping_add(1);
         let id = h1_id(s);
-        abort(s, id, app_abort::STALLED);
+        abort(s, id, abort_reason::STALLED);
         let started = cur_slot(s).map(|c| c.resp_started != 0).unwrap_or(true);
         h1_close_exchange(s);
         if let Some(cur) = cur_slot_mut(s) {
@@ -922,14 +1141,14 @@ pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
 /// step with that return code.
 unsafe fn h1_forward(s: &mut HttpState) -> Option<i32> {
     let id = h1_id(s);
-    let mut rec = [0u8; APP_RECORD_MAX];
+    let mut rec = [0u8; RECORD_MAX];
     // A few records per step: enough that framing between chunks costs no
     // step of its own, bounded so one connection cannot hold the step.
     let mut step = super::reqbody::BodyStep::Wait;
     for _ in 0..FORWARDS_PER_STEP {
         let credit = cur_slot(s).map(|c| c.app.req_credit).unwrap_or(0);
-        let cap = APP_HDR + (credit as usize).min(APP_BODY_MAX);
-        step = match super::reqbody::peek(s, &mut rec[..cap], APP_HDR) {
+        let cap = HDR + (credit as usize).min(BODY_MAX);
+        step = match super::reqbody::peek(s, &mut rec[..cap], HDR) {
             Ok(p) if p.produced == 0 && !p.done => super::reqbody::commit(s, p),
             Ok(p) => {
                 if emit_body(s, &id, &mut rec[..cap], p.produced, p.done) {
@@ -960,7 +1179,7 @@ unsafe fn h1_forward(s: &mut HttpState) -> Option<i32> {
         super::reqbody::BodyStep::Wait => {
             // A peer gone mid-body leaves a request that can never complete.
             if cur_slot(s).map(|c| c.peer_closed != 0).unwrap_or(false) {
-                abort(s, id, app_abort::PEER_GONE);
+                abort(s, id, abort_reason::PEER_GONE);
                 h1_close_exchange(s);
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = super::Phase::CloseConn;
@@ -975,9 +1194,9 @@ unsafe fn h1_forward(s: &mut HttpState) -> Option<i32> {
                 s,
                 id,
                 if too_large {
-                    app_abort::TOO_LARGE
+                    abort_reason::TOO_LARGE
                 } else {
-                    app_abort::MALFORMED
+                    abort_reason::MALFORMED
                 },
             );
             if too_large {
@@ -1029,7 +1248,7 @@ unsafe fn h1_compose(s: &mut HttpState) {
                 // A head the connection buffer cannot hold. Nothing has gone
                 // out, so the server answers for the application.
                 s.server.app_violations = s.server.app_violations.wrapping_add(1);
-                h1_fail(s, Some(app_abort::UNDELIVERABLE));
+                h1_fail(s, Some(abort_reason::UNDELIVERABLE));
                 return;
             }
             (*slot).app_queue.take_front_head();
@@ -1050,7 +1269,7 @@ unsafe fn h1_compose(s: &mut HttpState) {
             // response. Refused before a byte past it is sent.
             if (*slot).resp_length_known != 0 && n as u64 > (*slot).resp_remaining {
                 s.server.app_violations = s.server.app_violations.wrapping_add(1);
-                h1_fail(s, Some(app_abort::CREDIT_OVERRUN));
+                h1_fail(s, Some(abort_reason::CREDIT_OVERRUN));
                 return;
             }
             let dst = (*slot).send_buf.add((*slot).send_len as usize);
@@ -1078,12 +1297,12 @@ unsafe fn h1_compose(s: &mut HttpState) {
 /// Write a response HEAD's status line and headers into `send_buf`. False when
 /// they do not fit.
 unsafe fn h1_compose_head(s: &mut HttpState, rec: &[u8]) -> bool {
-    let Some(AppRecord::Head(h)) = app_parse_response(rec) else {
+    let Some(Record::Head(h)) = parse_response(rec) else {
         return false;
     };
     let verb = cur_slot(s).map(|c| c.req_method).unwrap_or(0);
     let carries = status_allows_body(h.status, verb);
-    let streaming = h.flags & app_flag::MORE != 0;
+    let streaming = h.flags & flag::MORE != 0;
     let declared = declared_length(h.headers);
     // The framing the peer reads the body by:
     //  - no body (HEAD, 204, 304): the application's own `Content-Length`,
@@ -1126,7 +1345,7 @@ unsafe fn h1_compose_head(s: &mut HttpState, rec: &[u8]) -> bool {
 
 /// The `Content-Length` an application declared in its own header block.
 pub(crate) fn declared_length(headers: &[u8]) -> Option<u64> {
-    let v = super::super::http_app::app_header(headers, b"content-length")?;
+    let v = super::super::exchange::header(headers, b"content-length")?;
     if v.is_empty() {
         return None;
     }

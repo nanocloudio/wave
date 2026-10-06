@@ -62,6 +62,9 @@ const RECV_WINDOW_INITIAL: i32 = 65535;
 /// Below this we proactively queue a WINDOW_UPDATE to refill so the
 /// server keeps streaming response body without stalling.
 const RECV_WINDOW_THRESHOLD: i32 = 32768;
+/// The longest field name a requester's header block may carry here: names
+/// are lowercased into a buffer of this size on their way into HPACK.
+const FIELD_NAME_MAX: usize = 128;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
@@ -149,6 +152,13 @@ unsafe fn log_grpc_status(s: &HttpState, status: u32) {
     dev_log(&*s.syscalls, 3, buf.as_ptr(), o);
 }
 
+/// End the exchange in flight where it stands: the requester aborted it.
+pub(crate) fn abandon(s: &mut HttpState) {
+    if s.client.h2_phase != H2Phase::Init as u8 {
+        set_phase(s, H2Phase::Error);
+    }
+}
+
 /// Drive one tick. Returns 0 (idle), 1 (done), or a negative error.
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // The h1 step machine uses `client.phase`; the h2 path uses
@@ -180,6 +190,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     Some(false) => return 0,
                     None => {
                         log(s, b"[http] no authority to dial");
+                        s.client.fail_cause = super::CAUSE_CONNECT;
                         set_phase(s, H2Phase::Error);
                         return E_CONNECT_FAILED;
                     }
@@ -215,7 +226,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             payload_len,
                         ));
                         s.client.conn_present = 1;
+                        s.client.peer_closed = 0;
                         log(s, b"[http] connected (h2c)");
+                        #[cfg(feature = "exchange")]
+                        super::provider::connected(s);
                         build_preface(s);
                         set_phase(s, H2Phase::SendPreface);
                         continue;
@@ -233,6 +247,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         };
                         if etag == 0 || etag == dev_requester_tag(sys) {
                             log(s, b"[http] connect error");
+                            s.client.fail_cause = super::CAUSE_CONNECT;
                             set_phase(s, H2Phase::Error);
                             return E_CONNECT_FAILED;
                         }
@@ -240,6 +255,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 }
                 if dev_millis(sys).wrapping_sub(s.client.connect_start_ms) >= CONNECT_TIMEOUT_MS {
                     log(s, b"[http] connect timeout");
+                    s.client.fail_cause = super::CAUSE_CONNECT;
                     set_phase(s, H2Phase::Error);
                     return E_CONNECT_FAILED;
                 }
@@ -267,7 +283,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     Some(true) => {
                         // SETTINGS observed and consumed; queue ACK +
                         // HEADERS in request_buf, drive SendRequest.
-                        build_request(s);
+                        if !build_request(s) {
+                            set_phase(s, H2Phase::Error);
+                            return E_SEND_FAILED;
+                        }
                         set_phase(s, H2Phase::SendRequest);
                         continue;
                     }
@@ -327,8 +346,26 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 
                 let action = process_one_frame(s);
                 match action {
+                    // A connection the peer closed delivers nothing more: a
+                    // response it left unfinished has failed.
+                    FrameAction::NeedMore if s.client.peer_closed != 0 => {
+                        s.client.fail_cause = super::CAUSE_LINK;
+                        set_phase(s, H2Phase::Error);
+                        return E_NET_FAILED;
+                    }
                     FrameAction::NeedMore => return 0,
                     FrameAction::Continue => {
+                        // The response's own HEADERS: its head goes to the
+                        // requester as soon as it is known.
+                        #[cfg(feature = "exchange")]
+                        if s.client.headers_done != 0
+                            && super::provider::answering(s)
+                            && !super::provider::head_given(s)
+                            && !super::provider::head_from_fields(s, s.client.last_status)
+                        {
+                            set_phase(s, H2Phase::Error);
+                            return E_NET_FAILED;
+                        }
                         // For a WS upgrade, the response HEADERS
                         // (status=200) means the stream now tunnels
                         // RFC 6455 frames. Transition before processing
@@ -351,9 +388,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
                         // A body-less response (204, a bare 200) is still an
-                        // answer; an empty payload is not a refusal.
+                        // answer: its head, ended.
                         #[cfg(feature = "exchange")]
-                        super::exchange::complete(s);
+                        if super::provider::answering(s) && !super::provider::head_given(s) {
+                            super::provider::head_from_fields(s, s.client.last_status);
+                        }
                         return 1;
                     }
                     FrameAction::Error => {
@@ -390,8 +429,6 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     log_done(s);
                     let _ = send_close_frame(s);
                     set_phase(s, H2Phase::Done);
-                    #[cfg(feature = "exchange")]
-                    super::exchange::complete(s);
                     return 1;
                 }
                 // Bidirectional mode: if `in[1]` is wired and has
@@ -419,9 +456,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
                         // A body-less response (204, a bare 200) is still an
-                        // answer; an empty payload is not a refusal.
+                        // answer: its head, ended.
                         #[cfg(feature = "exchange")]
-                        super::exchange::complete(s);
+                        if super::provider::answering(s) && !super::provider::head_given(s) {
+                            super::provider::head_from_fields(s, s.client.last_status);
+                        }
                         return 1;
                     }
                     FrameAction::Error => {
@@ -432,24 +471,32 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             H2Phase::Writing => {
-                // Graph-driven: a reply is ONE frame, so the body is
-                // accumulated rather than streamed to `file_ctrl`. Same rule
-                // as h1 — the protocols differ in where the bytes come from,
-                // not in what an exchange does with them.
+                // Graph-driven: the DATA frame's payload goes to the requester
+                // as far as its credit reaches; the frame stays in `recv_buf`
+                // until all of it has. Same rule as h1 — the protocols differ
+                // in where the bytes come from, not in what an exchange does
+                // with them.
                 #[cfg(feature = "exchange")]
-                if super::exchange::busy(s) {
+                if super::provider::busy(s) {
                     let plen = data_frame_payload_len(s);
                     let end = data_frame_end_stream(s);
-                    let n = plen.min(super::RECV_BUF_SIZE - h2w::FRAME_HEADER_LEN);
-                    let src = s.client.recv_buf.as_ptr().add(h2w::FRAME_HEADER_LEN);
-                    super::exchange::accumulate(s, src, n);
-                    s.client.bytes_received += plen as u32;
+                    let pending = s.client.pending_offset as usize;
+                    let src = s
+                        .client
+                        .recv_buf
+                        .as_ptr()
+                        .add(h2w::FRAME_HEADER_LEN + pending);
+                    let taken = super::provider::body(s, src, plen - pending);
+                    s.client.pending_offset += taken as u16;
+                    s.client.bytes_received += taken as u32;
+                    if pending + taken < plen {
+                        return 0;
+                    }
                     consume_data_frame(s);
                     if end {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
-                        super::exchange::complete(s);
                         return 1;
                     }
                     set_phase(s, H2Phase::WaitResponse);
@@ -466,8 +513,6 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
-                        #[cfg(feature = "exchange")]
-                        super::exchange::complete(s);
                         return 1;
                     }
                     set_phase(s, H2Phase::WaitResponse);
@@ -491,8 +536,6 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
-                        #[cfg(feature = "exchange")]
-                        super::exchange::complete(s);
                         return 1;
                     }
                     set_phase(s, H2Phase::WaitResponse);
@@ -521,16 +564,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 
             H2Phase::Done => {
                 let _ = send_close_frame(s);
-                #[cfg(feature = "exchange")]
-                super::exchange::complete(s);
                 return 1;
             }
 
             H2Phase::Error => {
                 let _ = send_close_frame(s);
-                // No silent drops: a failed exchange is answered.
-                #[cfg(feature = "exchange")]
-                super::exchange::fail(s);
                 return -1;
             }
         }
@@ -582,7 +620,17 @@ unsafe fn process_one_frame(s: &mut HttpState) -> FrameAction {
             // HEADERS, or (Trailers-Only response) in the first HEADERS.
             let mut grpc_status: i32 = -1;
             let gs_ptr = &mut grpc_status as *mut i32;
+            // The response's own fields, kept for a requester that is owed
+            // them with the status. Trailers are not part of the head.
+            #[cfg(feature = "exchange")]
+            let keep = s.client.headers_done == 0 && super::provider::answering(s);
+            #[cfg(feature = "exchange")]
+            let sp = s as *mut HttpState;
             let dec = super::super::wire::hpack::decode_block(blk, block_len, |name, value| {
+                #[cfg(feature = "exchange")]
+                if keep {
+                    super::provider::note_field(&mut *sp, name, value);
+                }
                 if name == b":status" && value.len() <= 4 {
                     let mut v: u16 = 0;
                     for &c in value {
@@ -818,7 +866,10 @@ unsafe fn build_preface(s: &mut HttpState) {
     s.client.request_sent = 0;
 }
 
-unsafe fn build_request(s: &mut HttpState) {
+/// Compose the SETTINGS ACK and the request HEADERS into `request_buf`.
+/// False when a requester's field does not encode.
+#[must_use]
+unsafe fn build_request(s: &mut HttpState) -> bool {
     let buf = s.client.request_buf.as_mut_ptr();
     let mut o = 0usize;
     let is_ws = s.client.websocket != 0;
@@ -831,8 +882,17 @@ unsafe fn build_request(s: &mut HttpState) {
     // 2) Build the HEADERS frame.
     let block_start = o + h2w::FRAME_HEADER_LEN;
     let mut bo = block_start;
+    // A graph-driven request names its own method and carries its own
+    // fields, `content-type` among them; a param request is a GET, or a POST
+    // when it has a body.
+    #[cfg(feature = "exchange")]
+    let driven = super::provider::busy(s);
+    #[cfg(not(feature = "exchange"))]
+    let driven = false;
     let method: &[u8] = if is_ws {
         b"CONNECT"
+    } else if driven {
+        super::super::wire::method::method_name(s.client.method)
     } else if has_body {
         b"POST"
     } else {
@@ -877,18 +937,45 @@ unsafe fn build_request(s: &mut HttpState) {
         );
     }
 
-    if has_body {
-        let is_grpc = s.client.grpc != 0;
-        bo += super::super::wire::hpack::encode_header(
+    // The requester's fields, names lowercased as RFC 9113 §8.2.1 requires.
+    // The provider admitted them as field lines naming nothing this module
+    // writes itself.
+    let hl = s.client.request_headers_len as usize;
+    let block = core::slice::from_raw_parts(s.client.request_headers.as_ptr(), hl);
+    for (name, value) in super::super::exchange::header_lines(block) {
+        let mut lower = [0u8; FIELD_NAME_MAX];
+        if name.len() > FIELD_NAME_MAX {
+            return false;
+        }
+        for (d, c) in lower.iter_mut().zip(name) {
+            *d = c.to_ascii_lowercase();
+        }
+        let n = super::super::wire::hpack::encode_header(
             buf.add(bo),
             REQUEST_BUF_SIZE - bo,
-            b"content-type",
-            if is_grpc {
-                b"application/grpc" as &[u8]
-            } else {
-                b"application/octet-stream"
-            },
+            &lower[..name.len()],
+            value,
         );
+        if n == 0 {
+            return false;
+        }
+        bo += n;
+    }
+
+    if has_body {
+        let is_grpc = s.client.grpc != 0;
+        if !driven {
+            bo += super::super::wire::hpack::encode_header(
+                buf.add(bo),
+                REQUEST_BUF_SIZE - bo,
+                b"content-type",
+                if is_grpc {
+                    b"application/grpc" as &[u8]
+                } else {
+                    b"application/octet-stream"
+                },
+            );
+        }
         if is_grpc {
             // The gRPC HTTP/2 protocol requires `te: trailers` so the
             // server may send grpc-status/grpc-message in trailing HEADERS.
@@ -922,6 +1009,7 @@ unsafe fn build_request(s: &mut HttpState) {
 
     s.client.request_len = o as u16;
     s.client.request_sent = 0;
+    true
 }
 
 /// Frame the next chunk of `request_body` into a DATA frame in
@@ -1170,8 +1258,9 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
         return false;
     }
     if msg_type == NET_MSG_CLOSED {
-        // Peer hung up; treat as end of body.
+        // Peer hung up: nothing more arrives on this connection.
         log(s, b"[http] premature close");
+        s.client.peer_closed = 1;
         return true;
     }
     if msg_type != NET_MSG_DATA || payload_len < 2 {

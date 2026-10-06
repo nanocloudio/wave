@@ -22,23 +22,20 @@ direction    = "output"
 content_type = "TextPlain"
 buffer_size  = 2048
 
-# Driven mode: one exchange at a time in the HTTP application records of
-# modules/common/http_app.rs — the same records `http` speaks to its
-# applications, from the client side. A caller writes REQUEST-direction
-# records here: HEAD (method, `/bucket/key[?query]`, extra header lines,
-# response credit), BODY (MORE until the last), CREDIT (more response credit)
-# and ABORT. A body needs a `content-length` header (411 without one).
-#
-# Mailbox channels: wire both edges with a `buffer_group`, one per direction,
-# so a write is one whole record and a read takes one whole record. A
-# byte-streaming FIFO would fragment them.
+# Driven mode: the connector is a PROVIDER of the exchange contract
+# (`abi::contracts::exchange`), performing one exchange at a time. A requester
+# writes REQUEST-direction records here: HEAD (method, `/bucket/key[?query]`,
+# extra header lines, response credit, and the body inline when it fits), BODY
+# (MORE until the last) under the credit the connector grants, CREDIT (more
+# response credit) and ABORT. A body that does not ride whole in the HEAD needs
+# a `content-length` header (400 without one).
 #
 # Both ports unwired = the boot ListBuckets probe.
 [[ports]]
 name         = "request_in"
 index        = 1
 direction    = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 max_record   = 8192
 buffer_size  = 8192
 
@@ -51,7 +48,7 @@ buffer_size  = 8192
 name         = "response_out"
 index        = 2
 direction    = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 max_record   = 8192
 buffer_size  = 8192
 

@@ -47,10 +47,16 @@ capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 # `exchange`) and omitted from the embedded ones, where a transport anchor is
 # not the role a constrained device plays (protocol_surfaces.md §Target-Class
 # Fit) and its flash is. The ports it answers on are omitted with it.
+#
+# Two exchange roles, each behind its own feature:
+#   * `app` — the server as REQUESTER toward the application behind a
+#     `HANDLER_APP` route: `request_out` / `response_in`.
+#   * `exchange` — the client as PROVIDER of requests from the graph:
+#     `request_in` / `response_out`.
 [[variant]]
 name = "web"
 features = ["h1", "ws"]
-omit_ports = ["req_out", "resp_in", "publish_in", "reply_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
+omit_ports = ["request_out", "response_in", "request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 
 # h1 + the HANDLER_APP request/response fan-out, nothing else — the ingress
@@ -60,7 +66,7 @@ omit_capabilities = ["stream.ordered_ack.exchange"]
 [[variant]]
 name = "app"
 features = ["h1", "app"]
-omit_ports = ["publish_in", "reply_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
+omit_ports = ["request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 
 # h1 + h2 + ws — everything but HTTP/3.
@@ -74,22 +80,24 @@ omit_capabilities = ["stream.ordered_ack.exchange"]
 [[variant]]
 name = "h2"
 features = ["h1", "h2", "ws", "app", "session"]
-omit_ports = ["publish_in", "reply_out"]
+omit_ports = ["request_in", "response_out"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 
 
-# Every protocol generation plus the graph-driven client exchange: requests
-# arrive on `publish_in` at run time instead of being fixed by params, and
-# responses leave on `reply_out` as an ordered-ack exchange.
+# The client as an exchange provider over HTTP/1.1 alone: requests arrive on
+# `request_in` at run time instead of being fixed by params, and their answers
+# leave on `response_out`.
 #
-# Feature-gated because the accumulator, the key buffer and the staging frame
-# are ~26 KiB of state, and the wider path and request bodies that come with
-# them are real cost an embedded one-shot client should not carry.
+# Feature-gated because the request collector, the record buffers and the
+# wider path and header bounds are ~40 KiB of state an embedded one-shot
+# client should not carry.
 [[variant]]
 name = "h1_exchange"
 features = ["h1", "exchange"]
-omit_ports = ["req_out", "resp_in", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
+omit_ports = ["request_out", "response_in", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
 
+# Every protocol generation, the server's application fan-out, and the client
+# as an exchange provider over HTTP/1.1, h2c or HTTP/3.
 [[variant]]
 name = "exchange"
 features = ["h1", "h2", "h3", "ws", "app", "exchange", "session"]
@@ -97,7 +105,7 @@ features = ["h1", "h2", "h3", "ws", "app", "exchange", "session"]
 [[variant]]
 name = "full"
 features = ["h1", "h2", "ws", "h3", "app", "session"]
-omit_ports = ["publish_in", "reply_out"]
+omit_ports = ["request_in", "response_out"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 default = true
 
@@ -214,16 +222,19 @@ buffer_size = 4096
 # application protocol inside it; here it owns HTTP framing, connection state
 # and bounded bodies, and a downstream module owns what the request MEANS.
 #
-# Records are `modules/common/http_app.rs`: a 16-byte prefix naming the
-# exchange (`[kind][flags][origin][0][conn u32][stream u64]`), then HEAD, BODY,
-# ABORT, CREDIT or DATAGRAM. Both directions stream and run on credit, so every
-# connection on every generation shares this one pair and one slow exchange
-# holds back only itself. An application MUST echo the 14-byte id verbatim.
+# The server is the REQUESTER of the exchange contract
+# (`abi::contracts::exchange`) and the application its provider. Every record
+# is a 16-byte prefix naming the exchange, then HEAD, BODY, ABORT, CREDIT or
+# DATAGRAM. The 14-byte id packs `[origin u8][0][conn u32][stream u64]`, which
+# is this module's own business: an application MUST echo it verbatim. Both
+# directions stream and run on credit, so every connection on every generation
+# shares this one pair and one slow exchange holds back only itself. A request
+# body already received whole that fits one record rides inline in the HEAD.
 [[ports]]
-name = "req_out"
+name = "request_out"
 index = 6
 direction = "output"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 # One record. `max_record` is the ceiling on ONE record and is what the reader
 # can take; `buffer_size` is ring depth, so a larger ring pipelines more
 # records rather than bigger ones. A body of any size crosses as many records.
@@ -231,12 +242,12 @@ max_record = 8192
 buffer_size = { default = 8192, bcm2712 = 65536 }
 
 [[ports]]
-name = "resp_in"
+name = "response_in"
 index = 6
 direction = "input"
-content_type = "HttpResponse"
-# Same ceiling as `req_out`, for the same reason. A record that does not parse
-# is dropped and counted as `app_records_malformed`.
+content_type = "ExchangeResponse"
+# Same ceiling as `request_out`, for the same reason. A record that does not
+# parse is dropped and counted as `app_records_malformed`.
 max_record = 8192
 buffer_size = { default = 8192, bcm2712 = 65536 }
 
@@ -441,54 +452,41 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 8192
 
-# ── Exchange ports (client mode, `exchange` variant) ──────────────────
+# ── Exchange ports (client mode, `exchange` / `h1_exchange` variants) ──
 #
-# The provider half of `stream.ordered_ack.exchange` — the role that
-# ANSWERS, which the capability name states rather than a fact. A request
-# arrives as a `Publish` whose payload is
-# `[method:u8][path_len:u16][body_len:u16][path…][body…]`; the response leaves
-# as a `Reply` carrying the body and echoing the request's `msg_key`, so a
-# downstream stage rejoins without holding state.
-#
-# The verb's high bit marks an extended record, which carries a header block
-# of its own and is answered with the status and the response's headers ahead
-# of the body (`client/exchange.rs`). Both forms ride the same ports and the
-# same payload ceiling; the headers come out of that budget rather than adding
-# to it. The caller's block is checked before the record is accepted — field
-# lines only, and none naming a field this client frames the request with —
-# because those bytes land in the request head and decide where it ends.
+# The client as a PROVIDER of the exchange contract — the role that ANSWERS,
+# which the capability name `stream.ordered_ack.exchange` states. A requester
+# writes request records on `request_in` (method, target, headers with
+# `content-type` among them, body inline or in BODY records under the credit
+# this client grants); the client performs the HTTP request and answers on
+# `response_out` with the origin's status, content type, headers and a body
+# streamed under the requester's credit, echoing the requester's exchange id.
+# A pinned client (`authority` set) reports its backend link as LINK DOWN / UP.
+# `client/provider.rs` states the request and answer conventions in full.
 #
 # Both are optional: a graph using the one-shot param client wires neither and
 # nothing changes for it.
 #
-# `max_record` is the contract's `PUBLISH_FRAME_MAX` / `REPLY_FRAME_MAX`
-# (13 overhead + 512 key + 8192 payload = 8717) PLUS the 3-byte channel
-# envelope the frames ride, because a record is what one `channel_write` puts
-# on the ring and this module writes envelope and frame together. Declaring
-# the frame alone would under-declare every full-size record by 3 bytes — the
-# rejection nobody sees until the largest payload in production. The ring
-# holds two, so a producer can write the next while one is being performed.
-#
 # in[8] and out[9], not in[7]/out[7]: WebSocket admission already holds index 7
 # in BOTH directions, and the `exchange` variant compiles `ws` too. Sharing an
-# index would have this client read admission decisions as publish frames and
-# write replies onto the admission request port. Indices are per-direction, so
-# the two numbers differ — appended is what matters, not matched.
+# index would have this client read admission decisions as requests and write
+# answers onto the admission request port. Indices are per-direction, so the
+# two numbers differ — appended is what matters, not matched.
 [[ports]]
-name = "publish_in"
+name = "request_in"
 index = 8
 direction = "input"
-content_type = "OctetStream"
-buffer_size = 17440
-max_record = 8720
+content_type = "ExchangeRequest"
+max_record = 8192
+buffer_size = 16384
 
 [[ports]]
-name = "reply_out"
+name = "response_out"
 index = 9
 direction = "output"
-content_type = "OctetStream"
-buffer_size = 17440
-max_record = 8720
+content_type = "ExchangeResponse"
+max_record = 8192
+buffer_size = 16384
 
 # Facts are declared under the parent surface `stream.ordered_ack`: both roles
 # carry the same terms, and the capability NAME is what says which role this
@@ -498,10 +496,10 @@ max_record = 8720
 # A 2xx means the origin accepted the request, not that anything was made
 # durable — HTTP has no durability contract to offer.
 ack         = "transport"
-# One connection per exchange and one request in flight, so ordering is
-# trivially preserved: there is never a second record to reorder against.
+# One request in flight at a time, so ordering is trivially preserved: there
+# is never a second request to reorder against.
 ordering    = "single"
-# `FLAG_BROADCAST` is refused rather than ignored. This client dials one
+# `flag::BROADCAST` is refused (400) rather than ignored. This client dials one
 # origin, and acking a fan-out that reached one destination would report a
 # delivery that did not happen.
 broadcast   = "unsupported"

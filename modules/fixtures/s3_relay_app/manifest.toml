@@ -5,44 +5,43 @@ hardware_targets = ["bcm2712"]
 # module, which is why it lives in `modules/fixtures/` rather than
 # `modules/foundation/`.
 #
-# The connector speaks the `HttpRequest` / `HttpResponse` records that `http`
-# speaks to its applications, in the same roles, so a graph can put plain
-# HTTP in front of it: `http` → this relay → `s3` → any S3 endpoint. Every
-# record passes unchanged except a request HEAD, which loses the inbound
-# connection's own header lines (`host`, framing, `expect`, a signature) and
-# its peer, since the connector writes those for the request it signs.
-# `tools/e2e/s3_serve.sh` drives the connector against `s3_serve` this way.
-#
-# Records are `modules/common/http_app.rs`. Every edge is a mailbox: wire each
-# with its own `buffer_group`.
+# The connector is a provider of the exchange contract, as an application
+# behind `http` is, so a graph can put plain HTTP in front of it: `http` → this
+# relay → `s3` → any S3 endpoint. The relay is a PROVIDER toward `http`
+# (`request_in` / `response_out`) and a REQUESTER toward the connector
+# (`request_out` / `response_in`). Every record passes unchanged except a
+# request HEAD, which loses the inbound connection's own header lines (`host`,
+# framing, `expect`, a signature) and its peer, since the connector writes
+# those for the request it signs. `tools/e2e/s3_serve.sh` drives the connector
+# against `s3_serve` this way.
 
 [[ports]]
 name = "request_in"
 direction = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 max_record = 8192
 buffer_size = 8192
 
 [[ports]]
-name = "upstream_in"
+name = "response_in"
 index = 1
 direction = "input"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 max_record = 8192
 buffer_size = 8192
 
 [[ports]]
 name = "response_out"
 direction = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 max_record = 8192
 buffer_size = 8192
 
 [[ports]]
-name = "upstream_out"
+name = "request_out"
 index = 1
 direction = "output"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 max_record = 8192
 buffer_size = 8192
 

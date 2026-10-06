@@ -604,11 +604,13 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 cur.body_pending = 1;
                                 cur.body_declared = declared.unwrap_or(u64::MAX);
                                 cur.body_continue_wanted = continue_first as u8;
+                                cur.body_awaited = 0;
                             }
                             _ => {
                                 cur.body_pending = 0;
                                 cur.body_declared = 0;
                                 cur.body_continue_wanted = 0;
+                                cur.body_awaited = 0;
                             }
                         }
                     }
@@ -1175,13 +1177,22 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     let continue_first = cur_slot(s)
                         .map(|c| c.body_continue_wanted != 0)
                         .unwrap_or(false);
-                    match app::h1_begin(s, target, headers, body_pending, continue_first) {
+                    // The body is armed before the HEAD is composed, so a body
+                    // already here can be read into it; nothing is consumed
+                    // unless the HEAD goes.
+                    if body_pending {
+                        if let Some(decoder) = cur_slot(s).map(|c| c.body_decoder) {
+                            reqbody::arm(s, decoder, limit);
+                        }
+                    }
+                    let begun = app::h1_begin(s, target, headers, body_pending, continue_first);
+                    if begun != app::Emit::Waiting {
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.body_awaited = 0;
+                        }
+                    }
+                    match begun {
                         app::Emit::Sent => {
-                            if body_pending {
-                                if let Some(decoder) = cur_slot(s).map(|c| c.body_decoder) {
-                                    reqbody::arm(s, decoder, limit);
-                                }
-                            }
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::AppExchange;
                             }
@@ -1190,11 +1201,28 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         // The ring is momentarily full. Stay in DispatchRoute
                         // and retry — the application is alive, just behind.
                         app::Emit::Full => return 0,
+                        // The body is still arriving. A peer that has closed
+                        // will send no more of it: the request can never be
+                        // whole, and nobody is left to answer.
+                        app::Emit::Waiting => {
+                            if let Some(cur) = cur_slot_mut(s) {
+                                cur.body_awaited = 1;
+                            }
+                            if cur_slot(s).is_some_and(|c| c.peer_closed != 0) {
+                                reqbody::reset_body(s);
+                                if let Some(cur) = cur_slot_mut(s) {
+                                    cur.keepalive = 0;
+                                    cur.phase = Phase::CloseConn;
+                                }
+                                return 2;
+                            }
+                            return 0;
+                        }
                         app::Emit::Unwired => {
                             build_error(
                                 s,
                                 b"503 Service Unavailable",
-                                b"No application wired to req_out\n",
+                                b"No application wired to request_out\n",
                             );
                         }
                         app::Emit::TooLarge => {
@@ -1204,7 +1232,15 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 b"Request Header Fields Too Large\n",
                             );
                         }
+                        app::Emit::BodyTooLarge => {
+                            s.server.bodies_refused = s.server.bodies_refused.wrapping_add(1);
+                            build_error(s, b"413 Content Too Large", b"Content Too Large\n");
+                        }
+                        app::Emit::BodyBad => {
+                            build_error(s, b"400 Bad Request", b"Bad Request\n");
+                        }
                     }
+                    reqbody::reset_body(s);
                     if let Some(cur) = cur_slot_mut(s) {
                         if body_pending {
                             cur.keepalive = 0;

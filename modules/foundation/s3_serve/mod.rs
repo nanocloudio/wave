@@ -1,8 +1,8 @@
 //! `s3_serve` — an S3 server behind `http`'s application routes, storing
 //! through any `storage.object` provider.
 //!
-//! The module answers the `http_app` records `http` hands it on `request_in`
-//! and writes its answers to `response_out`. It never holds a body whole: a
+//! The module is an exchange provider: it answers the request records `http`
+//! hands it on `request_in` and writes its answers to `response_out`. It never holds a body whole: a
 //! request body moves to the provider record by record through the streamed
 //! put, as the module grants credit for it; an object moves to the peer record
 //! by record through ranged reads, as `http` grants credit back.
@@ -53,16 +53,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 include!("../../common/sigv4_core.rs");
 include!("../../common/s3_serve_core.rs");
 
-#[path = "../../common/http_app.rs"]
-mod http_app;
-use http_app::{
-    app_abort, app_flag, app_parse_request, app_write_body, app_write_credit,
-    app_write_response_head, AppId, AppRecord, AppResponseHead, APP_BODY_MAX, APP_RECORD_MAX,
+// The exchange records this module answers, as a provider.
+use abi::contracts::exchange::{
+    self as exchange, abort, flag, parse_request, write_body, write_credit, write_response_head,
+    ExchangeId, Record, RequestHead, ResponseHead, BODY_MAX, RECORD_MAX,
 };
-
-mod http_exchange {
-    include!("../../../target/fluxor/fluxor-abi/sdk/contracts/net/http_exchange.rs");
-}
 
 use abi::contracts::mesh::capability as cap;
 use abi::contracts::storage::handle::STORAGE_KEY_MAX;
@@ -235,7 +230,7 @@ enum Out {
 
 struct Exchange {
     phase: Phase,
-    id: AppId,
+    id: ExchangeId,
     op: S3Op,
     method: u8,
     cred: u8,
@@ -432,7 +427,7 @@ struct State {
     uploads: [Upload; MAX_UPLOADS],
     sweep_at: u64,
     request_seq: u64,
-    rec: [u8; APP_RECORD_MAX],
+    rec: [u8; RECORD_MAX],
     held: bool,
     held_len: usize,
     /// Upload ids whose staging is still to be removed.
@@ -560,7 +555,7 @@ const PART_ETAG_STRIDE: usize = 1 + ETAG_MAX;
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_arena_size"]
 pub extern "C" fn module_arena_size() -> u32 {
-    let per_exchange = APP_RECORD_MAX + LIST_PAGE_BUF;
+    let per_exchange = RECORD_MAX + LIST_PAGE_BUF;
     let per_completion = S3_PART_NUMBER_MAX as usize * (4 + PART_ETAG_STRIDE);
     let need = MAX_EXCHANGES * per_exchange + MAX_COMPLETIONS * per_completion;
     (need + need / 4) as u32
@@ -1156,7 +1151,7 @@ unsafe fn take_records(s: &mut State) -> bool {
             if ready <= 0 || (ready as u32 & POLL_IN) == 0 {
                 return worked;
             }
-            let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr(), APP_RECORD_MAX);
+            let n = (sys.channel_read)(s.request_in, s.rec.as_mut_ptr(), RECORD_MAX);
             if n <= 0 {
                 return worked;
             }
@@ -1176,11 +1171,11 @@ unsafe fn take_records(s: &mut State) -> bool {
 /// HEAD could not be written yet).
 unsafe fn take(s: &mut State) -> bool {
     let raw: &[u8] = core::slice::from_raw_parts(s.rec.as_ptr(), s.held_len);
-    let Some(rec) = app_parse_request(raw) else {
+    let Some(rec) = parse_request(raw) else {
         return true;
     };
     match rec {
-        AppRecord::Head(h) => {
+        Record::Head(h) => {
             let Some(i) = s.ex.iter().position(|e| e.phase == Phase::Free) else {
                 // Counted once, when the refusal goes: a HEAD held back by a
                 // full `response_out` is the same refusal asked again.
@@ -1199,28 +1194,28 @@ unsafe fn take(s: &mut State) -> bool {
             s.tlm_requests = s.tlm_requests.wrapping_add(1);
             true
         }
-        AppRecord::Body { id, flags, data } => {
+        Record::Body { id, flags, data } => {
             s.tlm_bytes_in = s.tlm_bytes_in.wrapping_add(data.len() as u64);
             if let Some(i) = find(s, &id) {
-                let last = flags & app_flag::MORE == 0;
+                let last = flags & flag::MORE == 0;
                 let data: &[u8] = core::slice::from_raw_parts(data.as_ptr(), data.len());
                 body(s, i, data, last);
             }
             true
         }
-        AppRecord::Credit { id, bytes } => {
+        Record::Credit { id, bytes } => {
             if let Some(i) = find(s, &id) {
                 s.ex[i].resp_credit = s.ex[i].resp_credit.saturating_add(bytes);
             }
             true
         }
-        AppRecord::Abort { id, .. } => {
+        Record::Abort { id, .. } => {
             if let Some(i) = find(s, &id) {
                 end(s, i, false);
             }
             true
         }
-        AppRecord::Datagram { .. } => true,
+        Record::Datagram { .. } | Record::Link { .. } => true,
     }
 }
 
@@ -1240,7 +1235,7 @@ fn next_request_id(s: &mut State) -> [u8; 16] {
     rid
 }
 
-unsafe fn find(s: &State, id: &AppId) -> Option<usize> {
+unsafe fn find(s: &State, id: &ExchangeId) -> Option<usize> {
     s.ex.iter()
         .position(|e| e.phase != Phase::Free && e.id == *id)
 }
@@ -1248,7 +1243,7 @@ unsafe fn find(s: &State, id: &AppId) -> Option<usize> {
 /// Answer a HEAD with no exchange to serve it: `503 SlowDown`, or
 /// `ServiceUnavailable` while the module is not serving. Written straight
 /// away; false when `response_out` is full, and the HEAD waits.
-unsafe fn refuse_now(s: &mut State, id: &AppId, credit: u32) -> bool {
+unsafe fn refuse_now(s: &mut State, id: &ExchangeId, credit: u32) -> bool {
     let err = if s.boot == Boot::Serving {
         S3Err::SlowDown
     } else {
@@ -1270,7 +1265,7 @@ unsafe fn refuse_now(s: &mut State, id: &AppId, credit: u32) -> bool {
     h.put(b"\r\n");
     let hl = h.len;
     let mut rec = [0u8; 1024];
-    let head = AppResponseHead {
+    let head = ResponseHead {
         id: *id,
         flags: 0,
         status: err.status(),
@@ -1278,7 +1273,7 @@ unsafe fn refuse_now(s: &mut State, id: &AppId, credit: u32) -> bool {
         headers: &hdr[..hl],
         body: &body[..len],
     };
-    let Some(n) = app_write_response_head(&head, &mut rec) else {
+    let Some(n) = write_response_head(&head, &mut rec) else {
         return true;
     };
     ((*s.syscalls).channel_write)(s.response_out, rec.as_ptr(), n) > 0
@@ -1288,12 +1283,15 @@ unsafe fn refuse_now(s: &mut State, id: &AppId, credit: u32) -> bool {
 
 /// Open exchange `i` for a request HEAD. False, with the exchange left free,
 /// when there is no room to answer it from; the caller refuses the HEAD.
-unsafe fn begin(s: &mut State, i: usize, h: &http_app::AppRequestHead<'_>) -> bool {
+unsafe fn begin(s: &mut State, i: usize, h: &RequestHead<'_>) -> bool {
     let e = &mut s.ex[i];
     e.phase = Phase::Answer;
     e.id = h.id;
     e.method = h.method;
-    e.body_open = h.flags & app_flag::MORE != 0;
+    // A body is open while BODY records follow it, or while the HEAD's own
+    // inline bytes are still to be taken below.
+    let more = h.flags & flag::MORE != 0;
+    e.body_open = more || !h.body.is_empty();
     e.credit_out = 0;
     e.credit_owed = 0;
     e.resp_credit = h.resp_credit;
@@ -1320,7 +1318,7 @@ unsafe fn begin(s: &mut State, i: usize, h: &http_app::AppRequestHead<'_>) -> bo
     e.out_final = false;
     s.ex[i].request_id = next_request_id(s);
     if s.ex[i].out.is_null() {
-        s.ex[i].out = heap_alloc(&*s.syscalls, APP_RECORD_MAX as u32);
+        s.ex[i].out = heap_alloc(&*s.syscalls, RECORD_MAX as u32);
         if s.ex[i].out.is_null() {
             s.ex[i].phase = Phase::Free;
             return false;
@@ -1331,6 +1329,17 @@ unsafe fn begin(s: &mut State, i: usize, h: &http_app::AppRequestHead<'_>) -> bo
     let peer: &[u8] = core::slice::from_raw_parts(h.peer.as_ptr(), h.peer.len());
     if let Err(err) = dispatch(s, i, target, headers, peer) {
         fail(s, i, err);
+    }
+    // The body bytes the HEAD carried, taken as the first body record. They
+    // spent no credit, so the credit their taking owes back is not owed.
+    if !h.body.is_empty() && s.ex[i].phase != Phase::Free {
+        let inline: &[u8] = core::slice::from_raw_parts(h.body.as_ptr(), h.body.len());
+        s.tlm_bytes_in = s.tlm_bytes_in.wrapping_add(inline.len() as u64);
+        let credit_out = s.ex[i].credit_out;
+        body(s, i, inline, !more);
+        let e = &mut s.ex[i];
+        e.credit_out = credit_out;
+        e.credit_owed = e.credit_owed.saturating_sub(inline.len() as u32);
     }
     true
 }
@@ -1343,7 +1352,7 @@ unsafe fn dispatch(
     headers: &[u8],
     peer: &[u8],
 ) -> Result<(), S3Err> {
-    let method = http_exchange::method_name(s.ex[i].method);
+    let method = exchange::method_name(s.ex[i].method);
     let r = s3_resource(target);
     let op = s3_classify(method, &r);
     s.ex[i].op = op;
@@ -1620,12 +1629,11 @@ unsafe fn fail(s: &mut State, i: usize, err: S3Err) {
     }
     let resource_len = r.len;
     s3_error_xml(err, err.code(), &resource[..resource_len], &rid, &mut o);
-    let len =
-        if !o.over && (o.len as u32) <= e.resp_credit && e.method != http_exchange::METHOD_HEAD {
-            o.len
-        } else {
-            0
-        };
+    let len = if !o.over && (o.len as u32) <= e.resp_credit && e.method != exchange::METHOD_HEAD {
+        o.len
+    } else {
+        0
+    };
     let mut hdr = [0u8; 64];
     let mut h = S3Out::new(&mut hdr);
     h.put(b"x-amz-request-id: ");
@@ -1655,12 +1663,12 @@ unsafe fn stage_head(
     last: bool,
 ) -> bool {
     let e = &mut s.ex[i];
-    let out = core::slice::from_raw_parts_mut(e.out, APP_RECORD_MAX);
+    let out = core::slice::from_raw_parts_mut(e.out, RECORD_MAX);
     if body.len() as u64 > e.resp_credit as u64 {
         // A document past the credit `http` offered cannot be sent whole,
         // and sending part of it would be a different answer: the exchange
         // is given up, and `http` answers for it.
-        if let Some(n) = http_app::app_write_abort(&e.id, app_abort::FAILED, out) {
+        if let Some(n) = exchange::write_abort(&e.id, abort::FAILED, out) {
             e.out_len = n;
             e.out_state = Out::Pending;
             e.out_final = true;
@@ -1668,15 +1676,15 @@ unsafe fn stage_head(
         s.tlm_aborts = s.tlm_aborts.wrapping_add(1);
         return false;
     }
-    let head = AppResponseHead {
+    let head = ResponseHead {
         id: e.id,
-        flags: if last { 0 } else { app_flag::MORE },
+        flags: if last { 0 } else { flag::MORE },
         status,
         content_type: ct,
         headers,
         body,
     };
-    match app_write_response_head(&head, out) {
+    match write_response_head(&head, out) {
         Some(n) => {
             e.out_len = n;
             e.out_state = Out::Pending;
@@ -1692,8 +1700,8 @@ unsafe fn stage_head(
 /// Stage a response BODY.
 unsafe fn stage_body(s: &mut State, i: usize, data: &[u8], last: bool) {
     let e = &mut s.ex[i];
-    let out = core::slice::from_raw_parts_mut(e.out, APP_RECORD_MAX);
-    if let Some(n) = app_write_body(&e.id, if last { 0 } else { app_flag::MORE }, data, out) {
+    let out = core::slice::from_raw_parts_mut(e.out, RECORD_MAX);
+    if let Some(n) = write_body(&e.id, if last { 0 } else { flag::MORE }, data, out) {
         e.out_len = n;
         e.out_state = Out::Pending;
         e.out_final = last;
@@ -1723,8 +1731,8 @@ unsafe fn flush(s: &mut State, i: usize) -> bool {
 unsafe fn abort_out(s: &mut State, i: usize) {
     s.tlm_aborts = s.tlm_aborts.wrapping_add(1);
     let e = &mut s.ex[i];
-    let out = core::slice::from_raw_parts_mut(e.out, APP_RECORD_MAX);
-    if let Some(n) = http_app::app_write_abort(&e.id, app_abort::FAILED, out) {
+    let out = core::slice::from_raw_parts_mut(e.out, RECORD_MAX);
+    if let Some(n) = exchange::write_abort(&e.id, abort::FAILED, out) {
         e.out_len = n;
         e.out_state = Out::Pending;
         e.out_final = true;
@@ -1741,7 +1749,7 @@ unsafe fn grant(s: &mut State, i: usize) {
         return;
     }
     let mut rec = [0u8; 32];
-    if let Some(n) = app_write_credit(&e.id, e.credit_owed, &mut rec) {
+    if let Some(n) = write_credit(&e.id, e.credit_owed, &mut rec) {
         if ((*s.syscalls).channel_write)(s.response_out, rec.as_ptr(), n) > 0 {
             e.credit_out = e.credit_out.saturating_add(e.credit_owed);
             e.credit_owed = 0;
@@ -2393,12 +2401,12 @@ fn trim(v: &[u8]) -> &[u8] {
 unsafe fn get_body(s: &mut State, i: usize) -> bool {
     let e = &mut s.ex[i];
     let left = e.end - e.offset;
-    let n = (left.min(e.resp_credit as u64).min(APP_BODY_MAX as u64)) as usize;
+    let n = (left.min(e.resp_credit as u64).min(BODY_MAX as u64)) as usize;
     if n == 0 && left > 0 {
         return false;
     }
-    let out = core::slice::from_raw_parts_mut(e.out, APP_RECORD_MAX);
-    let data_at = http_app::APP_HDR;
+    let out = core::slice::from_raw_parts_mut(e.out, RECORD_MAX);
+    let data_at = exchange::HDR;
     let mut got = 0usize;
     while got < n {
         let mut arg = [0u8; 20];
@@ -2428,8 +2436,8 @@ unsafe fn get_body(s: &mut State, i: usize) -> bool {
     }
     let e = &mut s.ex[i];
     let last = e.offset + got as u64 == e.end;
-    let flags = if last { 0 } else { app_flag::MORE };
-    let Some(len) = http_app::app_seal_body(&e.id, flags, got, out) else {
+    let flags = if last { 0 } else { flag::MORE };
+    let Some(len) = exchange::seal_body(&e.id, flags, got, out) else {
         abort_out(s, i);
         return true;
     };
@@ -2812,12 +2820,12 @@ unsafe fn list_send(s: &mut State, i: usize) -> bool {
     let pending = s.ex[i].list.pending as usize;
     let done = s.ex[i].list.done;
     let credit = s.ex[i].resp_credit as usize;
-    let room = APP_BODY_MAX - 64;
+    let room = BODY_MAX - 64;
     let n = pending.min(credit).min(room);
     if n == 0 {
         return false;
     }
-    let mut chunk = [0u8; APP_BODY_MAX];
+    let mut chunk = [0u8; BODY_MAX];
     chunk[..n].copy_from_slice(core::slice::from_raw_parts(s.ex[i].list.page, n));
     let rest = pending - n;
     let page = s.ex[i].list.page;
@@ -3212,7 +3220,7 @@ unsafe fn complete_copy(s: &mut State, i: usize) -> bool {
         s.ex[i].offset = 0;
     }
     let rh = s.ex[i].mtime as i32;
-    let mut buf = [0u8; APP_BODY_MAX];
+    let mut buf = [0u8; BODY_MAX];
     let mut arg = [0u8; 20];
     arg[..8].copy_from_slice(&s.ex[i].offset.to_le_bytes());
     arg[8..12].copy_from_slice(&(buf.len() as u32).to_le_bytes());

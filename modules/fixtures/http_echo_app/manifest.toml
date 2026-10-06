@@ -11,8 +11,8 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 # `docs/specification.md` places "HTTP application resources, tenant routing
 # policy, authorization, CDN policy, webhook meaning, or business handlers"
 # OUTSIDE Wave. A permanent application module here would contradict that. What
-# Wave does own is the port CONTRACT — the `HttpRequest` / `HttpResponse`
-# records and their correlation rules — and a contract with nothing on the
+# Wave does own is the port SURFACE — the exchange records `http` speaks as a
+# requester and the id it packs into them — and a surface with nothing on the
 # far side of it is untested by construction.
 #
 # So this echoes: it reflects the method, path and body it was handed back as a
@@ -20,19 +20,19 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 # pair intact and its answer came back to the connection that asked. Anything
 # more would be a business handler.
 #
-# Records are `modules/common/http_app.rs`, the contract `foundation/http`
-# speaks on `req_out` / `resp_in`.
+# Records are the SDK's exchange contract, which `foundation/http` speaks on
+# `request_out` / `response_in`; this fixture is their provider.
 
 [[ports]]
 name = "request_in"
 direction = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 buffer_size = { default = 8192, bcm2712 = 65536 }
 
 [[ports]]
 name = "response_out"
 direction = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 buffer_size = { default = 8192, bcm2712 = 65536 }
 
 [observability]
@@ -40,6 +40,6 @@ buffer_size = { default = 8192, bcm2712 = 65536 }
 # module reports what it moved — but this one exists to be ASSERTED on, not
 # operated: every request it handles is already visible as the response
 # `tools/e2e/linux_graph.sh --app` reads back, and a counter would be a second
-# source of truth for the same fact. A real application behind `req_out` should
+# source of truth for the same fact. A real application behind `request_out` should
 # declare metrics; a fixture that stands in for one should not pretend to be it.
 exempt = "conformance fixture: observed through the E2E assertions it exists to serve"

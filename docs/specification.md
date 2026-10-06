@@ -130,11 +130,12 @@ Wave owns:
   resolve against, request-body framing (`Content-Length`, chunked
   transfer coding, `Expect: 100-continue`) and the refusal of a
   message that carries contradictory framing headers;
-- the HTTP application fan-out contract — the `HttpRequest` /
-  `HttpResponse` envelopes, their `(conn_id, stream_id)` correlation,
-  and the backpressure and streaming rules that carry them — which is
-  how a graph node outside Wave holds the resources and business
-  handlers listed below as not Wave's;
+- the HTTP application fan-out — `http` as the requester of fluxor's
+  exchange contract toward an application route: what a request HEAD
+  carries, the exchange id it packs (`(transport, conn_id, stream_id)`),
+  when a body rides inline and when it follows on credit — which is how
+  a graph node outside Wave holds the resources and business handlers
+  listed below as not Wave's;
 - HTTP/2 framing, stream state, flow control, and HPACK;
 - HTTP/3 request/response semantics, QPACK, and request-stream
   multiplexing above QUIC;
@@ -238,65 +239,55 @@ method dispatch, protobuf schemas and reflection are application
 concerns.
 
 The `exchange` variant carries the graph-driven client: requests
-arrive as records at run time instead of being fixed by params, which
-makes `http` a provider of fluxor's `stream.ordered_ack.exchange`
-surface — the role a producer binds to reach a destination that
-ANSWERS, as opposed to a sink that only accepts. A request record is
-`[method:u8][path_len:u16][body_len:u16][path…][body…]` on
-`publish_in`; the response body returns on `reply_out`, correlated by
-`corr` and echoing the publish's `msg_key` so a downstream stage
-rejoins it without holding state.
+arrive as exchange records at run time instead of being fixed by
+params, which makes `http` a provider of fluxor's exchange contract
+and of its `stream.ordered_ack.exchange` capability — the role a
+requester binds to reach a destination that ANSWERS, as opposed to a
+sink that only accepts. A request HEAD on `request_in` names the
+method, the target, the header lines (`content-type` among them) and
+the body; the answer leaves on `response_out` under the requester's
+own exchange id, carrying the origin's status verbatim, its content
+type and headers, and its body streamed under the requester's credit.
+`h1_exchange` is the same provider over HTTP/1.1 alone.
 
-The verb's high bit marks an extended record, which carries a header
-block of its own — `[method|0x80][path_len:u16 LE][body_len:u16 LE]
-[hdr_len:u16 LE][path…][headers…][body…]` — and is answered with the
-whole response rather than its body alone:
-`[status:u16 LE][hdr_len:u16 LE][headers…][body…]`. A caller answering
-somebody else needs both halves of that: a status tells a 204 from a
-200, and the headers carry the content type, the location, the entity
-tag.
+The requester's header block is spliced into the request head, so its
+bytes decide where that head ends and what the origin reads as
+framing, and it is checked before the request is performed: each line
+a field ending CRLF, none empty, none holding a stray CR or LF, each
+naming a field in token characters. A block naming a field this client
+frames the request with — `Connection`, `Transfer-Encoding`,
+`Keep-Alive`, `TE`, `Trailer`, `Upgrade`, `Proxy-Connection`,
+`Expect` — is answered 400; `Host` chooses where an open client goes
+and must name a pinned client's own authority, and `Content-Length`
+must agree with the body. A second reading of where a request ends is
+how one request becomes two.
 
-The caller's block is spliced into the request head, so its bytes decide
-where that head ends and what the origin reads as framing, and it is
-checked before the record is accepted: each line a field ending CRLF,
-none empty, none holding a stray CR or LF, each naming a field in token
-characters and carrying a value of printable ones. A block naming
-`Content-Length`, `Transfer-Encoding`, `Host` or `Connection` is refused
-with the rest — those are the fields this client frames the request
-with, and a second reading of where a request ends is how one request
-becomes two. An extended record is an HTTP/1.1 arrangement, and a client
-configured for h2c or HTTP/3 refuses one rather than perform a lesser
-request under its name.
-
-What Wave owns here is only the mapping between that surface and an
-HTTP request: the verb vocabulary, the head, and which reply status a
-failure earns. The surface itself, its frames and its correlation
-rules are fluxor's, and what a payload MEANS stays with the producer.
+What Wave owns here is only the mapping between that contract and an
+HTTP request: the head, which fields a requester may name, and which
+status a failure earns. The contract itself, its records and its
+correlation and credit rules are fluxor's, and what a body MEANS stays
+with the requester.
 
 The declared terms are `ack = "transport"` (a 2xx is the origin
 accepting the request, not a durability claim HTTP has no way to
-make), `ordering = "single"` (one connection per exchange and one
-request in flight, so there is never a second record to reorder
-against), `broadcast = "unsupported"` (refused rather than ignored —
-this client dials one origin, and acking a fan-out that reached one
-destination would report a delivery that did not happen) and
-`max_payload = 8192`. Credentials, retry policy and the meaning of a
-refusal belong to the producer.
+make), `ordering = "single"` (one request in flight, so there is never
+a second to reorder against), `broadcast = "unsupported"` (answered
+400 rather than ignored — this client dials one origin, and acking a
+fan-out that reached one destination would report a delivery that did
+not happen) and `max_payload = 8192`. Credentials, retry policy and
+the meaning of a status belong to the requester: a response is an
+answer whatever its status, and the status is the origin's own.
 
-What an upstream failure looks like is a deployment choice. By default
-a response is a completed exchange whatever its status, and an error
-body is the answer — which is what a consumer reading a problem
-document wants. A graph may instead ask for a status of 400 or above
-to answer as a typed refusal carrying the code, so a producer can
-retry a 503 and discard a 404 without parsing a payload whose shape it
-does not know. Wave classifies; what to do about a class stays with
-the producer.
+A pinned client reports its origin as its backend link: LINK DOWN when
+a connection cannot be opened or drops before a response completes,
+LINK UP once a connection opens again, so a requester knows to issue
+again what it held open.
 
 `capabilities` is declared per module rather than per variant, so the
 manifest states this surface for artefacts that do not compile it.
 That is a property of the variant split — the `app` fan-out ports have
-it too — and it means a deployment wiring `publish_in`/`reply_out`
-must ship `http-exchange.fmod`.
+it too — and it means a deployment wiring `request_in`/`response_out`
+must ship `http-exchange.fmod` or `http-h1_exchange.fmod`.
 
 ### `websocket`
 
@@ -400,7 +391,10 @@ authentication step, then a dot-stuffed DATA body to
 QUIT, with delivery reported on a status port only when end-of-data
 (250) and QUIT (221) are both accepted. `wall_clock` timer class for
 the connect and reply deadlines. Message meaning belongs to
-Conclave; Wave owns the wire mechanics.
+Conclave; Wave owns the wire mechanics. Driven, it is a provider of
+fluxor's exchange contract: a submission is a POST whose target is
+the recipient, with a `mail-from` header and the message as the body,
+answered once with an `SmtpResult` body.
 
 Submission may be authenticated: `AUTH PLAIN` (RFC 4616) only, and
 only on a channel the graph has declared confidential, since the
@@ -478,9 +472,10 @@ request, and a bytecode codec cannot compute it. SHA-256 is
 SDK-owned, as `websocket`'s SHA-1 is.
 
 Two modes, chosen by whether `request_in` is wired: driven, one
-exchange at a time in the same HTTP application records `http` speaks
-to its applications — request and response bodies streamed under
-credit, so an object of any size crosses without being held whole; and
+exchange at a time as a provider of fluxor's exchange contract — the
+same records `http` speaks to its applications — with request and
+response bodies streamed under credit, so an object of any size
+crosses without being held whole; and
 probe, which signs a ListBuckets on boot and reports the status, as
 the cheapest proof that credentials work against a real endpoint.
 Which bucket backs which namespace, and what a key denotes, are the

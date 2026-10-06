@@ -44,9 +44,9 @@ const H3_FIELD_SCRATCH: usize = 512;
 /// different questions, and importing the server's would make the client
 /// depend on the role it is deliberately separate from.
 pub const H3_CLIENT_RECV_BUF: usize = 1024;
-/// Response body accumulated for one client exchange, at the contract's
-/// payload ceiling — the same number h1 and h2 accumulate to, so a response
-/// this client can hold does not depend on which generation carried it.
+/// Response body held between the transport and whoever takes it: the app
+/// port, or the requester of a graph-driven exchange. Sized to the contract's
+/// payload ceiling.
 pub const H3_CLIENT_BODY_BUF: usize = super::super::exchange::PAYLOAD_MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,6 +110,12 @@ pub struct H3Client {
     /// it before responding, so a refused close is retried rather than
     /// dropped.
     pub fin_sent: bool,
+    /// The final response's field section, kept for a graph-driven exchange
+    /// whose requester is owed the response's headers with its status.
+    #[cfg(feature = "exchange")]
+    pub head_block: [u8; H3_CLIENT_RECV_BUF],
+    #[cfg(feature = "exchange")]
+    pub head_block_len: usize,
 }
 
 impl H3Client {
@@ -136,6 +142,10 @@ impl H3Client {
             request_sent: false,
             request_offset: 0,
             fin_sent: false,
+            #[cfg(feature = "exchange")]
+            head_block: [0; H3_CLIENT_RECV_BUF],
+            #[cfg(feature = "exchange")]
+            head_block_len: 0,
         }
     }
 
@@ -207,6 +217,29 @@ pub fn build_request(
     out[..hdr].copy_from_slice(&scratch[..hdr]);
     out[hdr..hdr + block_len].copy_from_slice(&block[..block_len]);
     hdr + block_len
+}
+
+/// Every regular field of a response field section, in order. False when the
+/// section does not decode.
+pub fn response_head_fields(block: &[u8], mut each: impl FnMut(&[u8], &[u8])) -> bool {
+    let Some(mut off) = qpack::qpack_decode_block_prefix(block) else {
+        return false;
+    };
+    let mut scratch = [0u8; H3_FIELD_SCRATCH];
+    while off < block.len() {
+        let Some(r) = qpack::qpack_decode_field_into(&block[off..], &mut scratch) else {
+            return false;
+        };
+        if r.consumed == 0 {
+            return false;
+        }
+        let name = &scratch[r.name.0..r.name.1];
+        if !name.starts_with(b":") {
+            each(name, &scratch[r.value.0..r.value.1]);
+        }
+        off += r.consumed;
+    }
+    true
 }
 
 /// Decode a response field section far enough to learn `:status`.
@@ -509,6 +542,12 @@ fn client_ingest(c: &mut H3Client, mut bytes: &[u8]) {
                             } else {
                                 c.status = code;
                                 c.expected_len = length;
+                                #[cfg(feature = "exchange")]
+                                {
+                                    c.head_block[..c.recv_len]
+                                        .copy_from_slice(&c.recv_buf[..c.recv_len]);
+                                    c.head_block_len = c.recv_len;
+                                }
                                 if code == 204 && length.is_some() {
                                     c.state = H3ClientState::Failed;
                                     return;
@@ -571,6 +610,20 @@ pub(crate) fn next_request(s: &mut super::super::HttpState) {
     c.request_sent = false;
     c.request_offset = 0;
     c.fin_sent = false;
+    #[cfg(feature = "exchange")]
+    {
+        c.head_block_len = 0;
+    }
+}
+
+/// End the exchange in flight where it stands: the requester aborted it.
+pub(crate) fn abandon(s: &mut super::super::HttpState) {
+    if matches!(
+        s.h3_client.state,
+        H3ClientState::Opening | H3ClientState::AwaitingResponse
+    ) {
+        s.h3_client.state = H3ClientState::Failed;
+    }
 }
 
 /// One step of the HTTP/3 client: ask for a stream, send the request, collect
@@ -603,24 +656,68 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
                     && s.h3_client.status == 0
                     && expired(s.client.response_start_ms, s.client.client_header_ms))))
     {
+        if s.h3_client.state != H3ClientState::Failed {
+            s.client.fail_cause = super::CAUSE_TIMEOUT;
+        }
         s.h3_client.state = H3ClientState::Failed;
     }
     if s.h3_client.state == H3ClientState::Failed {
-        if !close_session(s) {
+        #[cfg(feature = "exchange")]
+        if super::provider::armed(s) {
+            // The session outlives one failed request: the next request on
+            // `request_in` rides it again.
+            super::provider::fail(s, s.client.fail_cause);
+            s.client.phase = super::Phase::Error;
             return 0;
         }
-        #[cfg(feature = "exchange")]
-        if super::exchange::armed(s) {
-            super::exchange::fail(s);
+        if !close_session(s) {
             return 0;
         }
         return if s.client.draining != 0 { 1 } else { -1 };
     }
 
     #[cfg(feature = "exchange")]
-    let streaming = !super::exchange::armed(s);
+    let driven = super::provider::busy(s);
     #[cfg(not(feature = "exchange"))]
-    let streaming = true;
+    let driven = false;
+    // A graph-driven response: its head goes once the status is known, and
+    // its body as far as the requester's credit reaches.
+    #[cfg(feature = "exchange")]
+    if driven && s.h3_client.status >= 200 && super::provider::answering(s) {
+        if !super::provider::head_given(s) {
+            let n = s.h3_client.head_block_len;
+            let sp = s as *mut super::super::HttpState;
+            let block = core::slice::from_raw_parts(s.h3_client.head_block.as_ptr(), n);
+            response_head_fields(block, |name, value| {
+                super::provider::note_field(&mut *sp, name, value);
+            });
+            if !super::provider::head_from_fields(s, s.h3_client.status) {
+                s.h3_client.state = H3ClientState::Failed;
+                return 0;
+            }
+        }
+        if s.h3_client.body_len != 0 {
+            let src = s.h3_client.body.as_ptr();
+            let taken = super::provider::body(s, src, s.h3_client.body_len);
+            let c = &mut s.h3_client;
+            c.body.copy_within(taken..c.body_len, 0);
+            c.body_len -= taken;
+            if taken > 0 {
+                s.client.progress_ms = now;
+            }
+            if s.h3_client.body_len != 0 {
+                return 0;
+            }
+        }
+        if s.h3_client.state == H3ClientState::Complete {
+            if super::provider::end(s) {
+                s.h3_client.body_emitted = true;
+                s.client.phase = super::Phase::Done;
+            }
+            return 0;
+        }
+    }
+    let streaming = !driven;
     if streaming && s.h3_client.body_len != 0 {
         let c = &mut s.h3_client;
         if s.client.out_chan < 0 {
@@ -686,7 +783,59 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
         // arrives on the ingress drain below.
     }
 
-    // Bound input work per scheduler step.
+    ingress(s, now);
+
+    // The stream is granted: send the request on it, then FIN the request
+    // half. Each is retried until the transport takes it whole.
+    if s.h3_client.state == H3ClientState::AwaitingResponse {
+        client_send_request(s);
+    }
+
+    // Hand the body onward, once, the way the h1 client does (out[1]).
+    if s.h3_client.state == H3ClientState::Complete && !s.h3_client.body_emitted {
+        {
+            // One line per exchange, so a graph without out[1] wired still
+            // shows whether the request completed and with what.
+            let mut lb = [0u8; 64];
+            let pre = b"[http] h3 client status=";
+            let mut p = 0usize;
+            for &c in pre {
+                lb[p] = c;
+                p += 1;
+            }
+            let st = s.h3_client.status;
+            lb[p] = b'0' + ((st / 100) % 10) as u8;
+            lb[p + 1] = b'0' + ((st / 10) % 10) as u8;
+            lb[p + 2] = b'0' + (st % 10) as u8;
+            p += 3;
+            let tail = b" body=";
+            for &c in tail {
+                lb[p] = c;
+                p += 1;
+            }
+            let n = s.h3_client.body_len.min(999);
+            lb[p] = b'0' + ((n / 100) % 10) as u8;
+            lb[p + 1] = b'0' + ((n / 10) % 10) as u8;
+            lb[p + 2] = b'0' + (n % 10) as u8;
+            p += 3;
+            super::super::dev_log(sys, 3, lb.as_ptr(), p);
+        }
+        if s.h3_client.body_len == 0 {
+            s.h3_client.body_emitted = true;
+        }
+    }
+    0
+}
+
+/// Read what the transport delivered — session events, the server's control
+/// and QPACK streams, and the response — bounded per step.
+unsafe fn ingress(s: &mut super::super::HttpState, now: u64) {
+    let sys = &*s.syscalls;
+    let in_chan = s.net_in_chan;
+    // The session is the link to the backend: its loss and its return are
+    // reported to a requester as LINK.
+    #[cfg(feature = "exchange")]
+    let had_session = s.h3_client.session.allocated;
     for _ in 0..8 {
         let poll = (sys.channel_poll)(in_chan, super::super::POLL_IN);
         if poll <= 0 || (poll as u32) & super::super::POLL_IN == 0 {
@@ -730,65 +879,42 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
         {
             s.client.progress_ms = now;
         }
-        if s.h3_client.state == H3ClientState::Failed || (streaming && s.h3_client.body_len != 0) {
+        if s.h3_client.state == H3ClientState::Failed || s.h3_client.body_len != 0 {
             break;
         }
     }
-
-    // The stream is granted: send the request on it, then FIN the request
-    // half. Each is retried until the transport takes it whole.
-    if s.h3_client.state == H3ClientState::AwaitingResponse {
-        client_send_request(s);
-    }
-
-    // Hand the body onward, once, the way the h1 client does (out[1]).
-    if s.h3_client.state == H3ClientState::Complete && !s.h3_client.body_emitted {
-        {
-            // One line per exchange, so a graph without out[1] wired still
-            // shows whether the request completed and with what.
-            let mut lb = [0u8; 64];
-            let pre = b"[http] h3 client status=";
-            let mut p = 0usize;
-            for &c in pre {
-                lb[p] = c;
-                p += 1;
+    #[cfg(feature = "exchange")]
+    if super::provider::armed(s) {
+        let has_session = s.h3_client.session.allocated;
+        if had_session && !has_session {
+            s.client.fail_cause = super::CAUSE_LINK;
+            if !super::provider::busy(s) {
+                super::provider::link_lost(s);
             }
-            let st = s.h3_client.status;
-            lb[p] = b'0' + ((st / 100) % 10) as u8;
-            lb[p + 1] = b'0' + ((st / 10) % 10) as u8;
-            lb[p + 2] = b'0' + (st % 10) as u8;
-            p += 3;
-            let tail = b" body=";
-            for &c in tail {
-                lb[p] = c;
-                p += 1;
-            }
-            let n = s.h3_client.body_len.min(999);
-            lb[p] = b'0' + ((n / 100) % 10) as u8;
-            lb[p + 1] = b'0' + ((n / 10) % 10) as u8;
-            lb[p + 2] = b'0' + (n % 10) as u8;
-            p += 3;
-            super::super::dev_log(sys, 3, lb.as_ptr(), p);
-        }
-        // Graph-driven: answer the request that produced this response
-        // instead of streaming it to `file_ctrl`. h3 has already accumulated
-        // the whole body, so there is nothing to re-assemble here.
-        #[cfg(feature = "exchange")]
-        if super::exchange::busy(s) {
-            s.client.last_status = s.h3_client.status;
-            let n = s.h3_client.body_len;
-            let src = s.h3_client.body.as_ptr();
-            super::exchange::accumulate(s, src, n);
-            super::exchange::complete(s);
-            s.h3_client.body_emitted = true;
-            return 0;
-        }
-
-        if s.h3_client.body_len == 0 {
-            s.h3_client.body_emitted = true;
+        } else if !had_session && has_session {
+            super::provider::link_restored(s);
         }
     }
-    0
+}
+
+/// A graph-driven client between requests: the session's comings and goings
+/// are still read, so its loss and its return reach the requester as LINK
+/// when they happen rather than when the next request does.
+#[cfg(feature = "exchange")]
+pub(crate) unsafe fn idle(s: &mut super::super::HttpState) {
+    if s.net_in_chan < 0 {
+        return;
+    }
+    // A finished exchange's state stands down, so a session the transport
+    // announces now is adopted rather than ignored.
+    if matches!(
+        s.h3_client.state,
+        H3ClientState::Complete | H3ClientState::Failed
+    ) {
+        next_request(s);
+    }
+    let now = super::super::dev_millis(&*s.syscalls);
+    ingress(s, now);
 }
 
 /// Fields supplied by the application, before encoding the request head.
@@ -796,9 +922,14 @@ pub struct RequestHead<'a> {
     pub method: &'a [u8],
     pub authority: &'a [u8],
     pub path: &'a [u8],
-    pub content_type: &'a [u8],
+    /// Further fields, as `name: value\r\n` lines; names are lowercased on
+    /// the way out (RFC 9114 §4.2).
+    pub headers: &'a [u8],
     pub body_len: usize,
 }
+
+/// The longest field name [`configured_request`] lowercases.
+const FIELD_NAME_MAX: usize = 128;
 
 /// Encode a configured request without truncating any field.
 pub fn configured_request(head: &RequestHead<'_>, out: &mut [u8]) -> usize {
@@ -809,7 +940,6 @@ pub fn configured_request(head: &RequestHead<'_>, out: &mut [u8]) -> usize {
         || head.path.iter().any(|b| *b <= 32 || *b == 127)
         || head.authority.is_empty()
         || head.authority.iter().any(|b| *b <= 32 || *b == 127)
-        || head.content_type.iter().any(|b| *b < 32 || *b == 127)
     {
         return 0;
     }
@@ -820,10 +950,15 @@ pub fn configured_request(head: &RequestHead<'_>, out: &mut [u8]) -> usize {
     if n == 0 {
         return 0;
     }
-    if !head.content_type.is_empty() {
-        let mut name = [0u8; 12];
-        name.copy_from_slice(b"content-type");
-        let added = qpack::qpack_encode_field(&name, head.content_type, &mut block[n..]);
+    for (name, value) in super::super::exchange::header_lines(head.headers) {
+        if name.len() > FIELD_NAME_MAX || value.iter().any(|b| *b < 32 && *b != b'\t') {
+            return 0;
+        }
+        let mut lower = [0u8; FIELD_NAME_MAX];
+        for (d, c) in lower.iter_mut().zip(name) {
+            *d = c.to_ascii_lowercase();
+        }
+        let added = qpack::qpack_encode_field(&lower[..name.len()], value, &mut block[n..]);
         if added == 0 {
             return 0;
         }
@@ -891,7 +1026,7 @@ unsafe fn client_send_request(s: &mut super::super::HttpState) {
             method,
             authority,
             path: &s.client.path[..s.client.path_len as usize],
-            content_type: &s.client.content_type[..s.client.content_type_len as usize],
+            headers: &s.client.request_headers[..s.client.request_headers_len as usize],
             body_len: s.client.request_body_len as usize,
         };
         let mut req = [0u8; super::REQUEST_BUF_SIZE];

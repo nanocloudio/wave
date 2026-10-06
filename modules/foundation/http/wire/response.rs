@@ -23,9 +23,9 @@ pub enum ResponseError {
     Unsupported,
 }
 
-/// The response header block the decoder keeps for a caller that asked for
-/// the whole response. Zero without the `exchange` feature, which is the only
-/// one that reads it.
+/// The response header block the decoder keeps for a requester owed the
+/// response's headers with its status. Zero without the `exchange` feature,
+/// which is the only one that reads it.
 ///
 /// Sized to the scratch a head arrives in, so a block that reached the
 /// decoder at all fits here: a longer head is refused as
@@ -53,9 +53,9 @@ pub struct ResponseDecoder {
     /// without the blank line that ends it.
     ///
     /// The decoder reads the headers it needs for framing and discards the
-    /// rest, which is all a body-only consumer wants. A consumer answering a
-    /// caller who asked for the response — not just its body — needs the ones
-    /// it did not parse: a content type, a location, an entity tag. Kept as
+    /// rest, which is all a body-only consumer wants. A provider answering a
+    /// requester with the response — not just its body — needs the ones it
+    /// did not parse: a content type, a location, an entity tag. Kept as
     /// the bytes that arrived rather than a parse, because whichever field is
     /// wanted is the caller's business and not this decoder's.
     ///
