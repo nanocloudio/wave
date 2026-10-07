@@ -50,8 +50,9 @@
 //! `REQUEST_BODY_SIZE`, an authority past `AUTHORITY_MAX`), 502 when the
 //! origin cannot be reached or answers with something that does not parse,
 //! 503 while it holds as many requests as it takes or is draining, 504 when
-//! the origin does not answer in time. After the head has gone, a failure is
-//! an ABORT.
+//! the origin does not answer in time. Each is a HEAD marked `RAISED`, which
+//! is how a requester tells it from the origin answering with the same
+//! number. After the head has gone, a failure is an ABORT.
 //!
 //! # LINK
 //!
@@ -75,7 +76,7 @@
 use super::super::connection::net_proto::Target;
 use super::super::exchange::{
     abort, flag, header_lines, link, parse_request, status, write_abort, write_credit, write_link,
-    write_response, write_response_head, Collector, ExchangeId, Record, Refuse, ResponseHead, HDR,
+    write_refusal, write_response_head, Collector, ExchangeId, Record, Refuse, ResponseHead, HDR,
     METHOD_DELETE, METHOD_GET, METHOD_HEAD, METHOD_OPTIONS, METHOD_PATCH, METHOD_POST, METHOD_PUT,
     RECORD_MAX, RESP_HEAD_FIXED,
 };
@@ -265,9 +266,9 @@ unsafe fn ctl_send(s: &mut HttpState, len: usize) -> bool {
     }
 }
 
-/// Answer `id` with `code` and nothing else, on the control record.
+/// Refuse `id` with `code`, raised here and nothing else, on the control record.
 unsafe fn ctl_refuse(s: &mut HttpState, id: ExchangeId, code: u16) -> bool {
-    let Some(n) = write_response(&id, code, &[], &[], &mut s.client.ex.ctl_rec) else {
+    let Some(n) = write_refusal(&id, code, &mut s.client.ex.ctl_rec) else {
         return false;
     };
     ctl_send(s, n)
@@ -921,14 +922,14 @@ pub(crate) unsafe fn end(s: &mut HttpState) -> bool {
     true
 }
 
-/// Answer the exchange in flight with `code` alone, before any of its
+/// Refuse the exchange in flight with `code`, raised here, before any of its
 /// response has gone.
 unsafe fn refuse_live(s: &mut HttpState, code: u16) {
     let sys = &*s.syscalls;
     let x = &mut s.client.ex;
     x.out_len = 0;
     x.ended = 1;
-    if let Some(n) = write_response(&x.id, code, &[], &[], &mut x.out_rec) {
+    if let Some(n) = write_refusal(&x.id, code, &mut x.out_rec) {
         x.out_box.send(sys, x.response_chan, &x.out_rec, n);
     }
     if !x.out_box.holding() {

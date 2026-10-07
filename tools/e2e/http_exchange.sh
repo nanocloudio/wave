@@ -112,14 +112,18 @@ run_one() {
 }
 
 # Decode the answer — one response HEAD carrying the whole body — and assert
-# its id and status, then hand it to the caller's own checks.
-#   decode_answer <id> <status> [python-assertions-on-`ct`,`headers`,`body`]
+# its id and status, then hand it to the caller's own checks. `raised` says
+# the client refused the request itself, so the HEAD must be marked RAISED;
+# an origin's answer must not be.
+#   decode_answer <id> <status> [python-assertions-on-`ct`,`headers`,`body`] [raised]
 decode_answer() {
-  XID="$1" STATUS="$2" EXTRA="${3:-}" python3 - "$WORK/reply.bin" <<'INNER'
+  XID="$1" STATUS="$2" EXTRA="${3:-}" RAISED="${4:-}" python3 - "$WORK/reply.bin" <<'INNER'
 import os, struct, sys
 raw = open(sys.argv[1], "rb").read()
 assert raw[:1] == b"\x01", f"not a response HEAD: {raw[:16]!r}"
-assert raw[1] == 0, f"the answer is not whole in one record: flags {raw[1]}"
+want = 0x80 if os.environ["RAISED"] else 0
+assert raw[1] & 0x01 == 0, f"the answer is not whole in one record: flags {raw[1]}"
+assert raw[1] == want, f"flags {raw[1]:#x}, wanted {want:#x} (RAISED marks a refusal)"
 xid = struct.unpack_from('<Q', raw, 2)[0]
 assert xid == int(os.environ["XID"]) and raw[10:16] == bytes(6), f"id {raw[2:16]!r}"
 status, ct_len, hdr_len = struct.unpack_from('<HBH', raw, 16)
@@ -198,9 +202,9 @@ refused() {
   rec="$(request 1 /refused "$hdrs" '' "$xid")"
   run_one "$rec" "$label"
   [ ! -s "$WORK/req.txt" ] || fail "$label: a request reached the origin: $(cat "$WORK/req.txt")"
-  decode_answer "$xid" 400 "assert body == b'', f'body {body!r}'" \
+  decode_answer "$xid" 400 "assert body == b'', f'body {body!r}'" raised \
     || fail "$label: not answered 400"
-  echo "   ok  answered 400, no request on the wire"
+  echo "   ok  answered 400, raised by the client, no request on the wire"
 }
 
 refused "a block whose blank line would end the head" \

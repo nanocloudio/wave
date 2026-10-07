@@ -119,7 +119,7 @@ use smtp_wire::{
 // The exchange records submissions arrive in and are answered with.
 use abi::contracts::exchange::{
     abort, flag, header, parse_request, status, write_abort, write_body, write_credit,
-    write_response, write_response_head, ExchangeId, Record, ResponseHead, BODY_MAX, METHOD_POST,
+    write_refusal, write_response_head, ExchangeId, Record, ResponseHead, BODY_MAX, METHOD_POST,
     RECORD_MAX,
 };
 
@@ -634,7 +634,11 @@ unsafe fn flush_result(s: &mut SmtpState) {
     let code = answer_status(s.res_outcome);
     let fits = s.resp_credit as usize >= total;
     let (n, done) = if s.head_sent == 0 {
-        let flags = if fits { 0 } else { flag::MORE };
+        // A relay that was never reached, or never decided, gave no verdict:
+        // the status is this connector's own, and the body says how far it
+        // got.
+        let raised = if code == status::OK { 0 } else { flag::RAISED };
+        let flags = raised | if fits { 0 } else { flag::MORE };
         let carried: &[u8] = if fits { body } else { &[] };
         let n = write_response_head(
             &ResponseHead {
@@ -1004,7 +1008,7 @@ unsafe fn flush_owed(s: &mut SmtpState) -> bool {
     }
     if s.refusal != 0 {
         let mut rec = [0u8; 32];
-        if let Some(n) = write_response(&s.refusal_id, s.refusal, &[], &[], &mut rec) {
+        if let Some(n) = write_refusal(&s.refusal_id, s.refusal, &mut rec) {
             if (sys.channel_write)(s.response_out, rec.as_ptr(), n) <= 0 {
                 return false;
             }

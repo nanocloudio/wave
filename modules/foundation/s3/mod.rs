@@ -807,9 +807,11 @@ fn produce(s: &mut S3State, now: u64) {
         let n = if s.abort_owed != 0 {
             write_abort(&id, s.abort_owed, &mut s.out)
         } else {
+            // Every owed status is this connector's own: the server's
+            // answers go out as the response itself, never through here.
             let head = ResponseHead {
                 id,
-                flags: 0,
+                flags: flag::RAISED,
                 status: s.status_owed,
                 content_type: &[],
                 headers: &[],
