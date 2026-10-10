@@ -3,7 +3,7 @@ version = "2.0.1"
 # run and carries a flash ceiling in `tools/ci/fmod_size_budget.sh`. A variant
 # that cannot fit is meant to fail admission there rather than drop out of the
 # matrix unremarked, which is the failure a per-target opt-out invites.
-hardware_targets = ["rp2040", "rp2350", "bcm2712"]
+hardware_targets = ["rp2040", "rp2350", "bcm2712", "linux"]
 
 # timer_class: every deadline this module holds is read from wall-clock
 # `dev_millis` — the client connect timeout (client.rs / client_h2.rs
@@ -116,7 +116,7 @@ content_type = "NetProto"
 # Sized to absorb 8 KiB CMD_SEND payloads (the staging cap on aarch64)
 # plus in-flight headroom; embedded workloads stage 1600-byte payloads
 # on a 2 KiB budget.
-buffer_size = { default = 2048, bcm2712 = 16384 }
+buffer_size = { default = 2048, aarch64 = 16384 }
 
 [[ports]]
 name = "variables"
@@ -130,13 +130,13 @@ name = "file_data"
 index = 2
 direction = "input"
 content_type = "OctetStream"
-buffer_size = { default = 2048, bcm2712 = 16384 }
+buffer_size = { default = 2048, aarch64 = 16384 }
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
-buffer_size = { default = 2048, bcm2712 = 16384 }
+buffer_size = { default = 2048, aarch64 = 16384 }
 
 [[ports]]
 name = "file_ctrl"
@@ -174,7 +174,7 @@ content_type = "WsFrame"
 # Declaring the true ceiling makes the config validator reject the mistake
 # instead of the runtime discarding data. The ring stays deep so several
 # envelopes pipeline.
-buffer_size = { default = 65600, bcm2712 = 131072 }
+buffer_size = { default = 65600, aarch64 = 131072 }
 max_record  = 8192
 
 # Compiled-route subscription sink. The graph self-wires
@@ -239,7 +239,7 @@ content_type = "ExchangeRequest"
 # can take; `buffer_size` is ring depth, so a larger ring pipelines more
 # records rather than bigger ones. A body of any size crosses as many records.
 max_record = 8192
-buffer_size = { default = 8192, bcm2712 = 65536 }
+buffer_size = { default = 8192, aarch64 = 65536 }
 
 [[ports]]
 name = "response_in"
@@ -249,7 +249,7 @@ content_type = "ExchangeResponse"
 # Same ceiling as `request_out`, for the same reason. A record that does not
 # parse is dropped and counted as `app_records_malformed`.
 max_record = 8192
-buffer_size = { default = 8192, bcm2712 = 65536 }
+buffer_size = { default = 8192, aarch64 = 65536 }
 
 [[resources]]
 requires_contract = "channel"
@@ -588,7 +588,7 @@ name = "ws2_in"
 index = 12
 direction = "input"
 content_type = "WsFrame"
-buffer_size = { default = 65600, bcm2712 = 131072 }
+buffer_size = { default = 65600, aarch64 = 131072 }
 max_record  = 8192
 
 # Swap-trigger subscription self-edge. The graph self-wires `sessions_sink`

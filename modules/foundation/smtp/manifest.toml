@@ -1,5 +1,5 @@
 version          = "0.1.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # timer_class: the two delivery deadlines (CONNECT_TIMEOUT_MS 10 s,
 # REPLY_TIMEOUT_MS 15 s) are read from wall-clock `dev_millis`. A lockstep

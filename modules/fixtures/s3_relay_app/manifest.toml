@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # CONFORMANCE FIXTURE for the `s3` connector's driven mode — not a product
 # module, which is why it lives in `modules/fixtures/` rather than

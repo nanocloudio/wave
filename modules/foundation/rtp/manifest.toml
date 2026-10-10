@@ -1,5 +1,5 @@
 version = "1.1.0"
-hardware_targets = ["rp2350", "bcm2712"]
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # timer_class: this module reads no clock at all — verified, it calls neither
 # `dev_millis` nor `dev_micros`. Transmit is DATA-driven: each access unit on

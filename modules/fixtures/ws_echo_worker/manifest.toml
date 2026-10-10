@@ -39,7 +39,7 @@ name = "data_in"
 index = 1
 direction = "input"
 content_type = "WsFrame"
-buffer_size = { default = 65600, bcm2712 = 131072 }
+buffer_size = { default = 65600, aarch64 = 131072 }
 max_record = 8192
 
 # SessionCtrlV1 replies to the anchor.

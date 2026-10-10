@@ -27,13 +27,13 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 name = "request_in"
 direction = "input"
 content_type = "ExchangeRequest"
-buffer_size = { default = 8192, bcm2712 = 65536 }
+buffer_size = { default = 8192, aarch64 = 65536 }
 
 [[ports]]
 name = "response_out"
 direction = "output"
 content_type = "ExchangeResponse"
-buffer_size = { default = 8192, bcm2712 = 65536 }
+buffer_size = { default = 8192, aarch64 = 65536 }
 
 [observability]
 # No metrics or spans, deliberately. The convention is that a data-moving

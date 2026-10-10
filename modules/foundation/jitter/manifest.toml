@@ -1,5 +1,5 @@
 version = "0.2.0"
-hardware_targets = ["rp2350", "bcm2712"]
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # timer_class: how long a missing packet is waited for is real time — a relaxed
 # scheduler tick must stretch scheduling, never the hold — so the hold reads

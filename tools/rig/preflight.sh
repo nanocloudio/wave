@@ -15,11 +15,13 @@ set -euo pipefail
 die() { printf '\nrig pre-flight FAILED: %s\n\n' "$1" >&2; shift; printf '  %s\n' "$@" >&2; exit 1; }
 
 check_modules() {
-  local silicon="$1" bad=0 dir
+  local silicon="$1" bad=0 dir abi
+  # The target's modules live on its module-ABI shelf; ask fluxor which.
+  abi=$(basename "$(dirname "$(fluxor modules resolve --target "$silicon")")")
   # Check this project's module dir and the Fluxor checkout it symlinks into.
   # A consuming project cannot repair the platform fmods: its own
   # `fluxor modules build` only builds its own modules.
-  for dir in "target/fluxor/$silicon/modules" "deps/fluxor/target/fluxor/$silicon/modules"; do
+  for dir in "target/fluxor/$abi/modules" "deps/fluxor/target/fluxor/$abi/modules"; do
     [ -d "$dir" ] || continue
     # -L so a symlink to a zeroed original is caught, not just a local zero.
     local n

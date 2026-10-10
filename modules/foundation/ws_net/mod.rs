@@ -231,14 +231,14 @@ fn maybe_emit_telemetry(s: &mut State) {
 ///
 /// `net_proto` carries a connection id in sixteen bits
 /// ([`net_proto::CONN_ID_LEN`]) and the `ws_frame` envelope carries thirty-two.
-/// The extra half is not padding: with `tls` in front of `http` it holds the
-/// session generation, so the id `http` stamps on a frame and the id a consumer
-/// can name are DIFFERENT NUMBERS for the same connection.
+/// `http` stamps the envelope with its own sixteen-bit connection id widened,
+/// so today the high half is always zero and the two ids are the same number.
 ///
-/// So this module keeps the transport's whole id and looks it up by the half a
-/// consumer can say. Comparing the two directly is the mistake that hides
-/// behind a fallback: on a TLS-fronted chain every outbound frame fails to
-/// match, and whatever the fallback resolves to receives it instead.
+/// The table is still keyed by the half a consumer can name, because that is
+/// the only half that round-trips: a consumer answers with what `MSG_ACCEPTED`
+/// told it, which is sixteen bits. Keying on all thirty-two would make the
+/// join depend on the high half staying zero, which nothing in the envelope
+/// promises.
 fn conn_key(conn: u32) -> u32 {
     conn & 0xFFFF
 }

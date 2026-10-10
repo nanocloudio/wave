@@ -1,5 +1,5 @@
 version = "1.1.0"
-hardware_targets = ["rp2350", "bcm2712"]
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # timer_class: the RFC 3261 T1 retransmit timer (500 ms, in-transaction
 # states) reads wall-clock `dev_millis`. Playout's clock moved to the `jitter`
