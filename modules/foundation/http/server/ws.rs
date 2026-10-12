@@ -878,6 +878,7 @@ pub(crate) struct PendingWsEvent {
     pub(crate) event: u8,
     pub(crate) origin: u8,
     pub(crate) code: u16,
+    pub(crate) generation: u16,
 }
 
 impl PendingWsEvent {
@@ -887,6 +888,7 @@ impl PendingWsEvent {
             event: 0,
             origin: 0,
             code: 0,
+            generation: 0,
         }
     }
 }
@@ -986,12 +988,13 @@ pub(crate) unsafe fn ws_report_event(
     event: u8,
     origin: u8,
     code: u16,
+    generation: u16,
     reason: &[u8],
 ) {
     if s.server.ws_event_out_chan < 0 {
         return;
     }
-    if try_write_ws_event(s, conn, event, origin, code, reason) {
+    if try_write_ws_event(s, conn, event, origin, code, generation, reason) {
         return;
     }
     let len = s.server.ws_event_len as usize;
@@ -1004,6 +1007,7 @@ pub(crate) unsafe fn ws_report_event(
         event,
         origin,
         code,
+        generation,
     };
     s.server.ws_event_len += 1;
 }
@@ -1015,6 +1019,7 @@ unsafe fn try_write_ws_event(
     event: u8,
     origin: u8,
     code: u16,
+    generation: u16,
     reason: &[u8],
 ) -> bool {
     let chan = s.server.ws_event_out_chan;
@@ -1025,7 +1030,15 @@ unsafe fn try_write_ws_event(
     }
     let mut out = [0u8; WS_EVENT_HDR + WS_REASON_MAX];
     let take = reason.len().min(WS_REASON_MAX);
-    match write_ws_event(conn, event, origin, code, &reason[..take], &mut out) {
+    match write_ws_event(
+        conn,
+        event,
+        origin,
+        code,
+        generation,
+        &reason[..take],
+        &mut out,
+    ) {
         Some(total) => (sys.channel_write)(chan, out.as_ptr(), total) == total as i32,
         // Unencodable at this length — retrying cannot help.
         None => true,
@@ -1037,7 +1050,7 @@ unsafe fn try_write_ws_event(
 pub(crate) unsafe fn ws_flush_events(s: &mut HttpState) {
     while s.server.ws_event_len > 0 {
         let e = s.server.ws_event_ring[0];
-        if !try_write_ws_event(s, e.conn, e.event, e.origin, e.code, b"") {
+        if !try_write_ws_event(s, e.conn, e.event, e.origin, e.code, e.generation, b"") {
             return;
         }
         let n = s.server.ws_event_len as usize;

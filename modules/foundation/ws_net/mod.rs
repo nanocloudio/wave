@@ -637,14 +637,23 @@ fn handle_ws_event(s: &mut State, n: usize) {
     };
     let conn = ev.conn;
     match ev.event {
-        ws_admit::WS_EV_OPENED => accept_conn(s, conn),
+        ws_admit::WS_EV_OPENED => accept_conn(s, conn, ev.generation),
         ws_admit::WS_EV_CLOSED => close_conn(s, conn),
         _ => {}
     }
 }
 
 /// Report `conn` as accepted, if it is not already live.
-fn accept_conn(s: &mut State, conn: u32) {
+/// Report a connection to the consumer as `MSG_ACCEPTED`.
+///
+/// `generation` is the session `http` reported the connection under — the
+/// number the stage below it (`tls`) gave the session and names it by on
+/// `peer_identity`. It is appended exactly as a session stage appends it, so a
+/// consumer that binds a peer to a session (`remote_channel` under
+/// `require_peer: 1`) can join the two. 0 means nothing below numbered the
+/// session, and then nothing is appended: a consumer must not be told a
+/// session was numbered when it was not.
+fn accept_conn(s: &mut State, conn: u32, generation: u16) {
     if conn_live(s, conn) || !conn_add(s, conn) {
         return;
     }
@@ -653,10 +662,17 @@ fn accept_conn(s: &mut State, conn: u32) {
     };
     // Port-qualified, so a consumer fanned alongside others claims only the
     // connections accepted on its own bind.
-    let mut payload = [0u8; net_proto::CONN_ID_LEN + 2];
+    let mut payload = [0u8; net_proto::ACCEPTED_FIXED + 2];
     net_proto::put_conn_id(&mut payload, id);
-    payload[net_proto::CONN_ID_LEN..].copy_from_slice(&s.bound_port.to_le_bytes());
-    stage_net(s, net_proto::MSG_ACCEPTED, &payload);
+    payload[net_proto::CONN_ID_LEN..net_proto::ACCEPTED_FIXED]
+        .copy_from_slice(&s.bound_port.to_le_bytes());
+    let len = if generation == 0 {
+        net_proto::ACCEPTED_FIXED
+    } else {
+        net_proto::put_session_generation(&mut payload, net_proto::ACCEPTED_FIXED, generation)
+            .unwrap_or(net_proto::ACCEPTED_FIXED)
+    };
+    stage_net(s, net_proto::MSG_ACCEPTED, &payload[..len]);
 }
 
 /// Report `conn` as closed, if it was live.
@@ -690,7 +706,10 @@ fn handle_ws_frame(s: &mut State, n: usize) {
             // consumer has not been told about. The accept is staged and the
             // payload held below, so it still arrives — one step later.
             if !conn_live(s, conn) {
-                accept_conn(s, conn);
+                // A frame names no session, so a connection learned this way
+                // is reported as unnumbered — which a consumer that binds
+                // peers to sessions refuses, rather than binding the wrong one.
+                accept_conn(s, conn, 0);
             }
             if plen == 0 {
                 return;

@@ -19,11 +19,18 @@
 //                   [reason_len:u16][protocol][reason]
 //
 //   WsEvent         [op:u8][conn:u32][event:u8][origin:u8][code:u16]
-//                   [reason_len:u16][reason]
+//                   [reason_len:u16][generation:u16][reason]
 //
 // `conn` is the module's connection id — the same one that addresses data
 // frames on `ws_out` / `ws_in`, so an application correlates an admission, its
 // frames, and its closure without a second identifier scheme.
+//
+// `generation` is the session the connection belongs to, as the stage that
+// terminated it numbered that session: `tls` numbers each it opens and names
+// it by the same number on `peer_identity`. It is what lets a consumer tie
+// what it learns about a connection to the peer that stage authenticated —
+// a connection id alone is reused, and a later session on the same id is a
+// different peer. 0 when nothing below the server numbers sessions.
 
 /// The module asks whether this connection may be admitted.
 pub const WS_OP_ADMIT_REQUEST: u8 = 0x80;
@@ -61,7 +68,7 @@ pub const WS_ADMIT_REQ_HDR: usize = 1 + 4 + 2 + 2 + 2;
 /// Fixed prefix of a `WsAdmitDecision`.
 pub const WS_ADMIT_DEC_HDR: usize = 1 + 4 + 1 + 2 + 2 + 2;
 /// Fixed prefix of a `WsEvent`.
-pub const WS_EVENT_HDR: usize = 1 + 4 + 1 + 1 + 2 + 2;
+pub const WS_EVENT_HDR: usize = 1 + 4 + 1 + 1 + 2 + 2 + 2;
 
 /// A parsed `WsAdmitRequest`, as offsets into the caller's buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -220,6 +227,8 @@ pub struct WsEventView {
     pub event: u8,
     pub origin: u8,
     pub code: u16,
+    /// The session the connection belongs to; 0 when nothing numbers them.
+    pub generation: u16,
     pub reason_at: usize,
     pub reason_len: usize,
 }
@@ -230,6 +239,7 @@ pub fn write_ws_event(
     event: u8,
     origin: u8,
     code: u16,
+    generation: u16,
     reason: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
@@ -243,6 +253,7 @@ pub fn write_ws_event(
     out[6] = origin;
     out[7..9].copy_from_slice(&code.to_le_bytes());
     out[9..11].copy_from_slice(&(reason.len() as u16).to_le_bytes());
+    out[11..13].copy_from_slice(&generation.to_le_bytes());
     out[WS_EVENT_HDR..total].copy_from_slice(reason);
     Some(total)
 }
@@ -275,6 +286,7 @@ pub fn parse_ws_event(buf: &[u8]) -> Option<WsEventView> {
         event: buf[5],
         origin: buf[6],
         code: u16::from_le_bytes([buf[7], buf[8]]),
+        generation: u16::from_le_bytes([buf[11], buf[12]]),
         reason_at: WS_EVENT_HDR,
         reason_len,
     })

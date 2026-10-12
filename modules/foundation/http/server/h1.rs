@@ -291,7 +291,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         ((lo as u16) | ((hi as u16) << 8)) == s.server.port
                     };
                     if ours {
-                        if let Some(idx) = alloc_free_slot(s, conn) {
+                        if let Some(idx) =
+                            alloc_free_slot(s, conn, super::accepted_generation(s, payload_len))
+                        {
                             let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                             slot.phase = Phase::RecvRequest;
                         } else {
@@ -2327,10 +2329,11 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 let already = cur_slot(s).is_some_and(|c| c.ws_opened_sent != 0);
                 if !already {
                     let conn = u32::from(cur_conn_id(s));
+                    let generation = cur_slot(s).map_or(0, |c| c.session_generation);
                     // `ws_report_event` either delivers or defers; either way
                     // the event is owed exactly once, so the latch is correct
                     // here and the retry belongs to the ring, not this slot.
-                    ws_report_event(s, conn, WS_EV_OPENED, WS_ORIGIN_LOCAL, 0, b"");
+                    ws_report_event(s, conn, WS_EV_OPENED, WS_ORIGIN_LOCAL, 0, generation, b"");
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.ws_opened_sent = 1;
                     }

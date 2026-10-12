@@ -30,8 +30,31 @@ given.
 `http` owns the id space, so `net_proto`'s release rule — a transport holding a
 closed id back from the next accept — is not this module's to enforce, and it
 needs nothing from it. `CMD_CLOSE` for an id no longer live is a no-op, which
-the contract already allows, and a data frame for an id that is not live is a
-new connection whatever that id was used for before.
+the contract already allows.
+
+A frame is only ever sent to the connection it names. One for a connection this
+module no longer holds is dropped rather than handed to `http`'s fan-out
+sentinel, which resolves to whichever connection is active — and that is how a
+consumer tidying up one session would close the session that replaced it.
+
+## Connections come from the lifecycle
+
+A connection is reported when `http` commits it — its `opened` event on
+`event_in` — not when it first sends a frame. A carrier greets its peer before
+the peer says anything, so a module that learned of connections only from their
+traffic would wait on a greeting the peer is waiting on too.
+
+## Sessions are numbered by the stage below
+
+`http`'s `opened` event carries the session generation the stage beneath it
+numbered the connection's session with: `tls` numbers each session it opens,
+and names it by the same number on its `peer_identity` records. This module
+appends that generation to the `MSG_ACCEPTED` it gives the consumer — at the
+place `net_proto::session_generation` reads it — which is what lets a consumer
+that binds a session to an authenticated peer (`remote_channel` under
+`require_peer: 1`) join the two. With nothing below `http` numbering sessions
+the generation is 0 and nothing is appended: a consumer is never told a session
+was numbered when it was not.
 
 ## What it answers
 
@@ -44,10 +67,15 @@ new connection whatever that id was used for before.
 
 | From the browser | Effect |
 | --- | --- |
-| First data frame of a connection | `MSG_ACCEPTED [conn][port]`, then the payload as `MSG_DATA`. |
+| Data frame for a connection `event_in` never reported | `MSG_ACCEPTED [conn][port]` with no generation, then the payload as `MSG_DATA`. A consumer that binds sessions to peers refuses it. |
 | Data frame (text, binary, continuation) | `MSG_DATA [conn][data]`, split across frames when longer than `MAX_DATA_FRAGMENT`. |
 | Close | `MSG_CLOSED [conn]`. |
 | Ping, pong | Ignored; they are the HTTP server's business. |
+
+| From `http`'s `event_in` | Effect |
+| --- | --- |
+| `opened` | `MSG_ACCEPTED [conn][port]`, followed by `[generation]` when the session is numbered. |
+| `closed` | `MSG_CLOSED [conn]`, and the connection is forgotten. |
 
 ## Ports
 
@@ -55,6 +83,7 @@ new connection whatever that id was used for before.
 | --- | --- | --- |
 | `net_in` | input | `NetProto` |
 | `rx_in` | input (index 1) | `WsFrame` |
+| `event_in` | input (index 2) | `OctetStream` — `http`'s `ws_event_out` |
 | `net_out` | output | `NetProto` |
 | `tx_out` | output (index 1) | `WsFrame` |
 | `telemetry` | output (index 2, optional) | `Telemetry` |

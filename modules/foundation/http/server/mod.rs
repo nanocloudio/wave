@@ -381,6 +381,13 @@ pub(crate) const PEER_EMPTY: PeerEntry = PeerEntry {
 pub(crate) struct ConnSlot {
     /// Conn id from `MSG_ACCEPTED`. `-1` when the slot is free.
     pub(crate) conn_id: i32,
+    /// The session this connection belongs to, as the stage below numbered
+    /// it on `MSG_ACCEPTED` — `tls` numbers each session it opens and names
+    /// it by the same number on `peer_identity`. 0 when nothing below this
+    /// server numbers sessions. Carried on every `WsEvent` for the
+    /// connection, so a consumer can tie the session to the peer that stage
+    /// authenticated rather than to whichever peer last held the id.
+    pub(crate) session_generation: u16,
     /// Per-slot phase machine state.
     pub(crate) phase: Phase,
     pub(crate) matched_route: i8,
@@ -886,8 +893,9 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
                 ws::WS_ORIGIN_LOCAL
             };
             let code = slot.ws_close_code;
+            let generation = slot.session_generation;
             slot.ws_opened_sent = 0;
-            ws::ws_report_event(s, conn, ws::WS_EV_CLOSED, origin, code, b"");
+            ws::ws_report_event(s, conn, ws::WS_EV_CLOSED, origin, code, generation, b"");
         }
     }
     // If this slot owned `file_chan`, release the lock so a sibling
@@ -1463,7 +1471,24 @@ pub(crate) unsafe fn find_sentinel_ws_fanout_slot(s: &HttpState) -> Option<usize
 /// pointers) by `slot_release_buffers` on the close path — this
 /// function therefore only needs to acquire fresh buffers and set
 /// the conn id.
-pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u16) -> Option<usize> {
+/// The session generation on the `MSG_ACCEPTED` sitting in `net_buf`, or 0
+/// when the stage below numbers no sessions.
+///
+/// # Safety
+///
+/// `net_buf` holds a frame whose payload is `payload_len` bytes long.
+pub(crate) unsafe fn accepted_generation(s: &HttpState, payload_len: usize) -> u16 {
+    net_proto::session_generation(
+        core::slice::from_raw_parts(s.net_buf.as_ptr().add(NET_FRAME_HDR), payload_len),
+        net_proto::ACCEPTED_FIXED,
+    )
+}
+
+pub(crate) unsafe fn alloc_free_slot(
+    s: &mut HttpState,
+    conn_id: u16,
+    session_generation: u16,
+) -> Option<usize> {
     let mut chosen: Option<usize> = None;
     for i in 0..MAX_CONCURRENT_CONNS {
         let slot = &*s.server.slots.as_ptr().add(i);
@@ -1501,6 +1526,7 @@ pub(crate) unsafe fn alloc_free_slot(s: &mut HttpState, conn_id: u16) -> Option<
     }
     let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
     slot.conn_id = conn_id as i32;
+    slot.session_generation = session_generation;
     // Clear any trace context inherited from a prior connection on this slot;
     // the new connection's `MSG_TRACE_CTX` (if any) repopulates it.
     slot.conn_trace_id = [0u8; 16];
@@ -2539,7 +2565,9 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                         // dropping it is what stops a continuous arrival
                         // stream from holding quiescence open indefinitely.
                         close_net_conn(s, conn);
-                    } else if let Some(idx) = alloc_free_slot(s, conn) {
+                    } else if let Some(idx) =
+                        alloc_free_slot(s, conn, accepted_generation(s, payload_len))
+                    {
                         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                         slot.phase = Phase::RecvRequest;
                     } else {

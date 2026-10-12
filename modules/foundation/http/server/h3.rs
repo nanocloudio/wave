@@ -3328,7 +3328,8 @@ unsafe fn tunnel_seat(s: &mut super::super::HttpState, session: u32, stream: u64
     if !st.slots[idx].ws_fan_out || st.slots[idx].conn_slot >= 0 {
         return;
     }
-    let Some(ci) = super::alloc_free_slot(s, idx as u16) else {
+    // A QUIC stream is its own session layer; nothing below numbers it.
+    let Some(ci) = super::alloc_free_slot(s, idx as u16, 0) else {
         // No seat: the tunnel cannot reach the seam and is closed rather
         // than left open and silent.
         let _ = ws_queue_close(st, idx, super::super::wire::ws::CLOSE_GOING_AWAY);
