@@ -68,6 +68,18 @@ const RECV_WINDOW_INITIAL: i32 = 65535;
 /// keeps streaming. Picked at half the initial window to leave a
 /// generous in-flight buffer.
 const RECV_WINDOW_THRESHOLD: i32 = 32768;
+/// Initial per-stream recv window, advertised as SETTINGS_INITIAL_WINDOW_SIZE:
+/// what one connection's `recv_buf` holds of a frame's payload. A frame is
+/// read whole before it is processed, and a peer may send DATA frames up to
+/// 16384 bytes, the least SETTINGS_MAX_FRAME_SIZE can say (RFC 9113 §6.5.2),
+/// which is more than `recv_buf` holds — such a frame closed the connection
+/// with FRAME_SIZE_ERROR, so a request body past ~8 KiB never arrived. A
+/// sender may not send DATA past the stream's window (§6.9.1), so a window
+/// no larger than the buffer bounds every DATA frame to it.
+const STREAM_RECV_WINDOW: i32 = (RECV_BUF_SIZE - h2w::FRAME_HEADER_LEN) as i32;
+/// Below this a stream's window is refilled: half of it, as for the
+/// connection's.
+const STREAM_RECV_THRESHOLD: i32 = STREAM_RECV_WINDOW / 2;
 /// Initial conn-level + per-stream send window — RFC 7540 §6.9.2
 /// default. Adjusted by peer SETTINGS_INITIAL_WINDOW_SIZE (per-stream)
 /// or peer WINDOW_UPDATE deltas.
@@ -149,7 +161,7 @@ pub(crate) struct StreamSlot {
     /// u16 cursor and corrupt the response mid-stream.
     pub(crate) tmpl_pos: u32,
     /// Stream-level recv flow-control window (RFC 7540 §6.9.1). Starts
-    /// at 65535; decremented as peer sends DATA on this stream;
+    /// at `STREAM_RECV_WINDOW`, the window we advertise; decremented as peer sends DATA on this stream;
     /// refilled with a per-stream WINDOW_UPDATE when low.
     pub(crate) recv_window: i32,
     /// Stream-level send flow-control window. Starts at peer's
@@ -211,7 +223,7 @@ impl StreamSlot {
             matched_route: -1,
             file_index: -1,
             tmpl_pos: 0,
-            recv_window: RECV_WINDOW_INITIAL,
+            recv_window: STREAM_RECV_WINDOW,
             send_window: SEND_WINDOW_INITIAL,
             hdr_buf: core::ptr::null_mut(),
             hdr_len: 0,
@@ -272,6 +284,14 @@ pub(crate) struct H2State {
     /// changes here adjust every open stream's `send_window` by the
     /// delta (RFC 7540 §6.9.2).
     pub(crate) peer_initial_window_size: i32,
+    /// A DATA frame larger than `recv_buf`, read in pieces (see
+    /// `split_data`): the payload still to come, its stream and flags.
+    /// `split_armed` is set while a piece sits at the head of `recv_buf`,
+    /// so the remainder's header is written once that piece is shifted off.
+    pub(crate) split_left: u32,
+    pub(crate) split_stream: u32,
+    pub(crate) split_flags: u8,
+    pub(crate) split_armed: u8,
     pub(crate) streams: [StreamSlot; MAX_STREAMS],
     /// WebSocket reassembly buffer. Shared across the (at most one)
     /// WS-active stream. RFC 6455 frames may span multiple h2 DATA
@@ -290,6 +310,10 @@ impl H2State {
             file_owner: -1,
             last_stream_id: 0,
             ws_active: 0,
+            split_left: 0,
+            split_stream: 0,
+            split_flags: 0,
+            split_armed: 0,
             ws_defer: 0,
             window_update_pending: 0,
             ws_buf_len: 0,
@@ -340,7 +364,7 @@ unsafe fn alloc_slot(s: &mut HttpState, id: u32) -> i8 {
             slot.end_stream_in = 0;
             slot.req_path_len = 0;
             slot.window_update_pending = 0;
-            slot.recv_window = RECV_WINDOW_INITIAL;
+            slot.recv_window = STREAM_RECV_WINDOW;
             // Each new stream inherits peer's most-recent advertised
             // initial window size (default 65535).
             slot.send_window = cur_h2(s).peer_initial_window_size;
@@ -725,6 +749,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     (h2w::SETTINGS_MAX_CONCURRENT_STREAMS, MAX_STREAMS as u32),
                     (h2w::SETTINGS_HEADER_TABLE_SIZE, 0),
                     (h2w::SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
+                    (h2w::SETTINGS_INITIAL_WINDOW_SIZE, STREAM_RECV_WINDOW as u32),
                 ],
             );
             if let Some(cur) = cur_slot_mut(s) {
@@ -821,6 +846,7 @@ unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
         loop {
             match peek_frame_complete(s) {
                 FrameStatus::Complete => {}
+                FrameStatus::Split => split_data(s),
                 FrameStatus::NeedMore => break,
                 FrameStatus::TooBig => {
                     queue_goaway(s, h2w::ERR_FRAME_SIZE_ERROR);
@@ -1009,6 +1035,7 @@ unsafe fn active(s: &mut HttpState) -> i32 {
     // more bytes into recv_buf for the next pass.
     match peek_frame_complete(s) {
         FrameStatus::NeedMore => return 0,
+        FrameStatus::Split => {}
         FrameStatus::TooBig => {
             queue_goaway(s, h2w::ERR_FRAME_SIZE_ERROR);
             return 2;
@@ -1019,6 +1046,7 @@ unsafe fn active(s: &mut HttpState) -> i32 {
     loop {
         match peek_frame_complete(s) {
             FrameStatus::Complete => {}
+            FrameStatus::Split => split_data(s),
             FrameStatus::NeedMore => break,
             FrameStatus::TooBig => {
                 queue_goaway(s, h2w::ERR_FRAME_SIZE_ERROR);
@@ -1038,6 +1066,9 @@ unsafe fn active(s: &mut HttpState) -> i32 {
 enum FrameStatus {
     Complete,
     NeedMore,
+    /// A DATA frame larger than `recv_buf`, part of whose payload has
+    /// arrived: `split_data` turns that part into a frame of its own.
+    Split,
     /// Peer announced a frame larger than `recv_buf` can hold. Caller
     /// should respond with GOAWAY(FRAME_SIZE_ERROR) and close — RFC
     /// 7540 §4.2 lets a receiver bound the maximum frame size below
@@ -1053,12 +1084,88 @@ unsafe fn peek_frame_complete(s: &HttpState) -> FrameStatus {
     };
     let total = h2w::FRAME_HEADER_LEN + hdr.length as usize;
     if total > RECV_BUF_SIZE {
-        return FrameStatus::TooBig;
+        // DATA is body bytes and can be taken in pieces; any other frame
+        // must be read whole. A padded one is refused too: its padding is
+        // at the far end, past what a piece can see.
+        if hdr.ftype != h2w::FRAME_DATA || (hdr.flags & h2w::FLAG_PADDED) != 0 {
+            return FrameStatus::TooBig;
+        }
+        // Whatever of it has arrived is a piece: inbound bytes are routed
+        // here a whole network message at a time, so the buffer need not
+        // ever be exactly full, and waiting for that would wait forever.
+        return if len > h2w::FRAME_HEADER_LEN {
+            FrameStatus::Split
+        } else {
+            FrameStatus::NeedMore
+        };
     }
     if total > len {
         FrameStatus::NeedMore
     } else {
         FrameStatus::Complete
+    }
+}
+
+/// Turn the head of an oversized DATA frame into a frame of its own: the
+/// payload buffered so far, without END_STREAM. The rest of the frame —
+/// its length less this piece, and its flags — is remembered, and once this
+/// piece is shifted off `process_one_frame` writes the rest's header at the
+/// front of the emptied `recv_buf`, ahead of the bytes still to come. Each
+/// piece goes through `handle_data` like any frame, so windows are charged
+/// for exactly the frame's length and END_STREAM lands on the last piece.
+/// A sender may send DATA frames of up to 16384 bytes before it has read our
+/// SETTINGS (whose window would bound them), and `recv_buf` holds less.
+unsafe fn split_data(s: &mut HttpState) {
+    let len = cur_recv_len(s) as usize;
+    let Some(hdr) = h2w::parse_header(cur_recv_buf_ptr(s), len) else {
+        return;
+    };
+    let piece = (len - h2w::FRAME_HEADER_LEN) as u32;
+    let p = cur_recv_buf_mut_ptr(s);
+    // Length (24-bit) and flags of the head; type and stream stay.
+    *p = (piece >> 16) as u8;
+    *p.add(1) = (piece >> 8) as u8;
+    *p.add(2) = piece as u8;
+    *p.add(4) = hdr.flags & !h2w::FLAG_END_STREAM;
+    let h = cur_h2_mut(s);
+    h.split_left = hdr.length - piece;
+    h.split_stream = hdr.stream_id;
+    h.split_flags = hdr.flags;
+    h.split_armed = 1;
+}
+
+/// Write the remainder's header of a split DATA frame at the front of
+/// `recv_buf`, once the piece before it has been shifted off.
+unsafe fn split_resume(s: &mut HttpState) {
+    let left = cur_h2(s).split_left;
+    let stream = cur_h2(s).split_stream;
+    let flags = cur_h2(s).split_flags;
+    cur_h2_mut(s).split_armed = 0;
+    let len = cur_recv_len(s) as usize;
+    if len + h2w::FRAME_HEADER_LEN > RECV_BUF_SIZE {
+        // The piece was all that was buffered, so nothing follows it yet;
+        // this cannot happen, and a header that does not fit would be a lie.
+        queue_goaway(s, h2w::ERR_INTERNAL_ERROR);
+        return;
+    }
+    let p = cur_recv_buf_mut_ptr(s);
+    let mut i = len;
+    while i > 0 {
+        i -= 1;
+        *p.add(i + h2w::FRAME_HEADER_LEN) = *p.add(i);
+    }
+    *p = (left >> 16) as u8;
+    *p.add(1) = (left >> 8) as u8;
+    *p.add(2) = left as u8;
+    *p.add(3) = h2w::FRAME_DATA;
+    *p.add(4) = flags;
+    let sid = stream & 0x7FFF_FFFF;
+    *p.add(5) = (sid >> 24) as u8;
+    *p.add(6) = (sid >> 16) as u8;
+    *p.add(7) = (sid >> 8) as u8;
+    *p.add(8) = sid as u8;
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.recv_len = (len + h2w::FRAME_HEADER_LEN) as u16;
     }
 }
 
@@ -1151,6 +1258,9 @@ unsafe fn process_one_frame(s: &mut HttpState) -> i32 {
     }
     if let Some(cur) = cur_slot_mut(s) {
         cur.recv_len = leftover as u16;
+    }
+    if cur_h2(s).split_armed != 0 && result.is_ok() {
+        split_resume(s);
     }
 
     if let Err(code) = result {
@@ -1653,7 +1763,7 @@ unsafe fn consume_slot_recv_window(s: &mut HttpState, slot_idx: i8, n: u32) {
     }
     let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(slot_idx as usize);
     slot.recv_window = slot.recv_window.saturating_sub(n as i32);
-    if slot.recv_window <= RECV_WINDOW_THRESHOLD {
+    if slot.recv_window <= STREAM_RECV_THRESHOLD {
         slot.window_update_pending = 1;
     }
 }
@@ -1701,7 +1811,7 @@ unsafe fn queue_window_update(s: &mut HttpState) {
     while (i as usize) < MAX_STREAMS {
         let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(i as usize);
         if slot.id != 0 && slot.window_update_pending != 0 && slot.state != SlotState::Idle {
-            let delta = RECV_WINDOW_INITIAL - slot.recv_window - slot.rx_len as i32;
+            let delta = STREAM_RECV_WINDOW - slot.recv_window - slot.rx_len as i32;
             if delta > 0 {
                 let n = h2w::write_window_update(cur_send_buf_mut_ptr(s), slot.id, delta as u32);
                 slot.recv_window += delta;
@@ -1731,8 +1841,8 @@ unsafe fn rearm_refills(s: &mut HttpState) {
     while i < MAX_STREAMS {
         let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(i);
         if slot.state != SlotState::Idle
-            && RECV_WINDOW_INITIAL - slot.recv_window - slot.rx_len as i32
-                >= RECV_WINDOW_INITIAL - RECV_WINDOW_THRESHOLD
+            && STREAM_RECV_WINDOW - slot.recv_window - slot.rx_len as i32
+                >= STREAM_RECV_WINDOW - STREAM_RECV_THRESHOLD
         {
             slot.window_update_pending = 1;
         }

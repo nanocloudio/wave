@@ -61,54 +61,56 @@ limit_register_coverage = "fail"
 # manifest. `tools/load/wave-bench` still inlines its relaxed `[lints]` mirror —
 # there is simply no workspace left for it to have opted out of.
 
+[ci.setup]
+# Run before every other phase. dev_certs.sh mints the throwaway certificate the
+# TLS and QUIC example graphs name (`target/pki/`, never committed) when it is
+# missing or about to expire, so the examples check and every graph build after
+# it read a pair this run provided rather than residue an earlier run left.
+scripts = ["tools/ci/dev_certs.sh"]
+
 [ci.test]
-# Ten project gates, run in order at CI phase 3.5 (after the strict module
-# build):
+# Nine project gates, run in order in the gate's project-e2e phase, after the
+# strict module build and the examples check:
 #
-#   1. dev_certs.sh — the TLS example graphs name a certificate and a key on
-#      disk under /tmp, which is RAM-backed here and empty after a reboot. This
-#      mints whatever is missing, reading the paths out of the graphs, so no
-#      later gate passes on residue an earlier run happened to leave behind.
-#   2. shadow_guard.sh — tests/ is shadow-tracked in .git-shadow/, so a
+#   1. shadow_guard.sh — tests/ is shadow-tracked in .git-shadow/, so a
 #      primary-only checkout has zero files there and the test phases would
 #      pass vacuously. It also fails when the primary repo TRACKS a path under
 #      a shadow tier: ignoring a tree does not untrack what is already in it,
 #      so a force-add reaches the shared remote with every ignore rule still
 #      reading as correct.
-#   3. host_crates.sh — the module build fmt-checks and clippies the PIC
+#   2. host_crates.sh — the module build fmt-checks and clippies the PIC
 #      sources directly, which leaves the two host crates linted by nothing and
 #      `tools/load/wave-bench` built by nothing. This gate is that.
-#   4. fmod_size_budget.sh — the variant split's whole point is fitting smaller
+#   3. fmod_size_budget.sh — the variant split's whole point is fitting smaller
 #      devices, which is a claim about BYTES; enforced here, after the module
 #      build, so a variant cannot quietly stop being smaller than its superset.
-#   5. identity_accessor_guard.sh — module pumps must decode contract
+#   4. identity_accessor_guard.sh — module pumps must decode contract
 #      identities through the owning accessors, never literal offsets. Every
 #      remaining byte-decode site carries an individual justification in
 #      tools/ci/identity_accessor_allowlist.txt, and a stale or unjustified
 #      entry fails the gate.
-#   6. envelope_table.sh — the connection envelope, generated from the
+#   5. envelope_table.sh — the connection envelope, generated from the
 #      constants that compile it (SDK profile + Wave sources) and diffed
 #      against docs/reference/envelope.md, so the ceiling a reader consults is
 #      the ceiling the module compiled.
-#   7. fmod_pic_relocs.sh — no module may store an address of its own image in
+#   6. fmod_pic_relocs.sh — no module may store an address of its own image in
 #      its data. A `.fmod` is mapped at an arbitrary base with no relocations
 #      applied, so such an address is wrong at every read, and the shape that
 #      produces one is ordinary Rust a reviewer cannot see.
-#   8. http_exchange.sh — the exchange client against a real origin. It is here
+#   7. http_exchange.sh — the exchange client against a real origin. It is here
 #      rather than under a manual E2E because the fault it guards lands between
 #      the connection opening and the first byte going out, where every
 #      HTTP-level check sees silence rather than an error.
-#   9. http_app_reply.sh — the application fan-out's reply half. A forwarded
+#   8. http_app_reply.sh — the application fan-out's reply half. A forwarded
 #      request whose answer is never composed leaves the connection open and
 #      silent, which reaches a client as a timeout and names no component.
-#  10. s3_serve.sh — the `wave-s3` service bundle published, pinned, synced
+#   9. s3_serve.sh — the `wave-s3` service bundle published, pinned, synced
 #      and run through `fluxor run`, then driven with real S3 traffic and by
 #      Wave's own `s3` connector. The guarantees it checks — acknowledged only
 #      at the provider's fence, refusals rather than clamps, one slow body
 #      never stalling another — only hold or fail with every module, the
 #      runtime's store and a real client in the loop.
 scripts = [
-  "tools/ci/dev_certs.sh",
   "tools/ci/shadow_guard.sh",
   "tools/ci/host_crates.sh",
   "tools/ci/fmod_size_budget.sh",

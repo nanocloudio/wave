@@ -44,14 +44,15 @@ python3 -c "import aioquic" 2>/dev/null || {
   [ "${WAVE_REQUIRE_INTEROP:-0}" = "1" ] && fail "WAVE_REQUIRE_INTEROP=1 but aioquic is missing"
   echo "SKIP: aioquic not installed — h3 client interop not exercised"; exit 0; }
 [ -x "$RUNTIME" ] || fail "no fluxor-linux runtime at $RUNTIME"
-[ -s /tmp/server_cert.pem ] || fail "/tmp/server_cert.pem missing (PEM, for the aioquic server)"
+bash "$ROOT/tools/ci/dev_certs.sh" || fail "could not provision the certificate (PEM, for the aioquic server)"
 
 WORK="$(mktemp -d /tmp/wave-h3cli-XXXXXX)"
 echo "── building examples/linux/wave_h3_client.yaml ──"
 ( cd "$ROOT" && fluxor build examples/linux/wave_h3_client.yaml ) >/dev/null || fail "graph build"
 
 echo "── starting the aioquic server on udp:$PORT ──"
-python3 "$ROOT/tools/peers/h3_server.py" "$PORT" /tmp/server_cert.pem /tmp/server_key.pem \
+python3 "$ROOT/tools/peers/h3_server.py" "$PORT" \
+  "$ROOT/target/pki/server_cert.pem" "$ROOT/target/pki/server_key.pem" \
   > "$WORK/server.log" 2>&1 &
 SRV=$!
 for _ in $(seq 1 40); do ss -ulnp 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done

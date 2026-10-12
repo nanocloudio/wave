@@ -1,77 +1,60 @@
 #!/usr/bin/env bash
-# The throwaway certificates the example graphs name.
+# The throwaway certificate the TLS and QUIC example graphs serve.
 #
-# A TLS graph names a certificate and a key on disk, and `fluxor build --check`
-# reads them, so the `examples` gate fails when they are absent. The paths the
-# examples use are under `/tmp`, which on this host is RAM-backed and empty
-# after a reboot — and the end-to-end script that mints them runs in a later
-# phase than the gate that reads them. That made the gate pass on residue from
-# an earlier run and fail on a clean boot, which is the opposite of what a gate
-# is for.
+# A graph names its certificate and key on disk (`target/pki/server_cert.der`,
+# `target/pki/server_key.der`), and `fluxor build` reads them, so every build
+# of one needs the pair present. No key is committed: a fixture key in the
+# tree is a key someone eventually uses somewhere real. This script mints one
+# per machine instead, under `target/`, which is ignored, survives a reboot,
+# and goes with `fluxor clean`.
 #
-# This script mints whatever is missing, before anything reads it. The paths are
-# read out of the example graphs rather than listed here, so a new TLS example
-# is provisioned by adding the example and nothing else.
+# It is the gate's `[ci.setup]` script, so the pair exists before any phase
+# reads it, and every other path that builds such a graph runs it first too:
+# the end-to-end scripts, the rig preflight and the H3 interop test. It mints
+# only when the pair is missing, or expires within a day, so running it is
+# free once a machine has one.
 #
-# Certificates are self-signed P-256, valid for a day, and exist only to
-# exercise a handshake and a record layer. They are not a PKI decision, and
-# nothing outside a test run should ever meet one.
+# The pair is self-signed P-256, CN=wave with subject alternative names
+# localhost and 127.0.0.1, valid for 30 days: DER for the graphs, PEM for the
+# aioquic peers. It exists to exercise a handshake and a record layer and must
+# never protect anything.
 #
 # Usage: tools/ci/dev_certs.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT"
+PKI="$ROOT/target/pki"
 
-[[ -d examples ]] || exit 0
+current() {
+  local f
+  for f in server_cert.der server_key.der server_cert.pem server_key.pem; do
+    [[ -s "$PKI/$f" ]] || return 1
+  done
+  openssl x509 -in "$PKI/server_cert.pem" -noout -checkend 86400 >/dev/null 2>&1
+}
 
 command -v openssl >/dev/null 2>&1 || {
   echo "dev_certs: openssl not on PATH" >&2
   exit 1
 }
 
-# `cert_file:`/`key_file:` values under /tmp, paired by the stem they share:
-# `/tmp/server_cert.der` and `/tmp/server_key.der` are one pair, minted once.
-mapfile -t certs < <(
-  grep -rhoE '(cert|key)_file:[[:space:]]*"/tmp/[A-Za-z0-9_./-]+"' examples \
-    | grep -oE '/tmp/[A-Za-z0-9_./-]+' | sort -u
-)
+current && exit 0
 
-minted=0
-for cert in "${certs[@]}"; do
-  case "$cert" in *_cert.*) ;; *) continue ;; esac
-  ext="${cert##*.}"
-  key="${cert%_cert.$ext}_key.$ext"
-  [[ -f "$cert" && -f "$key" ]] && continue
-
-  work="$(mktemp -d)"
-  trap 'rm -rf "$work"' EXIT
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -keyout "$work/key.pem" -out "$work/cert.pem" -days 1 -subj "/CN=wave" \
-    >/dev/null 2>&1 || {
-    echo "dev_certs: openssl could not mint a certificate" >&2
-    exit 1
-  }
-  case "$ext" in
-    der)
-      openssl x509 -in "$work/cert.pem" -outform DER -out "$cert" 2>/dev/null
-      openssl ec -in "$work/key.pem" -outform DER -out "$key" 2>/dev/null
-      ;;
-    pem)
-      cp "$work/cert.pem" "$cert"
-      cp "$work/key.pem" "$key"
-      ;;
-    *)
-      echo "dev_certs: $cert names an encoding this script does not mint: $ext" >&2
-      exit 1
-      ;;
-  esac
-  chmod 600 "$key"
-  rm -rf "$work"
-  trap - EXIT
-  minted=$((minted + 1))
-done
-
-if (( minted > 0 )); then
-  echo "dev_certs: minted $minted certificate pair(s)"
-fi
+mkdir -p "$PKI"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout "$work/key.pem" -out "$work/cert.pem" -days 30 -subj "/CN=wave" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1 || {
+  echo "dev_certs: openssl could not mint a certificate" >&2
+  exit 1
+}
+openssl ec -in "$work/key.pem" -out "$work/key.sec1.pem" >/dev/null 2>&1
+openssl x509 -in "$work/cert.pem" -outform DER -out "$work/cert.der"
+openssl ec -in "$work/key.pem" -outform DER -out "$work/key.der" >/dev/null 2>&1
+chmod 600 "$work/key.sec1.pem" "$work/key.der"
+mv "$work/cert.der" "$PKI/server_cert.der"
+mv "$work/key.der" "$PKI/server_key.der"
+mv "$work/cert.pem" "$PKI/server_cert.pem"
+mv "$work/key.sec1.pem" "$PKI/server_key.pem"
+echo "dev_certs: minted target/pki/server_{cert,key}.{der,pem}"

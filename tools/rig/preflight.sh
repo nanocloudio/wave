@@ -69,17 +69,14 @@ check_artifact() {
 }
 
 # Every file a graph embeds at BUILD time must exist on the build host now.
-# `fluxor build` warns and carries on when it cannot read one, so a graph whose
-# `cert_file:` has gone missing produces a green build line, boots a tls module
-# with no certificate, and fails at the first handshake — reported as a load
-# phase with zero commits, which reads as a DUT fault.
-#
-# These paths are under /tmp by convention (examples/web_server/README.md), so a
-# host reboot or a tmp sweep silently disarms every HTTPS and h3 scenario. Fail
-# at the recipe instead, naming the openssl lines that regenerate them.
+# `fluxor build` refuses a graph whose embed it cannot read, one file at a time;
+# this provisions the throwaway certificate the example graphs embed
+# (`tools/ci/dev_certs.sh`, into `target/pki/`) and then names every file
+# still missing at once, before a build starts.
 check_embeds() {
   local config="$1" missing=() f
   [ -f "$config" ] || die "no such config: $config"
+  bash "$(dirname "${BASH_SOURCE[0]}")/../ci/dev_certs.sh" || die "could not provision the example certificate"
   # `key: /path` for the file-valued params a graph embeds.
   while IFS= read -r f; do
     [ -s "$f" ] || missing+=("$f")
@@ -88,13 +85,7 @@ check_embeds() {
   [ "${#missing[@]}" -eq 0 ] || die "config embeds file(s) that do not exist on this host" \
     "$(printf '  %s\n' "${missing[@]}")" \
     "  config: $config" \
-    "fluxor build only WARNS on an unreadable embed, so the run would boot" \
-    "without them and fail later as a protocol error. Regenerate certs with:" \
-    "  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \\" \
-    "    -nodes -keyout /tmp/server_key.pem -out /tmp/server_cert.pem \\" \
-    "    -days 365 -subj \"/CN=fluxor\"" \
-    "  openssl x509 -in /tmp/server_cert.pem -outform DER -out /tmp/server_cert.der" \
-    "  openssl ec  -in /tmp/server_key.pem  -outform DER -out /tmp/server_key.der"
+    "A graph names its embeds relative to the project root."
 }
 
 case "${1:-}" in

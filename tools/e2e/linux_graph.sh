@@ -181,9 +181,7 @@ run_plaintext() {
 run_tls() {
   local yaml="examples/linux/wave_https.yaml"
   [ -f "$ROOT/$yaml" ] || fail "no TLS graph at $yaml"
-  # The certificate this graph names is minted by tools/ci/dev_certs.sh, which
-  # reads the paths out of the graph itself; this script does not mint its own.
-  bash "$ROOT/tools/ci/dev_certs.sh" || fail "could not provision a test certificate"
+  bash "$ROOT/tools/ci/dev_certs.sh" || fail "could not provision the certificate the graph names"
 
   boot_graph "$yaml" "wave_https" "$TLS_PORT"
   local base="https://127.0.0.1:$TLS_PORT"

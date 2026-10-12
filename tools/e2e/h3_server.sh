@@ -64,7 +64,7 @@ python3 -c "import aioquic" 2>/dev/null || {
   exit 0
 }
 [ -x "$RUNTIME" ] || fail "no fluxor-linux runtime at $RUNTIME (build it: cd $FLUXOR_ROOT && cargo build --bin fluxor-linux --no-default-features --features host-linux --target aarch64-unknown-linux-gnu)"
-[ -s /tmp/server_cert.der ] || fail "/tmp/server_cert.der missing — the graph needs a server certificate"
+bash "$ROOT/tools/ci/dev_certs.sh" || fail "could not provision the server certificate the graph names"
 
 WORK="$(mktemp -d /tmp/wave-h3-XXXXXX)"
 cat > "$WORK/client.py" <<'PY'
