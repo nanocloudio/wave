@@ -11,8 +11,8 @@ use super::super::connection::{
 };
 use super::super::wire::h1;
 use super::super::{
-    dev_channel_port, dev_log, dev_millis, dev_requester_tag, net_read_frame,
-    net_read_frame_aligned, net_write_frame, NET_FRAME_HDR, POLL_IN, POLL_OUT,
+    dev_channel_port, dev_log, dev_millis, dev_requester_tag, net_read_frame, net_read_frame_sized,
+    net_write_frame, NET_FRAME_HDR, POLL_IN, POLL_OUT,
 };
 use super::{
     build_request, is_foreign_frame, log, send_close_frame, HttpState, Phase, CAUSE_CONNECT,
@@ -298,7 +298,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     }
                     let nbuf = s.net_buf.as_mut_ptr();
                     let (kind, len, declared) =
-                        net_read_frame_aligned(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
+                        net_read_frame_sized(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
                     if kind == 0 {
                         return 0;
                     }

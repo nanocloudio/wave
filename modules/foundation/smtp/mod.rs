@@ -265,7 +265,7 @@ struct SmtpState {
     /// to land in slot 0, leaking a transport slot per failure. Same split the
     /// HTTP client carries for the same reason.
     conn_present: u8,
-    tag: u8,
+    tag: net_proto::RequesterTag,
     started_ms: u64,
     draining: u8,
 
@@ -1211,13 +1211,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 let payload = core::slice::from_raw_parts(s.nbuf.as_ptr().add(NET_FRAME_HDR), plen);
                 match msg {
-                    NET_MSG_CONNECTED if s.phase == SmtpPhase::Connecting => {
-                        let (cid, tag) = if plen >= 3 {
-                            net_proto::connected_parts(payload)
-                        } else {
-                            (0, net_proto::REQUESTER_TAG_NONE)
-                        };
-                        if plen >= 3 && tag == s.tag {
+                    NET_MSG_CONNECTED
+                        if s.phase == SmtpPhase::Connecting && plen >= net_proto::CONN_ID_LEN =>
+                    {
+                        let (cid, tag) = net_proto::connected_parts(payload);
+                        if tag == s.tag {
                             s.conn_id = cid;
                             s.conn_present = 1;
                             s.phase = SmtpPhase::Greet; // await 220
@@ -1270,16 +1268,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // module's connect failure, and its meaningless
                         // conn_id colliding with ours must not read as our
                         // established connection failing.
-                        let (err_cid, err_tag) = if plen >= 3 {
+                        let (err_cid, err_tag) = if plen >= net_proto::ERROR_FIXED {
                             let (c, _e, t) = net_proto::error_parts(payload);
                             (c, t)
                         } else {
                             (0, net_proto::REQUESTER_TAG_NONE)
                         };
-                        let connecting =
-                            s.phase == SmtpPhase::Connecting && plen >= 4 && err_tag == s.tag;
+                        let connecting = s.phase == SmtpPhase::Connecting
+                            && plen >= net_proto::ERROR_FIXED + net_proto::REQUESTER_TAG_LEN
+                            && err_tag == s.tag;
                         let established = s.conn_present != 0
-                            && plen >= 3
+                            && plen >= net_proto::ERROR_FIXED
                             && err_tag == net_proto::REQUESTER_TAG_NONE
                             && err_cid == s.conn_id;
                         if (connecting || established)

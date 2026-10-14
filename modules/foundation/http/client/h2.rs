@@ -46,8 +46,8 @@ use super::super::wire::h2 as h2w;
 use super::super::wire::ws;
 use super::super::HttpState;
 use super::super::{
-    dev_csprng_fill, dev_log, dev_millis, dev_requester_tag, net_read_frame,
-    net_read_frame_aligned, E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT,
+    dev_csprng_fill, dev_log, dev_millis, dev_requester_tag, net_read_frame, net_read_frame_sized,
+    E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT,
 };
 use super::{
     send_close_frame, Phase as H1Phase, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED,
@@ -1245,7 +1245,7 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
     // Alignment-safe: per the net_proto cap a MSG_DATA frame fits our buffer,
     // but a misbehaving producer's oversized frame is drained rather than left
     // to desync the FIFO.
-    let (msg_type, payload_len, _full) = net_read_frame_aligned(sys, chan, buf, NET_BUF_SIZE);
+    let (msg_type, payload_len, _full) = net_read_frame_sized(sys, chan, buf, NET_BUF_SIZE);
     // Established-stream isolation: ignore DATA/CLOSED/ERROR frames for other
     // connections sharing a fanned net_in (e.g. an OTLP exporter).
     if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)

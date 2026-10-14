@@ -49,7 +49,7 @@ pub(crate) unsafe fn dial(
     chan: i32,
     scratch: *mut u8,
     authority: &[u8],
-    tag: u8,
+    tag: net_proto::RequesterTag,
 ) -> Option<bool> {
     let (target, port) = net_proto::Target::parse(authority)?;
     let mut payload = [0u8; net_proto::CONNECT_TO_MAX];

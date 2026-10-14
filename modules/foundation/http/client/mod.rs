@@ -33,9 +33,8 @@ use super::connection::{
 use super::wire;
 use super::HttpState;
 use super::{
-    dev_channel_port, dev_log, dev_millis, dev_requester_tag, net_read_frame,
-    net_read_frame_aligned, net_write_frame, E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT,
-    SOCK_TYPE_STREAM,
+    dev_channel_port, dev_log, dev_millis, dev_requester_tag, net_read_frame, net_read_frame_sized,
+    net_write_frame, E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────

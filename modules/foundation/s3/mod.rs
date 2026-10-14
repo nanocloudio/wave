@@ -186,7 +186,7 @@ struct S3State {
     /// 1 once `MSG_CONNECTED` established a connection. Separate from
     /// `conn_id`'s value because the net stack can assign `conn_id == 0`.
     conn_present: u8,
-    tag: u8,
+    tag: net_proto::RequesterTag,
     draining: u8,
     /// The transport command staged for `net_out`, `0` when none is owed. A
     /// command takes effect only once `net_out` has taken the whole frame, so
@@ -1539,7 +1539,7 @@ fn pump_net(s: &mut S3State, now: u64) {
         let payload_end = (NET_FRAME_HDR + plen).min(NET_BUF);
         let payload = s.rxf.get(NET_FRAME_HDR..payload_end).unwrap_or(&[]);
         match msg {
-            NET_MSG_CONNECTED if plen >= 3 => {
+            NET_MSG_CONNECTED if plen >= net_proto::CONN_ID_LEN => {
                 let (cid, tag) = net_proto::connected_parts(payload);
                 if tag != s.tag {
                     continue;
@@ -1576,8 +1576,8 @@ fn pump_net(s: &mut S3State, now: u64) {
                 s.eof = 1;
                 on_closed(s, now);
             }
-            NET_MSG_ERROR if plen >= 3 => {
-                // `[conn_id u16][errno i8][requester_tag u8]`. A connect-phase
+            NET_MSG_ERROR if plen >= net_proto::ERROR_FIXED => {
+                // `[conn_id u16][errno i8][requester_tag u16]`. A connect-phase
                 // failure is matched on the tag alone (its conn_id is
                 // meaningless); an established connection's on an untagged
                 // error naming it.

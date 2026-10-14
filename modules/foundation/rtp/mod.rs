@@ -1349,13 +1349,13 @@ unsafe fn step_rx_one(s: &mut RtpState) -> bool {
     }
 
     let buf = s.rx_buf.as_mut_ptr();
-    // Frame-ALIGNED: a payload larger than `rx_buf` has its tail drained from
+    // Whole-frame: a payload larger than `rx_buf` has its tail drained from
     // the channel rather than left in the FIFO. Plain `net_read_frame` leaves
     // it, so the next read would start mid-payload and every following packet
     // would be misparsed: one oversized datagram costing the whole stream
     // rather than itself.
     let (msg_type, payload_len, declared_len) =
-        net_read_frame_aligned(sys, s.net_in_chan, buf, RX_BUF_SIZE);
+        net_read_frame_sized(sys, s.net_in_chan, buf, RX_BUF_SIZE);
     if declared_len > payload_len {
         // Loud, not silent: a truncated packet is a lost audio frame, and a
         // receiver that drops media quietly turns a peer misconfiguration into

@@ -115,7 +115,7 @@ struct WsState {
     message: [u8; NAME_BUF],
     message_len: u16,
 
-    tag: u8,
+    tag: net_proto::RequesterTag,
     draining: u8,
     sent_msg: u8,
     request_opcode: u8,
@@ -740,11 +740,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// id, which is the link's own.
 unsafe fn link_for(s: &WsState, msg: u8, payload: &[u8], plen: usize) -> Option<usize> {
     match msg {
-        NET_MSG_CONNECTED if plen >= 3 => {
+        NET_MSG_CONNECTED if plen >= net_proto::CONN_ID_LEN => {
             let (_cid, tag) = net_proto::connected_parts(payload);
             (tag == s.tag).then(|| dialling(s)).flatten()
         }
-        NET_MSG_ERROR if plen >= 3 => {
+        NET_MSG_ERROR if plen >= net_proto::ERROR_FIXED => {
             let (cid, _errno, tag) = net_proto::error_parts(payload);
             if tag == s.tag {
                 dialling(s)

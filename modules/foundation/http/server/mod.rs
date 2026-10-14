@@ -2657,7 +2657,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
             }
             NET_MSG_CONNECTED if payload_len >= 2 => {
                 // Reply to a serialised proxy dial. `MSG_CONNECTED` carries
-                // `[conn_id u16][requester_tag u8]`. The tag is our module
+                // `[conn_id u16][requester_tag u16]`. The tag is our module
                 // index + 1 and is identical across slots, so it cannot say
                 // WHICH slot dialled — the pending `proxy_connect_owner` is
                 // that correlator — but it does say whether the connection is
