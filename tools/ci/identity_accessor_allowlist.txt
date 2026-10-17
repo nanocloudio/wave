@@ -32,7 +32,7 @@ modules/foundation/http/server/h3.rs|v.extend_from_slice(&(plen as u16).to_le_by
 modules/foundation/http/server/h3.rs|v.extend_from_slice(&session.to_le_bytes());|mux STOP/RESET body fields past the accessor-owned prefix; layout is opcode-specific and named by mux consts
 modules/foundation/http/server/h3.rs|v.extend_from_slice(&stream.to_le_bytes());|mux STOP/RESET body fields past the accessor-owned prefix; layout is opcode-specific and named by mux consts
 modules/foundation/http/server/mod.rs|let peeked_payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;|TLV frame length field, not an identity
-modules/foundation/http/server/h1.rs|let count = u16::from_le_bytes([readdir_buf[0], readdir_buf[1]]) as usize;|storage-provider record field (readdir/stat/seek), not a net identity
+modules/foundation/http/server/h1.rs|let count = u16::from_le_bytes([batch[0], batch[1]]) as usize;|storage-provider record field (readdir/stat/seek), not a net identity
 modules/foundation/http/server/h1.rs|let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]);|storage-provider record field (readdir/stat/seek), not a net identity
 modules/foundation/http/server/h1.rs|let mut seek_arg = (start as i32).to_le_bytes();|storage-provider record field (readdir/stat/seek), not a net identity
 modules/foundation/http/server/h1.rs|let r_len = u16::from_le_bytes([*buf.add(2), *buf.add(3)]) as usize;|record length field of a Wave-local layout

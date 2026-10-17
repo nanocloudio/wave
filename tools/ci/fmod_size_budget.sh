@@ -58,7 +58,7 @@ thumbv6m|http-h1_exchange.fmod|105000|97108 (2026-09-07, first RP2040 qualificat
 thumbv8m|http-h1_exchange.fmod|100000|92572 (2026-09-08, first row; HTTP/1.1 plus the graph-driven exchange client and nothing else)
 aarch64|http-h1_exchange.fmod|217000|201220 (2026-09-08, first row; HTTP/1.1 plus the graph-driven exchange client and nothing else)
 thumbv8m|http.fmod|216900|206508 (2026-10-06: request bodies whole in the application HEAD and the exchange id the server packs itself; ceiling re-based 5% above measured)
-thumbv8m|http-h2.fmod|157000|149495 (2026-09-10, +14.0K since the 2026-09-07 row: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
+thumbv8m|http-h2.fmod|165300|157420 (2026-10-18, +7.9K since the 2026-09-10 row: h1 file serving resumes across filesystem backpressure as a step machine; ceiling re-based 5% above measured)
 thumbv8m|http-web.fmod|98000|90020 (2026-09-07, current ABI and readiness hardening)
 thumbv8m|http-app.fmod|103000|95004 (2026-09-07, current ABI and readiness hardening)
 thumbv8m|http-exchange.fmod|234700|223508 (2026-10-06: the client as an exchange provider: request collection, streamed answers under credit, LINK, and request headers over h1, h2 and h3; ceiling re-based 5% above measured)

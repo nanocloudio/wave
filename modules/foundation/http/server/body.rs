@@ -752,11 +752,14 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
                 cur_send_buf_mut_ptr(s),
                 cap,
             );
-            // EAGAIN: provider has no bytes ready but the stream isn't
-            // done. Yield; the next step re-polls. Distinguishing this
-            // from EOF matters — closing on a not-yet-ready read would
-            // truncate every async-backed file.
-            if n == -11 {
+            // EAGAIN: provider has no bytes ready (sectors still being
+            // fetched) but the stream isn't done; nothing moved, the
+            // offset is where it was. Yield; the next step re-asks.
+            // Distinguishing this from EOF (0) matters — closing on a
+            // not-yet-ready read would truncate every async-backed file.
+            // A short count is not EOF either: it is sent, and the next
+            // read continues from where it stopped.
+            if super::h1::fs_pending(n) {
                 return if progressed { 2 } else { 0 };
             }
             if n <= 0 {

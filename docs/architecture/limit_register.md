@@ -135,6 +135,7 @@ canonical request, which is built in fixed scratch: 64 query parameters and
 | `ETAG_MAX` | 32 | `InternalError`; a listed part's longer tag is `InvalidPart` |
 | `UPLOAD_TTL_S` | 24 h | the upload's staging is reclaimed |
 | `LIST_RENDER_CAP` | `(LIST_PAGE_BUF - LIST_DOC_RESERVE) / LIST_EXPANSION` | a listing page is asked for no more entries |
+| `STASH_CAP` | `BODY_WINDOW` (one credit window) | body bytes the object provider refused wait here; no further credit is granted while it holds any |
 | `MAX_CREDENTIALS` | 16 | the module serves nothing; every request `503` |
 | `CREDS_FILE_MAX` | 16 KiB | the module serves nothing |
 | `S3_ACCESS_KEY_MAX` | 128 | the module serves nothing |
@@ -236,6 +237,7 @@ MAX_COMPLETIONS | modules/foundation/s3_serve/mod.rs | 4
 ETAG_MAX | modules/foundation/s3_serve/mod.rs | 32
 UPLOAD_TTL_S | modules/foundation/s3_serve/mod.rs | 24 * 3600
 LIST_RENDER_CAP | modules/foundation/s3_serve/mod.rs | (LIST_PAGE_BUF - LIST_DOC_RESERVE) / LIST_EXPANSION
+STASH_CAP | modules/foundation/s3_serve/mod.rs | BODY_WINDOW as usize
 MAX_CREDENTIALS | modules/foundation/s3_serve/mod.rs | 16
 CREDS_FILE_MAX | modules/foundation/s3_serve/mod.rs | 16 * 1024
 MAX_TARGET | modules/foundation/s3/mod.rs | 2048

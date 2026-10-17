@@ -183,8 +183,8 @@ use super::{
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
 //
-// All cross-cutting capacity tunables live in `abi::config::http`,
-// `abi::config::kernel`, etc. Per-board profiles. See
+// The capacities below are the SDK's, not this module's: they are per-board
+// profiles, so a value here is one board's. See
 // `../fluxor/modules/sdk/abi/config.rs` for the full envelope.
 
 pub(crate) use super::abi::config::http::{
@@ -323,6 +323,15 @@ pub(crate) enum Phase {
     /// hit the wire until the outcome is known.
     AwaitFsStat = 22,
 
+    /// HANDLER_FS_LIST listing: the directory is open on `fs_fd` and the
+    /// JSON body is being built in the tail of `send_buf`, one `FS_READDIR`
+    /// batch at a time. A step reads batches while entries move and yields
+    /// on `EAGAIN`, so the walk resumes at the provider's cursor on a later
+    /// step instead of restarting or ending early. Leaves for `SendHeaders`
+    /// once READDIR answers 0, and for a 500/504 on a real error or on
+    /// `EAGAIN` past the fs wait bound.
+    FsList = 27,
+
     /// An HTTP/3 WebSocket tunnel's seat at the fan-out seam. In h3 mode the
     /// connection table is otherwise unused, so each RFC 9220 tunnel on a
     /// fan-out route takes a slot: its `conn_id` is the tunnel's H3 stream
@@ -450,6 +459,10 @@ pub(crate) struct ConnSlot {
     pub(crate) file_index: i16,
     pub(crate) file_count: u16,
     pub(crate) index_pos: u16,
+    /// Steps an fs wait has answered `EAGAIN` — FS_OPEN / FS_OPENDIR in
+    /// `DispatchRoute`, FS_STAT / FS_SEEK in `AwaitFsStat`, FS_READDIR in
+    /// `FsList`. Zeroed as each wait begins; bounded by
+    /// `h1::FS_WAIT_TIMEOUT_TICKS`.
     pub(crate) fs_stat_ticks: u16,
     /// Render position into the route's `body_offset..body_offset+body_len`
     /// region of the body_pool arena. Widened to u32 to match the
@@ -459,8 +472,14 @@ pub(crate) struct ConnSlot {
     /// renderer to resend or corrupt mid-body.
     pub(crate) tmpl_pos: u32,
 
+    /// The open FS_CONTRACT handle: the file being served, or the
+    /// directory being listed in `FsList`. Closed by every teardown path.
     pub(crate) fs_fd: i32,
+    /// File serving: the body length to send. `FsList`: listing entries
+    /// emitted so far (0 → no separating comma yet).
     pub(crate) fs_total: u32,
+    /// File serving: body bytes sent. `FsList`: JSON body bytes built in
+    /// the `send_buf` tail.
     pub(crate) fs_sent: u32,
 
     /// Where the request target (path and query) sits in `recv_buf`, and its
@@ -1637,7 +1656,7 @@ pub(crate) unsafe fn slot_deadline_limit(s: &HttpState) -> (u32, DeadlineKind) {
                 (0, DeadlineKind::None)
             }
         }
-        // Own timers: AwaitFsStat, WsAwaitAdmit,
+        // Own timers: AwaitFsStat, FsList, WsAwaitAdmit,
         // ProxyConnect/ProxyWaitConnect. WsActive is the ping policy in
         // `ws::ws_idle_policy`; H2Active is `h2::step`'s own check, which
         // knows whether a stream is open.

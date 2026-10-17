@@ -70,23 +70,33 @@ trap cleanup EXIT
 # the tail is whatever the last connection did. Answering every object call
 # `ENOSYS` looks like a broken module from the outside, so the line that names
 # the real cause must not scroll away.
-# WAVE_KEEP_LOGS=<dir>: copy the run's logs there before cleanup, so a
-# failure that needs correlating across both graphs can be read whole rather
-# than through a 30-line tail.
+# A failure is diagnosed from the graphs' logs, so the run keeps them rather
+# than leaving a tail as the only record: the scratch directory goes at exit,
+# and a failure here is rare enough that re-running it may not show it again.
+# WAVE_KEEP_LOGS=<dir> puts them somewhere else.
+LOG_KEEP="${WAVE_KEEP_LOGS:-$ROOT/target/e2e-logs/s3_serve}"
+
+# What a graph's log says, minus the per-step telemetry and the scheduler's
+# budget monitor: both report continuously, so an unfiltered tail is 20 lines
+# of them and none of the failure.
+graph_tail() {
+  [ -f "$D/$1" ] || return 0
+  echo "--- $1 ---"
+  grep -v '\] \(tlm\|state\) \|MON_' "$D/$1" | tail -"${2:-30}"
+}
+
 fail() {
-  if [ -n "${WAVE_KEEP_LOGS:-}" ]; then
-    mkdir -p "$WAVE_KEEP_LOGS"
-    for l in run.log client.log; do
-      [ -f "$D/$l" ] && cp "$D/$l" "$WAVE_KEEP_LOGS/$l"
-    done
-    echo "  logs kept in $WAVE_KEEP_LOGS"
-  fi
+  mkdir -p "$LOG_KEEP"
+  for l in run.log client.log; do
+    [ -f "$D/$l" ] && cp "$D/$l" "$LOG_KEEP/$l"
+  done
   echo "FAIL: $1"
   if [ -f "$D/run.log" ]; then
     grep -iE '\[store\]|ERROR' "$D/run.log" | head -10 | sed 's/^/--- /'
-    echo "--- run.log ---"
-    grep -v '\] \(tlm\|state\) \|MON_' "$D/run.log" | tail -30
   fi
+  graph_tail run.log
+  graph_tail client.log
+  echo "  logs kept whole in $LOG_KEEP"
   exit 1
 }
 
@@ -236,7 +246,7 @@ for _ in $(seq 1 40); do
   curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$CLIENT_PORT/" && break
   sleep 0.25
 done
-python3 - "127.0.0.1:$PORT" "127.0.0.1:$CLIENT_PORT" "$D/traffic.json" "$ROOT/tools/e2e/s3_traffic.py" <<'PY' || { tail -20 "$D/client.log"; fail "the s3 connector"; }
+python3 - "127.0.0.1:$PORT" "127.0.0.1:$CLIENT_PORT" "$D/traffic.json" "$ROOT/tools/e2e/s3_traffic.py" <<'PY' || fail "the s3 connector"
 import hashlib, http.client, importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("s3_traffic", sys.argv[4])
 t = importlib.util.module_from_spec(spec); spec.loader.exec_module(t)

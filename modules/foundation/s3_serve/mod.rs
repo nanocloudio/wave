@@ -86,6 +86,13 @@ pub const CREDS_FILE_MAX: usize = 16 * 1024;
 /// Request-body credit an exchange holds out to `http` at once: what may be
 /// in flight between the client and the provider for one upload.
 pub const BODY_WINDOW: u32 = 64 * 1024;
+/// Body bytes a streamed put holds while the provider pushes back
+/// (`PUT_STREAMED_WRITE` answering `EAGAIN`). Credit is withheld while any
+/// wait, so what arrives meanwhile is at most the credit already out: one
+/// window. The HEAD's inline body spends no credit and arrives before any
+/// is granted, so it fits the same room.
+pub const STASH_CAP: usize = BODY_WINDOW as usize;
+const _: () = assert!(STASH_CAP >= RECORD_MAX, "an inline body fits the stash");
 /// One `LIST` page buffer.
 pub const LIST_PAGE_BUF: usize = 32 * 1024;
 /// Bytes of a listing document kept for its head and tail: the XML
@@ -184,6 +191,9 @@ enum Phase {
     /// A whole response is staged in `out`; the exchange ends once it is
     /// written.
     Answer,
+    /// The streamed put's `PUT_STREAMED_OPEN` answered "not now": asked
+    /// again from `arg` on a later step. Inline body bytes wait in the stash.
+    PutOpen,
     /// Body records go to the provider's streamed put.
     PutBody,
     /// The streamed put is committing (asked again while pending).
@@ -209,6 +219,9 @@ enum Phase {
     CompleteCopy,
     /// Committing the completed object.
     CompleteCommit,
+    /// The object is committed; reading its metadata for the result's ETag
+    /// (asked again while the provider is not ready).
+    CompleteHead,
     /// The object is committed; its result document waits for credit.
     CompleteResult,
     /// Removing an upload's staging.
@@ -265,6 +278,22 @@ struct Exchange {
     scope_date: [u8; 8],
     declared: u64,
     received: u64,
+    /// Body bytes taken from `http` that the provider has not taken yet:
+    /// `stash[stash_off..stash_len]`, in body order, ahead of anything that
+    /// follows. Allocated (`STASH_CAP`) the first time the provider pushes
+    /// back; freed when the exchange ends.
+    stash: *mut u8,
+    stash_off: u32,
+    stash_len: u32,
+    /// Length of the chunk at the stash's front that the provider answered
+    /// `EAGAIN` to: sent again as the same chunk. 0 when none was refused.
+    stash_retry: u32,
+    /// The step (`State::steps`) the provider last refused that chunk in:
+    /// it is not asked again within it.
+    refused_at: u32,
+    /// The body's last record has been taken; the put commits once the
+    /// stash has drained.
+    put_last: bool,
     // Provider handles and buffers whose addresses a pending call names.
     handle: i32,
     fence: [u8; WIRE_MAX_LEN],
@@ -436,6 +465,14 @@ struct State {
     reap_bucket_len: [u8; MAX_UPLOADS],
     reap_cred: [u8; MAX_UPLOADS],
     reap_len: usize,
+    /// Where the walk of the first queued upload's parts resumes: the cursor
+    /// the last page returned, empty at the start of a walk. A `LIST` that
+    /// answers `EAGAIN` leaves it as it was, and is asked again from it.
+    reap_cursor: [u8; NAME_MAX],
+    reap_cursor_len: usize,
+    /// The walk under way deleted a part, so it ends with another walk from
+    /// the start rather than with the marker's removal.
+    reap_dirty: bool,
     page: [u8; LIST_PAGE_BUF],
     // Telemetry, in `[observability].metrics` order.
     tlm_bytes_in: u64,
@@ -555,7 +592,14 @@ const PART_ETAG_STRIDE: usize = 1 + ETAG_MAX;
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_arena_size"]
 pub extern "C" fn module_arena_size() -> u32 {
-    let per_exchange = RECORD_MAX + LIST_PAGE_BUF;
+    // A listing's page and a put's stash are never held by one exchange at
+    // once: an exchange lists or puts.
+    let held = if STASH_CAP > LIST_PAGE_BUF {
+        STASH_CAP
+    } else {
+        LIST_PAGE_BUF
+    };
+    let per_exchange = RECORD_MAX + held;
     let per_completion = S3_PART_NUMBER_MAX as usize * (4 + PART_ETAG_STRIDE);
     let need = MAX_EXCHANGES * per_exchange + MAX_COMPLETIONS * per_completion;
     (need + need / 4) as u32
@@ -604,6 +648,7 @@ pub extern "C" fn module_new(
         e.out = core::ptr::null_mut();
         e.parts = core::ptr::null_mut();
         e.part_etags = core::ptr::null_mut();
+        e.stash = core::ptr::null_mut();
     }
     let is_tlv = !params.is_null() && params_len >= 4;
     // SAFETY: `params` is valid for `params_len` bytes per the ABI.
@@ -729,6 +774,7 @@ unsafe fn load(s: &mut State) {
             s.creds_path.as_mut_ptr(),
             s.creds_path_len,
         );
+        // Mount not up or the entry not cached yet: not an absent file.
         if fd == errno::EAGAIN {
             return;
         }
@@ -743,6 +789,7 @@ unsafe fn load(s: &mut State) {
     if s.file_len > CREDS_FILE_MAX {
         log(s, b"[s3_serve] credentials file is past its ceiling");
         call(s.syscalls, s.fd, fs::CLOSE, core::ptr::null_mut(), 0);
+        s.fd = -1;
         s.boot = Boot::Failed;
         return;
     }
@@ -753,11 +800,15 @@ unsafe fn load(s: &mut State) {
         s.file.as_mut_ptr().add(s.file_len),
         room,
     );
+    // Not cached yet: nothing moved, the offset is where it was. Re-ask on
+    // a later step. A short count is not the end of the file; only 0 is.
     if n == errno::EAGAIN {
         return;
     }
     if n < 0 {
         log(s, b"[s3_serve] credentials file cannot be read");
+        call(s.syscalls, s.fd, fs::CLOSE, core::ptr::null_mut(), 0);
+        s.fd = -1;
         s.boot = Boot::Failed;
         return;
     }
@@ -1305,6 +1356,10 @@ unsafe fn begin(s: &mut State, i: usize, h: &RequestHead<'_>) -> bool {
     e.chunked = None;
     e.declared = 0;
     e.received = 0;
+    e.stash_off = 0;
+    e.stash_len = 0;
+    e.stash_retry = 0;
+    e.put_last = false;
     e.handle = -1;
     e.arg_len = 0;
     e.etag_len = 0;
@@ -1745,7 +1800,10 @@ unsafe fn abort_out(s: &mut State, i: usize) {
 /// takes it.
 unsafe fn grant(s: &mut State, i: usize) {
     let e = &mut s.ex[i];
-    if e.credit_owed == 0 || !e.body_open {
+    // While body bytes wait for the provider, `http` is given no more: the
+    // body stops at what is already in flight, and nothing past the stash's
+    // room can arrive.
+    if e.credit_owed == 0 || !e.body_open || e.stash_off < e.stash_len {
         return;
     }
     let mut rec = [0u8; 32];
@@ -1758,6 +1816,10 @@ unsafe fn grant(s: &mut State, i: usize) {
 }
 
 unsafe fn release_handles(s: &mut State, i: usize) {
+    // What waited for the provider goes with the put it was for.
+    s.ex[i].stash_off = 0;
+    s.ex[i].stash_len = 0;
+    s.ex[i].stash_retry = 0;
     // A completion's copy holds the part it reads beside its put, in `mtime`.
     if s.ex[i].phase == Phase::CompleteCopy && s.ex[i].mtime != u64::MAX {
         call(
@@ -1808,6 +1870,11 @@ unsafe fn end(s: &mut State, i: usize, answered: bool) {
         e.part_etags = core::ptr::null_mut();
         s.completions -= 1;
     }
+    let e = &mut s.ex[i];
+    if !e.stash.is_null() {
+        heap_free(&*s.syscalls, e.stash);
+        e.stash = core::ptr::null_mut();
+    }
     let slot = e.upload_slot;
     if slot >= 0 {
         s.uploads[slot as usize].busy = false;
@@ -1834,6 +1901,8 @@ unsafe fn drive(s: &mut State, i: usize) -> bool {
     }
     match s.ex[i].phase {
         Phase::Answer => false,
+        Phase::PutOpen => put_open(s, i),
+        Phase::PutBody => put_drain(s, i),
         Phase::PutCommit => put_commit(s, i),
         Phase::PutHead => put_head(s, i),
         Phase::ReadHead => read_head(s, i),
@@ -1844,11 +1913,12 @@ unsafe fn drive(s: &mut State, i: usize) -> bool {
         Phase::CompleteCheck => complete_check(s, i),
         Phase::CompleteCopy => complete_copy(s, i),
         Phase::CompleteCommit => complete_commit(s, i),
+        Phase::CompleteHead => complete_head(s, i),
         Phase::CompleteResult => complete_result(s, i),
         Phase::UploadDelete => upload_delete(s, i),
         Phase::Delete => delete_step(s, i),
         Phase::BucketProbe => bucket_probe(s, i),
-        Phase::PutBody | Phase::CompleteParts | Phase::Free => false,
+        Phase::CompleteParts | Phase::Free => false,
     }
 }
 
@@ -1860,7 +1930,7 @@ unsafe fn body(s: &mut State, i: usize, data: &[u8], last: bool) {
         e.body_open = false;
     }
     match e.phase {
-        Phase::PutBody => put_data(s, i, data, last),
+        Phase::PutOpen | Phase::PutBody => put_data(s, i, data, last),
         Phase::CompleteParts => complete_data(s, i, data, last),
         // A body the operation does not read: consumed, and credited so it
         // keeps moving until it ends.
@@ -1934,10 +2004,17 @@ unsafe fn begin_put(s: &mut State, i: usize, headers: &[u8], part: bool) -> Resu
         Payload::Chunked => e.chunked = Some(S3Chunked::new(&e.seed)),
         Payload::Unsigned => {}
     }
+    e.put_last = !e.body_open;
     let key = &e.name[..e.name_len];
     let mut arg = [0u8; NAME_MAX + 300];
     let p = encode_put_open(&mut arg, key, ct, declared, precondition, &etag[..etag_len])
         .ok_or(S3Err::KeyTooLong)?;
+    if p > e.arg.len() {
+        return Err(S3Err::KeyTooLong);
+    }
+    // Kept: an open the provider cannot take yet is asked again with it.
+    e.arg[..p].copy_from_slice(&arg[..p]);
+    e.arg_len = p;
     let grant = s.creds[s.ex[i].cred as usize].grant;
     let h = call(
         s.syscalls,
@@ -1946,31 +2023,193 @@ unsafe fn begin_put(s: &mut State, i: usize, headers: &[u8], part: bool) -> Resu
         arg.as_mut_ptr(),
         p,
     );
+    if h == errno::EAGAIN {
+        // Not now, nothing opened: asked again on a later step. No credit
+        // goes out until it opens, so only the inline body can arrive.
+        s.ex[i].phase = Phase::PutOpen;
+        return Ok(());
+    }
     if h < 0 {
         return Err(s3_errno(h, false));
     }
+    put_opened(s, i, h);
+    Ok(())
+}
+
+/// Ask the provider again for the streamed put's handle.
+unsafe fn put_open(s: &mut State, i: usize) -> bool {
+    let grant = s.creds[s.ex[i].cred as usize].grant;
+    let e = &mut s.ex[i];
+    let h = call(
+        s.syscalls,
+        grant,
+        obj::PUT_STREAMED_OPEN,
+        e.arg.as_mut_ptr(),
+        e.arg_len,
+    );
+    if h == errno::EAGAIN {
+        return false;
+    }
+    if h < 0 {
+        fail(s, i, s3_errno(h, false));
+        return true;
+    }
+    put_opened(s, i, h);
+    true
+}
+
+/// The streamed put is open: the body flows, and what waited goes first.
+unsafe fn put_opened(s: &mut State, i: usize, h: i32) {
     let e = &mut s.ex[i];
     e.handle = h;
     e.phase = Phase::PutBody;
     if e.body_open {
         e.credit_owed = BODY_WINDOW;
-    } else {
-        finish_put_body(s, i);
     }
-    Ok(())
+    put_drain(s, i);
+}
+
+/// Where a streamed put's body bytes go: straight to the provider while
+/// nothing waits, into the stash behind anything that does.
+struct PutSink {
+    sys: *const SyscallTable,
+    handle: i32,
+    stash: *mut u8,
+    off: u32,
+    len: u32,
+    retry: u32,
+    /// Body bytes taken, whether the provider has them yet or the stash.
+    taken: u64,
+    /// The provider refused a piece in this call.
+    refused: bool,
+    bad: Option<S3Err>,
+}
+
+/// Hand one piece of body to the provider, or keep it in order.
+///
+/// `PUT_STREAMED_WRITE` is all or nothing: 0 took the whole piece, `EAGAIN`
+/// took none of it. A refused piece is kept whole and is the first thing
+/// sent again, on a later step: never within this one, where the provider
+/// has had no chance to make room.
+unsafe fn put_piece(k: &mut PutSink, d: &[u8]) {
+    if k.bad.is_some() || d.is_empty() {
+        return;
+    }
+    k.taken += d.len() as u64;
+    let mut refused = false;
+    if k.off == k.len && k.handle >= 0 {
+        let rc = ((*k.sys).provider_call)(
+            k.handle,
+            obj::PUT_STREAMED_WRITE,
+            d.as_ptr() as *mut u8,
+            d.len(),
+        );
+        if rc == 0 {
+            return;
+        }
+        if rc != errno::EAGAIN {
+            k.bad = Some(s3_errno(rc, false));
+            return;
+        }
+        refused = true;
+    }
+    if k.off == k.len {
+        k.off = 0;
+        k.len = 0;
+    }
+    if k.stash.is_null() {
+        k.stash = heap_alloc(&*k.sys, STASH_CAP as u32);
+        if k.stash.is_null() {
+            k.bad = Some(S3Err::SlowDown);
+            return;
+        }
+    }
+    // Credit is withheld while the stash holds anything, so it never fills
+    // unless `http` sent past the credit it was given.
+    let at = k.len as usize;
+    if d.len() > STASH_CAP - at {
+        k.bad = Some(S3Err::InternalError);
+        return;
+    }
+    core::ptr::copy_nonoverlapping(d.as_ptr(), k.stash.add(at), d.len());
+    k.len += d.len() as u32;
+    if refused {
+        k.retry = d.len() as u32;
+        k.refused = true;
+    }
+}
+
+/// Send what the stash holds, in order, until the provider pushes back or
+/// it is empty; commit once the body has ended and nothing waits.
+unsafe fn put_drain(s: &mut State, i: usize) -> bool {
+    let sys = s.syscalls;
+    let steps = s.steps;
+    let mut worked = false;
+    loop {
+        let e = &mut s.ex[i];
+        if e.stash_off >= e.stash_len {
+            break;
+        }
+        // Refused in this step: the provider has had no chance to make room.
+        if e.stash_retry != 0 && e.refused_at == steps {
+            return worked;
+        }
+        let rest = (e.stash_len - e.stash_off) as usize;
+        let n = if e.stash_retry != 0 {
+            (e.stash_retry as usize).min(rest)
+        } else {
+            rest.min(BODY_MAX)
+        };
+        let rc = ((*sys).provider_call)(
+            e.handle,
+            obj::PUT_STREAMED_WRITE,
+            e.stash.add(e.stash_off as usize),
+            n,
+        );
+        if rc == errno::EAGAIN {
+            // The same chunk goes again on a later step.
+            e.stash_retry = n as u32;
+            e.refused_at = steps;
+            return worked;
+        }
+        if rc < 0 {
+            fail(s, i, s3_errno(rc, false));
+            return true;
+        }
+        e.stash_off += n as u32;
+        e.stash_retry = 0;
+        worked = true;
+    }
+    let e = &mut s.ex[i];
+    e.stash_off = 0;
+    e.stash_len = 0;
+    if e.put_last {
+        finish_put_body(s, i);
+        return true;
+    }
+    worked
 }
 
 /// Body bytes for a streamed put.
 unsafe fn put_data(s: &mut State, i: usize, data: &[u8], last: bool) {
-    let handle = s.ex[i].handle;
     let sys = s.syscalls;
-    let mut write_err = 0i32;
-    let mut written = 0u64;
+    let steps = s.steps;
     // The region the chunk signatures are scoped to is the server's.
     let region_len = s.region_len;
     let mut region = [0u8; 32];
     region[..region_len].copy_from_slice(&s.region[..region_len]);
     let e = &mut s.ex[i];
+    let mut k = PutSink {
+        sys,
+        handle: e.handle,
+        stash: e.stash,
+        off: e.stash_off,
+        len: e.stash_len,
+        retry: e.stash_retry,
+        taken: 0,
+        refused: false,
+        bad: None,
+    };
     let outcome: Result<(), S3Err> = match e.payload {
         Payload::Chunked => {
             let key = S3ChunkKey {
@@ -1982,20 +2221,7 @@ unsafe fn put_data(s: &mut State, i: usize, data: &[u8], last: bool) {
             };
             match e.chunked.as_mut() {
                 Some(c) => c
-                    .feed(data, &key, |d| {
-                        if write_err == 0 && !d.is_empty() {
-                            let rc = ((*sys).provider_call)(
-                                handle,
-                                obj::PUT_STREAMED_WRITE,
-                                d.as_ptr() as *mut u8,
-                                d.len(),
-                            );
-                            if rc < 0 {
-                                write_err = rc;
-                            }
-                            written += d.len() as u64;
-                        }
-                    })
+                    .feed(data, &key, |d| put_piece(&mut k, d))
                     .map_err(|err| match err {
                         S3ChunkErr::Signature => S3Err::SignatureDoesNotMatch,
                         S3ChunkErr::Malformed => S3Err::IncompleteBody,
@@ -2007,37 +2233,40 @@ unsafe fn put_data(s: &mut State, i: usize, data: &[u8], last: bool) {
             if let Some(h) = e.hasher.as_mut() {
                 h.update(data);
             }
-            if !data.is_empty() {
-                let rc = ((*sys).provider_call)(
-                    handle,
-                    obj::PUT_STREAMED_WRITE,
-                    data.as_ptr() as *mut u8,
-                    data.len(),
-                );
-                if rc < 0 {
-                    write_err = rc;
-                }
-                written = data.len() as u64;
-            }
+            put_piece(&mut k, data);
             Ok(())
         }
     };
+    let e = &mut s.ex[i];
+    e.stash = k.stash;
+    e.stash_off = k.off;
+    e.stash_len = k.len;
+    e.stash_retry = k.retry;
+    if k.refused {
+        e.refused_at = steps;
+    }
     if let Err(err) = outcome {
         fail(s, i, err);
         return;
     }
-    if write_err != 0 {
-        fail(s, i, s3_errno(write_err, false));
+    if let Some(err) = k.bad {
+        fail(s, i, err);
         return;
     }
     let e = &mut s.ex[i];
-    e.received += written;
+    e.received += k.taken;
     if e.received > e.declared {
         fail(s, i, S3Err::IncompleteBody);
         return;
     }
     e.credit_owed = e.credit_owed.saturating_add(data.len() as u32);
     if last {
+        e.put_last = true;
+    }
+    // The put commits once its body has ended and nothing of it waits.
+    if e.put_last && e.phase == Phase::PutBody && e.stash_off >= e.stash_len {
+        e.stash_off = 0;
+        e.stash_len = 0;
         finish_put_body(s, i);
     }
 }
@@ -3144,6 +3373,11 @@ unsafe fn complete_open(s: &mut State, i: usize) -> bool {
         arg.as_mut_ptr(),
         p,
     );
+    if h == errno::EAGAIN {
+        // Not now, nothing opened: the check stays done, and the open is
+        // asked again on a later step.
+        return false;
+    }
     if h < 0 {
         fail(s, i, s3_errno(h, false));
         return true;
@@ -3246,6 +3480,11 @@ unsafe fn complete_copy(s: &mut State, i: usize) -> bool {
         buf.as_mut_ptr(),
         n as usize,
     );
+    if rc == errno::EAGAIN {
+        // Backpressure: none of the chunk was taken. The offset stays, so a
+        // later step reads the same bytes of the part and sends them again.
+        return false;
+    }
     if rc < 0 {
         call(s.syscalls, rh, obj::CLOSE, core::ptr::null_mut(), 0);
         s.ex[i].mtime = u64::MAX;
@@ -3313,13 +3552,10 @@ unsafe fn complete_commit(s: &mut State, i: usize) -> bool {
             let e = &mut s.ex[i];
             e.name[..u.name_len as usize].copy_from_slice(&u.name[..u.name_len as usize]);
             e.name_len = u.name_len as usize;
-            if head_object(s, i).is_err() {
-                s.ex[i].etag_len = 0;
-            }
             reap(s, slot);
             s.ex[i].upload_slot = -1;
-            s.ex[i].phase = Phase::CompleteResult;
-            complete_result(s, i);
+            s.ex[i].phase = Phase::CompleteHead;
+            complete_head(s, i);
             true
         }
         obj::WriteAnswer::Decided(err) => {
@@ -3332,6 +3568,27 @@ unsafe fn complete_commit(s: &mut State, i: usize) -> bool {
             );
             s.ex[i].handle = -1;
             complete_fail(s, i, s3_errno(err, false));
+            true
+        }
+    }
+}
+
+/// The committed object's ETag for the result. A `HEAD` not answered yet
+/// (`EAGAIN`) holds the result until it is; it never answers an empty tag.
+unsafe fn complete_head(s: &mut State, i: usize) -> bool {
+    match head_object(s, i) {
+        Err(errno::EAGAIN) => false,
+        Err(_) => {
+            // The object is committed; a provider that cannot describe it
+            // leaves the result without its tag rather than failing it.
+            s.ex[i].etag_len = 0;
+            s.ex[i].phase = Phase::CompleteResult;
+            complete_result(s, i);
+            true
+        }
+        Ok(()) => {
+            s.ex[i].phase = Phase::CompleteResult;
+            complete_result(s, i);
             true
         }
     }
@@ -3421,13 +3678,30 @@ unsafe fn sweep(s: &mut State) {
         pop_reap(s);
         return;
     };
-    // The parts under `marker/`, then the marker.
+    // The parts under `marker/`, a page per step from the walk's cursor,
+    // then the marker. The marker goes only after a whole walk that found no
+    // part: a page not answered yet (`EAGAIN`) decides nothing, so the reap
+    // waits and the page is asked again from the same cursor on a later step.
     let mut prefix = [0u8; NAME_MAX];
     prefix[..ml].copy_from_slice(&marker[..ml]);
     prefix[ml] = b'/';
-    let mut deleted_any = false;
-    if let Ok((len, _)) = list_page(s, grant, &prefix[..ml + 1], &[], 64, LIST_PAGE_BUF) {
+    let cursor = s.reap_cursor;
+    let cl = s.reap_cursor_len.min(NAME_MAX);
+    let page = list_page(
+        s,
+        grant,
+        &prefix[..ml + 1],
+        &cursor[..cl],
+        64,
+        LIST_PAGE_BUF,
+    );
+    if page == Err(errno::EAGAIN) {
+        return;
+    }
+    if let Ok((len, _)) = page {
         let page = core::slice::from_raw_parts(s.page.as_ptr(), len);
+        let mut next = [0u8; NAME_MAX];
+        let mut next_len = 0usize;
         if let Some(p) = obj::list::decode_page(page) {
             for e in p.entries() {
                 let mut arg = [0u8; NAME_MAX + 32];
@@ -3440,13 +3714,24 @@ unsafe fn sweep(s: &mut State) {
                         arg.as_mut_ptr(),
                         n,
                     ));
-                    deleted_any = true;
+                    s.reap_dirty = true;
                 }
             }
+            next_len = p.cursor().len().min(NAME_MAX);
+            next[..next_len].copy_from_slice(&p.cursor()[..next_len]);
         }
-    }
-    if deleted_any {
-        return;
+        if next_len > 0 {
+            s.reap_cursor[..next_len].copy_from_slice(&next[..next_len]);
+            s.reap_cursor_len = next_len;
+            return;
+        }
+        s.reap_cursor_len = 0;
+        if s.reap_dirty {
+            // Walk again from the start: the marker goes once a walk finds
+            // nothing left under it.
+            s.reap_dirty = false;
+            return;
+        }
     }
     let mut arg = [0u8; NAME_MAX + 32];
     let mut fence = [0u8; WIRE_MAX_LEN];
@@ -3465,4 +3750,6 @@ unsafe fn pop_reap(s: &mut State) {
         s.reap_cred[k - 1] = s.reap_cred[k];
     }
     s.reap_len -= 1;
+    s.reap_cursor_len = 0;
+    s.reap_dirty = false;
 }

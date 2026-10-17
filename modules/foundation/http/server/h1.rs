@@ -85,6 +85,307 @@ use super::{
 #[cfg(feature = "h2")]
 use super::{cur_h2_mut, ensure_h2_state};
 
+/// Steps an fs wait may answer "not now" before the server gives up on it
+/// (~30 s on pi5 4 kHz). Each wait — open, stat/seek, a directory walk —
+/// starts its own count.
+pub(crate) const FS_WAIT_TIMEOUT_TICKS: u16 = 1500;
+
+/// The fs contract's "not decided yet" answers: `EAGAIN` (nothing taken, ask
+/// again) and `EINPROGRESS` (taken, re-ask the same request). Neither is a
+/// failure, an end of data, or an absence; every caller here re-asks the
+/// byte-identical request on a later step.
+#[inline(always)]
+pub(crate) fn fs_pending(rc: i32) -> bool {
+    use super::super::abi::kernel_abi::errno;
+    rc == errno::EAGAIN || rc == errno::EINPROGRESS
+}
+
+/// Count one pending answer against the current fs wait. True once the
+/// wait has run past `FS_WAIT_TIMEOUT_TICKS`.
+unsafe fn fs_wait_expired(s: &mut HttpState) -> bool {
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.fs_stat_ticks = cur.fs_stat_ticks.saturating_add(1);
+        cur.fs_stat_ticks >= FS_WAIT_TIMEOUT_TICKS
+    } else {
+        false
+    }
+}
+
+/// An FS_OPEN / FS_OPENDIR in `DispatchRoute` answered pending: no handle
+/// was made, so the slot stays in `DispatchRoute` and the dispatch — which is
+/// idempotent up to that call — re-asks on a later step. Past the wait bound
+/// the server answers 503 rather than holding the client forever.
+unsafe fn fs_dispatch_wait(s: &mut HttpState) -> i32 {
+    if fs_wait_expired(s) {
+        build_error(s, b"503 Service Unavailable", b"Filesystem not ready\n");
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::DrainSend;
+        }
+    }
+    0
+}
+
+/// Largest JSON body a `HANDLER_FS_LIST` listing builds. It is assembled in
+/// the last `FS_LIST_BODY_MAX` bytes of `send_buf`, so the response head has
+/// the front of the buffer to itself when the length is finally known.
+pub(crate) const FS_LIST_BODY_MAX: usize = 2048;
+/// Where in `send_buf` the listing body is built.
+pub(crate) const FS_LIST_BODY_AT: usize = SEND_BUF_SIZE - FS_LIST_BODY_MAX;
+// The head (status line, Content-Type, Content-Length, Connection) must fit in
+// front of the body region.
+const _: () = assert!(SEND_BUF_SIZE >= FS_LIST_BODY_MAX + 512);
+
+/// READDIR calls one `FsList` step makes at most. The walk continues while
+/// entries move and yields on a pending answer; this only bounds a step.
+const FS_LIST_ROUNDS: usize = 8;
+
+/// Append one FS_READDIR batch (`[count: u16 LE]` then `count` ×
+/// `[name_len: u8][entry_type: u8][name]`) to the JSON listing in `body`,
+/// at `*bp`, keeping files whose name ends in one of `filter`'s
+/// comma-separated extensions (case-insensitive; empty keeps every file).
+/// `*items` counts names emitted so far, for the separating comma.
+///
+/// Returns false when the batch says the directory is drained (no entries) —
+/// some providers answer `count = 0` rather than 0 at the end.
+pub(crate) fn fs_list_append_batch(
+    body: &mut [u8; FS_LIST_BODY_MAX],
+    bp: &mut usize,
+    items: &mut u32,
+    batch: &[u8],
+    filter: &[u8],
+) -> bool {
+    let nb = batch.len();
+    if nb < 2 {
+        return false;
+    }
+    let count = u16::from_le_bytes([batch[0], batch[1]]) as usize;
+    if count == 0 {
+        return false;
+    }
+    let filter_len = filter.len();
+    let mut pos = 2usize;
+    let mut emitted = 0usize;
+    while emitted < count && pos + 2 <= nb {
+        let name_len = batch[pos] as usize;
+        let entry_type = batch[pos + 1];
+        pos += 2;
+        if pos + name_len > nb {
+            break;
+        }
+        let Some(name) = batch.get(pos..pos + name_len) else {
+            break;
+        };
+        pos += name_len;
+        emitted += 1;
+        // Skip subdirectories.
+        if entry_type == 1 {
+            continue;
+        }
+        // Extension filter (case-insensitive).
+        if filter_len > 0 {
+            let mut ok = false;
+            let mut fi = 0usize;
+            while fi < filter_len {
+                let start = fi;
+                while fi < filter_len && filter[fi] != b',' {
+                    fi += 1;
+                }
+                let elen = fi - start;
+                if elen > 0 && elen <= name.len() {
+                    let tail_at = name.len() - elen;
+                    let mut m = true;
+                    let mut k = 0usize;
+                    while k < elen {
+                        let al = name[tail_at + k].to_ascii_lowercase();
+                        let bl = filter[start + k].to_ascii_lowercase();
+                        if al != bl {
+                            m = false;
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if m {
+                        ok = true;
+                        break;
+                    }
+                }
+                if fi < filter_len && filter[fi] == b',' {
+                    fi += 1;
+                }
+            }
+            if !ok {
+                continue;
+            }
+        }
+        let mut p = *bp;
+        // Comma separator between items.
+        if *items != 0 && p < body.len() {
+            body[p] = b',';
+            p += 1;
+        }
+        *items = items.saturating_add(1);
+        // Opening quote.
+        if p < body.len() {
+            body[p] = b'"';
+            p += 1;
+        }
+        // Name bytes (escape `"` and `\`; everything else passes
+        // through — filenames are ASCII-ish in practice).
+        let mut k = 0usize;
+        while k < name.len() && p + 2 < body.len() {
+            let c = name[k];
+            if c == b'"' || c == b'\\' {
+                body[p] = b'\\';
+                p += 1;
+            }
+            body[p] = c;
+            p += 1;
+            k += 1;
+        }
+        // Closing quote.
+        if p < body.len() {
+            body[p] = b'"';
+            p += 1;
+        }
+        *bp = p;
+    }
+    true
+}
+
+/// `Phase::FsList`: walk the directory open on `fs_fd`, one FS_READDIR batch
+/// at a time, into the JSON body in the `send_buf` tail. A pending answer
+/// moved nothing — the provider's cursor is where it was — so the step
+/// yields and the next one re-asks; the walk resumes, it never restarts and
+/// never ends early. READDIR's 0 ends it: the directory is closed and the
+/// head is composed in front of the body.
+unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
+    let dir_fd = cur_fs_fd(s);
+    let base = cur_send_buf_mut_ptr(s);
+    if dir_fd < 0 || base.is_null() {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::CloseConn;
+        }
+        return 0;
+    }
+    // The filter is re-read each step from the matched route, which a
+    // static route never changes mid-request.
+    let mut filter = [0u8; 64];
+    let mut filter_len = 0usize;
+    let ri = cur_matched_route(s);
+    if ri >= 0 {
+        let route = &*s.server.routes.as_ptr().add(ri as usize);
+        filter_len = (route.fs_filter_len as usize).min(filter.len());
+        filter[..filter_len].copy_from_slice(&route.fs_filter[..filter_len]);
+    }
+    // SAFETY: `send_buf` is SEND_BUF_SIZE bytes; the body region is its
+    // last FS_LIST_BODY_MAX, and nothing else writes it while in FsList.
+    let body = &mut *(base.add(FS_LIST_BODY_AT) as *mut [u8; FS_LIST_BODY_MAX]);
+    let (mut bp, mut items) = cur_slot(s)
+        .map(|c| ((c.fs_sent as usize).min(FS_LIST_BODY_MAX), c.fs_total))
+        .unwrap_or((0, 0));
+
+    let sys = &*s.syscalls;
+    let mut readdir_buf = [0u8; 1024];
+    let mut done = false;
+    let mut failed = false;
+    let mut pending = false;
+    for _ in 0..FS_LIST_ROUNDS {
+        let nb = (sys.provider_call)(
+            dir_fd,
+            0x0908, /* FS_READDIR */
+            readdir_buf.as_mut_ptr(),
+            readdir_buf.len(),
+        );
+        if fs_pending(nb) {
+            pending = true;
+            break;
+        }
+        if nb < 0 {
+            failed = true;
+            break;
+        }
+        let nb = (nb as usize).min(readdir_buf.len());
+        if nb == 0
+            || !fs_list_append_batch(
+                body,
+                &mut bp,
+                &mut items,
+                &readdir_buf[..nb],
+                &filter[..filter_len],
+            )
+        {
+            done = true;
+            break;
+        }
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.fs_sent = bp as u32;
+        cur.fs_total = items;
+    }
+
+    if pending {
+        if fs_wait_expired(s) {
+            (sys.provider_call)(dir_fd, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.fs_fd = -1;
+            }
+            build_error(
+                s,
+                b"504 Gateway Timeout",
+                b"Directory listing did not complete\n",
+            );
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::DrainSend;
+            }
+            return 2;
+        }
+        return 0;
+    }
+    if failed {
+        (sys.provider_call)(dir_fd, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.fs_fd = -1;
+        }
+        build_error(s, b"500 Internal Server Error", b"Directory read failed\n");
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::DrainSend;
+        }
+        return 2;
+    }
+    if !done {
+        // Every round moved entries; more may follow. Step again.
+        return 2;
+    }
+
+    (sys.provider_call)(dir_fd, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.fs_fd = -1;
+    }
+    // Closing `]}`.
+    let suffix: &[u8] = b"]}";
+    for &c in suffix {
+        if bp < body.len() {
+            body[bp] = c;
+            bp += 1;
+        }
+    }
+    // The head goes in front; `build_header_with_len` writes only the head,
+    // which fits ahead of the body region, so the body is then moved down to
+    // follow it.
+    build_header_with_len(s, b"200 OK", b"application/json", bp as u32);
+    let header_end = (cur_send_len(s) as usize).min(FS_LIST_BODY_AT);
+    let moved = bp.min(SEND_BUF_SIZE - header_end);
+    core::ptr::copy(base.add(FS_LIST_BODY_AT), base.add(header_end), moved);
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.send_len = (header_end + moved) as u16;
+        cur.send_offset = 0;
+        cur.fs_sent = 0;
+        cur.fs_total = 0;
+        cur.phase = Phase::SendHeaders;
+    }
+    2
+}
+
 /// Stage `HTTP/1.1 100 Continue` in `send_buf` and mark the slot so
 /// `Phase::RecvBody` flushes it before reading a byte of body.
 ///
@@ -168,6 +469,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             | Phase::WsHandshake
             | Phase::WsClose
             | Phase::AwaitFsStat
+            | Phase::FsList
             | Phase::ProxyConnect
             | Phase::ProxyWaitConnect
             | Phase::ProxySendRequest
@@ -620,6 +922,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.keepalive = if keepalive { 1 } else { 0 };
                         cur.header_end_off = head_len as u16;
+                        cur.fs_stat_ticks = 0;
                         cur.phase = Phase::DispatchRoute;
                         let flags = match header_ctx {
                             Some((tid, pid, flags)) => {
@@ -697,6 +1000,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 reqbody::BodyStep::Done => {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.body_pending = 0;
+                        cur.fs_stat_ticks = 0;
                         cur.phase = Phase::DispatchRoute;
                     }
                     return 2;
@@ -1141,6 +1445,11 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         fs_path.as_mut_ptr(),
                         n,
                     );
+                    // Not opened yet (mount not up, entry not cached) is not
+                    // a missing file: re-ask on a later step.
+                    if fs_pending(fd) {
+                        return fs_dispatch_wait(s);
+                    }
                     if fd < 0 {
                         build_error(s, b"404 Not Found", b"Not Found\n");
                         if let Some(cur) = cur_slot_mut(s) {
@@ -1370,6 +1679,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             composed.as_mut_ptr(),
                             total,
                         );
+                        if fs_pending(fd) {
+                            return fs_dispatch_wait(s);
+                        }
                         if fd < 0 {
                             build_error(s, b"404 Not Found", b"Not Found\n");
                             if let Some(cur) = cur_slot_mut(s) {
@@ -1400,14 +1712,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                         return 0;
                     }
-                    // Snapshot path + filter so the FS calls + body
-                    // build don't borrow `s` immutably while we later
-                    // need it mutable to write send_buf.
                     let mut fs_path = [0u8; MAX_FS_PATH];
                     fs_path[..n].copy_from_slice(&route.fs_path[..n]);
-                    let filter_len = route.fs_filter_len as usize;
-                    let mut filter = [0u8; 64];
-                    filter[..filter_len].copy_from_slice(&route.fs_filter[..filter_len]);
 
                     let sys = &*s.syscalls;
                     let dir_fd = (sys.provider_call)(
@@ -1416,6 +1722,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         fs_path.as_mut_ptr(),
                         n,
                     );
+                    if fs_pending(dir_fd) {
+                        return fs_dispatch_wait(s);
+                    }
                     if dir_fd < 0 {
                         build_error(s, b"404 Not Found", b"Directory not found\n");
                         if let Some(cur) = cur_slot_mut(s) {
@@ -1424,159 +1733,28 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         return 0;
                     }
 
-                    // Build JSON body into a local scratch then write
-                    // headers + body into send_buf together (we need
-                    // body_len for Content-Length before writing).
-                    let mut body = [0u8; 2048];
-                    let mut bp = 0usize;
-                    // Opening `{"items":[`.
+                    // The walk runs in `Phase::FsList`, across as many steps
+                    // as the provider needs. The JSON body is built in the
+                    // tail of `send_buf` (headers need its length first), and
+                    // the directory handle rides `fs_fd` so every teardown
+                    // path closes it.
                     let prefix: &[u8] = b"{\"items\":[";
-                    while bp < prefix.len() && bp < body.len() {
-                        body[bp] = prefix[bp];
-                        bp += 1;
-                    }
-                    let mut first = true;
-                    let mut readdir_buf = [0u8; 1024];
-                    loop {
-                        let nb = (sys.provider_call)(
-                            dir_fd,
-                            0x0908, /* FS_READDIR */
-                            readdir_buf.as_mut_ptr(),
-                            readdir_buf.len(),
+                    let body = cur_send_buf_mut_ptr(s);
+                    if !body.is_null() {
+                        core::ptr::copy_nonoverlapping(
+                            prefix.as_ptr(),
+                            body.add(FS_LIST_BODY_AT),
+                            prefix.len(),
                         );
-                        if nb <= 0 {
-                            break;
-                        }
-                        let nb = nb as usize;
-                        if nb < 2 {
-                            break;
-                        }
-                        let count = u16::from_le_bytes([readdir_buf[0], readdir_buf[1]]) as usize;
-                        // Belt-and-braces: some providers may return
-                        // `nb=2 count=0` at end-of-dir; honour either.
-                        if count == 0 {
-                            break;
-                        }
-                        let mut pos = 2usize;
-                        let mut emitted = 0usize;
-                        while emitted < count && pos + 2 <= nb {
-                            let name_len = readdir_buf[pos] as usize;
-                            let entry_type = readdir_buf[pos + 1];
-                            pos += 2;
-                            if pos + name_len > nb {
-                                break;
-                            }
-                            let name = &readdir_buf[pos..pos + name_len];
-                            pos += name_len;
-                            emitted += 1;
-                            // Skip subdirectories.
-                            if entry_type == 1 {
-                                continue;
-                            }
-                            // Extension filter (case-insensitive).
-                            if filter_len > 0 {
-                                let mut ok = false;
-                                let mut fi = 0usize;
-                                while fi < filter_len {
-                                    let start = fi;
-                                    while fi < filter_len && filter[fi] != b',' {
-                                        fi += 1;
-                                    }
-                                    let elen = fi - start;
-                                    if elen > 0 && elen <= name.len() {
-                                        let tail = &name[name.len() - elen..];
-                                        let mut m = true;
-                                        let mut k = 0usize;
-                                        while k < elen {
-                                            let a = tail[k];
-                                            let b = filter[start + k];
-                                            let al = a.to_ascii_lowercase();
-                                            let bl = b.to_ascii_lowercase();
-                                            if al != bl {
-                                                m = false;
-                                                break;
-                                            }
-                                            k += 1;
-                                        }
-                                        if m {
-                                            ok = true;
-                                            break;
-                                        }
-                                    }
-                                    if fi < filter_len && filter[fi] == b',' {
-                                        fi += 1;
-                                    }
-                                }
-                                if !ok {
-                                    continue;
-                                }
-                            }
-                            // Comma separator between items.
-                            if !first && bp < body.len() {
-                                body[bp] = b',';
-                                bp += 1;
-                            }
-                            first = false;
-                            // Opening quote.
-                            if bp < body.len() {
-                                body[bp] = b'"';
-                                bp += 1;
-                            }
-                            // Name bytes (escape `"` and `\`; everything else
-                            // pass-through — filenames are ASCII-ish in practice).
-                            let mut k = 0usize;
-                            while k < name.len() && bp + 2 < body.len() {
-                                let c = name[k];
-                                if c == b'"' || c == b'\\' {
-                                    body[bp] = b'\\';
-                                    bp += 1;
-                                }
-                                body[bp] = c;
-                                bp += 1;
-                                k += 1;
-                            }
-                            // Closing quote.
-                            if bp < body.len() {
-                                body[bp] = b'"';
-                                bp += 1;
-                            }
-                        }
-                    }
-                    (sys.provider_call)(
-                        dir_fd,
-                        0x0903, /* FS_CLOSE */
-                        core::ptr::null_mut(),
-                        0,
-                    );
-                    // Closing `]}`.
-                    let suffix: &[u8] = b"]}";
-                    let mut si = 0usize;
-                    while si < suffix.len() && bp < body.len() {
-                        body[bp] = suffix[si];
-                        bp += 1;
-                        si += 1;
-                    }
-                    let body_len = bp as u32;
-
-                    // Write status line + Content-Length headers, then
-                    // the body bytes, all into send_buf.
-                    build_header_with_len(s, b"200 OK", b"application/json", body_len);
-                    // After build_header_with_len, send_len is the
-                    // header length. Append the body bytes.
-                    let header_end = cur_send_len(s) as usize;
-                    let dst = cur_send_buf_mut_ptr(s);
-                    let body_ptr = body.as_ptr();
-                    let max_total = SEND_BUF_SIZE.min(header_end + bp);
-                    let mut k = 0usize;
-                    while header_end + k < max_total {
-                        *dst.add(header_end + k) = *body_ptr.add(k);
-                        k += 1;
                     }
                     if let Some(cur) = cur_slot_mut(s) {
-                        cur.send_len = (header_end + k) as u16;
-                        cur.send_offset = 0;
-                        cur.phase = Phase::SendHeaders;
+                        cur.fs_fd = dir_fd;
+                        cur.fs_sent = prefix.len() as u32;
+                        cur.fs_total = 0;
+                        cur.fs_stat_ticks = 0;
+                        cur.phase = Phase::FsList;
                     }
+                    return 2;
                 }
                 HANDLER_PROXY => {
                     // Build-time static proxy backend (`proxy_ip/port`).
@@ -1717,6 +1895,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
         }
 
+        Phase::FsList => {
+            return step_fs_list(s);
+        }
+
         Phase::AwaitFsStat => {
             // Poll FS_STAT until the four-state code resolves:
             //   OK     → known length; commit Content-Length.
@@ -1725,12 +1907,11 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             //            sentinel that `step_send_fs_file` reads to
             //            avoid gating on `fs_sent >= fs_total`.
             //   ENODEV → fetch failed; commit 502.
-            //   EAGAIN → headers pending; keep polling up to
-            //            `FS_STAT_PROBE_TIMEOUT_TICKS`, then 504.
+            //   EAGAIN → not decided yet (headers in flight, entry not
+            //            cached); keep polling up to
+            //            `FS_WAIT_TIMEOUT_TICKS`, then 504.
             const E_NODEV: i32 = -19;
             const E_NOSYS: i32 = -38;
-            const E_AGAIN: i32 = -11;
-            const FS_STAT_PROBE_TIMEOUT_TICKS: u16 = 1500; // ~30 s on pi5 4 kHz
             let sys = &*s.syscalls;
             let mut stat = [0u8; 8];
             let st = (sys.provider_call)(
@@ -1830,6 +2011,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         // (wasm browser-fetch returns ENOSYS), degrade
                         // to 200 OK on the full body rather than 5xx —
                         // the client falls back to a non-range fetch.
+                        //
+                        // A pending SEEK moved nothing, so the slot stays
+                        // here and re-asks on a later step (STAT again,
+                        // then the same SEEK) — never a degrade to 200.
                         let mut seek_arg = (start as i32).to_le_bytes();
                         let seek_rc = (sys.provider_call)(
                             cur_fs_fd(s),
@@ -1837,6 +2022,29 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             seek_arg.as_mut_ptr(),
                             seek_arg.len(),
                         );
+                        if fs_pending(seek_rc) {
+                            if fs_wait_expired(s) {
+                                (sys.provider_call)(
+                                    cur_fs_fd(s),
+                                    0x0903, // FS_CLOSE
+                                    core::ptr::null_mut(),
+                                    0,
+                                );
+                                if let Some(cur) = cur_slot_mut(s) {
+                                    cur.fs_fd = -1;
+                                }
+                                build_error(
+                                    s,
+                                    b"504 Gateway Timeout",
+                                    b"Upstream fetch did not respond\n",
+                                );
+                                if let Some(cur) = cur_slot_mut(s) {
+                                    cur.phase = Phase::DrainSend;
+                                }
+                                return 2;
+                            }
+                            return 0;
+                        }
                         if seek_rc < 0 {
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.fs_total = size;
@@ -1892,19 +2100,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 }
                 return 2;
             }
-            if st == E_AGAIN {
-                // The active slot is guaranteed by the AwaitFsStat
-                // entry path (`HANDLER_FS_FILE` sets cur_slot before
-                // transitioning here); the `if let` is just a
-                // panic-free borrow that PIC builds tolerate (no
-                // `core::option::expect_failed` symbol).
-                let timed_out = if let Some(cur) = cur_slot_mut(s) {
-                    cur.fs_stat_ticks = cur.fs_stat_ticks.saturating_add(1);
-                    cur.fs_stat_ticks >= FS_STAT_PROBE_TIMEOUT_TICKS
-                } else {
-                    false
-                };
-                if timed_out {
+            if fs_pending(st) {
+                if fs_wait_expired(s) {
                     (sys.provider_call)(
                         cur_fs_fd(s),
                         0x0903, // FS_CLOSE
