@@ -1,0 +1,21 @@
+# An S3 server: `http` terminating the protocol, `s3_serve` answering it, and
+# objects stored through the node's `storage.object` provider under the mesh
+# capability each access key is bound to. Its params are the graph's
+# (linux.yaml).
+#
+#   fluxor publish                               # in this project
+#   # in the consumer: [dependencies] wave = "…", [uses] bundles = ["wave-s3"]
+#   fluxor update && fluxor sync
+#   FLUXOR_STORE_DIR=… FLUXOR_MESH_ROOTS=<root> \
+#     fluxor run wave-s3 --param credentials=/etc/s3/credentials --param mesh_roots=<root>
+#
+# The store the node provides must hold the same mesh root: `s3_serve` refuses
+# to serve through a store that keeps no authority.
+[workload]
+name = "wave-s3"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"

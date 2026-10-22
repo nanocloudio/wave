@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # THE `wave-s3` SERVICE, END TO END, WITH REAL S3 TRAFFIC.
 #
-#   publish examples/s3_service as a bundle (+ the fluxor-linux runtime)
-#   into an isolated store
-#   → a scratch consumer pins both, syncs, and checks the materialised bundle
-#     carries exactly the pinned .fmod bytes
+#   publish packaging/service/wave-s3 as a bundle (+ the fluxor-linux
+#   runtime) into an isolated store
+#   → a scratch consumer declares wave and fluxor as dependencies and the
+#     bundle under `[uses] bundles`, updates (which pins both), syncs, and
+#     checks the materialised bundle carries exactly the pinned .fmod bytes
 #   → an unknown param, a missing required param and a wrong type each refuse
 #     the run before anything starts
 #   → `fluxor run` serves it over the node's `storage.object` store, holding
@@ -114,20 +115,32 @@ export FLUXOR_INSTALL_ROOT="$FLUXOR_ROOT"
 unset FLUXOR_PROJECT_ROOT
 
 echo "== publish =="
-(cd "$ROOT" && "$FLUXOR" publish bundle examples/s3_service/workload.toml) >"$D/publish.log" 2>&1 \
+(cd "$ROOT" && "$FLUXOR" publish bundle packaging/service/wave-s3/workload.toml) >"$D/publish.log" 2>&1 \
   || { cat "$D/publish.log"; fail "publish bundle"; }
 (cd "$FLUXOR_ROOT" && "$FLUXOR" publish runtime) >>"$D/publish.log" 2>&1 \
   || { cat "$D/publish.log"; fail "publish runtime"; }
 
-echo "== consumer: pin + sync =="
+echo "== consumer: update + sync =="
 C="$D/consumer"
 mkdir -p "$C"
-printf '[project]\nname = "s3-consumer"\nversion = "0.1.0"\n' >"$C/fluxor.toml"
+: >"$C/.fluxor"
+cat >"$C/fluxor.toml" <<'TOML'
+[project]
+name = "s3-consumer"
+version = "0.1.0"
+
+[dependencies]
+fluxor = "0.0.1"
+wave = "0.0.1"
+
+# Run by name from this script, which no graph names: a reference.
+[uses]
+bundles = ["wave-s3"]
+TOML
 (
   cd "$C"
-  "$FLUXOR" store pin wave-s3:latest >/dev/null || fail "store pin bundle"
-  "$FLUXOR" store pin fluxor/run/fluxor-linux-aarch64-unknown-linux-gnu:latest >/dev/null \
-    || fail "store pin runtime"
+  export FLUXOR_PROJECT_ROOT="$C"
+  "$FLUXOR" update >"$D/update.log" 2>&1 || { cat "$D/update.log"; fail "update"; }
   grep -q 'kind = "bundle"' fluxor.lock || fail "fluxor.lock has no bundle pin"
   "$FLUXOR" sync >"$D/sync.log" 2>&1 || { cat "$D/sync.log"; fail "sync"; }
 )

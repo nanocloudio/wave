@@ -1,0 +1,80 @@
+# The `wave-s3` service graph: `http` hands every request to `s3_serve`, which
+# stores through the node's `storage.object` provider.
+target: linux
+tick_us: 100
+
+# The bundle's params: `fluxor run wave-s3 --param <name>=<value>`.
+params:
+  port:
+    type: integer
+    default: 9000
+    min: 1
+    max: 65535
+    description: TCP port the S3 endpoint listens on
+  credentials:
+    type: string
+    required: true
+    example: /etc/wave-s3/credentials
+    description: "Path of the credentials file: access key, secret, scope and capability per line"
+  mesh_roots:
+    type: string
+    required: true
+    example: 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29
+    description: The mesh root (or two, comma-separated) the credentials' capabilities verify against
+  region:
+    type: string
+    default: us-east-1
+    description: Region requests must be signed for
+  max_object_mib:
+    type: integer
+    default: 5120
+    min: 1
+    max: 5242880
+    description: Largest object accepted, MiB
+  part_min_kib:
+    type: integer
+    default: 5120
+    min: 0
+    max: 5242880
+    description: Smallest multipart part but the last, KiB
+
+# `linux_net` and `http` feed each other, and `http` and `s3_serve` feed each
+# other: a request/response pair is a cycle by construction.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: http
+    port: ${param:port}
+    # The kernel owns TCP segmentation.
+    host_tcp: 1
+    # The body ceiling of the S3 route: the largest the route accepts (1 TiB,
+    # in KiB). Bodies stream to `s3_serve` on credit and are never held whole;
+    # the object-size ceiling a request meets is `s3_serve`'s.
+    route_0_max_body_kib: 1073741824
+    routes:
+      # A bare `/` is a prefix for an application route: every bucket and key
+      # reaches `s3_serve` with its full target.
+      - path: "/"
+        app: true
+
+  - name: s3_serve
+    credentials: ${param:credentials}
+    mesh_roots: ${param:mesh_roots}
+    region: ${param:region}
+    max_object_mib: ${param:max_object_mib}
+    part_min_kib: ${param:part_min_kib}
+
+wiring:
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+  # The exchange: `http` asks, `s3_serve` answers.
+  - from: http.request_out
+    to: s3_serve.request_in
+  - from: s3_serve.response_out
+    to: http.response_in
