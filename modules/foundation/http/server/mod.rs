@@ -154,7 +154,7 @@ use routes::{
     match_route, match_route_path, DynRoutes, Route, HANDLER_STATIC, HANDLER_TEMPLATE,
     HANDLER_WEBSOCKET,
 };
-use ws::RETAINED_BUF_CAP;
+pub(crate) use ws::RETAINED_BUF_CAP;
 
 // Per-generation front ends onto this core, one file each.
 server_mod!(
@@ -1067,6 +1067,9 @@ pub(crate) struct ServerState {
     /// 1 when a `route_N_max_body_kib` was past the ceiling; construction
     /// refuses it.
     pub(crate) route_body_refused: u8,
+    /// 1 when an inline `body:` route could not be staged whole in the body
+    /// pool; construction refuses it rather than serve a truncated body.
+    pub(crate) inline_body_refused: u8,
     /// How a request is served when no route params were wired: 1 = the
     /// inline `body` answers `/`, 2 = the file channel answers everything,
     /// 0 = neither, and the route table decides. Settled at boot in
@@ -1998,7 +2001,9 @@ pub(crate) unsafe fn active_slot_count(s: &HttpState) -> usize {
 
 // ── Init / post-params ────────────────────────────────────────────────────
 
-pub(crate) unsafe fn init(s: &mut HttpState) {
+/// `pool_bytes` is the body pool `params::admit_body_pool` sized from the
+/// declared routes.
+pub(crate) unsafe fn init(s: &mut HttpState, pool_bytes: u32) {
     let sys = s.syscalls;
     s.server.var_chan = -1;
     s.server.file_chan = -1;
@@ -2068,23 +2073,10 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
         cur.phase = Phase::Init;
     }
 
-    let pool = heap_alloc(&*sys, DEFAULT_BODY_POOL_SIZE as u32);
+    let pool = heap_alloc(&*sys, pool_bytes);
     if !pool.is_null() {
         s.server.body_pool = pool;
-        s.server.body_pool_cap = DEFAULT_BODY_POOL_SIZE as u32;
-    }
-
-    // Retention buffer: server-wide snapshot of the most recent
-    // burst on `ws_in`. Best-effort — if STATE_ARENA can't satisfy
-    // a 2 MiB request we leave `retained_buf` null and the capture /
-    // replay paths short-circuit (retention silently degrades to off,
-    // producers must re-emit on every connect just like before).
-    let retained = heap_alloc(&*sys, RETAINED_BUF_CAP as u32);
-    if !retained.is_null() {
-        s.server.retained_buf = retained;
-        s.server.retained_cap = RETAINED_BUF_CAP as u32;
-    } else {
-        log(s, b"[http] retention disabled (no heap)");
+        s.server.body_pool_cap = pool_bytes;
     }
 }
 
@@ -2102,6 +2094,21 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     s.server.ws_in_chan = dev_channel_port(sys, 0, 3);
     s.server.out_chan = dev_channel_port(sys, 1, 1);
     s.server.ws_out_chan = dev_channel_port(sys, 1, 2);
+    // Retention buffer: server-wide snapshot of the most recent burst on
+    // `ws_in`, so a connection that joins a fan-out sees the producer's last
+    // state. Allocated only when `ws_in` is wired — nothing else reads it —
+    // and reserved by the type's cap (`arena_construction_reserve`), so an
+    // instance that wires it does not take it from the connection working
+    // set. If the heap still cannot give it, retention is off and says so.
+    if s.server.ws_in_chan >= 0 {
+        let retained = heap_alloc(sys, RETAINED_BUF_CAP as u32);
+        if !retained.is_null() {
+            s.server.retained_buf = retained;
+            s.server.retained_cap = RETAINED_BUF_CAP as u32;
+        } else {
+            log(s, b"[http] retention disabled (no heap)");
+        }
+    }
     //   in[7]  = ws_admit_in       (OctetStream, admission decisions)
     //   out[7] = ws_admit_out      (OctetStream, admission requests)
     //   out[8] = ws_event_out      (OctetStream, committed lifecycle facts)

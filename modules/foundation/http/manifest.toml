@@ -58,6 +58,11 @@ name = "web"
 features = ["h1", "ws"]
 omit_ports = ["request_out", "response_in", "request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
+# Heap rule for a variant without `h2` or `app`: no per-connection h2 state and
+# no application buffer budget, so its default cap is smaller. See
+# `[capacities] heap_from_params` below.
+[variant.capacities.heap_from_params]
+base = { default = 5782528, aarch64 = 5782528, thumbv8m = 2156752, thumbv6m = 2113588 }
 
 # h1 + the HANDLER_APP request/response fan-out, nothing else — the ingress
 # for graphs whose application IS downstream modules (chronicle's reverser
@@ -68,6 +73,9 @@ name = "app"
 features = ["h1", "app"]
 omit_ports = ["request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
+# Heap rule for `app` without `h2`: the application buffer budget, no h2 state.
+[variant.capacities.heap_from_params]
+base = { default = 22559744, aarch64 = 22559744, thumbv8m = 2181320, thumbv6m = 2138156 }
 
 # h1 + h2 + ws — everything but HTTP/3.
 #
@@ -95,6 +103,11 @@ omit_capabilities = ["stream.ordered_ack.exchange"]
 name = "h1_exchange"
 features = ["h1", "exchange"]
 omit_ports = ["request_out", "response_in", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
+# Heap rule for `h1_exchange`, which has neither `h2` nor `app`: no per-connection h2 state and
+# no application buffer budget, so its default cap is smaller. See
+# `[capacities] heap_from_params` below.
+[variant.capacities.heap_from_params]
+base = { default = 5782528, aarch64 = 5782528, thumbv8m = 2156752, thumbv6m = 2113588 }
 
 # Every protocol generation, the server's application fan-out, and the client
 # as an exchange provider over HTTP/1.1, h2c or HTTP/3.
@@ -108,6 +121,35 @@ features = ["h1", "h2", "ws", "h3", "app", "session"]
 omit_ports = ["request_in", "response_out"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 default = true
+
+# The heap cap follows the inline `body:` routes a graph declares.
+#
+# The body pool holds every inline body plus the file-cache region, and module
+# construction refuses (-27) a route set the instance's heap cap cannot hold.
+# The composer therefore sizes the cap from the params: it totals the bytes
+# under the body tags, `body` (2) and `route_N_body` (11 + 10·N), and when they
+# pass `included` it emits `base + (total - included)` as the instance's
+# `heap.arena_bytes`. A graph that sets `heap.arena_bytes` itself keeps its
+# figure, with a warning when it is below what the bodies need.
+#
+#   base     = `module_arena_size()`, the type's default cap:
+#              BODY_BUDGET_DEFAULT + arena_non_body_reserve(). It depends on the
+#              board profile (per ABI) and on whether `h2` and `app` are
+#              compiled in (per variant). This row is `full`, `h2` and
+#              `exchange`; `web`, `app` and `h1_exchange` set their own above.
+#   included = DEFAULT_BODY_POOL_SIZE, the inline bytes the default cap holds
+#              besides the file-cache region (`inline_body_limit` of `base`).
+#
+# Bodies within `included` emit no tag, and the module keeps its own default.
+# Past it, the cap grows by exactly the excess, which is the figure the -27
+# refusal names. Each `base` is `arena_size` for that variant's features on
+# that ABI, which the module declares (`declare_module_arena_bytes!`): `pack`
+# refuses a build whose `base` here differs from the arena it declares, so every
+# variant x ABI row is checked whenever it is built, and
+# `tests/harness/tests/manifest_contract.rs` checks the aarch64 rows against
+# `arena_size` on the host. A refusal names the figure to write.
+[capacities]
+heap_from_params = { tags = [2, 11, 21, 31, 41, 51, 61, 71, 81], base = { default = 23063552, aarch64 = 23063552, thumbv8m = 2186120, thumbv6m = 2139356 }, included = { default = 262144, aarch64 = 262144, thumbv8m = 16384, thumbv6m = 4096 } }
 
 [[ports]]
 name = "net_in"

@@ -35,9 +35,9 @@ use super::body::{
     step_send_static, step_send_template, step_unrouted_file_dispatch,
 };
 use super::cache::{
-    cache_alloc, cache_evict_all, cache_fetch_step, cache_lookup, cache_release_for_route,
-    cache_retain_for_route, cache_try_or_fetch, drain_variables, CacheLookup, CacheStepResult,
-    CACHE_COMPLETE,
+    cache_alloc, cache_evict_all, cache_fetch_step, cache_lookup, cache_refuse_oversize,
+    cache_release_for_route, cache_retain_for_route, cache_try_or_fetch, drain_variables,
+    CacheLookup, CacheStepResult, CACHE_COMPLETE,
 };
 use super::listeners::{fill_bind_payload, is_listen_port};
 use super::proxy::{
@@ -2345,7 +2345,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let cur_len = ce.length as usize;
             let pool_cap = s.server.body_pool_cap as usize;
 
-            let space = pool_cap - (arena_off + cur_len);
+            let space = pool_cap.saturating_sub(arena_off + cur_len);
             if space > 0 && !s.server.body_pool.is_null() {
                 let dst = s.server.body_pool.add(arena_off + cur_len);
                 let to_read = space.min(SEND_BUF_SIZE);
@@ -2357,9 +2357,28 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
 
             let poll = ((*s.syscalls).channel_poll)(s.server.file_chan, POLL_IN | POLL_HUP);
             let eof = poll > 0 && (poll as u32 & POLL_HUP) != 0 && (poll as u32 & POLL_IN) == 0;
+            let more = poll > 0 && (poll as u32 & POLL_IN) != 0;
             let full = (arena_off + ce.length as usize) >= pool_cap;
 
-            if eof || full {
+            if full && !eof {
+                if more {
+                    // The file is larger than the cache region: refused,
+                    // never served cut short as if it were whole.
+                    cache_refuse_oversize(s);
+                    build_error(
+                        s,
+                        b"500 Internal Server Error",
+                        b"Source larger than the cache region\n",
+                    );
+                    if let Some(cur) = cur_slot_mut(s) {
+                        cur.phase = Phase::DrainSend;
+                    }
+                    return 0;
+                }
+                // Exactly full; wait for the source to end (or say more).
+                return 2;
+            }
+            if eof {
                 ce.flags |= CACHE_COMPLETE;
                 // Retain the entry on behalf of the imminent reader
                 // (this slot, transitioning to SendHeaders →

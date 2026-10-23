@@ -266,6 +266,34 @@ pub(crate) unsafe fn cache_alloc(s: &mut HttpState, route_idx: u8) -> i32 {
     idx as i32
 }
 
+/// A `source:` file larger than the cache region: log it and drop the
+/// partial fill so nothing ever serves the prefix as the whole file.
+///
+/// The fill is refused rather than truncated or streamed past the region:
+/// a cached route's response is rendered from the pool with its length known
+/// up front, and a prefix served as the body is a corrupt document that reads
+/// as a working route. The remedy the log names is an uncached file route,
+/// which streams from the source without holding the file.
+///
+/// # Safety
+/// `s.syscalls` is bound.
+pub(crate) unsafe fn cache_refuse_oversize(s: &mut HttpState) {
+    let ce = &mut *s.server.cache_entries.as_mut_ptr();
+    let route = ce.route_index;
+    let region = (s.server.body_pool_cap).saturating_sub(ce.arena_offset);
+    ce.flags = 0;
+    ce.length = 0;
+    ce.retain = 0;
+    s.server.cache_count = 0;
+    let mut m = super::params::LogLine::new();
+    m.push(b"[http] refused: route ");
+    m.num(route as u64);
+    m.push(b" source is larger than the ");
+    m.num(region as u64);
+    m.push(b" B cache region; serve it from an uncached file route");
+    m.emit(s);
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum CacheLookup {
     /// Cache hit; `route.body_offset` / `route.body_len` now point at
@@ -393,7 +421,18 @@ pub(crate) unsafe fn cache_fetch_step(s: &mut HttpState) -> CacheStepResult {
 
     let new_len = ce.length as usize;
     let full = (arena_off + new_len) >= pool_cap;
-    if eof || full {
+    if full && !eof {
+        if in_after {
+            // Bytes remain past the region: the file is bigger than the
+            // cache can hold. Refused, never published as complete.
+            cache_refuse_oversize(s);
+            return CacheStepResult::Error;
+        }
+        // Exactly full so far; the source has not yet said whether it
+        // ended here. Wait for HUP (complete) or more bytes (refused).
+        return CacheStepResult::Pending;
+    }
+    if eof {
         ce.flags |= CACHE_COMPLETE;
         // Retain on behalf of the imminent reader (the stream that
         // requested this fetch). Without this, a sibling cache

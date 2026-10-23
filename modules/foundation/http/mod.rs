@@ -624,13 +624,36 @@ pub extern "C" fn module_state_size() -> u32 {
 /// request bytes an h2 or h3 stream has received inside its flow-control
 /// window and not yet forwarded. Bodies are streamed, never held whole, so
 /// this bounds a working set rather than a body size. Past it, the exchange
-/// that cannot be given room is refused rather than any other slowed.
+/// that cannot be given room is refused rather than any other slowed. What an
+/// `app` build reserves; [`arena_size`] counts it only when `app` is on.
 #[cfg(all(feature = "app", target_arch = "aarch64"))]
 const APP_BUFFER_BUDGET: u32 = 16 << 20;
 #[cfg(all(feature = "app", not(target_arch = "aarch64")))]
 const APP_BUFFER_BUDGET: u32 = server::app::QUEUE_LIMIT;
 #[cfg(not(feature = "app"))]
 const APP_BUFFER_BUDGET: u32 = 0;
+
+/// One connection's h2 state, as an `h2` build allocates it on the h2c
+/// preface; [`arena_size`] counts it only when `h2` is on.
+#[cfg(feature = "h2")]
+const H2_STATE_SIZE: u32 = core::mem::size_of::<server::h2::H2State>() as u32;
+#[cfg(not(feature = "h2"))]
+const H2_STATE_SIZE: u32 = 0;
+
+/// The compiled features that move the heap arena: `h2` (per-connection h2
+/// state) and `app` (the application buffer budget). The variant's feature
+/// set, as [`arena_size`] takes it.
+#[derive(Clone, Copy)]
+pub struct ArenaFeatures {
+    pub h2: bool,
+    pub app: bool,
+}
+
+/// This build's [`ArenaFeatures`].
+pub const COMPILED_FEATURES: ArenaFeatures = ArenaFeatures {
+    h2: cfg!(feature = "h2"),
+    app: cfg!(feature = "app"),
+};
 
 /// Heap arena size — sized for the **working set**, not the slot
 /// table ceiling. The slot table (`MAX_CONCURRENT_CONNS`) is the
@@ -644,40 +667,87 @@ const APP_BUFFER_BUDGET: u32 = 0;
 /// Decoupling these means a 1024-slot table on aarch64 doesn't
 /// require 16+ MiB of pre-reserved arena that's idle 99% of the
 /// time. The arena holds:
-///   - the server's body pool (initial `DEFAULT_BODY_POOL_SIZE`,
-///     grown via `heap_realloc` doubling — accounted for by
-///     doubling the body budget here),
+///   - the WebSocket retention buffer, when `ws_in` is wired,
+///   - the server's body pool: [`BODY_BUDGET_DEFAULT`], which holds the
+///     inline `body:` routes plus the file-cache region
+///     (`server::params::admit_body_pool` sizes the pool from the routes a
+///     config declares and refuses one that does not fit),
 ///   - per-active-conn `recv_buf` + `send_buf` allocated on accept,
 ///   - per-active-conn `H2State` (~3 KB) allocated lazily on the
 ///     h2c preface,
 ///   - allocator overhead.
+///
+/// The type's default cap for a build of feature set `f` on this profile.
+/// The module declares it for the build it is (`COMPILED_FEATURES`), and the
+/// manifest's `[capacities] heap_from_params.base` must equal it for every
+/// variant and ABI: `pack` refuses a mismatch, and the host contract test
+/// evaluates it for each variant's features. A graph that inlines more than
+/// it leaves room for gets a larger cap from the composer, or sets
+/// `heap.arena_bytes`; the refusal names the figure.
+pub const fn arena_size(f: ArenaFeatures) -> u32 {
+    BODY_BUDGET_DEFAULT.saturating_add(arena_non_body_reserve_for(f))
+}
+
+declare_module_arena_bytes!(arena_size(COMPILED_FEATURES));
+
+/// [`arena_size`] for this build. Kept as the export the loader falls back
+/// to; `pack` reads the declared figure.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_arena_size"]
 pub extern "C" fn module_arena_size() -> u32 {
-    // Reserve room for the body pool plus headroom for `heap_realloc`
-    // doubling under big inline-template configurations.
-    let body_budget = (server::DEFAULT_BODY_POOL_SIZE as u32).saturating_mul(2);
+    arena_size(COMPILED_FEATURES)
+}
+
+/// The body-pool share of the default heap cap: the file-cache region plus
+/// as much again of inline `body:` routes.
+pub(crate) const BODY_BUDGET_DEFAULT: u32 = (server::DEFAULT_BODY_POOL_SIZE as u32) * 2;
+
+/// Everything the heap cap holds besides the body pool: what construction
+/// allocates ([`arena_construction_reserve`]) and what serving allocates
+/// ([`arena_runtime_reserve`]). Whatever an instance's cap leaves after this
+/// is its body budget.
+pub(crate) const fn arena_non_body_reserve() -> u32 {
+    arena_non_body_reserve_for(COMPILED_FEATURES)
+}
+
+const fn arena_non_body_reserve_for(f: ArenaFeatures) -> u32 {
+    arena_construction_reserve().saturating_add(arena_runtime_reserve(f))
+}
+
+/// What `module_new` allocates besides the body pool: the WebSocket
+/// retention buffer (allocated only when `ws_in` is wired, but reserved by the
+/// type's cap so an instance that wires it never takes it from the
+/// connection working set), plus slack for headers and the pool's own block.
+pub(crate) const fn arena_construction_reserve() -> u32 {
+    (server::RETAINED_BUF_CAP as u32).saturating_add(2048)
+}
+
+/// What serving allocates: the connection working set, h2 state, the
+/// application buffer budget and allocator overhead.
+const fn arena_runtime_reserve(f: ArenaFeatures) -> u32 {
     let per_slot_buffers = (server::RECV_BUF_SIZE + server::SEND_BUF_SIZE) as u32;
     let working_set = server::ARENA_WORKING_SET_CONNS as u32;
     let conns_buffers = per_slot_buffers.saturating_mul(working_set);
     // h2's per-connection state joins the arena budget only when the
     // feature is compiled in — the web variant's request shrinks by
     // ~3 KB × working set.
-    #[cfg(feature = "h2")]
-    let h2_state_size = core::mem::size_of::<server::h2::H2State>() as u32;
-    #[cfg(not(feature = "h2"))]
-    let h2_state_size = 0u32;
+    let h2_state_size = if f.h2 { H2_STATE_SIZE } else { 0 };
     let h2_buffers = h2_state_size.saturating_mul(working_set);
     // 16 bytes of allocator overhead per heap_alloc call (8-byte
     // header + alignment padding). Up to 3 allocs per active conn
     // (recv_buf, send_buf, h2).
     let alloc_overhead = (16u32 * 3).saturating_mul(working_set);
-    body_budget
-        .saturating_add(APP_BUFFER_BUDGET)
+    let app_budget = if f.app { APP_BUFFER_BUDGET } else { 0 };
+    app_budget
         .saturating_add(conns_buffers)
         .saturating_add(h2_buffers)
         .saturating_add(alloc_overhead)
-        .saturating_add(2048) // slack for body_pool resize + headers
+}
+
+#[cfg(feature = "host-test")]
+/// [`arena_construction_reserve`], for tests that hold construction to it.
+pub fn test_arena_construction_reserve() -> u32 {
+    arena_construction_reserve()
 }
 
 /// PIC module ABI entry: one-time initialisation. No state to bind yet.
@@ -733,13 +803,32 @@ pub unsafe extern "C" fn module_new(
             s.h3_client = client::h3::H3Client::new();
         }
 
-        // Pre-init both modes so the body pool is ready before TLV
-        // params (which may call parse_route_body) are dispatched.
-        server::init(s);
-        client::init(s);
-
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
+
+        // The body pool is sized from the inline `body:` routes the params
+        // declare, before any is staged, and a config whose routes the
+        // instance's heap cannot hold is refused here — loudly, never
+        // truncated.
+        let declared = if is_tlv {
+            server::params::scan_declared_bodies(params, params_len)
+        } else {
+            server::params::DeclaredBodies::NONE
+        };
+        let pool_bytes = match server::params::admit_body_pool(s, &declared) {
+            Ok(n) => n,
+            Err(rc) => return rc,
+        };
+
+        // Pre-init both modes so the body pool is ready before TLV
+        // params (which may call parse_route_body) are dispatched.
+        server::init(s, pool_bytes);
+        client::init(s);
+        if declared.total > 0 && s.server.body_pool.is_null() {
+            server::params::refuse_unallocated_pool(s, pool_bytes);
+            return -12;
+        }
+
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -753,6 +842,10 @@ pub unsafe extern "C" fn module_new(
             }
         } else {
             server::post_params(s);
+            if s.server.inline_body_refused != 0 {
+                // `parse_route_body` could not stage a body; it logged which.
+                return -12;
+            }
             if s.server.route_body_refused != 0 {
                 let m = b"[http] a route_N_max_body_kib is past the 1 TiB ceiling";
                 dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
