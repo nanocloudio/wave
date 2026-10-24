@@ -41,8 +41,6 @@ pub(crate) const NET_MSG_BIND_REFUSED: u8 = 0x07;
 /// Additional listeners beyond the static `port`, bound from the
 /// pre-leased pool. Small: listener churn is operator-rate.
 pub(crate) const MAX_DYN_LISTENERS: usize = 8;
-/// Input port index carrying the self-edged listener change sink (in[5]).
-pub(crate) const DYN_LISTENERS_PORT_INDEX: u8 = 5;
 
 // Reconciler bind states for one pooled listener.
 /// Desired, CMD_BIND not yet issued.
@@ -270,8 +268,8 @@ impl DynListeners {
 #[cfg(feature = "host-test")]
 /// Enable the dynamic-listener subsystem on a booted module (as if
 /// `listeners_prefix` were configured), so `pump_listeners` reconciles
-/// injected desired rows. `sink` is left resolved so the table_consumer
-/// never touches the store in a harness.
+/// injected desired rows. The consumer is marked subscribed and idle, and
+/// the store event resolved, so it never touches the store in a harness.
 ///
 /// # Safety
 /// See [`test_inject_dyn_route`].
@@ -279,8 +277,8 @@ pub unsafe fn test_enable_listeners(state: *mut u8) {
     let s = &mut *(state as *mut HttpState);
     s.server.listeners_prefix[0] = b'/';
     s.server.listeners_prefix_len = 1;
-    s.server.listeners_sink = i32::MAX; // non-negative: skip re-resolve
-    s.server.ltc.subscribed = 1; // skip SUBSCRIBE/relist in the harness
+    s.server.store_event = i32::MAX; // non-negative: skip CREATE
+    s.server.ltc.sub = super::table_consumer::SUB_OPEN; // skip SUBSCRIBE/relist
 }
 
 #[cfg(feature = "host-test")]
@@ -355,22 +353,19 @@ pub(crate) unsafe fn pump_listeners(s: &mut HttpState) {
     if prefix_len == 0 {
         return;
     }
-    let sys = &*s.syscalls;
-    if s.server.listeners_sink < 0 {
-        s.server.listeners_sink = dev_channel_port(sys, 0, DYN_LISTENERS_PORT_INDEX);
-        if s.server.listeners_sink < 0 {
-            return; // port unwired — nothing to subscribe against
-        }
+    if s.server.store_event >= 0 {
+        let sys = &*s.syscalls;
+        let ev = s.server.store_event;
+        // Disjoint field borrows of `s.server`. The listener CHANGES pages
+        // reuse `routes_scratch` — the pumps run in turn and each applies a
+        // page before the next is read, so the transient buffer is free to
+        // share.
+        let prefix = &s.server.listeners_prefix[..prefix_len];
+        let scratch = &mut s.server.routes_scratch;
+        let ltc = &mut s.server.ltc;
+        let listeners = &mut s.server.listeners;
+        ltc.advance(sys, ev, prefix, scratch, listeners);
     }
-    let sink = s.server.listeners_sink;
-    // Disjoint field borrows of `s.server`. The listener CHANGES relist
-    // reuses `routes_scratch` — the two pumps run sequentially, never
-    // mid-relist of the other, so the transient buffer is free to share.
-    let prefix = &s.server.listeners_prefix[..prefix_len];
-    let scratch = &mut s.server.routes_scratch;
-    let ltc = &mut s.server.ltc;
-    let listeners = &mut s.server.listeners;
-    ltc.step(sys, sink, prefix, scratch, listeners);
 
     // Reconcile only after the static bind: the mid-life CMD_BIND rides
     // the same net_out, and its reply comes back through the demux.

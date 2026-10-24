@@ -93,10 +93,6 @@ pub(crate) const CTRL_OUT_PORT: [u8; SC_WORKERS] = [3, 10];
 /// The standby data pair.
 pub(crate) const WS2_IN_PORT: u8 = 12;
 pub(crate) const WS2_OUT_PORT: u8 = 11;
-/// The input half of the swap-trigger self-edge. The graph wires
-/// `sessions_sink` (out[12]) to it; this module only ever names the input,
-/// because what it hands the store is the channel the store must write to.
-pub(crate) const SESSIONS_IN_PORT: u8 = 13;
 
 /// `sc_worker` when a slot carries no session.
 pub(crate) const NO_WORKER: u8 = 0xFF;
@@ -248,7 +244,6 @@ pub(crate) struct SessionAnchor {
     pub(crate) sessions_prefix: [u8; MAX_DYN_PREFIX],
     pub(crate) sessions_prefix_len: u16,
     _pad1: [u8; 2],
-    pub(crate) sessions_sink: i32,
     pub(crate) stc: TableConsumer,
     pub(crate) desired: DesiredWorker,
 
@@ -282,7 +277,6 @@ impl SessionAnchor {
         self.swaps_refused = 0;
         self.envelopes_misowned = 0;
         self.sessions_prefix_len = 0;
-        self.sessions_sink = -1;
         self.desired = DesiredWorker::new();
     }
 
@@ -702,19 +696,16 @@ unsafe fn pump_trigger_table(s: &mut HttpState) {
     if prefix_len == 0 {
         return;
     }
-    let sys = &*s.syscalls;
-    if s.server.sc.sessions_sink < 0 {
-        s.server.sc.sessions_sink = dev_channel_port(sys, 0, SESSIONS_IN_PORT);
-        if s.server.sc.sessions_sink < 0 {
-            return;
-        }
+    if s.server.store_event < 0 {
+        return;
     }
-    let sink = s.server.sc.sessions_sink;
+    let sys = &*s.syscalls;
+    let ev = s.server.store_event;
     {
         let a = &mut s.server.sc;
         let prefix = &a.sessions_prefix[..prefix_len];
         let scratch = &mut s.server.routes_scratch;
-        a.stc.step(sys, sink, prefix, scratch, &mut a.desired);
+        a.stc.advance(sys, ev, prefix, scratch, &mut a.desired);
     }
     let a = &mut s.server.sc;
     if a.desired.seen != 0 && a.desired.live != a.active_w && a.swap_active == 0 {

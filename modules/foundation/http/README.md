@@ -55,8 +55,6 @@ shared request path — so it is worth doing against a specific flash target the
 | `file_data` | 2 | input | `OctetStream` | Body bytes for file-backed routes |
 | `file_ctrl` | 1 | output | `OctetStream` | File request control |
 | `ws_out` / `ws_in` | 2 / 3 | out / in | `WsFrame` | WebSocket fan-out (handler 5) |
-| `routes_sink` / `routes_changes` | 4 | out / in | `OctetStream` | Compiled-route subscription self-edge |
-| `listeners_sink` / `listeners_changes` | 5 | out / in | `OctetStream` | Dynamic-listener subscription self-edge |
 | `request_out` / `response_in` | 6 | out / in | `ExchangeRequest` / `ExchangeResponse` | Application fan-out (handler 11): the server as exchange requester |
 | `ws_admit_out` / `ws_admit_in` | 7 | out / in | `OctetStream` | WebSocket admission request and decision |
 | `ws_event_out` | 8 | output | `OctetStream` | Committed WebSocket lifecycle facts |
@@ -65,7 +63,9 @@ shared request path — so it is worth doing against a specific flash target the
 | `peer_identity` | 9 | input | `OctetStream` | Verified peer from a mutual-TLS handshake |
 
 Indices are per direction, so an input and an output may share a number
-without sharing an edge. Every port past the first is optional: a graph wires
+without sharing an edge. Indices 4 and 5 are unused: the store tables (routes,
+listeners, the session trigger) need no port, because the store signals the
+module's own kernel event and the module reads what changed. Every port past the first is optional: a graph wires
 what its deployment uses, and an unwired port is silent rather than an error.
 
 ## Parameters

@@ -50,7 +50,6 @@ omitted with it. Every port is inert until wired: an instance with
 | `ctrl_out` / `ctrl_in` | out[3] / in[10] | `OctetStream` | SessionCtrlV1 to and from worker 0. |
 | `ws2_out` / `ws2_in` | out[11] / in[12] | `WsFrame` | The standby worker's data plane. |
 | `ctrl2_out` / `ctrl2_in` | out[10] / in[11] | `OctetStream` | SessionCtrlV1 to and from the standby. |
-| `sessions_sink` / `sessions_changes` | out[12] / in[13] | `OctetStream` | The operator's swap trigger: a store subscription self-edge. |
 
 The `WsFrame` edges are mailbox channels (`buffer_group` in the
 graph), one envelope per record, as every `WsFrame` edge must be. The
@@ -65,7 +64,9 @@ window and the deadline every `DRAIN` carries; default 500),
 `handoff_after_frames` (swap the workers every N forwarded envelopes;
 the gates' trigger, 0 = never), `sessions_prefix` (the store prefix
 whose `active = <0|1>` row names the worker new sessions attach to; a
-change away from the current one requests a swap).
+change away from the current one requests a swap). The trigger is a store
+subscription, not a port: the store signals the module's own kernel event
+and the module reads the row.
 
 ## The session's life
 

@@ -24,6 +24,7 @@ bookkeeping.
 | Ceiling | Value | What one past it meets |
 |---|---|---|
 | `MAX_STREAMS` | 4 | `REFUSED_STREAM`, counted as `h2_streams_refused` |
+| `STREAM_RECV_WINDOW` (`h2.rs`) | `RECV_BUF_SIZE` less a frame header | the per-stream window advertised as `SETTINGS_INITIAL_WINDOW_SIZE`: a peer may not send DATA past it (RFC 9113 §6.9.1), so no DATA frame outgrows the connection's receive buffer; it is refilled from half |
 
 Four concurrent streams per connection, the same on every target. A browser
 opening a fifth is told to retry it rather than queued, because a queue here
@@ -70,6 +71,7 @@ change to the buffer cannot silently outgrow the header allowance.
 | `MAX_TARGET` (`app.rs`) | 2048 | `414` |
 | `MAX_H3_FIELDS` | `MAX_FWD_HEADERS`, 0 without applications | `431` on HTTP/3 |
 | `MAX_EXCHANGES` (`app.rs`) | one per connection, h2 stream and h3 stream | `503`, the request is not opened |
+| `RESP_WINDOW` (`app.rs`) | four records on hosts, one on embedded | the response-body credit an application exchange starts with: an application waits for credit past it, never queues more |
 | `QUEUE_LIMIT` | `RESP_WINDOW` plus two records | `ABORT(CREDIT_OVERRUN)`, counted as `app_violations` |
 
 An application exchange travels in records of `APP_RECORD_MAX` bytes — one
@@ -135,6 +137,7 @@ canonical request, which is built in fixed scratch: 64 query parameters and
 | `ETAG_MAX` | 32 | `InternalError`; a listed part's longer tag is `InvalidPart` |
 | `UPLOAD_TTL_S` | 24 h | the upload's staging is reclaimed |
 | `LIST_RENDER_CAP` | `(LIST_PAGE_BUF - LIST_DOC_RESERVE) / LIST_EXPANSION` | a listing page is asked for no more entries |
+| `BODY_WINDOW` | 64 KiB | the request-body credit `s3_serve` holds out to `http` for one upload: the client is paced to it, nothing past it is in flight |
 | `STASH_CAP` | `BODY_WINDOW` (one credit window) | body bytes the object provider refused wait here; no further credit is granted while it holds any |
 | `MAX_CREDENTIALS` | 16 | the module serves nothing; every request `503` |
 | `CREDS_FILE_MAX` | 16 KiB | the module serves nothing |
@@ -199,6 +202,7 @@ Ceilings this register does not yet cover, and where they are enforced today:
 
 ```limit-register
 MAX_STREAMS | modules/foundation/http/server/h2.rs | 4
+STREAM_RECV_WINDOW | modules/foundation/http/server/h2.rs | (RECV_BUF_SIZE - h2w::FRAME_HEADER_LEN) as i32
 MAX_H3_SESSIONS | modules/foundation/http/server/h3.rs | 8
 MAX_H3_SESSIONS | modules/foundation/http/server/h3.rs | 2
 MAX_H3_STREAMS | modules/foundation/http/server/h3.rs | 16
@@ -209,6 +213,8 @@ TUNNEL_FRAME_MAX | modules/foundation/http/server/h3.rs | H3_SEND_BUF - 24
 MAX_FWD_HEADERS | modules/foundation/http/server/app.rs | 4096
 MAX_TARGET | modules/foundation/http/server/app.rs | 2048
 MAX_EXCHANGES | modules/foundation/http/server/app.rs | MAX_CONCURRENT_CONNS + H2_EXCHANGES + H3_EXCHANGES
+RESP_WINDOW | modules/foundation/http/server/app.rs | 4 * BODY_MAX as u32
+RESP_WINDOW | modules/foundation/http/server/app.rs | BODY_MAX as u32
 QUEUE_LIMIT | modules/foundation/http/server/app.rs | RESP_WINDOW + 2 * (RECORD_MAX as u32 + 4)
 MAX_H3_FIELDS | modules/foundation/http/server/h3.rs | super::app::MAX_FWD_HEADERS
 MAX_H3_FIELDS | modules/foundation/http/server/h3.rs | 0
@@ -237,6 +243,7 @@ MAX_COMPLETIONS | modules/foundation/s3_serve/mod.rs | 4
 ETAG_MAX | modules/foundation/s3_serve/mod.rs | 32
 UPLOAD_TTL_S | modules/foundation/s3_serve/mod.rs | 24 * 3600
 LIST_RENDER_CAP | modules/foundation/s3_serve/mod.rs | (LIST_PAGE_BUF - LIST_DOC_RESERVE) / LIST_EXPANSION
+BODY_WINDOW | modules/foundation/s3_serve/mod.rs | 64 * 1024
 STASH_CAP | modules/foundation/s3_serve/mod.rs | BODY_WINDOW as usize
 MAX_CREDENTIALS | modules/foundation/s3_serve/mod.rs | 16
 CREDS_FILE_MAX | modules/foundation/s3_serve/mod.rs | 16 * 1024

@@ -56,7 +56,7 @@ capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 [[variant]]
 name = "web"
 features = ["h1", "ws"]
-omit_ports = ["request_out", "response_in", "request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
+omit_ports = ["request_out", "response_in", "request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 # Heap rule for a variant without `h2` or `app`: no per-connection h2 state and
 # no application buffer budget, so its default cap is smaller. See
@@ -71,7 +71,7 @@ base = { default = 5782528, aarch64 = 5782528, thumbv8m = 2156752, thumbv6m = 21
 [[variant]]
 name = "app"
 features = ["h1", "app"]
-omit_ports = ["request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
+omit_ports = ["request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 # Heap rule for `app` without `h2`: the application buffer budget, no h2 state.
 [variant.capacities.heap_from_params]
@@ -102,7 +102,7 @@ omit_capabilities = ["stream.ordered_ack.exchange"]
 [[variant]]
 name = "h1_exchange"
 features = ["h1", "exchange"]
-omit_ports = ["request_out", "response_in", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in", "sessions_changes", "sessions_sink"]
+omit_ports = ["request_out", "response_in", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in"]
 # Heap rule for `h1_exchange`, which has neither `h2` nor `app`: no per-connection h2 state and
 # no application buffer budget, so its default cap is smaller. See
 # `[capacities] heap_from_params` below.
@@ -219,44 +219,10 @@ content_type = "WsFrame"
 buffer_size = { default = 65600, aarch64 = 131072 }
 max_record  = 8192
 
-# Compiled-route subscription sink. The graph self-wires
-# `routes_sink` (out[4]) -> `routes_changes` (in[4]) so the store's
-# namespace.change SUBSCRIBE for the `/dataplane/edge/` prefix has a
-# module-owned sink.
-[[ports]]
-name = "routes_changes"
-index = 4
-direction = "input"
-content_type = "OctetStream"
-buffer_size = 4096
-
-[[ports]]
-name = "routes_sink"
-index = 4
-direction = "output"
-content_type = "OctetStream"
-buffer_size = 4096
-
-# Dynamic-listener subscription self-edge.
-# A SECOND table_consumer: the graph self-wires `listeners_sink` (out[5])
-# -> `listeners_changes` (in[5]) so the store's namespace.change SUBSCRIBE
-# for `listeners_prefix` (e.g. /dataplane/edge-listeners/) has a
-# module-owned sink. Each added `<port> = proto=tcp;tls=<0|1>` row drives a
-# mid-life CMD_BIND of the pooled port; a removed row tears the listener
-# down. Both ports are inert unless `listeners_prefix` is configured.
-[[ports]]
-name = "listeners_changes"
-index = 5
-direction = "input"
-content_type = "OctetStream"
-buffer_size = 4096
-
-[[ports]]
-name = "listeners_sink"
-index = 5
-direction = "output"
-content_type = "OctetStream"
-buffer_size = 4096
+# Indices in[4]/out[4] and in[5]/out[5] are unused: they carried the route
+# and listener subscription self-edges, gone now that the store signals the
+# module's own kernel event (see the `event` resource below). They stay
+# unused rather than renumbered, so no other wiring moves.
 
 # HTTP application fan-out — populated only when a route uses HANDLER_APP
 # (handler value 11). The symmetric counterpart to ws_out/ws_in: there, this
@@ -304,6 +270,14 @@ access = "read"
 [[resources]]
 requires_contract = "storage.namespace"
 access = "read"
+
+# The one kernel event the table consumers (routes, listeners, session
+# trigger) name in their subscriptions: the store signals it when a watched
+# prefix changes, and writes no channel of this module's. Created on the
+# first step that has a table configured.
+[[resources]]
+requires_contract = "event"
+access = "write"
 
 # HANDLER_FS_FILE routes serve files by path through the FS_CONTRACT
 # (`fat32` on bare-metal, `linux_fs_dispatch` on the host). Granting
@@ -633,23 +607,9 @@ content_type = "WsFrame"
 buffer_size = { default = 65600, aarch64 = 131072 }
 max_record  = 8192
 
-# Swap-trigger subscription self-edge. The graph self-wires `sessions_sink`
-# (out[12]) -> `sessions_changes` (in[13]) so the store's namespace.change
-# SUBSCRIBE for `sessions_prefix` has a module-owned sink; the row
+# The swap trigger is a third table consumer, on `sessions_prefix`: the row
 # `<prefix>active = <0|1>` names the worker new sessions attach to, and a
 # change away from the current one requests a swap. The operator's trigger,
-# following the `listeners_changes` precedent; `handoff_after_frames` is the
-# gates'. Both inert unless `sessions_prefix` is configured.
-[[ports]]
-name = "sessions_changes"
-index = 13
-direction = "input"
-content_type = "OctetStream"
-buffer_size = 4096
-
-[[ports]]
-name = "sessions_sink"
-index = 12
-direction = "output"
-content_type = "OctetStream"
-buffer_size = 4096
+# following the dynamic listeners' precedent; `handoff_after_frames` is the
+# gates'. Inert unless `sessions_prefix` is configured. (in[13]/out[12], its
+# old subscription self-edge, are unused.)

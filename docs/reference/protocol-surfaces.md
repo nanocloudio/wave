@@ -87,10 +87,10 @@ not a Wave-local layout: the same `[msg_type][len u16 LE][payload]`
 frames `echo_anchor` and `echo_worker` speak, decoded and encoded
 through the contract's accessors. They are how a fan-out WebSocket
 becomes a session a worker can be swapped behind
-(`docs/architecture/session_continuity.md`). `sessions_changes` /
-`sessions_sink` is the store subscription self-edge that carries the
-operator's swap trigger, in the same shape as `routes_changes` and
-`listeners_changes`.
+(`docs/architecture/session_continuity.md`). The operator's swap
+trigger is a store subscription on `sessions_prefix`, in the same shape
+as the dynamic routes and listeners: no port carries it — the store
+signals the module's own kernel event and the module reads the change.
 
 The admission request carries no transport facts. The accept event
 below carries a connection id and a local port and no peer address, and

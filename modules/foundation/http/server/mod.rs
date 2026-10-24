@@ -195,14 +195,20 @@ pub(crate) use super::abi::config::http::{
 
 // ── Table consumers ───────────────────────────────────────────────────────
 //
-// Two runtime tables are programmed from the store rather than from params:
-// the dynamic route arena (`routes`) and the dynamic listener set
-// (`listeners`). Both ride the
-// reusable `cores/table_consumer` core, `include!`d here — it is an
-// implementation, not a wire contract, so it is included rather than linked
-// (see the file header). `SyscallTable` is brought into scope for the include
-// per the core's includer contract.
+// Three runtime tables are programmed from the store rather than from params:
+// the dynamic route arena (`routes`), the dynamic listener set (`listeners`)
+// and the session swap trigger (`session`). All three ride the reusable
+// `cores/table_consumer` core, `include!`d here — it is an implementation, not
+// a wire contract, so it is included rather than linked (see the file header).
+// `SyscallTable` and `abi` are brought into scope for the include per the
+// core's includer contract.
+//
+// The store wakes them through ONE kernel event this instance creates
+// (`store_event`); it writes no channel of ours, so no port carries it.
+// `pump_store_event` takes the rung subscriptions once per step for all three,
+// and each pump then advances its own consumer.
 mod table_consumer {
+    use super::super::abi;
     use super::super::abi::SyscallTable;
     include!("../../../../target/fluxor/fluxor-abi/sdk/cores/table_consumer.rs");
 }
@@ -1195,9 +1201,6 @@ pub(crate) struct ServerState {
     /// off.
     pub(crate) routes_prefix: [u8; MAX_DYN_PREFIX],
     pub(crate) routes_prefix_len: u16,
-    /// Change-sink channel (store SUBSCRIBE pushes here; self-edge
-    /// alloc, in[DYN_ROUTES_PORT_INDEX]). `-1` until resolved.
-    pub(crate) routes_sink: i32,
     /// Subscription bookkeeping.
     pub(crate) tc: TableConsumer,
     /// The dynamic-route arena + rebuild shadow.
@@ -1366,23 +1369,24 @@ pub(crate) struct ServerState {
     /// `/dataplane/edge-listeners/`). Empty = feature off.
     pub(crate) listeners_prefix: [u8; MAX_DYN_PREFIX],
     pub(crate) listeners_prefix_len: u16,
-    /// Change-sink channel (self-edge alloc, in[DYN_LISTENERS_PORT_INDEX]).
-    /// `-1` until resolved.
-    pub(crate) listeners_sink: i32,
     /// Listener-subscription bookkeeping (second table consumer).
     pub(crate) ltc: TableConsumer,
     /// Desired-listener table + reconciler bind records.
     pub(crate) listeners: DynListeners,
+
+    /// The kernel event every store subscription of this instance names
+    /// (routes, listeners, session trigger). Created on the first step
+    /// that has a table to follow; `-1` until then.
+    pub(crate) store_event: i32,
 }
 
 /// Store-prefix buffer for `routes_prefix`.
 pub(crate) const MAX_DYN_PREFIX: usize = 64;
-/// `CHANGES` relist scratch. Holds the full snapshot for a cold-start /
-/// LOST rebuild; a snapshot larger than this fails closed (keeps the
-/// prior table) — sized to comfortably cover the arena's worst case.
+/// `CHANGES` page scratch, shared by the three table consumers (they are
+/// stepped in turn and each page is applied before the next is read). A
+/// relist or a change read larger than this spans several pages; it must
+/// hold one record (the largest row) plus the page head and trailer.
 pub(crate) const DYN_SCRATCH: usize = 8192;
-/// Input port index carrying the self-edged change sink (in[4]).
-pub(crate) const DYN_ROUTES_PORT_INDEX: u8 = 4;
 
 /// Number of `u64` words needed to cover `MAX_CONCURRENT_CONNS`
 /// bits (rounded up). At the host profile's 256 that is 4 words = 32 bytes;
@@ -2028,14 +2032,11 @@ pub(crate) unsafe fn init(s: &mut HttpState, pool_bytes: u32) {
     s.server.app_out_chan = -1;
     s.server.app_in_chan = -1;
     s.server.latest_fanout_slot = -1;
-    // Dynamic-route subscription: sink resolved lazily on first pump.
-    // The arena, shadow, and TableConsumer are zero-init (kernel
-    // zero-fills state) — equivalent to `DynRoutes::new()` /
-    // `TableConsumer::new()`.
-    s.server.routes_sink = -1;
-    // Dynamic-listener subscription: sink resolved lazily on first pump;
-    // the table, shadow, bind records, and TableConsumer are zero-init.
-    s.server.listeners_sink = -1;
+    // Store subscriptions: the event is created on the first pump that has
+    // a table to follow. The route arena, listener table, their shadows and
+    // the TableConsumers are zero-init (kernel zero-fills state) —
+    // equivalent to `DynRoutes::new()` / `TableConsumer::new()`.
+    s.server.store_event = -1;
     s.server.proxy_connect_owner = -1;
     s.server.sc.init();
     s.server.port = 80;
@@ -2815,29 +2816,57 @@ unsafe fn demux_inbound(s: &mut HttpState) {
 /// Iteration starts at `step_cursor` and walks the bitmap forward
 /// (wrapping at the end). Each tick advances the cursor by one
 /// slot so no single conn can starve others on consecutive ticks.
-/// Pump the dynamic-route table consumer one step: resolve the sink on
-/// first use, then run the subscribe / apply / shadow-relist state
-/// machine against `routes_prefix`. No-op when the feature is off
-/// (`routes_prefix_len == 0`), keeping the server byte-identical.
-pub(crate) unsafe fn pump_dyn_routes(s: &mut HttpState) {
-    let prefix_len = s.server.routes_prefix_len as usize;
-    if prefix_len == 0 {
+/// Take the store's rung subscriptions for every table consumer of this
+/// instance, once per step: create the shared event on the first step that
+/// has a table to follow, then `event::POLL` it and `TAKE_RUNG`, marking each
+/// named consumer pending. No-op when no table is configured, keeping the
+/// server byte-identical.
+pub(crate) unsafe fn pump_store_event(s: &mut HttpState) {
+    #[cfg(feature = "session")]
+    let sessions_on = s.server.sc.sessions_prefix_len != 0;
+    #[cfg(not(feature = "session"))]
+    let sessions_on = false;
+    if s.server.routes_prefix_len == 0 && s.server.listeners_prefix_len == 0 && !sessions_on {
         return;
     }
     let sys = &*s.syscalls;
-    if s.server.routes_sink < 0 {
-        s.server.routes_sink = dev_channel_port(sys, 0, DYN_ROUTES_PORT_INDEX);
-        if s.server.routes_sink < 0 {
-            return; // port unwired — nothing to subscribe against
+    if s.server.store_event < 0 {
+        // Asked again next step if the event pool is spent.
+        s.server.store_event = table_consumer::create_event(sys);
+        if s.server.store_event < 0 {
+            return;
         }
     }
-    let sink = s.server.routes_sink;
+    let ev = s.server.store_event;
+    // Disjoint field borrows of `s.server`.
+    let server = &mut s.server;
+    #[cfg(feature = "session")]
+    table_consumer::take_rung(
+        sys,
+        ev,
+        &mut [&mut server.tc, &mut server.ltc, &mut server.sc.stc],
+    );
+    #[cfg(not(feature = "session"))]
+    table_consumer::take_rung(sys, ev, &mut [&mut server.tc, &mut server.ltc]);
+}
+
+/// Pump the dynamic-route table consumer one step: run the subscribe /
+/// read / shadow-relist state machine against `routes_prefix`. No-op when
+/// the feature is off (`routes_prefix_len == 0`), keeping the server
+/// byte-identical.
+pub(crate) unsafe fn pump_dyn_routes(s: &mut HttpState) {
+    let prefix_len = s.server.routes_prefix_len as usize;
+    if prefix_len == 0 || s.server.store_event < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let ev = s.server.store_event;
     // Disjoint field borrows of `s.server`.
     let prefix = &s.server.routes_prefix[..prefix_len];
     let scratch = &mut s.server.routes_scratch;
     let tc = &mut s.server.tc;
     let dyn_routes = &mut s.server.dyn_routes;
-    tc.step(sys, sink, prefix, scratch, dyn_routes);
+    tc.advance(sys, ev, prefix, scratch, dyn_routes);
 }
 
 /// Whether every abort owed to the application has been delivered: an
@@ -2865,6 +2894,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // `drain_responses` hands each record to the exchange it names.
     #[cfg(feature = "app")]
     app::drain_responses(s);
+    pump_store_event(s);
     pump_dyn_routes(s);
     pump_listeners(s);
     // Re-offer lifecycle events a full `ws_event_out` refused earlier. Before

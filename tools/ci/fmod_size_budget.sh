@@ -52,7 +52,7 @@ BUDGETS='
 thumbv6m|http.fmod|218700|208228 (2026-10-06: request bodies whole in the application HEAD and the exchange id the server packs itself; ceiling re-based 5% above measured)
 thumbv6m|http-h2.fmod|170000|161864 (2026-10-23, +8.4K since the 2026-09-10 row: inline body routes sized and admitted against the heap cap, oversize cache fills refused, the retention buffer only when ws_in is wired, plus h1 file serving resuming across backpressure; ceiling re-based 5% above measured)
 thumbv6m|http-web.fmod|102000|93780 (2026-09-07, first RP2040 qualification)
-thumbv6m|http-app.fmod|108000|99476 (2026-09-07, first RP2040 qualification)
+thumbv6m|http-app.fmod|113400|108012 (2026-10-24, +8.5K since the 2026-09-07 row: the store table consumers on the doorbell model (one event, TAKE_RUNG, paged CHANGES with a shadow relist) and earlier unmeasured growth; ceiling re-based 5% above measured)
 thumbv6m|http-exchange.fmod|237100|225772 (2026-10-06: the client as an exchange provider: request collection, streamed answers under credit, LINK, and request headers over h1, h2 and h3; ceiling re-based 5% above measured)
 thumbv6m|http-h1_exchange.fmod|112900|107464 (2026-10-23, +10.4K since the 2026-09-07 row: inline body admission, oversize cache refusal, and earlier work that landed unmeasured; ceiling re-based 5% above measured)
 thumbv8m|http-h1_exchange.fmod|112300|106952 (2026-10-23, +14.4K since the 2026-09-08 row: inline body admission, oversize cache refusal, and earlier work that landed unmeasured; ceiling re-based 5% above measured)
