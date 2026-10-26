@@ -73,12 +73,21 @@ what its deployment uses, and an unwired port is silent rather than an error.
 `mode` (0 server / 1 client), `port` (server: the listen port), `body`, `path`,
 `protocol`, `request_body`, `websocket`, `host_tcp`, `grpc`, then eight route blocks of
 `route_N_{path,body,handler,proxy_ip,proxy_port,source,content_type,fs_path,fs_list,fs_filter}`,
-and the high-tag set: `routes_prefix`, `listeners_prefix`, each route's body
-ceiling `route_N_max_body_kib`, then the connection-lifetime set
-`header_timeout_ms`, `keepalive_idle_ms`, `pressure_idle_ms`, `stall_ms`,
+and the high-tag set: `routes_prefix`, `listeners_prefix`, `table_volume`,
+each route's body ceiling `route_N_max_body_kib`, then the connection-lifetime
+set `header_timeout_ms`, `keepalive_idle_ms`, `pressure_idle_ms`, `stall_ms`,
 `ws_idle_ms`, and the client's `authority`.
 Tags are wire positions: append, never renumber; tags 4, 101, 102, 103, 120
 and 121 are unassigned.
+
+`table_volume` (parameter 130) names the store every table follows — the
+dynamic routes, the listeners and the session trigger: a keyed
+`storage.namespace` volume, or `platform` for the platform's own store beneath
+a graph-local default. It is the `storage.namespace` claim's `selector_param`,
+so the composer checks the store it names; empty, the tables follow the
+graph's default store. A graph whose own store is fed through `http` names
+another (`platform`), or the composer refuses it. A name longer than 64 bytes
+refuses the module at construction.
 
 `authority` (parameter 112) is the client's one address: `host[:port]` — a
 DNS name, a dotted quad or a bracketed IPv6 literal, port 80 when it names
@@ -180,6 +189,47 @@ on, is answered when the body is wanted: at once on a route that reads or drops
 it, and on an application route when the application first grants credit. An
 application that answers without granting any sends no 100; the connection
 closes after its response, because the body was never read.
+
+## Authority and the route key
+
+A request names its origin in up to three places — an absolute-form target,
+`:authority` on h2 and h3, `Host` — and `modules/common/http_route_key.rs`
+decides what it names. That core is shared with the Wormhole load balancer
+through `wave-common`, so the authority this server derives is the one the
+balancer placed the request by: lowercased, one trailing dot stripped, the
+scheme's default port removed, an IPv6 literal kept in its brackets and
+validated as one; the path with dot segments removed and percent-encoding
+normalised (unreserved characters decoded, hex uppercased, `%2F` left a
+`%2F`); the query set aside. `Example.COM:443` and `example.com` under https
+are one origin and never a reason to refuse.
+
+What IS refused — answered as malformed, counted as
+`http.requests.host_refused`, never routed on whichever spelling this server
+happened to read, because an intermediary in front of it may have read the
+other:
+
+- on h2, a `host` field that disagrees with `:authority` (`RST_STREAM
+  PROTOCOL_ERROR`), and `:authority` arriving after a `host` field, which is
+  a pseudo-header after a regular one (RFC 9113 §8.3). A `host` that agrees
+  is folded into the one `host` line the application sees;
+- on h3, the same disagreement as a message error on the stream, and an
+  `:authority` longer than `H3_MAX_AUTHORITY`, which is refused rather than
+  clipped;
+- on h1, a `Host` line that appears twice (`400`; RFC 9112 §3.2), whether or
+  not the two agree: a repeat that looks harmless here may be two values an
+  intermediary in front of this server joined into one line;
+- on any generation, an authority longer than `MAX_ROUTE_HOST` (255 bytes)
+  where the server holds it as a key.
+
+Non-ASCII and percent-encoded hosts are not canonicalised: IDNA is out of
+this server's scope, and a guess at it would be a second key for the same
+name. A dynamic route (`host=`) is stored in the same canonical spelling, so
+`host=Edge.Local.` matches `Host: edge.local:80`; a `host=` that does not
+canonicalise or whose canonical form does not fit `MAX_DYN_HOST` (64 bytes)
+refuses the whole route and counts it in `http.routes.dropped`, never stores
+it clipped. Dynamic-route hosts are canonicalised against port 80: this
+listener speaks plaintext HTTP/1.1, and a TLS terminator in front of it hands
+over the same bytes.
 
 ## Application fan-out
 

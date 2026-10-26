@@ -15,6 +15,7 @@
 //! shape and their matching, not their configuration.
 
 use super::super::connection::net_proto::Target;
+use super::super::wire::route_key;
 use super::{
     cur_slot, dyn_field, dyn_u32, hex_val, HttpState, TableSink, MAX_CONTENT_TYPE, MAX_DYN_KEY,
     MAX_DYN_ROUTES, MAX_FS_PATH, MAX_PATH, MAX_ROUTES, MAX_ROUTE_BACKENDS,
@@ -381,8 +382,17 @@ pub(crate) unsafe fn content_type_from_path(path: *const u8, plen: usize) -> &'s
 // selected backend and streams both ways; this table
 // is its runtime backend source.
 
-/// Host header buffer per dynamic route.
+/// Host buffer per dynamic route, holding the CANONICAL `host[:port]`
+/// (`wire::route_key::canonical_authority`): lowercased, one trailing dot
+/// stripped, the default port removed. A `host=` whose canonical form is
+/// longer, or that does not canonicalise, refuses the whole route and counts
+/// it dropped — never stored clipped, because half a name is another name.
 pub(crate) const MAX_DYN_HOST: usize = 64;
+/// The port a dynamic-route host is canonicalised against. This module
+/// speaks plaintext HTTP/1.1 on its listener, and a TLS terminator in front
+/// of it hands over the same bytes; a client that spells the default port
+/// out (`Host: edge.local:80`) matches the route that did not.
+pub(crate) const DYN_ROUTE_DEFAULT_PORT: u16 = 80;
 /// Longest backend authority a `be=` entry may carry. An entry over this is
 /// refused at parse and counted as dropped, never truncated: half a name is
 /// another name.
@@ -550,17 +560,20 @@ pub(crate) fn parse_backend(seg: &[u8]) -> Option<(&[u8], u32, u32)> {
 /// Fill a `DynRoute` slot from `key` + compact `value`
 /// (`host=…;path=…;be=<authority>:<w>:<r>,…`). Returns the number of
 /// backends dropped: past `MAX_ROUTE_BACKENDS`, or refused by
-/// `parse_backend`.
-fn dyn_fill(dst: &mut DynRoute, key: &[u8], value: &[u8]) -> u32 {
+/// `parse_backend`. `None` when the route itself is refused: a `host=` that
+/// does not canonicalise or whose canonical form is past `MAX_DYN_HOST`.
+fn dyn_fill(dst: &mut DynRoute, key: &[u8], value: &[u8]) -> Option<u32> {
     *dst = DynRoute::new();
     let kn = key.len().min(MAX_DYN_KEY);
     dst.key[..kn].copy_from_slice(&key[..kn]);
     dst.key_len = kn as u8;
 
     if let Some(h) = dyn_field(value, b"host=") {
-        let n = h.len().min(MAX_DYN_HOST);
-        dst.host[..n].copy_from_slice(&h[..n]);
-        dst.host_len = n as u8;
+        if !h.is_empty() {
+            let n =
+                route_key::canonical_authority(h, DYN_ROUTE_DEFAULT_PORT, &mut dst.host).ok()?;
+            dst.host_len = n as u8;
+        }
     }
     if let Some(p) = dyn_field(value, b"path=") {
         let n = p.len().min(MAX_PATH);
@@ -601,7 +614,7 @@ fn dyn_fill(dst: &mut DynRoute, key: &[u8], value: &[u8]) -> u32 {
             start = end + 1;
         }
     }
-    dropped
+    Some(dropped)
 }
 
 impl TableSink for DynRoutes {
@@ -627,10 +640,19 @@ impl TableSink for DynRoutes {
                 return;
             }
         };
-        let dropped = dyn_fill(&mut arena[slot], key, value);
-        arena[slot].used = 1;
-        if dropped > 0 {
-            self.dropped = self.dropped.wrapping_add(dropped);
+        match dyn_fill(&mut arena[slot], key, value) {
+            Some(dropped) => {
+                arena[slot].used = 1;
+                if dropped > 0 {
+                    self.dropped = self.dropped.wrapping_add(dropped);
+                }
+            }
+            None => {
+                // The route is refused whole, and a slot it was replacing is
+                // withdrawn rather than left half-applied.
+                arena[slot].used = 0;
+                self.dropped = self.dropped.wrapping_add(1);
+            }
         }
     }
 
@@ -685,12 +707,17 @@ impl DynRoutes {
     pub fn test_backend_count(&self, i: usize) -> usize {
         self.live[i].backend_count as usize
     }
+    /// The stored (canonical) host of a live slot.
+    pub fn test_host(&self, i: usize) -> &[u8] {
+        self.live[i].host()
+    }
 }
 
 /// Match a request `host`/`path` against the dynamic-route table: host
-/// must match exactly (byte-wise), then the longest path prefix wins
-/// (an empty route path matches any path). Returns the live index, or
-/// `-1` when none match. Consulted after the static arena.
+/// must match exactly (byte-wise, both sides already in the canonical
+/// `host[:port]` spelling `dyn_fill` stores and `proxy` derives), then the
+/// longest path prefix wins (an empty route path matches any path). Returns
+/// the live index, or `-1` when none match. Consulted after the static arena.
 pub fn match_dyn_route(dyn_routes: &DynRoutes, host: &[u8], path: &[u8]) -> i32 {
     let mut best: i32 = -1;
     let mut best_len: usize = 0;

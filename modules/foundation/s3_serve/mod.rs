@@ -435,6 +435,14 @@ struct State {
     roots_bad: bool,
     object_bad: bool,
     region_bad: bool,
+    /// The `storage.object` provider every grant is minted through: a
+    /// keyed volume, or `platform` for the target's own. Empty, the
+    /// graph's default provider.
+    object_volume: [u8; OBJECT_VOLUME_MAX],
+    object_volume_len: usize,
+    /// `object_volume` was longer than the bytes held for it. A truncated
+    /// name selects a different provider, so construction refuses it.
+    object_volume_bad: bool,
     max_object: u64,
     part_min: u64,
     // Loading.
@@ -572,7 +580,20 @@ define_params! {
     5, part_min_kib, u32, 5120 => |s, d, len| {
         s.part_min = (p_u32(d, len, 0, 5120) as u64) << 10;
     };
+    // The `storage.object` provider to reach: a keyed volume, or `platform`.
+    // Empty, the graph's default. The claim's `selector_param`.
+    6, object_volume, str, 0 => |s, d, len| {
+        s.object_volume_bad = len > OBJECT_VOLUME_MAX;
+        if !s.object_volume_bad {
+            core::ptr::copy_nonoverlapping(d, s.object_volume.as_mut_ptr(), len);
+            s.object_volume_len = len;
+        }
+    };
 }
+
+/// Longest `object_volume` held. A provider selector is a volume name, as
+/// a `volume:` param names one.
+const OBJECT_VOLUME_MAX: usize = 64;
 
 // ── PIC entry points ──────────────────────────────────────────────────────
 
@@ -667,6 +688,11 @@ pub extern "C" fn module_new(
     if s.region_bad {
         // SAFETY: the syscall table was set from a non-null pointer above.
         unsafe { log(s, b"[s3_serve] region is at most 32 bytes") };
+        return -22;
+    }
+    if s.object_volume_bad {
+        // SAFETY: the syscall table was set from a non-null pointer above.
+        unsafe { log(s, b"[s3_serve] object_volume is at most 64 bytes") };
         return -22;
     }
     if s.creds_path_bad {
@@ -927,7 +953,22 @@ unsafe fn present(s: &mut State) {
             s.boot = Boot::Failed;
             return;
         };
-        let rc = call(s.syscalls, -1, obj::PRESENT, arg.as_mut_ptr(), n);
+        // The grant is minted by the provider `object_volume` selects. Its
+        // handle is routed — it names that provider — so every operation
+        // run under it reaches the same one through a plain call.
+        let rc = if s.object_volume_len == 0 {
+            call(s.syscalls, -1, obj::PRESENT, arg.as_mut_ptr(), n)
+        } else {
+            let sel = &s.object_volume[..s.object_volume_len];
+            ((*s.syscalls).provider_call_sel)(
+                sel.as_ptr(),
+                sel.len(),
+                -1,
+                obj::PRESENT,
+                arg.as_mut_ptr(),
+                n,
+            )
+        };
         if rc == errno::EAGAIN {
             return;
         }

@@ -89,6 +89,24 @@ exchange may have queued toward the peer — the response credit it was given
 plus a head record and one record of slack. An application inside its credit
 never reaches it, so reaching it is a broken contract and is answered as one.
 
+## HTTP route key
+
+| Ceiling | Value | What one past it meets |
+|---|---|---|
+| `MAX_ROUTE_HOST` | 255 | `RouteKeyError::Oversize`: no key; the request is refused as malformed, counted as `requests_host_refused` |
+| `MAX_ROUTE_PATH` | 2048 | `RouteKeyError::Oversize`, the same refusal |
+
+The route key (`modules/common/http_route_key.rs`) is the canonical
+`(host, port, path)` a request names, shared with the Wormhole load balancer
+so both place the request by the same bytes. Its two bounds follow from
+what a key could ever resolve: 255 is the DNS name ceiling (RFC 1035
+§2.3.4), and 2048 is the target the application fan-out already bounds
+(`MAX_TARGET`). Past either there is no key at all — never a truncated one,
+because a truncated key is a different key that happens to share a prefix,
+and two readers that truncate differently place one request twice.
+`ROUTE_KEY_CANON_BYTES` is not a ceiling: it is the digest input at its
+widest, derived from the two above.
+
 ## Request bodies
 
 | Ceiling | Value | What one past it meets |
@@ -141,6 +159,7 @@ canonical request, which is built in fixed scratch: 64 query parameters and
 | `STASH_CAP` | `BODY_WINDOW` (one credit window) | body bytes the object provider refused wait here; no further credit is granted while it holds any |
 | `MAX_CREDENTIALS` | 16 | the module serves nothing; every request `503` |
 | `CREDS_FILE_MAX` | 16 KiB | the module serves nothing |
+| `OBJECT_VOLUME_MAX` | 64 | `object_volume` past it refuses construction: a truncated name would select a different provider |
 | `S3_ACCESS_KEY_MAX` | 128 | the module serves nothing |
 | `S3_SECRET_MAX` | 128 | the module serves nothing |
 | `S3_PEER_MAX` | 128 | the module serves nothing |
@@ -181,11 +200,12 @@ each frame within `net_out`'s record.
 
 ## Not ceilings
 
-Two constants in the named files match the naming convention without being
+Four constants in the named files match the naming convention without being
 policy. They are exempted in the second block below, each with its reason:
-`WS_BUF_SIZE` is per-stream reassembly scratch, and `H3_VARINT_MAX` is the
-width RFC 9000 gives a QUIC varint — a wire fact, not a decision this project
-made.
+`WS_BUF_SIZE` is per-stream reassembly scratch, `H3_VARINT_MAX` is the width
+RFC 9000 gives a QUIC varint — a wire fact, not a decision this project made
+— and the route-key core's `ROUTE_KEY_CANON_BYTES` and `PORT_SUFFIX_MAX` are
+derived widths, not ceilings.
 
 ## Elsewhere
 
@@ -221,6 +241,8 @@ MAX_H3_FIELDS | modules/foundation/http/server/h3.rs | 0
 H3_RX_HOLD | modules/foundation/http/server/h3.rs | 256 * 1024
 DEFAULT_MAX_BODY | modules/foundation/http/server/reqbody.rs | 64 * 1024
 MAX_BODY_KIB_CEILING | modules/foundation/http/server/reqbody.rs | 1 << 30
+MAX_ROUTE_HOST | modules/common/http_route_key.rs | 255
+MAX_ROUTE_PATH | modules/common/http_route_key.rs | 2048
 SV4_EXPIRES_MAX | modules/common/sigv4_core.rs | 7 * 24 * 3600
 SV4_SKEW_MAX | modules/common/sigv4_core.rs | 15 * 60
 SV4_QUERY_PARAMS_MAX | modules/common/sigv4_core.rs | 64
@@ -247,6 +269,7 @@ BODY_WINDOW | modules/foundation/s3_serve/mod.rs | 64 * 1024
 STASH_CAP | modules/foundation/s3_serve/mod.rs | BODY_WINDOW as usize
 MAX_CREDENTIALS | modules/foundation/s3_serve/mod.rs | 16
 CREDS_FILE_MAX | modules/foundation/s3_serve/mod.rs | 16 * 1024
+OBJECT_VOLUME_MAX | modules/foundation/s3_serve/mod.rs | 64
 MAX_TARGET | modules/foundation/s3/mod.rs | 2048
 MAX_CALLER_HEADERS | modules/foundation/s3/mod.rs | 2048
 RESP_HEAD_MAX | modules/foundation/s3/mod.rs | 4096
@@ -255,6 +278,8 @@ SEND_MAX | modules/foundation/s3/mod.rs | net_proto::MAX_DATA_FRAGMENT
 ```
 
 ```limit-register-exempt
+ROUTE_KEY_CANON_BYTES | modules/common/http_route_key.rs | the digest input at its widest, derived from MAX_ROUTE_HOST and MAX_ROUTE_PATH rather than chosen
+PORT_SUFFIX_MAX | modules/common/http_route_key.rs | the width of a `:65535` suffix, a wire fact rather than a choice
 WS_BUF_SIZE | modules/foundation/http/server/h2.rs | per-stream WebSocket reassembly scratch, sized to the frame codec rather than chosen as a limit
 H3_VARINT_MAX | modules/foundation/http/server/h3.rs | the width RFC 9000 gives a QUIC varint, not a choice this project makes
 ```

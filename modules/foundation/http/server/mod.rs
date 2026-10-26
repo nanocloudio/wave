@@ -1201,6 +1201,13 @@ pub(crate) struct ServerState {
     /// off.
     pub(crate) routes_prefix: [u8; MAX_DYN_PREFIX],
     pub(crate) routes_prefix_len: u16,
+    /// The store every table (routes, listeners, sessions) follows: a
+    /// keyed volume, or `platform` for the platform's own beneath a
+    /// graph-local default (`table_volume`). Empty: the default store.
+    pub(crate) table_volume: [u8; TABLE_VOLUME_MAX],
+    pub(crate) table_volume_len: u8,
+    /// `table_volume` was longer than it holds: refused at construction.
+    pub(crate) table_volume_refused: u8,
     /// Subscription bookkeeping.
     pub(crate) tc: TableConsumer,
     /// The dynamic-route arena + rebuild shadow.
@@ -1299,6 +1306,12 @@ pub(crate) struct ServerState {
     /// full (`http.h2.streams.refused`). Expected under a client that
     /// outruns `MAX_STREAMS`; a floor, not a fault.
     pub(crate) h2_streams_refused: u32,
+    /// Requests refused because they named two authorities, or one too long
+    /// to be a route key (`http.requests.host_refused`): an h2/h3 `host`
+    /// field disagreeing with `:authority`, a repeated h1 `Host` line,
+    /// an authority past the route-key ceiling. A client or intermediary
+    /// fault, not a load one — and the shape request smuggling takes.
+    pub(crate) requests_host_refused: u32,
     /// HTTP/3 requests answered 501 because the matched route's handler is not
     /// served over h3 (`http.h3.handler_unavailable`). A CONFIGURATION signal,
     /// not a load one: it means a route that works over HTTP/1.1 and HTTP/2 is
@@ -1382,6 +1395,8 @@ pub(crate) struct ServerState {
 
 /// Store-prefix buffer for `routes_prefix`.
 pub(crate) const MAX_DYN_PREFIX: usize = 64;
+/// The longest `table_volume` held: a store volume's name.
+pub(crate) const TABLE_VOLUME_MAX: usize = 64;
 /// `CHANGES` page scratch, shared by the three table consumers (they are
 /// stepped in turn and each page is applied before the next is read). A
 /// relist or a change read larger than this spans several pages; it must
@@ -2840,14 +2855,16 @@ pub(crate) unsafe fn pump_store_event(s: &mut HttpState) {
     let ev = s.server.store_event;
     // Disjoint field borrows of `s.server`.
     let server = &mut s.server;
+    let store = &server.table_volume[..usize::from(server.table_volume_len)];
     #[cfg(feature = "session")]
     table_consumer::take_rung(
         sys,
+        store,
         ev,
         &mut [&mut server.tc, &mut server.ltc, &mut server.sc.stc],
     );
     #[cfg(not(feature = "session"))]
-    table_consumer::take_rung(sys, ev, &mut [&mut server.tc, &mut server.ltc]);
+    table_consumer::take_rung(sys, store, ev, &mut [&mut server.tc, &mut server.ltc]);
 }
 
 /// Pump the dynamic-route table consumer one step: run the subscribe /
@@ -2863,10 +2880,11 @@ pub(crate) unsafe fn pump_dyn_routes(s: &mut HttpState) {
     let ev = s.server.store_event;
     // Disjoint field borrows of `s.server`.
     let prefix = &s.server.routes_prefix[..prefix_len];
+    let store = &s.server.table_volume[..usize::from(s.server.table_volume_len)];
     let scratch = &mut s.server.routes_scratch;
     let tc = &mut s.server.tc;
     let dyn_routes = &mut s.server.dyn_routes;
-    tc.advance(sys, ev, prefix, scratch, dyn_routes);
+    tc.advance(sys, store, ev, prefix, scratch, dyn_routes);
 }
 
 /// Whether every abort owed to the application has been delivered: an
@@ -3017,6 +3035,7 @@ pub unsafe fn test_shed_metrics(state: *mut u8) -> ShedMetrics {
         bodies_refused: s.server.bodies_refused,
         ws_envelopes_dropped: s.server.ws_envelopes_dropped,
         h2_streams_refused: s.server.h2_streams_refused,
+        requests_host_refused: s.server.requests_host_refused,
         conns_timeout_header: s.server.conns_timeout_header,
         conns_timeout_idle: s.server.conns_timeout_idle,
         conns_timeout_stall: s.server.conns_timeout_stall,
@@ -3050,6 +3069,8 @@ pub struct ShedMetrics {
     pub bodies_refused: u32,
     pub ws_envelopes_dropped: u32,
     pub h2_streams_refused: u32,
+    /// Requests refused for naming two authorities, or an oversize one.
+    pub requests_host_refused: u32,
     /// Connections closed by a lifetime deadline, by reason.
     pub conns_timeout_header: u32,
     pub conns_timeout_idle: u32,

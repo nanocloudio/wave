@@ -270,6 +270,14 @@ access = "read"
 [[resources]]
 requires_contract = "storage.namespace"
 access = "read"
+# The store the tables follow: `table_volume` names it (a keyed volume, or
+# `platform`); empty, the graph's default.
+selector_param = "table_volume"
+# Only a table consumer reads the store, and each is inert until its prefix
+# is set: an `http` with none of them configured never makes the call, so
+# the composer does not count the claim for it (an api plane's `http` that
+# feeds the graph's default store is not refused for a read it never does).
+active_when_params = ["routes_prefix", "listeners_prefix", "sessions_prefix"]
 
 # The one kernel event the table consumers (routes, listeners, session
 # trigger) name in their subscriptions: the store signals it when a watched
@@ -412,6 +420,15 @@ metrics = [
   "app_aborts",
   "app_exchanges",
   "bodies_refused",
+  # id 33 = requests_host_refused (http.requests.host_refused): requests refused for naming two
+  #         authorities — an h2/h3 `host` field disagreeing with `:authority`,
+  #         a repeated h1 `Host` line — or one past the route-key
+  #         ceiling. The request is answered as malformed rather than routed
+  #         on whichever spelling this server happened to read, because an
+  #         intermediary in front of it may have read the other. A client
+  #         fault; rising steadily means something between the client and
+  #         this listener is rewriting authorities.
+  "requests_host_refused",
 ]
 # Span 0: one `http.server.request` span per request (head parsed -> response
 # drained), SERVER kind. Minted only when a telemetry consumer is subscribed

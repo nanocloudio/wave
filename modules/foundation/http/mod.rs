@@ -123,6 +123,7 @@
 //! | 117   | session_drain_ms | u32 | 500 | Session anchor: the swap window and DRAIN deadline |
 //! | 118   | handoff_after_frames | u32 | 0 | Session anchor: swap workers every N envelopes (0 = never) |
 //! | 119   | sessions_prefix | str | (none) | Session anchor: store prefix whose `active` row picks the worker |
+//! | 130   | table_volume | str | (none) | The store the tables follow: a keyed volume or `platform`; empty, the default |
 //! | 120-121 | —         | —    | —       | retired                                             |
 //! | 122-129 | route_N_max_body_kib | u32 | 0 | Route N's request-body ceiling in KiB (0 = 64 KiB); at most 1 TiB |
 
@@ -421,6 +422,15 @@ mod params_def {
         => |s, d, len| { server::params::set_route_max_body(s, 6, d, len); };
     129, route_7_max_body_kib, u32, 0
         => |s, d, len| { server::params::set_route_max_body(s, 7, d, len); };
+
+    // The store every table — dynamic routes, listeners, the session
+    // trigger — subscribes to and reads: a keyed `storage.namespace` volume,
+    // or `platform` for the platform's own beneath a graph-local default.
+    // Empty (the default): the graph's default store. The claim's
+    // `selector_param`, so the composer checks the store named. Longer than
+    // `TABLE_VOLUME_MAX`: refused at construction.
+    130, table_volume, str, 0
+        => |s, d, len| { server::params::set_table_volume(s, d, len); };
 
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };
@@ -845,6 +855,11 @@ pub unsafe extern "C" fn module_new(
             if s.server.inline_body_refused != 0 {
                 // `parse_route_body` could not stage a body; it logged which.
                 return -12;
+            }
+            if s.server.table_volume_refused != 0 {
+                let m = b"[http] table_volume is longer than the 64 bytes held for it";
+                dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
+                return -22;
             }
             if s.server.route_body_refused != 0 {
                 let m = b"[http] a route_N_max_body_kib is past the 1 TiB ceiling";
@@ -1297,6 +1312,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 for (k, v) in ex.iter().enumerate() {
                     dev_telemetry_metric(sys, -1, midx, t, counter, 29 + k as u16, *v as u64);
                 }
+                // id 33 = requests_host_refused (http.requests.host_refused): two authorities named, or
+                // one past the route-key ceiling.
+                dev_telemetry_metric(
+                    sys,
+                    -1,
+                    midx,
+                    t,
+                    counter,
+                    33,
+                    s.server.requests_host_refused as u64,
+                );
             }
         }
 

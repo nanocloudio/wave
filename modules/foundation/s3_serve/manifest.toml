@@ -30,6 +30,9 @@ access            = "read"
 [[resources]]
 requires_contract = "storage.object"
 access            = "write"
+# The provider every grant is minted through: `object_volume` names it (a
+# keyed volume, or `platform`); empty, the graph's default.
+selector_param    = "object_volume"
 
 [[resources]]
 requires_contract = "fs"
