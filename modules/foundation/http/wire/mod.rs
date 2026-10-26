@@ -24,6 +24,20 @@ pub(crate) mod huffman {
     include!("../../../common/huffman_core.rs");
 }
 
+// The HTTP route-key core: what a request's canonical `(host, port, path)`
+// is, and which requests name two authorities at once. Shared with the
+// Wormhole load balancer through `wave-common`, so a `host` that this server
+// refuses as ambiguous is one the balancer refuses too. Not feature-gated:
+// every generation has an authority to check. The key derivation and digest
+// are the balancer's half of the file and go unused here.
+#[allow(
+    dead_code,
+    reason = "the key derivation and digest are consumed by the load balancer, not by this server"
+)]
+pub(crate) mod route_key {
+    include!("../../../common/http_route_key.rs");
+}
+
 // Method vocabulary — shared by h1, h2 and h3, so it is NOT feature-gated per
 // generation. `h1` is always compiled, and every variant that adds a generation
 // adds another consumer of the same table.

@@ -86,6 +86,7 @@ const STREAM_RECV_THRESHOLD: i32 = STREAM_RECV_WINDOW / 2;
 const SEND_WINDOW_INITIAL: i32 = 65535;
 use super::super::wire::h2 as h2w;
 use super::super::wire::method;
+use super::super::wire::route_key;
 use super::super::wire::ws;
 use super::super::HttpState;
 use super::super::{
@@ -1466,11 +1467,33 @@ unsafe fn handle_headers(
     let scratch: *mut u8 = core::ptr::null_mut();
     let mut hdr_used: u32 = 0;
     let mut over: u8 = 0;
-    let mut authority = 0u8;
     let hb_ptr = scratch;
     let hu_ptr = &mut hdr_used as *mut u32;
     let ov_ptr = &mut over as *mut u8;
-    let au_ptr = &mut authority as *mut u8;
+
+    // The authority, kept as the first of `:authority` / `host` to arrive so
+    // every later one can be held against it. An `:authority` and a `host`
+    // are the same fact twice, and twice is fine only while they agree: a
+    // pair that disagrees names two origins, and forwarding one of them
+    // routes the request somewhere the client did not ask for. Refused
+    // (`host_refused`), never silently resolved.
+    //
+    // Whether an explicit port is the default one depends on the scheme, and
+    // the scheme is known in time to judge it: `:scheme` is a pseudo-header
+    // and `host` a regular field, which every field block orders that way
+    // (RFC 9113 §8.3), so a `host` is never weighed against an authority
+    // under the wrong default.
+    let mut auth_buf = [0u8; route_key::MAX_ROUTE_HOST];
+    let mut auth_len: u16 = 0;
+    // 0 none, 1 `:authority`, 2 `host`.
+    let mut auth_kind: u8 = 0;
+    let mut host_refused: u8 = 0;
+    let mut scheme_port: u16 = 80;
+    let ab_ptr = auth_buf.as_mut_ptr();
+    let al_ptr = &mut auth_len as *mut u16;
+    let ak_ptr = &mut auth_kind as *mut u8;
+    let hr_ptr = &mut host_refused as *mut u8;
+    let sp_ptr = &mut scheme_port as *mut u16;
 
     let dec = super::super::wire::hpack::decode_block(block_ptr, block_len, |name, value| {
         if bytes_eq(name, b":method") {
@@ -1496,17 +1519,43 @@ unsafe fn handle_headers(
             }
         } else if bytes_eq(name, b":protocol") && bytes_eq(value, b"websocket") {
             *pr_ptr = 1;
-        } else if !hb_ptr.is_null()
-            && (bytes_eq(name, b":authority") || (!name.is_empty() && name[0] != b':'))
-        {
+        } else if bytes_eq(name, b":scheme") {
+            if bytes_eq(value, b"https") {
+                *sp_ptr = 443;
+            }
+        } else if bytes_eq(name, b":authority") || (!name.is_empty() && name[0] != b':') {
             // An ordinary field, or the authority as the `host` line h1 would
             // have carried. Other pseudo-headers are the request line in h2's
-            // encoding, not fields; and a `host` field beside an authority is
-            // the same fact twice.
+            // encoding, not fields.
             let is_authority = name[0] == b':';
-            if is_authority {
-                *au_ptr = 1;
-            } else if *au_ptr != 0 && bytes_eq(name, b"host") {
+            if is_authority || bytes_eq(name, b"host") {
+                let kind: u8 = if is_authority { 1 } else { 2 };
+                if *ak_ptr == 0 {
+                    if value.len() > route_key::MAX_ROUTE_HOST {
+                        // Past the longest name a key can hold: refused,
+                        // not forwarded clipped.
+                        *hr_ptr = 1;
+                        return;
+                    }
+                    core::ptr::copy_nonoverlapping(value.as_ptr(), ab_ptr, value.len());
+                    *al_ptr = value.len() as u16;
+                    *ak_ptr = kind;
+                } else {
+                    // A second spelling of the authority. `host` after
+                    // `:authority` is the ordinary case and is held to it
+                    // canonically; `:authority` after a `host` field is a
+                    // pseudo-header after a regular one (RFC 9113 §8.3),
+                    // malformed whatever it says.
+                    let first = core::slice::from_raw_parts(ab_ptr, *al_ptr as usize);
+                    if (*ak_ptr == 2 && is_authority)
+                        || !route_key::authority_agrees(first, value, *sp_ptr)
+                    {
+                        *hr_ptr = 1;
+                    }
+                    return;
+                }
+            }
+            if hb_ptr.is_null() {
                 return;
             }
             let name: &[u8] = if is_authority { b"host" } else { name };
@@ -1557,7 +1606,10 @@ unsafe fn handle_headers(
         ci += 1;
     }
 
-    if method_kind == 0 || path_len == 0 {
+    if host_refused != 0 {
+        s.server.requests_host_refused = s.server.requests_host_refused.wrapping_add(1);
+    }
+    if method_kind == 0 || path_len == 0 || host_refused != 0 {
         let n = h2w::write_rst_stream(
             cur_send_buf_mut_ptr(s),
             hdr.stream_id,

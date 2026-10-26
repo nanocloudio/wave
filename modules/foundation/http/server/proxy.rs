@@ -15,9 +15,11 @@
 //! and the byte pump.
 
 use super::super::connection::{self, NET_CMD_SEND};
-use super::super::wire::ws;
+use super::super::wire::route_key;
 use super::response::{build_error, put_bytes, put_ipv4_decimal, put_u32_decimal};
-use super::routes::{match_dyn_route, HANDLER_PROXY, MAX_BACKEND_AUTHORITY};
+use super::routes::{
+    match_dyn_route, DYN_ROUTE_DEFAULT_PORT, HANDLER_PROXY, MAX_BACKEND_AUTHORITY, MAX_DYN_HOST,
+};
 use super::{
     cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_slot,
     cur_slot_mut, current_slot_index, dev_millis, dev_requester_tag, find_slot_by_conn_id, log,
@@ -230,7 +232,7 @@ pub(crate) unsafe fn proxy_relay_step(s: &mut HttpState) {
 }
 
 /// Consult the dynamic-route table for a proxy match on the active
-/// slot's Host + path (host exact, then longest path-prefix, then
+/// slot's Host + path (host canonical, then longest path-prefix, then
 /// readiness-gated backend selection). Returns `true` when it took
 /// over dispatch (started a relay or emitted a 502); `false` when no
 /// dynamic route matched (caller falls back to its fixed surface).
@@ -247,9 +249,35 @@ pub(crate) unsafe fn try_begin_dyn_proxy(s: &mut HttpState) -> bool {
     if recv_ptr.is_null() || heo == 0 {
         return false;
     }
-    let host = match ws::find_header_value(recv_ptr, heo, b"Host") {
-        Some((o, n)) => core::slice::from_raw_parts(recv_ptr.add(o), n),
-        None => &[],
+    // The head's one Host, canonicalised to the spelling the route table
+    // stores. `DispatchRoute` owns the refusal and runs before any route is
+    // consulted, so what arrives here carries one Host or none; the arm
+    // below is the backstop that keeps the guarantee local to this function
+    // rather than resting on its caller's order.
+    //
+    // A Host that does not canonicalise — or does not fit a route's host
+    // field — matches nothing and falls through like any unmatched host.
+    let head = core::slice::from_raw_parts(recv_ptr, heo);
+    let raw_host = match route_key::h1_host(head) {
+        Ok(h) => h.unwrap_or(&[]),
+        Err(_) => {
+            s.server.requests_host_refused = s.server.requests_host_refused.wrapping_add(1);
+            build_error(s, b"400 Bad Request", b"Bad Request\n");
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.keepalive = 0;
+                cur.phase = Phase::DrainSend;
+            }
+            return true;
+        }
+    };
+    let mut canon = [0u8; MAX_DYN_HOST];
+    let host: &[u8] = if raw_host.is_empty() {
+        &[]
+    } else {
+        match route_key::canonical_authority(raw_host, DYN_ROUTE_DEFAULT_PORT, &mut canon) {
+            Ok(n) => &canon[..n],
+            Err(_) => return false,
+        }
     };
     let path = core::slice::from_raw_parts(rp_ptr, rp_len);
     let di = match_dyn_route(&s.server.dyn_routes, host, path);

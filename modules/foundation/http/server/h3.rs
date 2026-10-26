@@ -387,6 +387,10 @@ impl H3StreamSlot {
 pub struct H3State {
     pub slots: [H3StreamSlot; MAX_H3_STREAMS],
     pub emit_cursor: u8,
+    /// Requests refused for naming two authorities or an oversize one since
+    /// the last step, folded into `server.requests_host_refused` by
+    /// `step_mux`: the stream pump holds the server state shared.
+    pub host_refused: u32,
     /// One entry per QUIC connection the transport is carrying.
     ///
     /// Connection-scoped HTTP/3 state lives here rather than beside the
@@ -426,6 +430,7 @@ impl H3State {
                 [EMPTY_SLOT; MAX_H3_STREAMS]
             },
             emit_cursor: 0,
+            host_refused: 0,
             sessions: {
                 const EMPTY: H3Session = H3Session::empty();
                 [EMPTY; MAX_H3_SESSIONS]
@@ -1139,8 +1144,13 @@ pub const H3_MAX_PATH: usize = 2048;
 #[cfg(not(target_arch = "aarch64"))]
 pub const H3_MAX_PATH: usize = 200;
 
-/// Longest `:authority` retained. Only its presence and length are
-/// protocol-relevant here; routing is by path.
+/// Longest `:authority` accepted. One past it is refused as a message error,
+/// never clipped: a truncated authority is a different name that shares a
+/// prefix. The route-key ceiling where the h3 tables are sized for it, and
+/// the h1 dynamic-route host width elsewhere, where h3 is structurally idle.
+#[cfg(target_arch = "aarch64")]
+pub const H3_MAX_AUTHORITY: usize = super::super::wire::route_key::MAX_ROUTE_HOST;
+#[cfg(not(target_arch = "aarch64"))]
 pub const H3_MAX_AUTHORITY: usize = 64;
 
 /// Largest WebSocket payload this module will carry over an h3 tunnel. Sized
@@ -1246,6 +1256,10 @@ pub struct H3Request {
     /// The field lines did not fit the capture buffer: the request is
     /// refused rather than forwarded with fields missing.
     pub fields_over: bool,
+    /// The request named two authorities (`:authority` and a `host` field
+    /// that disagree) or one past `H3_MAX_AUTHORITY`. Set beside the
+    /// `MessageError` so the caller can count the reason.
+    pub host_refused: bool,
 }
 
 impl H3Request {
@@ -1262,6 +1276,7 @@ impl H3Request {
             content_length: None,
             fields_len: 0,
             fields_over: false,
+            host_refused: false,
         }
     }
 
@@ -1398,9 +1413,12 @@ pub fn decode_request_headers(
                         return Err(H3Error::MessageError);
                     }
                     seen_authority = true;
-                    let n = value.len().min(H3_MAX_AUTHORITY);
-                    out.authority[..n].copy_from_slice(&value[..n]);
-                    out.authority_len = n as u8;
+                    if value.len() > H3_MAX_AUTHORITY {
+                        out.host_refused = true;
+                        return Err(H3Error::MessageError);
+                    }
+                    out.authority[..value.len()].copy_from_slice(value);
+                    out.authority_len = value.len() as u8;
                     // The application reads the authority as h1's `host`.
                     capture_field(capture, out, b"host", value);
                 }
@@ -1425,8 +1443,20 @@ pub fn decode_request_headers(
             if name.iter().any(|c| c.is_ascii_uppercase()) {
                 return Err(H3Error::MessageError);
             }
-            // A `host` beside the authority is the same fact twice.
-            if !(seen_authority && name == b"host") {
+            // A `host` beside the authority is the same fact twice — and
+            // twice is fine only while they agree. A pair that disagrees
+            // names two origins; forwarding one of them routes the request
+            // somewhere the client did not ask for. h3 is always https.
+            if seen_authority && name == b"host" {
+                if !super::super::wire::route_key::authority_agrees(
+                    out.authority_bytes(),
+                    value,
+                    443,
+                ) {
+                    out.host_refused = true;
+                    return Err(H3Error::MessageError);
+                }
+            } else {
                 capture_field(capture, out, name, value);
             }
         }
@@ -2786,6 +2816,9 @@ unsafe fn take_frames(
             );
             consume_head(&mut st.slots[idx], end, true);
             if let Err(e) = decoded {
+                if req.host_refused {
+                    st.host_refused = st.host_refused.wrapping_add(1);
+                }
                 let slot = &mut st.slots[idx];
                 slot.state = H3StreamState::Reset;
                 slot.reset_code = e.code();
@@ -4540,6 +4573,9 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
         if st.draining {
             begin_drain(st);
         }
+        let refused = st.host_refused;
+        st.host_refused = 0;
+        s.server.requests_host_refused = s.server.requests_host_refused.wrapping_add(refused);
     }
     sweep_idle_sessions(s);
 

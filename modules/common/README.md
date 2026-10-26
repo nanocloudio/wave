@@ -37,6 +37,7 @@ direct fixture in `tests/harness` and never presented as a deployable role.
 | `turn_core` | TURN's relay extension to STUN: allocate/refresh/permission/channel methods, relay attributes, ChannelData framing | — (direct fixture only; no module presents relay mechanics it does not have) |
 | `sframe_core` | RFC 9605 SFrame framing: clear header, sealed payload boundary, what a cipher must authenticate. All 289 published header vectors. Framing, not encryption | — (direct fixture only) |
 | `webrtc_sdp` | The SDP attributes that make a description a WebRTC one: ICE credentials, candidates, DTLS fingerprint. Facts, not a WebRTC stack | — (direct fixture only) |
+| `http_route_key` | The canonical `(host, port, path)` an HTTP request names — host lowercased, trailing dot and default port removed, IPv6 literal validated, path dot-segment- and percent-encoding-normalised — and the refusals: two authorities that disagree, an oversize host or path, a non-ASCII host. Plus the domain-separated digest input a load balancer hashes. Parsing, not placement | `http` (`wire::route_key`: the h1 `Host` walk, the h2/h3 `:authority`/`host` agreement, the dynamic-route host spelling); the key and digest are consumed by Wormhole (direct fixture here) |
 
 SHA-1 (`Sec-WebSocket-Accept`) and Base64 (the key nonce and accept proof) are
 **Fluxor SDK-owned**, mounted from `target/fluxor/fluxor-abi/sdk/crypto/`. Wave

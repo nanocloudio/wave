@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # Flash budget for the built `.fmod` artefacts.
 #
-# Wave's variant split exists to fit smaller devices. That
-# claim is a NUMBER, and until now nothing held it: the 37% saving `http-web`
-# gives over `http` on rp2350 was true because someone measured it once, and any
-# change could have eaten it silently. A variant that quietly stops being smaller
-# than the thing it is a subset of has stopped doing its job.
+# Wave's variant split exists to fit smaller devices, and that claim is a
+# NUMBER: the saving `http-web` gives over `http` on rp2350 holds only while
+# something checks it. A variant that quietly stops being smaller than the
+# thing it is a subset of has stopped doing its job.
 #
-# Ceilings are set 5-8% above the measured size — tight enough that a real
+# Ceilings sit 5-8% above the measured size — tight enough that a real
 # regression trips, loose enough that ordinary work does not. A row re-based
-# after deliberate growth takes the 5% end, which is the tightest margin that
-# has not produced a false trip. When a ceiling is
-# hit deliberately, RAISE IT IN THIS FILE in the same commit as the change, so
-# the growth is a decision with a diff rather than a discovery months later.
+# after deliberate growth takes the 5% end, the tightest margin that does not
+# trip on noise. Growth that is meant RAISES THE CEILING IN THIS FILE
+# alongside it, so it arrives as a decision with a diff rather than as a
+# discovery months later.
 #
 # Also enforces the RELATION, not just the absolutes: a subset variant must be
 # strictly smaller than its superset. That check needs no maintenance and cannot
@@ -21,11 +20,11 @@
 # Usage: tools/ci/fmod_size_budget.sh [--print]
 #   --print   report sizes and exit 0 without enforcing (for re-baselining)
 #
-# BUDGETS and RELATIONS are SINGLE-quoted. They have to be: a note reading
-# "run `fluxor sync`" inside a double-quoted string is a command substitution,
-# and the script then runs it and reports whatever that says instead of a
-# budget. That has happened twice. Single quotes make a backtick a backtick, at
-# the cost of no apostrophes in a note.
+# BUDGETS and RELATIONS are SINGLE-quoted, and have to be: a note reading
+# "run `fluxor sync`" inside a double-quoted string is a command
+# substitution, so the script would run it and report whatever it printed in
+# place of a budget. Single quotes make a backtick a backtick, at the cost of
+# no apostrophes in a note.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -49,16 +48,16 @@ MODE="${1:-}"
 # silently omits an artefact is worse than no budget, because the omission
 # reads as coverage.
 BUDGETS='
-thumbv6m|http.fmod|218700|208228 (2026-10-06: request bodies whole in the application HEAD and the exchange id the server packs itself; ceiling re-based 5% above measured)
+thumbv6m|http.fmod|230600|219580 (2026-10-26, +11.4K since the 2026-10-06 row: the HTTP route-key core (canonical authority, two-authority refusal on h1/h2/h3, canonical dynamic-route hosts) and earlier growth that landed unmeasured; ceiling re-based 5% above measured)
 thumbv6m|http-h2.fmod|170000|161864 (2026-10-23, +8.4K since the 2026-09-10 row: inline body routes sized and admitted against the heap cap, oversize cache fills refused, the retention buffer only when ws_in is wired, plus h1 file serving resuming across backpressure; ceiling re-based 5% above measured)
 thumbv6m|http-web.fmod|102000|93780 (2026-09-07, first RP2040 qualification)
 thumbv6m|http-app.fmod|113400|108012 (2026-10-24, +8.5K since the 2026-09-07 row: the store table consumers on the doorbell model (one event, TAKE_RUNG, paged CHANGES with a shadow relist) and earlier unmeasured growth; ceiling re-based 5% above measured)
-thumbv6m|http-exchange.fmod|237100|225772 (2026-10-06: the client as an exchange provider: request collection, streamed answers under credit, LINK, and request headers over h1, h2 and h3; ceiling re-based 5% above measured)
+thumbv6m|http-exchange.fmod|250100|238172 (2026-10-26, +12.4K since the 2026-10-06 row: the HTTP route-key core and the two-authority refusal, plus earlier growth that landed unmeasured; ceiling re-based 5% above measured)
 thumbv6m|http-h1_exchange.fmod|112900|107464 (2026-10-23, +10.4K since the 2026-09-07 row: inline body admission, oversize cache refusal, and earlier work that landed unmeasured; ceiling re-based 5% above measured)
 thumbv8m|http-h1_exchange.fmod|112300|106952 (2026-10-23, +14.4K since the 2026-09-08 row: inline body admission, oversize cache refusal, and earlier work that landed unmeasured; ceiling re-based 5% above measured)
 aarch64|http-h1_exchange.fmod|217000|201220 (2026-09-08, first row; HTTP/1.1 plus the graph-driven exchange client and nothing else)
-thumbv8m|http.fmod|216900|206508 (2026-10-06: request bodies whole in the application HEAD and the exchange id the server packs itself; ceiling re-based 5% above measured)
-thumbv8m|http-h2.fmod|165300|157420 (2026-10-18, +7.9K since the 2026-09-10 row: h1 file serving resumes across filesystem backpressure as a step machine; ceiling re-based 5% above measured)
+thumbv8m|http.fmod|227900|217000 (2026-10-27, +10.5K since the 2026-10-06 row: table consumers that follow a named store (`table_volume`) through its selector, the HTTP route-key core, and earlier growth that landed unmeasured; ceiling re-based 5% above measured)
+thumbv8m|http-h2.fmod|175400|167020 (2026-10-26, +9.6K since the 2026-10-18 row: the HTTP route-key core and the h2 `:authority`/`host` agreement check, plus earlier growth that landed unmeasured; ceiling re-based 5% above measured)
 thumbv8m|http-web.fmod|98000|90020 (2026-09-07, current ABI and readiness hardening)
 thumbv8m|http-app.fmod|114100|108592 (2026-10-23, +13.6K since the 2026-09-07 row: inline body admission, oversize cache refusal, and earlier work that landed unmeasured; ceiling re-based 5% above measured)
 thumbv8m|http-exchange.fmod|234700|223508 (2026-10-06: the client as an exchange provider: request collection, streamed answers under credit, LINK, and request headers over h1, h2 and h3; ceiling re-based 5% above measured)

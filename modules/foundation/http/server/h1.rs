@@ -427,6 +427,22 @@ unsafe fn begin_discard(s: &mut HttpState, limit: u64) -> i32 {
     2
 }
 
+/// Whether this request's `Host` lines disagree about the origin it names.
+///
+/// A head carrying one `Host`, or none, is routed; a repeated `Host` is not
+/// (`route_key::h1_host`). The value itself is not judged here — a host that
+/// no route matches is a 404, not a refusal.
+unsafe fn host_refused(s: &HttpState) -> bool {
+    let (heo, recv_ptr) = match cur_slot(s) {
+        Some(c) => (c.header_end_off as usize, c.recv_buf as *const u8),
+        None => return false,
+    };
+    if recv_ptr.is_null() || heo == 0 {
+        return false;
+    }
+    wire::route_key::h1_host(core::slice::from_raw_parts(recv_ptr, heo)).is_err()
+}
+
 pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
     drain_variables(s);
 
@@ -1055,6 +1071,20 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
         }
 
         Phase::DispatchRoute => {
+            // The authority is weighed before any route is consulted: a
+            // request that names two origins is malformed whatever it would
+            // have matched, and a check that ran only on the paths no static
+            // route claimed would be evaded by naming one that it does.
+            // RFC 9112 §3.2 answers a repeated `Host` with 400.
+            if host_refused(s) {
+                s.server.requests_host_refused = s.server.requests_host_refused.wrapping_add(1);
+                build_error(s, b"400 Bad Request", b"Bad Request\n");
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.keepalive = 0;
+                    cur.phase = Phase::DrainSend;
+                }
+                return 0;
+            }
             if s.server.unrouted_mode == 2 {
                 // Returns false if file_chan was busy; caller stays
                 // in DispatchRoute and retries next tick.

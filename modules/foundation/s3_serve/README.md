@@ -41,10 +41,16 @@ heap cannot serve is answered `503 SlowDown`.
 | 3 | `mesh_roots` | required | One or two 64-hex Ed25519 mesh root keys, comma-separated |
 | 4 | `max_object_mib` | 5120 | Largest object, MiB; at most 5 TiB |
 | 5 | `part_min_kib` | 5120 | Smallest multipart part but the last, KiB |
+| 6 | `object_volume` | (none) | The `storage.object` provider to reach: a keyed volume, or `platform` for the target's own; empty, the graph's default. At most 64 bytes |
 
 A missing credentials path or roots, a path past 256 bytes, roots that do not
-parse, a region past 32 bytes and an object ceiling of 0 or past 5 TiB refuse
-construction.
+parse, a region past 32 bytes, an `object_volume` past 64 bytes and an object
+ceiling of 0 or past 5 TiB refuse construction.
+
+`object_volume` chooses where objects live when a graph holds more than one
+`storage.object` provider, each under its own `volume:`. Each access key's
+grant is minted by that provider, and the grant's handle names it, so every
+operation for that key reaches the same one.
 
 ## Credentials
 

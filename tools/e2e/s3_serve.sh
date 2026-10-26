@@ -88,6 +88,11 @@ graph_tail() {
 
 fail() {
   mkdir -p "$LOG_KEEP"
+  # One failure's evidence and no more: a log an earlier run left here would
+  # otherwise sit beside this run's, dated differently, and read as part of
+  # the same failure. A stage that never started leaves its log absent, which
+  # is itself a fact about where the run stopped.
+  rm -f "$LOG_KEEP/run.log" "$LOG_KEEP/client.log"
   for l in run.log client.log; do
     [ -f "$D/$l" ] && cp "$D/$l" "$LOG_KEEP/$l"
   done

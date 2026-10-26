@@ -596,8 +596,8 @@ mod params_def {
     define_params! {
         RtpState;
 
-        // Tags 1, 2 and 5 are retired; the next allocation is 26.
-        22, authority, str, 0
+        // Tags 1, 2 and 5 are retired; the next allocation is 27.
+        26, authority, str, 0
             => |s, d, len| { s.peer.set(core::slice::from_raw_parts(d, len)); };
 
         3, local_port, u16, 5004

@@ -27,7 +27,7 @@ use super::routes::{HANDLER_FS_FILE, HANDLER_FS_LIST};
 use super::{
     dev_log, fmt_u32_raw, heap_alloc, heap_free, heap_realloc, hex_val, log, p_u16, p_u32, p_u8,
     HttpState, DEFAULT_BODY_POOL_SIZE, MAX_CONTENT_TYPE, MAX_DYN_PREFIX, MAX_FS_PATH, MAX_PATH,
-    MAX_ROUTES,
+    MAX_ROUTES, TABLE_VOLUME_MAX,
 };
 
 // ── Body-pool admission ───────────────────────────────────────────────────
@@ -243,6 +243,17 @@ impl LogLine {
 ///
 /// # Safety
 /// `d` points at `len` readable bytes (the TLV value).
+/// `table_volume`: the store every table follows, held whole or refused —
+/// a name cut short would select a different store, or none.
+pub(crate) unsafe fn set_table_volume(s: &mut HttpState, d: *const u8, len: usize) {
+    if len > TABLE_VOLUME_MAX {
+        s.server.table_volume_refused = 1;
+        return;
+    }
+    core::ptr::copy_nonoverlapping(d, s.server.table_volume.as_mut_ptr(), len);
+    s.server.table_volume_len = len as u8;
+}
+
 pub(crate) unsafe fn set_routes_prefix(s: &mut HttpState, d: *const u8, len: usize) {
     let n = len.min(MAX_DYN_PREFIX);
     let dst = s.server.routes_prefix.as_mut_ptr();

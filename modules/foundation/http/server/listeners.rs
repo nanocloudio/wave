@@ -361,10 +361,11 @@ pub(crate) unsafe fn pump_listeners(s: &mut HttpState) {
         // page before the next is read, so the transient buffer is free to
         // share.
         let prefix = &s.server.listeners_prefix[..prefix_len];
+        let store = &s.server.table_volume[..usize::from(s.server.table_volume_len)];
         let scratch = &mut s.server.routes_scratch;
         let ltc = &mut s.server.ltc;
         let listeners = &mut s.server.listeners;
-        ltc.advance(sys, ev, prefix, scratch, listeners);
+        ltc.advance(sys, store, ev, prefix, scratch, listeners);
     }
 
     // Reconcile only after the static bind: the mid-life CMD_BIND rides
