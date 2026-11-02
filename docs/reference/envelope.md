@@ -20,7 +20,7 @@ connection at a time.
 | HTTP slots | `http::MAX_CONCURRENT_CONNS` | 256 | 4 | Fluxor profile constant | idle keepalive evicted, else accept closed (`conns_refused_slots`) |
 | HTTP arena working set | `http::ARENA_WORKING_SET_CONNS` | 256 | 4 | Fluxor profile constant | accept closed (`conns_refused_arena`) |
 | HTTP receive buffer / conn | `http::RECV_BUF_SIZE` | 8192 | 2048 | Fluxor profile constant | demux stalls (`demux_stalls`) |
-| h2 streams / connection | `h2::MAX_STREAMS` | 4 | 4 | Wave | REFUSED_STREAM (`h2_streams_refused`) |
+| h2 streams / connection | `h2::MAX_STREAMS` | 16 | 16 | Wave | REFUSED_STREAM (`h2_streams_refused`) |
 | QUIC connections | `quic::MAX_CONNS` | 64 | 2 | Fluxor profile constant | stateless CONNECTION_REFUSED |
 | h3 sessions | `MAX_H3_SESSIONS` | 8 | 2 | Wave | session closed H3_REQUEST_REJECTED |
 | h3 request streams (all sessions) | `MAX_H3_STREAMS` | 16 | 4 | Wave | stream refused |

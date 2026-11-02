@@ -106,7 +106,8 @@
 //! | 91    | listeners_prefix | str | (none) | Store prefix for dynamic listeners               |
 //! | 100   | h3          | u8   | 0       | Serve HTTP/3 over the `mux` contract                |
 //! | 101   | —           | —    | —       | retired                                             |
-//! | 102-103 | —         | —    | —       | unassigned                                          |
+//! | 102   | h2_max_streams | u8 | 16    | Server: concurrent HTTP/2 streams per connection, advertised and enforced (1..=16; 0 = 16) |
+//! | 103   | —           | —    | —       | unassigned                                          |
 //! | 104   | header_timeout_ms | u32 | 10000 | Close a connection with no complete head (0 = off) |
 //! | 105   | keepalive_idle_ms | u32 | 60000 | Close a keepalive with no next request (0 = off)   |
 //! | 106   | pressure_idle_ms | u32 | 2000  | Keepalive limit once the table is ¾ full (0 = off)  |
@@ -359,6 +360,13 @@ mod params_def {
 
     115, ws_multi_client, u8, 0
         => |s, d, len| { s.server.ws_multi_client = u8::from(p_u8(d, len, 0, 0) != 0); };
+
+    // Concurrent HTTP/2 streams a connection carries, as SETTINGS advertise
+    // them and the stream table enforces them. At most the table's size:
+    // a larger figure is refused at construction rather than advertised
+    // and then broken.
+    102, h2_max_streams, u8, 0
+        => |s, d, len| { s.server.h2_max_streams = p_u8(d, len, 0, 0); };
 
     109, client_header_ms, u32, 15_000
         => |s, d, len| { s.client.client_header_ms = p_u32(d, len, 0, 15_000); };
@@ -861,6 +869,12 @@ pub unsafe extern "C" fn module_new(
                 dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
                 return -22;
             }
+            #[cfg(feature = "h2")]
+            if usize::from(s.server.h2_max_streams) > server::h2::MAX_STREAMS {
+                let m = b"[http] h2_max_streams is past the 16 streams a connection holds";
+                dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
+                return -22;
+            }
             if s.server.route_body_refused != 0 {
                 let m = b"[http] a route_N_max_body_kib is past the 1 TiB ceiling";
                 dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
@@ -876,6 +890,19 @@ pub unsafe extern "C" fn module_new(
 
         0
     }
+}
+
+/// Whether the client is driven by the graph's exchange records.
+#[inline(always)]
+fn client_armed(s: &HttpState) -> bool {
+    #[cfg(feature = "exchange")]
+    let armed = client::provider::armed(s);
+    #[cfg(not(feature = "exchange"))]
+    let armed = {
+        let _ = s;
+        false
+    };
+    armed
 }
 
 /// PIC module ABI entry: per-tick cooperative step.
@@ -941,6 +968,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 client::provider::service(s);
                 if s.client.draining != 0 {
                     client::provider::drain(s);
+                    #[cfg(feature = "h2")]
+                    client::h2_streams::drain(s);
                     #[cfg(feature = "h3")]
                     let closed = if s.h3_mode != 0 {
                         client::h3::close_session(s)
@@ -949,11 +978,21 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     };
                     #[cfg(not(feature = "h3"))]
                     let closed = client::send_close_frame(s);
+                    #[cfg(feature = "h2")]
+                    let closed = closed && client::h2_streams::quiet(s);
                     return if closed && client::provider::quiet(s) {
                         1
                     } else {
                         0
                     };
+                }
+                // HTTP/2 carries many exchanges on one connection, and runs
+                // the connection itself: dial, preface, streams, answers.
+                #[cfg(feature = "h2")]
+                if client::h2_streams::holds_requests(s) {
+                    client::h2_streams::step(s);
+                    tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
+                    return 0;
                 }
                 if !client::provider::busy(s) && !client::provider::probing(s) {
                     #[cfg(feature = "h3")]
@@ -961,7 +1000,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         client::h3::idle(s);
                     }
                     if s.h3_mode == 0 {
-                        if s.client.protocol == 0 {
+                        if client::preferred_generation(s) == client::GEN_H1 {
                             client::h1::idle(s);
                         } else {
                             // h2 has no idle step of its own, and an armed client
@@ -1007,8 +1046,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
                 return r;
             }
+            // A graph-driven client reaches here only for HTTP/1.1: its
+            // HTTP/2 runs through the streams above. The one-shot param
+            // client takes the generation it is configured for.
             #[cfg(feature = "h2")]
-            let r = if s.client.protocol == 1 {
+            let r = if s.client.protocol == 1 && !client_armed(s) {
                 client::h2::step(s)
             } else {
                 client::h1::step(s)

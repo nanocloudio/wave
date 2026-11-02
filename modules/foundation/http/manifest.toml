@@ -149,7 +149,7 @@ default = true
 # `tests/harness/tests/manifest_contract.rs` checks the aarch64 rows against
 # `arena_size` on the host. A refusal names the figure to write.
 [capacities]
-heap_from_params = { tags = [2, 11, 21, 31, 41, 51, 61, 71, 81], base = { default = 23063552, aarch64 = 23063552, thumbv8m = 2186120, thumbv6m = 2139356 }, included = { default = 262144, aarch64 = 262144, thumbv8m = 16384, thumbv6m = 4096 } }
+heap_from_params = { tags = [2, 11, 21, 31, 41, 51, 61, 71, 81], base = { default = 24144896, aarch64 = 24144896, thumbv8m = 2193800, thumbv6m = 2141276 }, included = { default = 262144, aarch64 = 262144, thumbv8m = 16384, thumbv6m = 4096 } }
 
 [[ports]]
 name = "net_in"

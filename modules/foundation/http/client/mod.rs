@@ -25,6 +25,11 @@ pub mod h3;
 // `response_out`.
 #[cfg(feature = "exchange")]
 pub(crate) mod provider;
+// HTTP/2 for the exchange provider: many exchanges at once, one stream each,
+// over one connection. The one-shot param client's single stream stays in
+// `h2`.
+#[cfg(all(feature = "exchange", feature = "h2"))]
+pub(crate) mod h2_streams;
 
 use super::connection::{
     net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
@@ -39,7 +44,13 @@ use super::{
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
 
+/// Inbound bytes held for the phase machine. An HTTP/2 frame other than
+/// DATA is read whole, so this bounds the response header block a stream
+/// takes; the graph-driven client takes the larger one its responses carry.
+#[cfg(not(feature = "exchange"))]
 pub(crate) const RECV_BUF_SIZE: usize = 2048;
+#[cfg(feature = "exchange")]
+pub(crate) const RECV_BUF_SIZE: usize = 8192;
 
 /// A path plus its query string.
 ///
@@ -107,6 +118,53 @@ pub(crate) const CAUSE_CONNECT: u8 = 1;
 pub(crate) const CAUSE_LINK: u8 = 2;
 /// A deadline passed.
 pub(crate) const CAUSE_TIMEOUT: u8 = 3;
+
+// ── Generations ──────────────────────────────────────────────────────────
+//
+// The values of the `protocol` parameter.
+
+/// HTTP/1.1.
+pub(crate) const GEN_H1: u8 = 0;
+/// HTTP/2.
+pub(crate) const GEN_H2: u8 = 1;
+
+/// The generation a connection speaks. The protocol the session stage in
+/// front negotiated (ALPN) decides when it names one this client speaks —
+/// the origin has already agreed to it, and speaking anything else on that
+/// connection is a protocol error. Otherwise the configured one does: h2c by
+/// prior knowledge, or HTTP/1.1. The one place the choice is made.
+pub(crate) fn generation_for(configured: u8, alpn: &[u8]) -> u8 {
+    if alpn == b"h2" {
+        GEN_H2
+    } else if alpn == b"http/1.1" {
+        GEN_H1
+    } else {
+        configured
+    }
+}
+
+/// The generation this client's next connection is expected to speak: the
+/// one its origin last negotiated, else the configured one.
+pub(crate) fn preferred_generation(s: &HttpState) -> u8 {
+    match s.client.negotiated {
+        0 => s.client.protocol,
+        n => n - 1,
+    }
+}
+
+/// Record the generation the session stage negotiated for a connection, from
+/// its `MSG_CONNECTED` payload, and return the one it speaks.
+pub(crate) fn negotiate(s: &mut HttpState, payload: &[u8]) -> u8 {
+    let alpn = super::connection::connected_alpn(payload);
+    let generation = generation_for(s.client.protocol, alpn);
+    if !alpn.is_empty() {
+        s.client.negotiated = generation + 1;
+        s.client.session_tls = 1;
+    } else {
+        s.client.session_tls = 0;
+    }
+    generation
+}
 
 // ── Phase machine ─────────────────────────────────────────────────────────
 
@@ -205,7 +263,14 @@ pub(crate) struct ClientState {
     pub(crate) headers_done: u8,
     /// Wire protocol — 0 = HTTP/1.1, 1 = HTTP/2 cleartext (h2c).
     /// Read by `mod.rs::module_step` to pick the right state machine.
+    /// A protocol the transport negotiated (`negotiated`) overrides it.
     pub(crate) protocol: u8,
+    /// The generation the origin last negotiated through the session stage
+    /// in front (ALPN), plus one; 0 when none has been.
+    pub(crate) negotiated: u8,
+    /// 1 when the connection in hand came through a session stage that
+    /// negotiated a protocol — TLS, so its requests are `https`.
+    pub(crate) session_tls: u8,
     /// The request verb, a `wire::method` code. `post_params` defaults it to
     /// `METHOD_GET`; a graph-driven request overwrites it per exchange. Zero
     /// (`METHOD_NONE`) is not a verb and composes no request head.
@@ -276,6 +341,9 @@ pub(crate) struct ClientState {
     /// a param client uses, re-armed per request rather than duplicated.
     #[cfg(feature = "exchange")]
     pub(crate) ex: provider::Provider,
+    /// The exchanges an HTTP/2 connection carries, one stream each.
+    #[cfg(all(feature = "exchange", feature = "h2"))]
+    pub(crate) streams: h2_streams::Streams,
 }
 
 // ClientState lives inside HttpState, which the kernel allocates as a

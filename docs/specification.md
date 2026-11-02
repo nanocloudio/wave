@@ -105,7 +105,7 @@ media-topology policy with the owners in the table below.
 | --- | --- |
 | Fluxor | ABI, scheduling, channels, content contracts, TCP/UDP, endpoint allocation, DNS, TLS, DTLS, QUIC, cryptographic operations and opaque key handles |
 | Wave | Reusable wire encoding, decoding, framing, protocol facts and bounded application-protocol transaction mechanics |
-| Wormhole | Candidate gathering policy, ICE pair formation, check scheduling and nomination, relay selection, allocation policy and relay operation |
+| ICE agent (outside Wave) | Candidate gathering policy, ICE pair formation, check scheduling and nomination, relay selection, allocation policy and relay operation |
 | Conclave | Conversation identity, participants, call/message intent, connector policy and authorisation |
 | Grove | Media topology, clocks, routing, advanced jitter/adaptation, mixing and distributed media-session execution |
 | Spectra | Audio, image and video codec algorithms and media-container mechanics |
@@ -117,7 +117,7 @@ fluxor content contract or a documented bounded record carried over
 an existing surface. A shared concept is not permission for private
 cross-repository state. Conclave's WebRTC profile records the same
 assignments from its side; the masterplan places SDP in Wave and ICE
-policy in Wormhole for the same reason integrity computation is here
+policy in the ICE agent for the same reason integrity computation is here
 and "whether to send" is not.
 
 ## Ownership
@@ -457,7 +457,7 @@ it waiting forever.
 It is not an ICE agent and not a TURN relay: it gathers no
 candidates, forms no pairs, schedules no connectivity checks and
 nominates nothing. Those are reachability decisions, and reachability
-policy belongs to Wormhole. It asks a question and answers one; it
+policy belongs to the ICE agent. It asks a question and answers one; it
 does not decide what to do with either.
 
 ### `s3`

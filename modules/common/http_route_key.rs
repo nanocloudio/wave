@@ -7,7 +7,7 @@
 //
 // This file says what a request's route key IS. It decides nothing about
 // where the request goes: placement, hashing policy and backend choice belong
-// to whoever consumes the key (the Wormhole load balancer, the http module's
+// to whoever consumes the key (a load balancer, the http module's
 // own route table). Wave owns the parsing because the parsing is
 // HTTP. The rule the file is built around: refuse what does not
 // canonicalise rather than hash a guess at it. Two readers that hash

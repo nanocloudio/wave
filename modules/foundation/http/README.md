@@ -77,8 +77,14 @@ and the high-tag set: `routes_prefix`, `listeners_prefix`, `table_volume`,
 each route's body ceiling `route_N_max_body_kib`, then the connection-lifetime
 set `header_timeout_ms`, `keepalive_idle_ms`, `pressure_idle_ms`, `stall_ms`,
 `ws_idle_ms`, and the client's `authority`.
-Tags are wire positions: append, never renumber; tags 4, 101, 102, 103, 120
-and 121 are unassigned.
+Tags are wire positions: append, never renumber; tags 4, 101, 103, 120 and 121
+are unassigned.
+
+`h2_max_streams` (parameter 102) is how many HTTP/2 streams the server carries
+at once on one connection: advertised as `SETTINGS_MAX_CONCURRENT_STREAMS` and
+enforced as the same figure, one past it refused `REFUSED_STREAM`. 1 to 16, the
+stream table's size; 0, the default, is all 16. A larger figure refuses the
+module at construction rather than advertising streams the table cannot hold.
 
 `table_volume` (parameter 130) names the store every table follows — the
 dynamic routes, the listeners and the session trigger: a keyed
@@ -194,7 +200,7 @@ closes after its response, because the body was never read.
 
 A request names its origin in up to three places — an absolute-form target,
 `:authority` on h2 and h3, `Host` — and `modules/common/http_route_key.rs`
-decides what it names. That core is shared with the Wormhole load balancer
+decides what it names. That core is shared with a load balancer
 through `wave-common`, so the authority this server derives is the one the
 balancer placed the request by: lowercased, one trailing dot stripped, the
 scheme's default port removed, an IPv6 literal kept in its brackets and
@@ -330,7 +336,11 @@ full; in short:
 
 - **The request.** `method` is `METHOD_GET` … `METHOD_OPTIONS`; `CONNECT`,
   `PUBLISH` and anything else are answered 400, as are the `BROADCAST`,
-  `WEBSOCKET` and `WEBTRANSPORT` flags. `target` is the request target,
+  `WEBSOCKET` and `WEBTRANSPORT` flags. `HOLD` asks for a HELD exchange — a
+  watch, an event stream — which its origin ends: its answer is marked
+  `HOLD | MORE`, and once its head has come no whole-exchange deadline
+  (`client_total_ms`) cuts it short (over HTTP/2 not `client_stall_ms`
+  either: the connection is kept honest by PING instead). `target` is the request target,
   `/path[?query]`, sent verbatim (empty means `/`). `headers` are `name:
   value\r\n` lines sent as given — `content-type` among them — and must be
   well-formed field lines naming no field this client frames the request with
@@ -361,17 +371,79 @@ full; in short:
 - **LINK.** A pinned client's origin is its backend link. A connection that
   cannot be opened, or drops before a response completes, is reported LINK
   DOWN instead of an answer: everything the client holds is unknowable, and
-  the requester issues it again after LINK UP. The client probes the origin
-  itself — 1 s, doubling to 30 s — and reports LINK UP once a connection opens.
-  Over HTTP/3 the link is the QUIC session the transport announces.
-- **Concurrency.** One request is performed at a time and one more collected
-  behind it; a third is answered 503. A requester ABORT closes the connection
-  under its exchange and nothing more is written for it. Drain answers what is
-  held 503 (or ABORTs a response under way) and reports done once nothing is
-  owed. Requests are never replayed automatically.
+  the requester issues it again after LINK UP. Every time the client drops an
+  exchange that way it says DOWN — also when the link was already down: a
+  request taken after the last DOWN, whose own dial then fails, was not
+  covered by it. A dial a session stage in front refuses — a failed handshake
+  (`ECONNREFUSED`), an identity not yet certified (`EAGAIN`) — is the link's
+  like any other. The client probes the origin itself — 1 s, doubling with
+  each failure to 30 s — and reports LINK UP once a connection opens, always
+  after any DOWN still owed. Over HTTP/3 the link is the QUIC session the
+  transport announces.
+- **Concurrency.** Over HTTP/1.1 one request is performed at a time and one
+  more collected behind it; a third is answered 503. Over HTTP/2 up to 16
+  exchanges share one connection, one stream each, fewer when the origin's
+  `SETTINGS_MAX_CONCURRENT_STREAMS` says so, and one more is collected behind
+  them (below). A requester ABORT ends its exchange — over HTTP/1.1 by closing
+  the connection under it, over HTTP/2 by resetting its stream — and nothing
+  more is written for it. Drain answers what is held 503 (or ABORTs a
+  response under way) and reports done once nothing is owed. Requests are
+  never replayed automatically.
+- **Which generation.** A connection speaks the protocol the session stage in
+  front negotiated for it (TLS ALPN, reported on `MSG_CONNECTED`): `h2` opens
+  HTTP/2 on it, `http/1.1` sends HTTP/1.1, whatever `protocol` says — the
+  origin agreed to that protocol on that connection. With nothing negotiated
+  (plain TCP), `protocol` decides: 1 is HTTP/2 by prior knowledge (h2c). The
+  choice is `client::generation_for`, and the protocol last negotiated is the
+  one the next connection is expected to speak.
 
 The fluxor debug stack's OTLP export (`../fluxor/stacks/debug.toml`) is this provider
 behind `exchange_poster`, pinned to the collector's authority.
+
+## HTTP/2 client streams
+
+`client/h2_streams.rs` carries the exchange provider's HTTP/2. One connection
+to the origin holds a stream per exchange, ids odd and increasing; a
+connection whose ids run out, that the origin sends GOAWAY on, or that an
+open client needs for another authority opens no more streams, and closes
+once its last one has ended.
+
+- **Flow control.** A stream's receive window is its requester's credit: the
+  client advertises `SETTINGS_INITIAL_WINDOW_SIZE = 0` and opens each stream's
+  window by WINDOW_UPDATE as far as its requester has granted. The origin
+  never sends a stream more than its requester takes, so every DATA byte is
+  forwarded as it arrives — a frame of any length streams through — and a
+  requester that stops reading holds back its own stream and no other. The
+  connection's window is opened to 1 MiB and refilled as it is spent. Request
+  bodies go out under the origin's stream and connection windows and its
+  `SETTINGS_MAX_FRAME_SIZE`.
+- **Per-stream ends.** RST_STREAM answers its exchange alone: 503 for
+  `REFUSED_STREAM` (never processed, safe to repeat), 502 otherwise, ABORT
+  `PEER_GONE` once its head has gone. GOAWAY answers the streams past its last
+  id 503 and lets the earlier ones finish.
+- **Waiting.** Up to the stream limit, requests open streams as they arrive,
+  and one more is collected behind them; past that a request is answered 503,
+  as over HTTP/1.1. While no stream is open — the connection still being
+  dialled — requests wait in the channel instead of being refused, so the
+  burst a requester opens with reaches the connection whole.
+- **Deadlines.** `client_header_ms` bounds the wait for a stream's head,
+  `client_total_ms` its whole exchange, `client_stall_ms` a response whose
+  window is open and whose origin sends nothing; each answers that stream 504
+  (an ABORT `STALLED` after its head) and resets it. A held exchange is
+  bounded only until its head. A connection carrying streams that has been
+  silent for `client_stall_ms` is sent a PING, and is lost if that goes
+  unanswered as long again.
+- **A lost connection.** On a pinned client it is LINK DOWN for every stream
+  on it and every request held; an open client answers each stream 502, or
+  ABORT once its head has gone.
+- **Scope.** HPACK static table and literals, no dynamic table
+  (`SETTINGS_HEADER_TABLE_SIZE = 0`); no CONTINUATION, so a response header
+  block is one HEADERS frame of at most the 8 KiB receive buffer; no push.
+  Trailers end the answer and are not carried. Requests are `https` when a
+  session stage negotiated the protocol, `http` otherwise.
+
+The one-shot param client (`protocol: 1` without `request_in`) keeps its
+single stream in `client/h2.rs`, with the WebSocket and gRPC bootstraps.
 
 ## HTTP/1 client response framing
 

@@ -23,13 +23,18 @@ bookkeeping.
 
 | Ceiling | Value | What one past it meets |
 |---|---|---|
-| `MAX_STREAMS` | 4 | `REFUSED_STREAM`, counted as `h2_streams_refused` |
+| `MAX_STREAMS` | 16 | the ceiling of `h2_max_streams` (default: all of it), the figure advertised as `SETTINGS_MAX_CONCURRENT_STREAMS` and enforced; past it `REFUSED_STREAM`, counted as `h2_streams_refused`. A larger `h2_max_streams` is refused at construction |
 | `STREAM_RECV_WINDOW` (`h2.rs`) | `RECV_BUF_SIZE` less a frame header | the per-stream window advertised as `SETTINGS_INITIAL_WINDOW_SIZE`: a peer may not send DATA past it (RFC 9113 §6.9.1), so no DATA frame outgrows the connection's receive buffer; it is refilled from half |
 
-Four concurrent streams per connection, the same on every target. A browser
-opening a fifth is told to retry it rather than queued, because a queue here
-is indistinguishable from a slow server and costs the memory the refusal
-exists to protect.
+Sixteen concurrent streams per connection, the same on every target: enough
+for a client that holds several watches open on one connection and still
+makes calls beside them, which four was not. Each slot is part of the
+per-connection `H2State` the arena reserves for every working-set connection,
+so the table is a memory figure; `h2_max_streams` advertises and enforces
+fewer where that matters, never more. A client opening one past the limit is
+told to retry it rather than queued, because a queue here is
+indistinguishable from a slow server and costs the memory the refusal exists
+to protect.
 
 ## HTTP/3
 
@@ -97,7 +102,7 @@ never reaches it, so reaching it is a broken contract and is answered as one.
 | `MAX_ROUTE_PATH` | 2048 | `RouteKeyError::Oversize`, the same refusal |
 
 The route key (`modules/common/http_route_key.rs`) is the canonical
-`(host, port, path)` a request names, shared with the Wormhole load balancer
+`(host, port, path)` a request names, shared with any load balancer that places HTTP requests
 so both place the request by the same bytes. Its two bounds follow from
 what a key could ever resolve: 255 is the DNS name ceiling (RFC 1035
 §2.3.4), and 2048 is the target the application fan-out already bounds
@@ -221,7 +226,7 @@ Ceilings this register does not yet cover, and where they are enforced today:
   smaller than the superset it is a subset of.
 
 ```limit-register
-MAX_STREAMS | modules/foundation/http/server/h2.rs | 4
+MAX_STREAMS | modules/foundation/http/server/h2.rs | 16
 STREAM_RECV_WINDOW | modules/foundation/http/server/h2.rs | (RECV_BUF_SIZE - h2w::FRAME_HEADER_LEN) as i32
 MAX_H3_SESSIONS | modules/foundation/http/server/h3.rs | 8
 MAX_H3_SESSIONS | modules/foundation/http/server/h3.rs | 2

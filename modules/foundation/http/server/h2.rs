@@ -9,8 +9,10 @@
 //!
 //! # Scope
 //!
-//! - up to `MAX_STREAMS` (4) concurrent client streams. Streams beyond
-//!   the limit are refused with REFUSED_STREAM.
+//! - up to `h2_max_streams` concurrent client streams (at most
+//!   `MAX_STREAMS`, 16, the table's size; the default), advertised as
+//!   `SETTINGS_MAX_CONCURRENT_STREAMS`. Streams beyond the limit are
+//!   refused with REFUSED_STREAM.
 //! - `HANDLER_STATIC`, `HANDLER_TEMPLATE` (inline + file-cached), and
 //!   `HANDLER_FILE` are streamed via `Sub::SendingBody`. Each tick
 //!   advances one slot's emission round-robin via `emit_cursor` so
@@ -57,10 +59,21 @@ use super::{
 /// frames that don't fit close with 1009 (Message Too Big).
 const WS_BUF_SIZE: usize = 512;
 
-/// Maximum concurrent client-initiated streams. Advertised in our
-/// SETTINGS frame. Sized for the embedded memory budget; bump the
-/// constant if `H2State` can absorb additional slots.
-pub(crate) const MAX_STREAMS: usize = 4;
+/// The stream table's size: the most concurrent client-initiated streams a
+/// connection carries, and the ceiling of `h2_max_streams`. Enough for a
+/// client holding several watches open beside its calls on one connection.
+/// Every slot is part of `H2State`, which the arena reserves per working-set
+/// connection, so this is a memory figure as much as a protocol one.
+pub(crate) const MAX_STREAMS: usize = 16;
+
+/// The streams this server carries at once on a connection: `h2_max_streams`,
+/// or the whole table when it is 0. Advertised and enforced as one figure.
+fn stream_limit(s: &HttpState) -> usize {
+    match s.server.h2_max_streams as usize {
+        0 => MAX_STREAMS,
+        n => n.min(MAX_STREAMS),
+    }
+}
 
 /// Initial connection-level recv window — RFC 7540 §6.9.2 default.
 const RECV_WINDOW_INITIAL: i32 = 65535;
@@ -349,6 +362,12 @@ unsafe fn slot_for_id(s: &HttpState, id: u32) -> i8 {
 /// Allocate an Idle slot for a new stream id. Returns `-1` if the table
 /// is full (caller should respond REFUSED_STREAM).
 unsafe fn alloc_slot(s: &mut HttpState, id: u32) -> i8 {
+    let open = (0..MAX_STREAMS)
+        .filter(|&k| (*cur_h2(s).streams.as_ptr().add(k)).state != SlotState::Idle)
+        .count();
+    if open >= stream_limit(s) {
+        return -1;
+    }
     let mut i = 0u8;
     while (i as usize) < MAX_STREAMS {
         let slot = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(i as usize);
@@ -747,7 +766,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 cur_send_buf_mut_ptr(s),
                 &[
                     (h2w::SETTINGS_ENABLE_PUSH, 0),
-                    (h2w::SETTINGS_MAX_CONCURRENT_STREAMS, MAX_STREAMS as u32),
+                    (h2w::SETTINGS_MAX_CONCURRENT_STREAMS, stream_limit(s) as u32),
                     (h2w::SETTINGS_HEADER_TABLE_SIZE, 0),
                     (h2w::SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
                     (h2w::SETTINGS_INITIAL_WINDOW_SIZE, STREAM_RECV_WINDOW as u32),

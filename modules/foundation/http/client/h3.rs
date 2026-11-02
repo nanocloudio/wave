@@ -889,7 +889,7 @@ unsafe fn ingress(s: &mut super::super::HttpState, now: u64) {
         if had_session && !has_session {
             s.client.fail_cause = super::CAUSE_LINK;
             if !super::provider::busy(s) {
-                super::provider::link_lost(s);
+                super::provider::link_lost(s, false);
             }
         } else if !had_session && has_session {
             super::provider::link_restored(s);

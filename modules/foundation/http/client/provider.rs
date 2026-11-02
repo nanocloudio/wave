@@ -24,7 +24,9 @@
 //! - `body`: inline in the HEAD, or after it in BODY records under the
 //!   credit this client grants — all of it at once, up to the body bound.
 //!   The request is performed once it is whole.
-//! - flags: `BROADCAST`, `WEBSOCKET` and `WEBTRANSPORT` are 400.
+//! - flags: `BROADCAST`, `WEBSOCKET` and `WEBTRANSPORT` are 400. `HOLD`
+//!   asks for a held exchange (a watch): answered `HOLD | MORE`, ended by its
+//!   origin, and not cut short by `client_total_ms` once its head has come.
 //!
 //! # Where a request goes
 //!
@@ -61,17 +63,22 @@
 //! of answering: the exchange in flight and any it holds are unknowable, and
 //! the requester issues them again after LINK UP, which the client writes once
 //! a connection to its origin opens again — on the next request, or on a
-//! probe it dials itself with a backoff. A request taken while the link is
-//! down is tried; if its connection fails too it is as unknowable as the
-//! rest, and is issued again after LINK UP like them. Over HTTP/3 the link is
-//! the QUIC session the transport announces. An open client has no one
-//! backend and answers a failed connection 502.
+//! probe it dials itself with a backoff that doubles with each failure. A
+//! request taken while the link is down is tried; if its connection fails too
+//! it is as unknowable as the rest, and the client says LINK DOWN again — the
+//! one before was written before this request was read, and so did not cover
+//! it. Every exchange the client drops is covered by a DOWN, and LINK UP is
+//! written only after any DOWN still owed. Over HTTP/3 the link is the QUIC
+//! session the transport announces. An open client has no one backend and
+//! answers a failed connection 502.
 //!
 //! # Concurrency
 //!
-//! One request is performed at a time and one more is collected behind it; a
-//! third is answered 503. A requester wanting concurrency asks for more
-//! instances, which is also how it gets more sockets.
+//! Over HTTP/1.1 one request is performed at a time and one more is collected
+//! behind it; a third is answered 503. Over HTTP/2 each request is handed to
+//! a stream on one shared connection (`h2_streams.rs`), so as many are
+//! performed at once as the connection carries streams, with one more
+//! collected behind them.
 
 use super::super::connection::net_proto::Target;
 use super::super::exchange::{
@@ -195,13 +202,21 @@ pub(crate) struct Provider {
     ended: u8,
     /// The requester aborted it: nothing more is written for it.
     abandoned: u8,
+    /// The requester asked for it to be HELD (`flag::HOLD` on its HEAD): a
+    /// watch or an event stream, ended by the origin, whose answer is
+    /// marked HOLD and which no whole-exchange deadline cuts short.
+    held: u8,
     /// An ABORT owed for it once the response record in hand has left.
     abort_owed: u8,
 
     /// The backend link is down (pinned clients and HTTP/3).
     link_down: u8,
-    /// A LINK record to write, `link::DOWN` or `link::UP`; 0 when none.
-    link_owed: u8,
+    /// LINK records to write, DOWN before UP: a DOWN owed for exchanges
+    /// just dropped is still owed when the link comes back, and the
+    /// requester must read it before the UP that tells it to issue them
+    /// again.
+    owe_down: u8,
+    owe_up: u8,
     /// The connection in hand is a probe of the lost link, not a request.
     probing: u8,
     probe_at_ms: u64,
@@ -246,7 +261,17 @@ pub(crate) fn probing(s: &HttpState) -> bool {
 /// Nothing is owed on `response_out` and nothing is held.
 pub(crate) fn quiet(s: &HttpState) -> bool {
     let x = &s.client.ex;
-    x.live == 0 && x.queued == 0 && !x.out_box.holding() && !x.ctl_box.holding() && x.link_owed == 0
+    x.live == 0
+        && x.queued == 0
+        && !x.out_box.holding()
+        && !x.ctl_box.holding()
+        && x.owe_down == 0
+        && x.owe_up == 0
+}
+
+/// Whether the exchange in hand asked to be held open.
+pub(crate) fn held(s: &HttpState) -> bool {
+    s.client.ex.held != 0
 }
 
 /// Whether the connection in hand is to the authority of a pinned client.
@@ -297,15 +322,47 @@ pub(crate) unsafe fn service(s: &mut HttpState) {
     if x.live != 0 && x.ended != 0 && x.abort_owed == 0 && !x.out_box.holding() {
         x.live = 0;
     }
-    if x.link_owed != 0 && !x.ctl_box.holding() {
-        let state = x.link_owed;
-        if let Some(n) = write_link(state, &mut x.ctl_rec) {
-            x.link_owed = 0;
-            ctl_send(s, n);
+    // DOWN before UP, each once the control record before it has left.
+    for _ in 0..2 {
+        let x = &mut s.client.ex;
+        if x.ctl_box.holding() {
+            break;
         }
+        let state = if x.owe_down != 0 {
+            link::DOWN
+        } else if x.owe_up != 0 {
+            link::UP
+        } else {
+            break;
+        };
+        let Some(n) = write_link(state, &mut x.ctl_rec) else {
+            break;
+        };
+        if state == link::DOWN {
+            x.owe_down = 0;
+        } else {
+            x.owe_up = 0;
+        }
+        ctl_send(s, n);
     }
     for _ in 0..RECORDS_PER_STEP {
-        if s.client.ex.ctl_box.holding() || s.client.ex.link_owed != 0 {
+        let x = &s.client.ex;
+        // A request read while a LINK is owed would be read before the
+        // requester hears it, and a DOWN must invalidate only what came
+        // before it.
+        if x.ctl_box.holding() || x.owe_down != 0 || x.owe_up != 0 {
+            break;
+        }
+        // Over HTTP/2 a whole request waits in the collector until its
+        // connection can open a stream for it. While no stream is open
+        // nothing waits on a credit or an abort behind it, so the next
+        // request waits in the channel rather than being refused busy: the
+        // burst a requester opens with reaches the connection whole. With
+        // streams open the records behind may be their credits, and a
+        // request still being collected needs its BODY records; both are
+        // read.
+        #[cfg(feature = "h2")]
+        if x.ready != 0 && super::h2_streams::holds_requests(s) && !super::h2_streams::live(s) {
             break;
         }
         let chan = s.client.ex.request_chan;
@@ -328,6 +385,13 @@ pub(crate) unsafe fn service(s: &mut HttpState) {
         x.abort_owed = 0;
         x.live = 0;
         x.abandoned = 0;
+        // A request the HTTP/2 connection has not yet opened a stream for
+        // is simply not opened; the connection, and every stream on it, is
+        // not this exchange's to close.
+        #[cfg(feature = "h2")]
+        if super::h2_streams::holds_requests(s) {
+            return;
+        }
         s.client.phase = Phase::Error;
         #[cfg(feature = "h2")]
         super::h2::abandon(s);
@@ -345,21 +409,28 @@ unsafe fn take_record(s: &mut HttpState, n: usize) {
         // Without a parse there is no id, and so nobody to answer.
         return;
     };
-    let (id, is_head) = match record {
-        Record::Head(h) => (h.id, true),
-        Record::Body { id, .. }
-        | Record::Abort { id, .. }
-        | Record::Credit { id, .. }
-        | Record::Datagram { id, .. } => (id, false),
+    // What the record says, read out so the state can be taken again.
+    let (id, is_head, aborted, credit) = match record {
+        Record::Head(h) => (h.id, true, false, 0),
+        Record::Abort { id, .. } => (id, false, true, 0),
+        Record::Credit { id, bytes } => (id, false, false, bytes),
+        Record::Body { id, .. } | Record::Datagram { id, .. } => (id, false, false, 0),
         Record::Link { .. } => return,
     };
+    // An exchange an HTTP/2 stream carries takes its credit and its abort
+    // there.
+    #[cfg(feature = "h2")]
+    if !is_head && super::h2_streams::requester_record(s, &id, credit, aborted) {
+        return;
+    }
+    let x = &mut s.client.ex;
     if x.live != 0 && x.ended == 0 && id == x.id {
-        match record {
-            Record::Abort { .. } => x.abandoned = 1,
-            Record::Credit { bytes, .. } => x.resp_credit = x.resp_credit.saturating_add(bytes),
-            // The request in flight was taken whole; a later record for it
-            // is a requester's mistake with nothing to act on.
-            _ => {}
+        if aborted {
+            x.abandoned = 1;
+        } else {
+            // A later BODY for a request taken whole is a requester's
+            // mistake with nothing to act on.
+            x.resp_credit = x.resp_credit.saturating_add(credit);
         }
         return;
     }
@@ -376,7 +447,7 @@ unsafe fn take_record(s: &mut HttpState, n: usize) {
             x.queued_id = id;
         }
         Ok(None) => {
-            if matches!(record, Record::Abort { .. }) && x.queued != 0 && id == x.queued_id {
+            if aborted && x.queued != 0 && id == x.queued_id {
                 x.queued = 0;
                 x.ready = 0;
             }
@@ -473,6 +544,7 @@ unsafe fn adopt(s: &mut HttpState) -> bool {
         return false;
     };
     let method = req.method;
+    let held = u8::from(req.flags & flag::HOLD != 0);
     let resp_credit = req.resp_credit;
     let target_len = req.target.len();
     let body_len = req.body.len();
@@ -542,6 +614,7 @@ unsafe fn adopt(s: &mut HttpState) -> bool {
     x.head_given = 0;
     x.ended = 0;
     x.abandoned = 0;
+    x.held = held;
     x.abort_owed = 0;
     x.out_len = 0;
     x.resp_ct_len = 0;
@@ -707,7 +780,7 @@ pub(crate) unsafe fn head(
         write_response_head(
             &ResponseHead {
                 id: x.id,
-                flags: flag::MORE,
+                flags: flag::MORE | if x.held != 0 { flag::HOLD } else { 0 },
                 status: code,
                 content_type,
                 headers,
@@ -823,7 +896,7 @@ unsafe fn send_out(s: &mut HttpState, more: bool) {
     }
     let flags = if more { flag::MORE } else { 0 };
     if x.out_head != 0 {
-        x.out_rec[1] = flags;
+        x.out_rec[1] = flags | if x.held != 0 && more { flag::HOLD } else { 0 };
     } else if super::super::exchange::seal_body(&x.id, flags, len - HDR, &mut x.out_rec).is_none() {
         x.out_len = 0;
         return;
@@ -942,10 +1015,12 @@ unsafe fn refuse_live(s: &mut HttpState, code: u16) {
 /// pinned client a lost connection is a lost link: LINK DOWN instead.
 pub(crate) unsafe fn fail(s: &mut HttpState, why: u8) {
     if s.client.ex.probing != 0 {
+        // A probe that did not prove the link waits out the next, longer
+        // backoff, whatever stopped it: retrying at once would turn a link
+        // that refuses (or a transport that answers `EAGAIN` until its
+        // identity is certified) into a dial loop.
         s.client.ex.probing = 0;
-        if matches!(why, CAUSE_CONNECT | CAUSE_LINK) {
-            schedule_probe(s);
-        }
+        schedule_probe(s);
         return;
     }
     if !answering(s) {
@@ -958,7 +1033,7 @@ pub(crate) unsafe fn fail(s: &mut HttpState, why: u8) {
     // A pinned client has one backend, and an HTTP/3 client's link is the
     // session the transport holds; losing either is losing the link.
     if (pinned(s) || s.h3_mode != 0) && matches!(why, CAUSE_CONNECT | CAUSE_LINK) {
-        link_lost(s);
+        link_lost(s, false);
         return;
     }
     if !head_given(s) {
@@ -1001,10 +1076,17 @@ unsafe fn service_abort(s: &mut HttpState) {
 }
 
 /// The backend link went down: everything held without a terminal response
-/// is unknowable, and the requester is told so once.
-pub(crate) unsafe fn link_lost(s: &mut HttpState) {
+/// is unknowable, and the requester is told so — every time anything is
+/// dropped, not only when the link was up. A request taken while the link is
+/// already down whose own dial then fails was read after the last DOWN went
+/// out, so that DOWN did not cover it; without another the requester would
+/// wait on it for ever. `streams` says an HTTP/2 connection dropped streams
+/// of its own beside what this provider holds.
+pub(crate) unsafe fn link_lost(s: &mut HttpState, streams: bool) {
     let x = &mut s.client.ex;
+    let mut dropped = streams || x.queued != 0 || x.collector.live() != 0;
     if x.live != 0 && x.ended == 0 {
+        dropped |= x.abandoned == 0;
         x.out_len = 0;
         x.ended = 1;
         if !x.out_box.holding() {
@@ -1016,8 +1098,18 @@ pub(crate) unsafe fn link_lost(s: &mut HttpState) {
     x.ready = 0;
     if x.link_down == 0 {
         x.link_down = 1;
-        x.link_owed = link::DOWN;
         x.probe_wait_ms = PROBE_FIRST_MS;
+        // An UP not yet written is withdrawn rather than followed by a DOWN:
+        // the requester still holds the link down, and has issued nothing
+        // since.
+        if x.owe_up != 0 {
+            x.owe_up = 0;
+            x.owe_down |= u8::from(dropped);
+        } else {
+            x.owe_down = 1;
+        }
+    } else if dropped {
+        x.owe_down = 1;
     }
     log(s, b"[http] link down");
     schedule_probe(s);
@@ -1047,14 +1139,174 @@ pub(crate) unsafe fn connected(s: &mut HttpState) -> bool {
     false
 }
 
-/// The backend link is (re)connected.
+/// The backend link is (re)connected. The UP is owed behind any DOWN not yet
+/// written, so the requester always reads both, in that order.
 pub(crate) fn link_restored(s: &mut HttpState) {
     let x = &mut s.client.ex;
     if x.link_down != 0 {
         x.link_down = 0;
         x.probe_wait_ms = 0;
-        x.link_owed = link::UP;
+        x.owe_up = 1;
     }
+}
+
+// ── Records for exchanges an HTTP/2 connection carries ──────────────────
+//
+// An HTTP/2 connection answers many exchanges at once, each from its own
+// stream. They share this provider's response record and its outbox; each
+// helper composes one whole record and offers it, or returns false when the
+// record before it is still leaving, in which case nothing was composed.
+
+/// Whether a response record can be composed now.
+#[cfg(feature = "h2")]
+pub(crate) unsafe fn out_free(s: &mut HttpState) -> bool {
+    let sys = &*s.syscalls;
+    let x = &mut s.client.ex;
+    !x.out_box.holding() || x.out_box.flush(sys, x.response_chan, &x.out_rec)
+}
+
+#[cfg(feature = "h2")]
+unsafe fn out_send(s: &mut HttpState, n: usize) {
+    let sys = &*s.syscalls;
+    let x = &mut s.client.ex;
+    x.out_box.send(sys, x.response_chan, &x.out_rec, n);
+}
+
+/// The response HEAD for `id` from the fields [`note_field`] recorded.
+/// `Some(false)` when they do not fit a record — the caller answers 502.
+#[cfg(feature = "h2")]
+pub(crate) unsafe fn stream_head(
+    s: &mut HttpState,
+    id: &ExchangeId,
+    code: u16,
+    flags: u8,
+) -> Option<bool> {
+    if !out_free(s) {
+        return None;
+    }
+    let x = &mut s.client.ex;
+    if x.resp_over != 0 {
+        return Some(false);
+    }
+    let ct_len = x.resp_ct_len as usize;
+    let hl = x.resp_hdrs_len as usize;
+    let mut ct = [0u8; RESP_CT_MAX];
+    ct[..ct_len].copy_from_slice(&x.resp_ct[..ct_len]);
+    let mut hdrs = [0u8; RESP_HDRS_MAX];
+    hdrs[..hl].copy_from_slice(&x.resp_hdrs[..hl]);
+    let Some(n) = write_response_head(
+        &ResponseHead {
+            id: *id,
+            flags,
+            status: code,
+            content_type: &ct[..ct_len],
+            headers: &hdrs[..hl],
+            body: &[],
+        },
+        &mut x.out_rec,
+    ) else {
+        return Some(false);
+    };
+    out_send(s, n);
+    Some(true)
+}
+
+/// Forget the response fields recorded so far: a new header block follows.
+#[cfg(feature = "h2")]
+pub(crate) fn clear_fields(s: &mut HttpState) {
+    let x = &mut s.client.ex;
+    x.resp_ct_len = 0;
+    x.resp_hdrs_len = 0;
+    x.resp_over = 0;
+}
+
+/// A BODY for `id` carrying `len` bytes from `src` (at most
+/// [`super::super::exchange::BODY_MAX`]); `more` unless it ends the answer.
+///
+/// # Safety
+/// `src` must be valid for reads of `len` bytes and must not alias the
+/// provider's records.
+#[cfg(feature = "h2")]
+pub(crate) unsafe fn stream_body(
+    s: &mut HttpState,
+    id: &ExchangeId,
+    src: *const u8,
+    len: usize,
+    more: bool,
+) -> bool {
+    if !out_free(s) {
+        return false;
+    }
+    let x = &mut s.client.ex;
+    let len = len.min(RECORD_MAX - HDR);
+    core::ptr::copy_nonoverlapping(src, x.out_rec.as_mut_ptr().add(HDR), len);
+    let flags = if more { flag::MORE } else { 0 };
+    let Some(n) = super::super::exchange::seal_body(id, flags, len, &mut x.out_rec) else {
+        return true;
+    };
+    out_send(s, n);
+    true
+}
+
+/// A raised refusal for `id`: no response from the origin reached it.
+#[cfg(feature = "h2")]
+pub(crate) unsafe fn stream_refuse(s: &mut HttpState, id: &ExchangeId, code: u16) -> bool {
+    if !out_free(s) {
+        return false;
+    }
+    if let Some(n) = write_refusal(id, code, &mut s.client.ex.out_rec) {
+        out_send(s, n);
+    }
+    true
+}
+
+/// An ABORT for `id`, whose answer had begun.
+#[cfg(feature = "h2")]
+pub(crate) unsafe fn stream_abort(s: &mut HttpState, id: &ExchangeId, reason: u8) -> bool {
+    if !out_free(s) {
+        return false;
+    }
+    if let Some(n) = write_abort(id, reason, &mut s.client.ex.out_rec) {
+        out_send(s, n);
+    }
+    true
+}
+
+/// The exchange in hand, handed to an HTTP/2 stream that answers it from
+/// here on: its id, its response credit, whether it is held. The request
+/// itself stays in the client's fields until the stream has sent it.
+#[cfg(feature = "h2")]
+pub(crate) fn hand_off(s: &mut HttpState) -> Option<(ExchangeId, u32, bool)> {
+    let x = &mut s.client.ex;
+    if x.live == 0 || x.ended != 0 || x.abandoned != 0 {
+        return None;
+    }
+    x.live = 0;
+    Some((x.id, x.resp_credit, x.held != 0))
+}
+
+/// Refuse the exchange in hand, which never reached a stream, with `code`.
+/// False when the record before it is still leaving; offer it again.
+#[cfg(feature = "h2")]
+pub(crate) unsafe fn refuse_unopened(s: &mut HttpState, code: u16) -> bool {
+    if !out_free(s) {
+        return false;
+    }
+    refuse_live(s, code);
+    true
+}
+
+/// Whether a complete request is waiting to be started.
+#[cfg(feature = "h2")]
+pub(crate) fn ready(s: &HttpState) -> bool {
+    s.client.ex.ready != 0
+}
+
+/// Whether the exchange in hand has no stream yet: adopted, its connection
+/// being opened.
+pub(crate) fn unopened(s: &HttpState) -> bool {
+    let x = &s.client.ex;
+    x.live != 0 && x.ended == 0
 }
 
 /// Draining: the exchange in flight and the one held are answered rather than

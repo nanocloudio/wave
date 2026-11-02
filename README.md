@@ -24,7 +24,7 @@ attributes it carries, and how message integrity and a long-term
 credential key are computed. Whether to send one, to whom, in what
 order, which candidate pair wins, whether to allocate a relay, and
 when to give up are reachability decisions and belong to
-[wormhole](../wormhole/). A wire format is a codec; a decision about
+the ICE agent that consumes these modules. A wire format is a codec; a decision about
 the network is not. The same line puts the WebRTC session-description
 attributes here and ICE policy there.
 

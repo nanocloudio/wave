@@ -25,8 +25,8 @@ pub(crate) mod huffman {
 }
 
 // The HTTP route-key core: what a request's canonical `(host, port, path)`
-// is, and which requests name two authorities at once. Shared with the
-// Wormhole load balancer through `wave-common`, so a `host` that this server
+// is, and which requests name two authorities at once. Shared with a
+// load balancer through `wave-common`, so a `host` that this server
 // refuses as ambiguous is one the balancer refuses too. Not feature-gated:
 // every generation has an authority to check. The key derivation and digest
 // are the balancer's half of the file and go unused here.

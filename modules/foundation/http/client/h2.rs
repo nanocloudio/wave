@@ -228,6 +228,17 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         s.client.conn_present = 1;
                         s.client.peer_closed = 0;
                         log(s, b"[http] connected (h2c)");
+                        // A session stage that negotiated HTTP/1.1 has
+                        // promised the origin that, not h2.
+                        let negotiated = super::negotiate(
+                            s,
+                            core::slice::from_raw_parts(buf.add(NET_FRAME_HDR), payload_len),
+                        );
+                        if negotiated != super::GEN_H2 {
+                            log(s, b"[http] http/1.1 negotiated on an h2 client");
+                            set_phase(s, H2Phase::Error);
+                            return E_CONNECT_FAILED;
+                        }
                         #[cfg(feature = "exchange")]
                         super::provider::connected(s);
                         build_preface(s);

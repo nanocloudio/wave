@@ -58,7 +58,7 @@ policy this module has no standing to decide.
 
 **Not an ICE agent.** It gathers no candidates, forms no pairs, schedules no
 connectivity checks and nominates nothing. Those are decisions about
-reachability, and reachability policy is Wormhole's; this module answers a
+reachability, and reachability policy is the ICE agent's; this module answers a
 question and does not decide what to do with the answer.
 
 **Not a TURN server.** It relays nothing.

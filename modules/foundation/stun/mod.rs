@@ -18,7 +18,7 @@
 //! **What this module is not.** It is not an ICE agent. It gathers no
 //! candidates, forms no pairs, schedules no connectivity checks and nominates
 //! nothing — those are decisions about reachability, and reachability policy
-//! belongs to Wormhole rather than to a protocol codec. It answers a question,
+//! belongs to the ICE agent rather than to a protocol codec. It answers a question,
 //! and asks one; it does not decide what to do with the answer.
 //!
 //! Ports:  net_in/net_out (the datagram surface), result_out (out[1]) — one

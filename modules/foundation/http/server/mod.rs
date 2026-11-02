@@ -1306,6 +1306,9 @@ pub(crate) struct ServerState {
     /// full (`http.h2.streams.refused`). Expected under a client that
     /// outruns `MAX_STREAMS`; a floor, not a fault.
     pub(crate) h2_streams_refused: u32,
+    /// The `h2_max_streams` parameter: streams one HTTP/2 connection
+    /// carries at once, advertised and enforced; 0 means the whole table.
+    pub(crate) h2_max_streams: u8,
     /// Requests refused because they named two authorities, or one too long
     /// to be a route key (`http.requests.host_refused`): an h2/h3 `host`
     /// field disagreeing with `:authority`, a repeated h1 `Host` line,

@@ -38,7 +38,7 @@ address yields a byte-swapped port that still looks like a port.
 The module answers Binding requests and nothing else. Candidate
 gathering, pair formation, connectivity checks and nomination are an
 ICE agent's work, and an agent's decisions are NAT-traversal policy
-rather than protocol mechanics — a different concern, in Wormhole.
+rather than protocol mechanics — a different concern, owned by the ICE agent.
 
 `rtp`'s `packets` port and `jitter`'s `rx_in` carry the realtime
 family's receive-record seam: one validated RTP payload per TLV frame,

@@ -29,6 +29,17 @@ pub(crate) use net_proto::{
     MSG_ERROR as NET_MSG_ERROR,
 };
 
+/// The application protocol the session stage in front negotiated for a
+/// connection (TLS ALPN: `h2`, `http/1.1`), from the `MSG_CONNECTED` payload
+/// that hands the connection over; empty when it negotiated none, when no
+/// session stage is in front, or when the record stops short.
+///
+/// The layout is the net contract's — `[generation][alpn_len][alpn]` after
+/// the fixed fields — read by its own reader.
+pub(crate) fn connected_alpn(payload: &[u8]) -> &[u8] {
+    net_proto::session_alpn(payload, net_proto::CONNECTED_FIXED)
+}
+
 /// The port a dial takes when its authority names none.
 pub(crate) const DEFAULT_PORT: u16 = 80;
 

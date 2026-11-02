@@ -16,8 +16,8 @@ use super::super::{
 };
 use super::{
     build_request, is_foreign_frame, log, send_close_frame, HttpState, Phase, CAUSE_CONNECT,
-    CAUSE_LINK, CAUSE_TIMEOUT, CONNECT_TIMEOUT_MS, E_AGAIN, E_CONNECT_FAILED, E_NET_FAILED,
-    E_SEND_FAILED, E_WRITE_FAILED, RECV_BUF_SIZE,
+    CAUSE_LINK, CAUSE_PEER, CAUSE_TIMEOUT, CONNECT_TIMEOUT_MS, E_AGAIN, E_CONNECT_FAILED,
+    E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED, RECV_BUF_SIZE,
 };
 
 /// The numeric status of an HTTP/1.x status line — the three digits after the
@@ -51,7 +51,16 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             s.client.phase,
             Phase::SendRequest | Phase::RecvHeaders | Phase::RecvBody | Phase::Writing
         );
-        if expired(s.client.request_start_ms, s.client.client_total_ms)
+        // A held exchange (a watch) is ended by its origin, not by a clock:
+        // once its head has come, the whole-exchange deadline no longer
+        // applies. Progress still does — HTTP/1.1 has no keepalive of its
+        // own, so a silent connection is told from a quiet watch only by
+        // its stall deadline.
+        #[cfg(feature = "exchange")]
+        let bounded = !(super::provider::held(s) && s.client.response.has_head());
+        #[cfg(not(feature = "exchange"))]
+        let bounded = true;
+        if (bounded && expired(s.client.request_start_ms, s.client.client_total_ms))
             || (waiting_head && expired(s.client.response_start_ms, s.client.client_header_ms))
             || (moving && expired(s.client.progress_ms, s.client.client_stall_ms))
         {
@@ -173,12 +182,34 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         s.client.conn_present = 1;
                         s.client.progress_ms = now;
                         log(s, b"[http] connected");
+                        // The generation is the connection's: a session
+                        // stage that negotiated h2 has promised the origin
+                        // HTTP/2 on it.
+                        let generation = super::negotiate(
+                            s,
+                            core::slice::from_raw_parts(buf.add(NET_FRAME_HDR), payload_len),
+                        );
                         // A probe of a lost link proves the link and goes no
                         // further: there is no request behind it.
                         #[cfg(feature = "exchange")]
                         if super::provider::connected(s) {
                             s.client.response.reusable = false;
                             s.client.phase = Phase::Done;
+                            continue;
+                        }
+                        // HTTP/2 negotiated: the connection, and the request
+                        // waiting for it, go to the streams. A client with
+                        // no streams to give it to cannot use it.
+                        if generation == super::GEN_H2 {
+                            #[cfg(all(feature = "exchange", feature = "h2"))]
+                            if super::provider::armed(s) {
+                                super::h2_streams::take_connection(s);
+                                s.client.phase = Phase::Init;
+                                return 0;
+                            }
+                            log(s, b"[http] h2 negotiated on an HTTP/1.1 exchange");
+                            s.client.fail_cause = CAUSE_PEER;
+                            s.client.phase = Phase::Error;
                             continue;
                         }
                         if !build_request(s) {
