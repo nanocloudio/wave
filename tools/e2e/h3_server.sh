@@ -189,7 +189,10 @@ asyncio.run(main(sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]))
 PYWS
 
 echo "── building $GRAPH ──"
-( cd "$ROOT" && fluxor build "$GRAPH" ) >/dev/null || fail "fluxor build $GRAPH"
+# `quic` reads the pair at runtime; the `file` params render it absolute.
+( cd "$ROOT" && fluxor build "$GRAPH" \
+  --param cert=target/pki/server_cert.der --param key=target/pki/server_key.der ) \
+  >/dev/null || fail "fluxor build $GRAPH"
 out="$ROOT/target/linux/$NAME"
 [ -s "$out/config.bin" ] && [ -s "$out/modules.bin" ] || fail "graph artefacts missing"
 

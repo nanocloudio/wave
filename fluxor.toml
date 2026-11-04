@@ -64,8 +64,10 @@ limit_register_coverage = "fail"
 [ci.setup]
 # Run before every other phase. dev_certs.sh mints the throwaway certificate the
 # TLS and QUIC example graphs name (`target/pki/`, never committed) when it is
-# missing or about to expire, so the examples check and every graph build after
-# it read a pair this run provided rather than residue an earlier run left.
+# missing or about to expire, so the examples check (the Linux graphs' `cert`/
+# `key` file-param examples, the rig graphs' `${file:}` embeds) and every graph
+# build or run after it use a pair this run provided rather than residue an
+# earlier run left.
 scripts = ["tools/ci/dev_certs.sh"]
 
 [ci.test]

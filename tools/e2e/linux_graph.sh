@@ -89,10 +89,13 @@ wait_for_port() {
   fail "nothing listening on 127.0.0.1:$port after 10 s — the graph never bound"
 }
 
+# boot_graph <yaml> <name> <port> [fluxor build args...] — the rest are the
+# graph's `--param` values (a TLS graph's cert/key, read at runtime).
 boot_graph() {
   local yaml="$1" name="$2" port="$3"
+  shift 3
   echo "── building $name ──"
-  ( cd "$ROOT" && fluxor build "$yaml" ) >/dev/null || fail "fluxor build $yaml"
+  ( cd "$ROOT" && fluxor build "$yaml" "$@" ) >/dev/null || fail "fluxor build $yaml"
 
   local out="$ROOT/target/linux/$name"
   [ -s "$out/config.bin" ] || fail "$out/config.bin missing or empty"
@@ -183,7 +186,9 @@ run_tls() {
   [ -f "$ROOT/$yaml" ] || fail "no TLS graph at $yaml"
   bash "$ROOT/tools/ci/dev_certs.sh" || fail "could not provision the certificate the graph names"
 
-  boot_graph "$yaml" "wave_https" "$TLS_PORT"
+  # `tls` reads the pair at runtime; the `file` params render it absolute.
+  boot_graph "$yaml" "wave_https" "$TLS_PORT" \
+    --param cert=target/pki/server_cert.der --param key=target/pki/server_key.der
   local base="https://127.0.0.1:$TLS_PORT"
   # --insecure: the cert is self-signed and minted seconds ago. This asserts the
   # TLS handshake and record layer, not a PKI decision.

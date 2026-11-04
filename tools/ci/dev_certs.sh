@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # The throwaway certificate the TLS and QUIC example graphs serve.
 #
-# A graph names its certificate and key on disk (`target/pki/server_cert.der`,
-# `target/pki/server_key.der`), and `fluxor build` reads them, so every build
-# of one needs the pair present. No key is committed: a fixture key in the
+# The graphs name the pair under `target/pki/` (`server_cert.der`,
+# `server_key.der`): a Linux graph takes it through its `cert`/`key` file
+# params, which the check resolves to the examples there and `tls`/`quic`
+# read at runtime; a rig graph embeds it at build (`${file:target/pki/…}`).
+# Either way the pair must be present. No key is committed: a fixture key in the
 # tree is a key someone eventually uses somewhere real. This script mints one
 # per machine instead, under `target/`, which is ignored, survives a reboot,
 # and goes with `fluxor clean`.

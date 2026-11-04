@@ -77,10 +77,15 @@ check_embeds() {
   local config="$1" missing=() f
   [ -f "$config" ] || die "no such config: $config"
   bash "$(dirname "${BASH_SOURCE[0]}")/../ci/dev_certs.sh" || die "could not provision the example certificate"
-  # `key: /path` for the file-valued params a graph embeds.
+  # The files a graph embeds: `file:` / `body_file:` paths as written, and the
+  # credentials in their build-time form, `cert_file` / `key_file` / `trust:
+  # "${file:<path>}"` (a bare credential path is the module's to read at
+  # runtime, which bcm2712 has no surface for, so the build refuses it).
   while IFS= read -r f; do
     [ -s "$f" ] || missing+=("$f")
-  done < <(sed -nE 's/^[[:space:]]*(cert_file|key_file|file|body_file):[[:space:]]*"?([^"#]+)"?[[:space:]]*$/\2/p' "$config")
+  done < <(sed -nE \
+    -e 's/^[[:space:]]*(cert_file|key_file|trust):[[:space:]]*"?\$\{file:([^}"#]+)\}"?[[:space:]]*$/\2/p' \
+    -e 's/^[[:space:]]*(file|body_file):[[:space:]]*"?([^"#]+)"?[[:space:]]*$/\2/p' "$config")
 
   [ "${#missing[@]}" -eq 0 ] || die "config embeds file(s) that do not exist on this host" \
     "$(printf '  %s\n' "${missing[@]}")" \

@@ -96,10 +96,12 @@ fi
 # they surface as unrelated-looking errors.
 bash tools/rig/preflight.sh modules bcm2712
 "$FLUXOR" modules build --target bcm2712
-# Files the graph EMBEDS must exist now: `fluxor build` only warns on one it
-# cannot read, so a missing cert_file yields a green build, a tls module with no
-# certificate, and a load phase that commits nothing — a DUT-looking failure for
-# a build-host problem. Cost a run on 2026-08-10 when /tmp was swept.
+# Files the graph EMBEDS must exist now. A missing embed once built green — a
+# tls module with no certificate and a load phase that committed nothing, a
+# DUT-looking failure for a build-host problem (it cost a run on 2026-08-10,
+# when /tmp was swept). `fluxor build` now refuses a missing `${file:}`
+# credential, one file at a time; the preflight names every missing embed at
+# once, before the build starts.
 bash tools/rig/preflight.sh embeds "$CONFIG"
 "$FLUXOR" build "$CONFIG"
 # 3. Surface the image at a stable path so ANY scenario config deploys, not

@@ -48,7 +48,10 @@ bash "$ROOT/tools/ci/dev_certs.sh" || fail "could not provision the certificate 
 
 WORK="$(mktemp -d /tmp/wave-h3cli-XXXXXX)"
 echo "── building examples/linux/wave_h3_client.yaml ──"
-( cd "$ROOT" && fluxor build examples/linux/wave_h3_client.yaml ) >/dev/null || fail "graph build"
+# `quic` reads the pair at runtime; the `file` params render it absolute.
+( cd "$ROOT" && fluxor build examples/linux/wave_h3_client.yaml \
+  --param cert=target/pki/server_cert.der --param key=target/pki/server_key.der ) \
+  >/dev/null || fail "graph build"
 
 echo "── starting the aioquic server on udp:$PORT ──"
 python3 "$ROOT/tools/peers/h3_server.py" "$PORT" \
