@@ -103,8 +103,45 @@ Payload forms:
 | `UNSIGNED-PAYLOAD` | not hashed |
 | `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | each `aws-chunked` chunk's signature, chained from the request's |
 
-Trailer forms, `x-amz-checksum-*`, `Content-MD5` and `x-amz-copy-source` are
-refused `501 NotImplemented` rather than accepted unchecked.
+A header this server would ignore is refused `501 NotImplemented` rather than
+accepted and dropped:
+
+| Header | Refused on |
+|---|---|
+| `x-amz-*` but `x-amz-date`, `x-amz-content-sha256`, `x-amz-decoded-content-length` and `x-amz-user-agent`: among them `x-amz-meta-*`, `x-amz-acl`, `x-amz-storage-class`, `x-amz-tagging`, `x-amz-security-token`, `x-amz-checksum-*`, `x-amz-trailer`, `x-amz-copy-source` | every operation |
+| `Content-MD5`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range` | every operation |
+| `Content-Encoding`, but `aws-chunked` on a request in that payload form | every operation |
+| `If-Match`, `If-None-Match` | all but PutObject, GetObject and HeadObject |
+| `Cache-Control`, `Content-Disposition`, `Content-Language`, `Expires` | PutObject, CreateMultipartUpload |
+| `Content-Type` | CreateMultipartUpload: the completed object is written without one |
+
+This server keeps nothing beside an object's bytes and content type. A request
+naming retention, a legal hold or encryption would be accepted only by dropping
+what it asked, so a write the caller asked to be immutable or sealed would be
+neither, and the caller told it succeeded. Any header whose
+name contains `retain`, `retention`, `legal-hold`, `object-lock`, `key-ref`
+(each of these also spelled with `_`), `immutab` or `encryption`, compared
+without regard to case, is refused `501 NotImplemented` without a call to the
+store: `x-amz-object-lock-*`, `x-amz-bypass-governance-retention`,
+`x-amz-bucket-object-lock-enabled`, `x-amz-server-side-encryption*`.
+
+A query parameter is served only if the operation reads it. Beside the
+presigned form's own `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`,
+`X-Amz-Expires`, `X-Amz-SignedHeaders` and `X-Amz-Signature`, an operation takes
+only the parameters its row under [Operations](#operations) names. Anything else
+is refused `501 NotImplemented` without a call to the store, so nothing a
+presigned URL hoists is dropped: `x-amz-object-lock-*`, `x-amz-checksum-*`,
+`x-amz-copy-source`, `x-amz-meta-*`, `x-amz-acl`, `X-Amz-Security-Token`,
+`X-Amz-Content-Sha256`, the `response-*` overrides, and the subresources. Names
+are compared as received, so an escaped spelling such as
+`x-amz-object%2dlock-mode` or `max%2Dkeys` is refused too. So are a repeated
+name, an `encoding-type` other than `url`, a `list-type` other than `1` or `2`,
+and `fetch-owner` other than `false`, since a listing names no owner.
+
+A presigned request's body is not hashed: an `x-amz-content-sha256` header other
+than `UNSIGNED-PAYLOAD` on one is refused `501 NotImplemented`. A request signed
+in its `Authorization` header that also carries the presigned form's parameters
+is refused `400 InvalidArgument`, since `X-Amz-Expires` would go unread.
 
 ## Operations
 
@@ -140,6 +177,7 @@ S3 errors are XML `<Error>` documents (`Code`, `Message`, `Resource`,
 |---|---|---|
 | `ENXIO`, `ENOENT` | `NoSuchKey` (`NoSuchUpload` for an upload) | 404 |
 | `EACCES` | `AccessDenied` | 403 |
+| `ERETAINED`: a retention or hold, set through another front to the same store, refuses the overwrite or delete | `AccessDenied` | 403 |
 | `EEXIST`, `EAGAIN` on a write | `PreconditionFailed` | 412 |
 | `EINVAL` | `InvalidArgument` | 400 |
 | `EOVERFLOW` | `KeyTooLongError` | 400 |

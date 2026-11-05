@@ -71,7 +71,7 @@ limit_register_coverage = "fail"
 scripts = ["tools/ci/dev_certs.sh"]
 
 [ci.test]
-# Nine project gates, run in order in the gate's project-e2e phase, after the
+# Ten project gates, run in order in the gate's project-e2e phase, after the
 # strict module build and the examples check:
 #
 #   1. shadow_guard.sh — tests/ is shadow-tracked in .git-shadow/, so a
@@ -112,6 +112,9 @@ scripts = ["tools/ci/dev_certs.sh"]
 #      at the provider's fence, refusals rather than clamps, one slow body
 #      never stalling another — only hold or fail with every module, the
 #      runtime's store and a real client in the loop.
+#  10. exchange_suites.sh — the harness suites gated on `http`'s `exchange`
+#      feature, with it on. The built-in harness phase runs default features,
+#      where each of them compiles to nothing and reports green.
 scripts = [
   "tools/ci/shadow_guard.sh",
   "tools/ci/host_crates.sh",
@@ -122,6 +125,7 @@ scripts = [
   "tools/e2e/http_exchange.sh",
   "tools/e2e/http_app_reply.sh",
   "tools/e2e/s3_serve.sh",
+  "tools/ci/exchange_suites.sh",
 ]
 
 # Crate-root `#![allow(...)]` is banned by `../standards/lints.md` §4. Each row

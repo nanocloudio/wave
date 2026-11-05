@@ -86,8 +86,18 @@ pub fn s3_resource(target: &[u8]) -> S3Resource<'_> {
 }
 
 /// Classify a request by method (the exchange contract vocabulary's names, as
-/// bytes) and resource.
+/// bytes) and resource. An operation whose query holds anything it does not act
+/// on is [`S3Op::NotImplemented`]: see [`s3_query_served`].
 pub fn s3_classify(method: &[u8], r: &S3Resource<'_>) -> S3Op {
+    let op = s3_classify_named(method, r);
+    match op {
+        S3Op::MethodNotAllowed | S3Op::NotImplemented => op,
+        _ if s3_query_served(op, r.query) => op,
+        _ => S3Op::NotImplemented,
+    }
+}
+
+fn s3_classify_named(method: &[u8], r: &S3Resource<'_>) -> S3Op {
     let q = r.query;
     if r.bucket.is_empty() {
         return if method == b"GET" {
@@ -152,10 +162,23 @@ enum Sub {
     Other,
 }
 
-/// Query parameters that only carry the request, never select a subresource.
+/// The parameters of the presigned form, each read by `sv4_parse_presigned`.
+pub fn s3_presign_param(k: &[u8]) -> bool {
+    matches!(
+        k,
+        b"X-Amz-Algorithm"
+            | b"X-Amz-Credential"
+            | b"X-Amz-Date"
+            | b"X-Amz-Expires"
+            | b"X-Amz-SignedHeaders"
+            | b"X-Amz-Signature"
+    )
+}
+
+/// Query parameters that some operation reads, and so select no subresource.
+/// Compared as received, as `sv4_query_param` reads them.
 fn s3_plain_param(k: &[u8]) -> bool {
-    k.starts_with(b"X-Amz-")
-        || k.starts_with(b"x-amz-")
+    s3_presign_param(k)
         || matches!(
             k,
             b"list-type"
@@ -169,10 +192,76 @@ fn s3_plain_param(k: &[u8]) -> bool {
                 | b"marker"
                 | b"partNumber"
                 | b"uploadId"
-                | b"response-content-type"
-                | b"response-content-disposition"
-                | b"response-cache-control"
         )
+}
+
+/// Whether `op` acts on the parameter `k` with the value `v`.
+fn s3_op_reads(op: S3Op, k: &[u8], v: &[u8]) -> bool {
+    match op {
+        S3Op::ListObjects => match k {
+            b"prefix" | b"delimiter" | b"max-keys" | b"marker" => true,
+            b"list-type" => v == b"1",
+            b"encoding-type" => v == b"url",
+            _ => false,
+        },
+        S3Op::ListObjectsV2 => match k {
+            b"list-type"
+            | b"prefix"
+            | b"delimiter"
+            | b"max-keys"
+            | b"continuation-token"
+            | b"start-after" => true,
+            b"encoding-type" => v == b"url",
+            // A listing names no owner, so only the answer that asks for none
+            // is met.
+            b"fetch-owner" => v == b"false",
+            _ => false,
+        },
+        S3Op::GetBucketLocation => k == b"location",
+        S3Op::CreateMultipartUpload => k == b"uploads",
+        S3Op::UploadPart => matches!(k, b"partNumber" | b"uploadId"),
+        S3Op::CompleteMultipartUpload | S3Op::AbortMultipartUpload => k == b"uploadId",
+        _ => false,
+    }
+}
+
+/// Whether `op` acts on everything the raw query `q` holds.
+///
+/// The test is what the operation reads, never what a request might ask for: a
+/// list of names to refuse is passed by the next name, and by any spelling of
+/// one (`x-amz-object%2dlock-mode`). A name is compared as received, because
+/// that is how it is read: an escaped spelling of a name the operation does
+/// read would otherwise be accepted and then not found. A repeated name is
+/// refused because only its first value is read, which also bounds the search
+/// for repeats by the few names that get this far.
+pub fn s3_query_served(op: S3Op, q: &[u8]) -> bool {
+    let name_of = |part: &'_ [u8]| -> (usize, usize) {
+        match part.iter().position(|&c| c == b'=') {
+            Some(e) => (e, e + 1),
+            None => (part.len(), part.len()),
+        }
+    };
+    let mut at = 0usize;
+    for part in q.split(|&c| c == b'&') {
+        let start = at;
+        at += part.len() + 1;
+        if part.is_empty() {
+            continue;
+        }
+        let (e, v) = name_of(part);
+        let k = &part[..e];
+        if !s3_presign_param(k) && !s3_op_reads(op, k, &part[v..]) {
+            return false;
+        }
+        let repeated = q[..start].split(|&c| c == b'&').any(|earlier| {
+            let (e, _) = name_of(earlier);
+            !earlier.is_empty() && &earlier[..e] == k
+        });
+        if repeated {
+            return false;
+        }
+    }
+    true
 }
 
 fn s3_bucket_subresource(q: &[u8]) -> Sub {
@@ -204,6 +293,70 @@ fn s3_object_subresource(q: &[u8]) -> bool {
         };
         !part.is_empty() && !s3_plain_param(k)
     })
+}
+
+// ── What a request asks the store to keep ────────────────────────────────
+
+/// Whether a header name asks for retention, a legal hold, a key reference,
+/// immutability or encryption, under any vendor's spelling. This server stores
+/// none of them, so a request naming one is refused, not served without it. A
+/// query parameter asking the same is refused by [`s3_query_served`]; any other
+/// header this server would ignore, by [`s3_header_dropped`].
+pub fn s3_name_asks_keeping(name: &[u8]) -> bool {
+    let has = |word: &[u8]| {
+        name.windows(word.len())
+            .any(|w| w.eq_ignore_ascii_case(word))
+    };
+    has(b"retain")
+        || has(b"retention")
+        || has(b"legal-hold")
+        || has(b"legal_hold")
+        || has(b"object-lock")
+        || has(b"object_lock")
+        || has(b"key-ref")
+        || has(b"key_ref")
+        || has(b"immutab")
+        || has(b"encryption")
+}
+
+/// Whether accepting a request carrying the header `name: value` would mean
+/// ignoring it. `chunked` is whether the request's payload form is `aws-chunked`.
+///
+/// `x-amz-` is S3's own namespace, where a name asks something of the server, so
+/// the test there is what this server reads. Outside it a request holds many
+/// headers that ask nothing, so the test is the names S3 acts on.
+pub fn s3_header_dropped(op: S3Op, name: &[u8], value: &[u8], chunked: bool) -> bool {
+    let is = |n: &[u8]| name.eq_ignore_ascii_case(n);
+    if name.len() >= 6 && name[..6].eq_ignore_ascii_case(b"x-amz-") {
+        return !(is(b"x-amz-date")
+            || is(b"x-amz-content-sha256")
+            || is(b"x-amz-decoded-content-length")
+            || is(b"x-amz-user-agent"));
+    }
+    if is(b"content-md5")
+        || is(b"if-modified-since")
+        || is(b"if-unmodified-since")
+        || is(b"if-range")
+    {
+        return true;
+    }
+    if is(b"content-encoding") {
+        return !(chunked && value == b"aws-chunked");
+    }
+    if is(b"if-match") || is(b"if-none-match") {
+        return !matches!(op, S3Op::PutObject | S3Op::GetObject | S3Op::HeadObject);
+    }
+    let creates = matches!(op, S3Op::PutObject | S3Op::CreateMultipartUpload);
+    if creates
+        && (is(b"cache-control")
+            || is(b"content-disposition")
+            || is(b"content-language")
+            || is(b"expires"))
+    {
+        return true;
+    }
+    // A completed upload's object is written with no content type.
+    op == S3Op::CreateMultipartUpload && is(b"content-type")
 }
 
 // ── Naming ───────────────────────────────────────────────────────────────
@@ -431,6 +584,8 @@ pub fn s3_errno(rc: i32, upload: bool) -> S3Err {
         // The grant does not cover the name, lacks the permission, or has
         // expired.
         EACCES => S3Err::AccessDenied,
+        // The object's retention or legal hold refuses the change.
+        ERETAINED => S3Err::AccessDenied,
         // An ABSENT precondition lost (EEXIST) or an ETAG one did (EAGAIN).
         EEXIST | EAGAIN => S3Err::PreconditionFailed,
         EINVAL => S3Err::InvalidArgument,

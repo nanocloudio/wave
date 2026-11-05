@@ -1072,7 +1072,8 @@ unsafe fn reclaim(s: &mut State) {
 /// wire layout is how two of them drift apart.
 ///
 /// `declared` is the expected size, a hint the provider may ignore; `etag` is
-/// empty unless `precondition` is `ETAG`.
+/// empty unless `precondition` is `ETAG`. The request keeps nothing beside the
+/// object: `dispatch` refuses a request that asks it to.
 fn encode_put_open(
     arg: &mut [u8],
     key: &[u8],
@@ -1081,7 +1082,7 @@ fn encode_put_open(
     precondition: u8,
     etag: &[u8],
 ) -> Option<usize> {
-    let n = 2 + key.len() + 1 + content_type.len() + 8 + 2 + etag.len();
+    let n = 2 + key.len() + 1 + content_type.len() + 8 + 2 + etag.len() + obj::KEPT_FIXED_LEN;
     if n > arg.len() || key.len() > u16::MAX as usize || content_type.len() > u8::MAX as usize {
         return None;
     }
@@ -1100,7 +1101,9 @@ fn encode_put_open(
     arg[p + 1] = etag.len() as u8;
     p += 2;
     arg[p..p + etag.len()].copy_from_slice(etag);
-    Some(p + etag.len())
+    p += etag.len();
+    p += obj::Kept::none().encode(&mut arg[p..])?;
+    Some(p)
 }
 
 /// Ask the provider whether it can take a streamed write, before accepting a
@@ -1459,13 +1462,32 @@ unsafe fn dispatch(
         S3Op::NotImplemented => return Err(S3Err::NotImplemented),
         _ => {}
     }
-    // Requests this server could only accept by ignoring part of them.
-    if sv4_header(headers, b"x-amz-copy-source").is_some()
-        || sv4_header(headers, b"content-md5").is_some()
-        || headers_have_prefix(headers, b"x-amz-checksum-")
-        || sv4_header(headers, b"x-amz-trailer").is_some()
+    // Requests this server could only accept by ignoring part of them, above
+    // all retention, a hold and encryption: dropped, each turns a write the
+    // caller asked to be immutable or sealed into one that is neither, and tells
+    // the caller it succeeded.
+    let chunked = s.ex[i].payload == Payload::Chunked;
+    if exchange::header_lines(headers).any(|(name, value)| {
+        s3_name_asks_keeping(name) || s3_header_dropped(op, name, value, chunked)
+    }) {
+        return Err(S3Err::NotImplemented);
+    }
+    // A presigned request's body is not hashed, so a digest it names would go
+    // unchecked.
+    if s.ex[i].payload == Payload::Unsigned
+        && sv4_header(headers, b"x-amz-content-sha256").is_some_and(|v| v != SV4_UNSIGNED)
     {
         return Err(S3Err::NotImplemented);
+    }
+    // A signature in the header leaves the presigned form's parameters unread,
+    // `X-Amz-Expires` among them.
+    if sv4_header(headers, b"authorization").is_some()
+        && r.query.split(|&c| c == b'&').any(|part| {
+            let e = part.iter().position(|&c| c == b'=').unwrap_or(part.len());
+            s3_presign_param(&part[..e])
+        })
+    {
+        return Err(S3Err::InvalidArgument);
     }
     if op == S3Op::ListBuckets {
         return list_buckets(s, i);
@@ -1531,12 +1553,6 @@ unsafe fn dispatch(
         }
         _ => Err(S3Err::NotImplemented),
     }
-}
-
-fn headers_have_prefix(headers: &[u8], prefix: &[u8]) -> bool {
-    headers
-        .split(|&c| c == b'\n')
-        .any(|line| line.len() >= prefix.len() && line[..prefix.len()].eq_ignore_ascii_case(prefix))
 }
 
 /// Verify the request's signature, header or presigned form, and return the
@@ -2047,7 +2063,7 @@ unsafe fn begin_put(s: &mut State, i: usize, headers: &[u8], part: bool) -> Resu
     }
     e.put_last = !e.body_open;
     let key = &e.name[..e.name_len];
-    let mut arg = [0u8; NAME_MAX + 300];
+    let mut arg = [0u8; NAME_MAX + 320];
     let p = encode_put_open(&mut arg, key, ct, declared, precondition, &etag[..etag_len])
         .ok_or(S3Err::KeyTooLong)?;
     if p > e.arg.len() {
@@ -2440,7 +2456,7 @@ fn fence_header(fence: &[u8; WIRE_MAX_LEN], h: &mut S3Out<'_>) {
 unsafe fn head_object(s: &mut State, i: usize) -> Result<(), i32> {
     let grant = s.creds[s.ex[i].cred as usize].grant;
     let e = &mut s.ex[i];
-    let mut out = [0u8; 8 + 8 + 1 + 255 + 1 + 255];
+    let mut out = [0u8; 8 + 8 + 1 + 255 + 1 + 255 + obj::KEPT_FIXED_LEN + obj::KEY_REF_MAX];
     // The read's own fence: the exchange's `fence` keeps what a write
     // reported, which is what its answer names.
     let mut fence = [0u8; WIRE_MAX_LEN];
@@ -2458,7 +2474,7 @@ unsafe fn head_object(s: &mut State, i: usize) -> Result<(), i32> {
     if rc < 0 {
         return Err(rc);
     }
-    let Some((h, _ct, etag)) = obj::range::decode_head(&out[..rc as usize]) else {
+    let Some((h, _ct, etag, _kept)) = obj::range::decode_head(&out[..rc as usize]) else {
         return Err(errno::ERROR);
     };
     let e = &mut s.ex[i];
@@ -3148,7 +3164,7 @@ unsafe fn begin_create_upload(s: &mut State, i: usize) -> Result<(), S3Err> {
     bucket[..bucket_len].copy_from_slice(&e.name[..bucket_len]);
     let mut marker = [0u8; NAME_MAX];
     let ml = s3_upload_name(&bucket[..bucket_len], &id, 0, &mut marker).ok_or(S3Err::KeyTooLong)?;
-    // [key_len][key][ct_len=0][body_ptr][body_len][precondition ABSENT][0][fence ptr][cap]
+    // [key_len][key][ct_len=0][body_ptr][body_len][precondition ABSENT][0][Kept none][fence ptr][cap]
     let body_ptr = e.name.as_ptr() as u64;
     let body_len = e.name_len as u64;
     let a = &mut e.arg;
@@ -3165,6 +3181,9 @@ unsafe fn begin_create_upload(s: &mut State, i: usize) -> Result<(), S3Err> {
     a[p] = obj::precondition::ABSENT;
     a[p + 1] = 0;
     p += 2;
+    p += obj::Kept::none()
+        .encode(&mut a[p..])
+        .ok_or(S3Err::KeyTooLong)?;
     a[p..p + 8].copy_from_slice(&(e.fence.as_mut_ptr() as u64).to_le_bytes());
     a[p + 8..p + 10].copy_from_slice(&(WIRE_MAX_LEN as u16).to_le_bytes());
     p += 10;

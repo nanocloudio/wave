@@ -492,9 +492,17 @@ pub(crate) unsafe fn start(s: &mut HttpState) -> bool {
     false
 }
 
-/// Ready the phase machine for a fresh request on a fresh decoder.
+/// Ready the phase machine for a fresh request on a fresh decoder. The unread
+/// frames of an HTTP/2 connection in hand stay: they answer the streams it
+/// already carries, and the request being readied is only one more.
 unsafe fn rearm(s: &mut HttpState) {
-    s.client.recv_len = 0;
+    #[cfg(feature = "h2")]
+    let keep = super::h2_streams::holds_connection(s);
+    #[cfg(not(feature = "h2"))]
+    let keep = false;
+    if !keep {
+        s.client.recv_len = 0;
+    }
     s.client.pending_offset = 0;
     s.client.headers_done = 0;
     s.client.bytes_received = 0;

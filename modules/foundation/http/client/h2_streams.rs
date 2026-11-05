@@ -238,6 +238,13 @@ pub(crate) fn live(s: &HttpState) -> bool {
     s.client.streams.streams.iter().any(|t| t.state != FREE)
 }
 
+/// Whether a connection is in hand. `recv_buf` is then the connection's: what
+/// is unread in it may be a frame in part, or frames held behind a record the
+/// outbox has not taken.
+pub(crate) fn holds_connection(s: &HttpState) -> bool {
+    s.client.streams.phase != IDLE
+}
+
 /// Nothing is owed and no connection is held.
 pub(crate) fn quiet(s: &HttpState) -> bool {
     s.client.streams.phase == IDLE && s.client.streams.close_owed == 0 && !live(s)
