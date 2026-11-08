@@ -125,6 +125,7 @@
 //! | 118   | handoff_after_frames | u32 | 0 | Session anchor: swap workers every N envelopes (0 = never) |
 //! | 119   | sessions_prefix | str | (none) | Session anchor: store prefix whose `active` row picks the worker |
 //! | 130   | table_volume | str | (none) | The store the tables follow: a keyed volume or `platform`; empty, the default |
+//! | 131   | fs_root     | str  | (none)  | Server: serve `<fs_root><path>` for a request no route matches; a directory serves its `index.html` (`full`, `exchange`) |
 //! | 120-121 | —         | —    | —       | retired                                             |
 //! | 122-129 | route_N_max_body_kib | u32 | 0 | Route N's request-body ceiling in KiB (0 = 64 KiB); at most 1 TiB |
 
@@ -439,6 +440,19 @@ mod params_def {
     // `TABLE_VOLUME_MAX`: refused at construction.
     130, table_volume, str, 0
         => |s, d, len| { server::params::set_table_volume(s, d, len); };
+
+    // The directory a request no route matches is served from: `<fs_root>
+    // <path>` through the FS provider, a directory's `index.html` for a path
+    // naming one (server/h1.rs `begin_fs_root`). Empty, the default: such a
+    // request is a 404. Carried by the `fs_root` feature (the `full` and
+    // `exchange` variants); inert in a variant without it, as `h3` is.
+    131, fs_root, str, 0
+        => |s, d, len| {
+            #[cfg(feature = "fs_root")]
+            server::params::set_fs_root(s, d, len);
+            #[cfg(not(feature = "fs_root"))]
+            let _ = (s, d, len);
+        };
 
     9, grpc, u8, 0
             => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };

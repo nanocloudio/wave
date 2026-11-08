@@ -1,0 +1,31 @@
+# A WebSocket client for one endpoint.
+#
+# `authority` is the one endpoint it reaches: the graph names it and nothing
+# the client is handed can change it. Links are opened on `open_in`
+# (`[conn: u8][path…]`, one resource of that endpoint each), frames cross on
+# `ws_in` / `ws_out`, and what happens to a link comes out on `event_out`.
+# `request_in` / `message_out` serve a caller that wants one message and its
+# answer. `net_in` / `net_out` go to the network.
+stack: wave_ws_client
+version: 0.1.0
+
+params:
+  authority:
+    type: string
+    required: true
+    example: "localhost:8080"
+    description: The endpoint, host[:port]
+
+exports:
+  open_in: websocket.open_in
+  ws_in: websocket.ws_in
+  ws_out: websocket.ws_out
+  event_out: websocket.event_out
+  request_in: websocket.request_in
+  message_out: websocket.message_out
+  net_in: websocket.net_in
+  net_out: websocket.net_out
+
+modules:
+  - name: websocket
+    authority: ${param:authority}

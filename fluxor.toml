@@ -11,6 +11,13 @@ version = "0.0.1"
 [dependencies]
 fluxor = "0.0.1"
 
+# The stacks the bound names this project's graphs, and `fluxor run`'s
+# browser host, include. `file_server` is the host `fluxor run` composes for a
+# scenario's `host:` block; Wave fills it with its own `wave_files`, which
+# resolves from packaging/stack/ and is never pinned.
+[uses.stacks]
+file_server = "wave_files"
+
 [required]
 fluxor = { abi = 1 }
 
@@ -115,6 +122,10 @@ scripts = ["tools/ci/dev_certs.sh"]
 #  10. exchange_suites.sh — the harness suites gated on `http`'s `exchange`
 #      feature, with it on. The built-in harness phase runs default features,
 #      where each of them compiles to nothing and reports green.
+#  11. browser_host.sh — a scenario run through `fluxor run`, its browser host
+#      composed from `@file_server` bound to Wave's own `wave_files`. The only
+#      place the binding, the stack and `http`'s `fs_root` meet a real runtime
+#      and a real client; each is otherwise tested alone.
 scripts = [
   "tools/ci/shadow_guard.sh",
   "tools/ci/host_crates.sh",
@@ -126,6 +137,7 @@ scripts = [
   "tools/e2e/http_app_reply.sh",
   "tools/e2e/s3_serve.sh",
   "tools/ci/exchange_suites.sh",
+  "tools/e2e/browser_host.sh",
 ]
 
 # Crate-root `#![allow(...)]` is banned by `../standards/lints.md` §4. Each row

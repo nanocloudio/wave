@@ -1,0 +1,34 @@
+# A static file server: every request is served from one directory.
+#
+# Fits the `file_server` interface a graph includes as `@file_server` (the
+# browser host `fluxor run` composes for a scenario): `port` to listen on,
+# `root` the absolute directory served, and the `net_in` / `net_out` pair to
+# the platform's network. A GET for `/p` serves `root/p`, following symbolic
+# links; a path naming a directory serves its `index.html`; the content type
+# comes from the extension. Served by `http`'s `fs_root`, so the default
+# (`full`) variant, which carries it.
+stack: wave_files
+version: 0.1.0
+
+params:
+  port:
+    type: integer
+    required: true
+    min: 1
+    max: 65535
+    example: 9876
+  root:
+    type: string
+    required: true
+    example: /srv/www
+
+exports:
+  net_in: http.net_in
+  net_out: http.net_out
+
+modules:
+  - name: http
+    port: ${param:port}
+    # The platform network below is kernel TCP: whole buffers, not one MSS.
+    host_tcp: 1
+    fs_root: ${param:root}

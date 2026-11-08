@@ -48,6 +48,11 @@ capabilities = ["transport.anchor.stream", "stream.ordered_ack.exchange"]
 # not the role a constrained device plays (protocol_surfaces.md §Target-Class
 # Fit) and its flash is. The ports it answers on are omitted with it.
 #
+# `fs_root` serves a directory tree for a request no route matches
+# (`server/h1.rs` `begin_fs_root`): a host's static-file server, carried by
+# the server-class `full` and `exchange` and omitted from the embedded shapes,
+# whose flash it would cost.
+#
 # Two exchange roles, each behind its own feature:
 #   * `app` — the server as REQUESTER toward the application behind a
 #     `HANDLER_APP` route: `request_out` / `response_in`.
@@ -113,11 +118,11 @@ base = { default = 5782528, aarch64 = 5782528, thumbv8m = 2156752, thumbv6m = 21
 # as an exchange provider over HTTP/1.1, h2c or HTTP/3.
 [[variant]]
 name = "exchange"
-features = ["h1", "h2", "h3", "ws", "app", "exchange", "session"]
+features = ["h1", "h2", "h3", "ws", "app", "exchange", "session", "fs_root"]
 
 [[variant]]
 name = "full"
-features = ["h1", "h2", "ws", "h3", "app", "session"]
+features = ["h1", "h2", "ws", "h3", "app", "session", "fs_root"]
 omit_ports = ["request_in", "response_out"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
 default = true

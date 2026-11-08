@@ -125,6 +125,188 @@ unsafe fn fs_dispatch_wait(s: &mut HttpState) -> i32 {
     0
 }
 
+/// Why a request path could not become a filesystem path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FsPathError {
+    /// Base and path together exceed `MAX_FS_PATH`.
+    TooLong,
+    /// A NUL or backslash byte, raw or percent-encoded.
+    BadByte,
+    /// A `..` segment.
+    Traversal,
+}
+
+/// Compose `<base><suffix>` into `out`, percent-decoding `suffix` — a
+/// request path, untrusted — so `%XX`-escaped bytes in file names resolve to
+/// the real name. A NUL or backslash byte and a `..` segment are refused.
+/// Returns the composed length.
+///
+/// Inlined into each caller: a variant serving `fs_list` alone compiles it
+/// as one inline block, as flash-bound as the code it replaced.
+///
+/// # Safety
+/// `suffix` must be valid for `suffix_len` bytes.
+#[inline(always)]
+pub(crate) unsafe fn compose_fs_path(
+    base: &[u8],
+    suffix: *const u8,
+    suffix_len: usize,
+    out: &mut [u8; MAX_FS_PATH],
+) -> Result<usize, FsPathError> {
+    // Decoding only shrinks, so bounding the encoded length bounds the result.
+    if base.len() + suffix_len > MAX_FS_PATH {
+        return Err(FsPathError::TooLong);
+    }
+    out[..base.len()].copy_from_slice(base);
+    let mut n = base.len();
+    let mut k = 0usize;
+    while k < suffix_len {
+        let mut b = *suffix.add(k);
+        if b == b'%' && k + 3 <= suffix_len {
+            match (hex_val(*suffix.add(k + 1)), hex_val(*suffix.add(k + 2))) {
+                (Some(h), Some(l)) => {
+                    b = (h << 4) | l;
+                    k += 3;
+                }
+                _ => k += 1,
+            }
+        } else {
+            k += 1;
+        }
+        if b == 0 || b == b'\\' {
+            return Err(FsPathError::BadByte);
+        }
+        out[n] = b;
+        n += 1;
+    }
+    // A `..` segment of the suffix: `/../`, a trailing `/..`, a leading
+    // `../` or a bare `..`.
+    let start = base.len();
+    let mut k = start;
+    while k + 1 < n {
+        if out[k] == b'.' && out[k + 1] == b'.' {
+            let before_ok = k == start || out[k - 1] == b'/';
+            let after_ok = k + 2 == n || out[k + 2] == b'/';
+            if before_ok && after_ok {
+                return Err(FsPathError::Traversal);
+            }
+        }
+        k += 1;
+    }
+    Ok(n)
+}
+
+/// Answer a request whose path [`compose_fs_path`] refused.
+#[cfg(feature = "fs_root")]
+unsafe fn fs_path_refused(s: &mut HttpState, e: FsPathError) -> i32 {
+    match e {
+        FsPathError::TooLong => build_error(s, b"414 URI Too Long", b"URI Too Long\n"),
+        FsPathError::BadByte => build_error(s, b"400 Bad Request", b"bad path\n"),
+        FsPathError::Traversal => build_error(s, b"400 Bad Request", b"path traversal rejected\n"),
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.phase = Phase::DrainSend;
+    }
+    0
+}
+
+/// Serve a request no route matched from `fs_root`: `<fs_root><path>`
+/// through the FS provider, the query dropped. A path ending in `/`, or
+/// naming a directory (an `FS_OPENDIR` probe answers), serves that
+/// directory's `index.html`. Links resolve as the provider resolves them.
+/// The content type follows the request path's extension, and an
+/// `index.html` is `text/html`. Every call up to the open is idempotent, so a
+/// pending answer leaves the slot in `DispatchRoute` to re-ask.
+#[cfg(feature = "fs_root")]
+unsafe fn begin_fs_root(s: &mut HttpState) -> i32 {
+    let (target_len, req_ptr, req_len) = match cur_slot(s) {
+        Some(c) => (
+            c.req_target_len as usize,
+            c.req_path.as_ptr(),
+            c.req_path_len as usize,
+        ),
+        None => return 0,
+    };
+    if target_len > MAX_PATH {
+        return fs_path_refused(s, FsPathError::TooLong);
+    }
+    let mut plen = 0usize;
+    while plen < req_len && *req_ptr.add(plen) != b'?' {
+        plen += 1;
+    }
+    let mut base = [0u8; MAX_FS_PATH];
+    let mut base_len = s.server.fs_root_len as usize;
+    base[..base_len].copy_from_slice(&s.server.fs_root[..base_len]);
+    while base_len > 0 && base[base_len - 1] == b'/' {
+        base_len -= 1;
+    }
+    let mut path = [0u8; MAX_FS_PATH];
+    let mut n = match compose_fs_path(&base[..base_len], req_ptr, plen, &mut path) {
+        Ok(n) => n,
+        Err(e) => return fs_path_refused(s, e),
+    };
+    let sys = &*s.syscalls;
+    let mut index = n == base_len || path[n - 1] == b'/';
+    if !index {
+        let dir = (sys.provider_call)(-1, 0x0907 /* FS_OPENDIR */, path.as_mut_ptr(), n);
+        if fs_pending(dir) {
+            return fs_dispatch_wait(s);
+        }
+        if dir >= 0 {
+            (sys.provider_call)(dir, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+            index = true;
+        }
+    }
+    if index {
+        let page: &[u8] = if n > 0 && path[n - 1] == b'/' {
+            b"index.html"
+        } else {
+            b"/index.html"
+        };
+        if n + page.len() > MAX_FS_PATH {
+            return fs_path_refused(s, FsPathError::TooLong);
+        }
+        path[n..n + page.len()].copy_from_slice(page);
+        n += page.len();
+    }
+    let fd = (sys.provider_call)(-1, 0x0900 /* FS_OPEN */, path.as_mut_ptr(), n);
+    if fs_pending(fd) {
+        return fs_dispatch_wait(s);
+    }
+    if fd < 0 {
+        build_error(s, b"404 Not Found", b"Not Found\n");
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::DrainSend;
+        }
+        return 0;
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.matched_route = -1;
+        cur.fs_index = index as u8;
+        cur.fs_fd = fd;
+        cur.fs_sent = 0;
+        cur.fs_total = 0;
+        cur.fs_stat_ticks = 0;
+        cur.phase = Phase::AwaitFsStat;
+    }
+    0
+}
+
+/// The handler a slot's send phases run: its matched route's, the FS
+/// streamer for a file `fs_root` serves (no route, a file open), else
+/// `HANDLER_FILE`.
+#[inline(always)]
+unsafe fn send_handler(s: &HttpState) -> u8 {
+    if cur_matched_route(s) >= 0 {
+        return (*s.server.routes.as_ptr().add(cur_matched_route(s) as usize)).handler;
+    }
+    #[cfg(feature = "fs_root")]
+    if cur_fs_fd(s) >= 0 {
+        return HANDLER_FS_FILE;
+    }
+    HANDLER_FILE
+}
+
 /// Largest JSON body a `HANDLER_FS_LIST` listing builds. It is assembled in
 /// the last `FS_LIST_BODY_MAX` bytes of `send_buf`, so the response head has
 /// the front of the buffer to itself when the length is finally known.
@@ -1168,6 +1350,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if body_pending {
                     return begin_discard(s, limit);
                 }
+                #[cfg(feature = "fs_root")]
+                if s.server.fs_root_len > 0 {
+                    return begin_fs_root(s);
+                }
                 build_error(s, b"404 Not Found", b"Not Found\n");
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::DrainSend;
@@ -1618,89 +1804,44 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     let is_file_request = req_path_len > route_path_len + 1;
 
                     if is_file_request {
-                        // Compose `<fs_path>/<suffix>`. The suffix
-                        // already includes its leading '/' (the
-                        // separator between route path and filename),
-                        // which lets us concat without inserting one.
+                        // Compose `<fs_path><suffix>`. The suffix already
+                        // includes its leading '/' (the separator between
+                        // route path and filename).
                         let mut composed = [0u8; MAX_FS_PATH];
                         let dir_len = route.fs_path_len as usize;
-                        let suffix_len = req_path_len - route_path_len;
-                        if dir_len == 0 || dir_len + suffix_len > MAX_FS_PATH {
-                            build_error(
-                                s,
-                                b"500 Internal Server Error",
-                                b"FS_LIST file path too long\n",
-                            );
-                            if let Some(cur) = cur_slot_mut(s) {
-                                cur.phase = Phase::DrainSend;
-                            }
-                            return 0;
-                        }
-                        composed[..dir_len].copy_from_slice(&route.fs_path[..dir_len]);
-                        let req_path_ptr = req_path_ptr_local;
-                        // Percent-decode the request suffix so spaces and
-                        // other `%XX`-escaped bytes in filenames resolve to
-                        // the real on-disk path (browsers encode them).
-                        // Decoding only shrinks the length, so the bound
-                        // check above stays valid.
-                        let mut out = dir_len;
-                        let mut k = 0usize;
-                        while k < suffix_len {
-                            let mut b = *req_path_ptr.add(route_path_len + k);
-                            if b == b'%' && k + 3 <= suffix_len {
-                                match (
-                                    hex_val(*req_path_ptr.add(route_path_len + k + 1)),
-                                    hex_val(*req_path_ptr.add(route_path_len + k + 2)),
-                                ) {
-                                    (Some(h), Some(l)) => {
-                                        b = (h << 4) | l;
-                                        k += 3;
-                                    }
-                                    _ => k += 1,
+                        let total = match compose_fs_path(
+                            &route.fs_path[..dir_len],
+                            req_path_ptr_local.add(route_path_len),
+                            req_path_len - route_path_len,
+                            &mut composed,
+                        ) {
+                            Ok(n) if dir_len > 0 => n,
+                            Ok(_) | Err(FsPathError::TooLong) => {
+                                build_error(
+                                    s,
+                                    b"500 Internal Server Error",
+                                    b"FS_LIST file path too long\n",
+                                );
+                                if let Some(cur) = cur_slot_mut(s) {
+                                    cur.phase = Phase::DrainSend;
                                 }
-                            } else {
-                                k += 1;
+                                return 0;
                             }
-                            // Reject embedded null / backslash control bytes.
-                            if b == 0 || b == b'\\' {
+                            Err(FsPathError::BadByte) => {
                                 build_error(s, b"400 Bad Request", b"bad path\n");
                                 if let Some(cur) = cur_slot_mut(s) {
                                     cur.phase = Phase::DrainSend;
                                 }
                                 return 0;
                             }
-                            composed[out] = b;
-                            out += 1;
-                        }
-                        let total = out;
-                        // Reject `..` traversal: scan for `/../`,
-                        // trailing `/..`, leading `../`, or bare `..`.
-                        // Cheap byte-window check rather than a full
-                        // canonicaliser — we're guarding the suffix
-                        // (already validated for nulls/backslashes
-                        // above), and the suffix is provided by the
-                        // request URL which we don't trust.
-                        let suffix_start = dir_len;
-                        let suffix_end = total;
-                        let mut k = suffix_start;
-                        while k + 1 < suffix_end {
-                            if composed[k] == b'.' && composed[k + 1] == b'.' {
-                                let before_ok = k == suffix_start || composed[k - 1] == b'/';
-                                let after_ok = (k + 2) == suffix_end || composed[k + 2] == b'/';
-                                if before_ok && after_ok {
-                                    build_error(
-                                        s,
-                                        b"400 Bad Request",
-                                        b"path traversal rejected\n",
-                                    );
-                                    if let Some(cur) = cur_slot_mut(s) {
-                                        cur.phase = Phase::DrainSend;
-                                    }
-                                    return 0;
+                            Err(FsPathError::Traversal) => {
+                                build_error(s, b"400 Bad Request", b"path traversal rejected\n");
+                                if let Some(cur) = cur_slot_mut(s) {
+                                    cur.phase = Phase::DrainSend;
                                 }
+                                return 0;
                             }
-                            k += 1;
-                        }
+                        };
 
                         let sys = &*s.syscalls;
                         let fd = (sys.provider_call)(
@@ -1968,14 +2109,31 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             //      with `content_type: "text/html"`).
             //   2. Sniffed from the request path's extension. Covers
             //      the HANDLER_FS_LIST file-serve path where the route
-            //      has no fixed content_type — the request URL is the
-            //      only source of mime info we have without a content
-            //      sniff.
+            //      has no fixed content_type, and `fs_root` (no route;
+            //      a directory's `index.html` is `text/html`) — the
+            //      request URL is the only source of mime info we have
+            //      without a content sniff.
             //   3. Fallback `application/octet-stream`.
-            let sniffed = if ct_len == 0 {
+            #[cfg(feature = "fs_root")]
+            let index_page = ct_owner.is_none() && cur_slot(s).is_some_and(|c| c.fs_index != 0);
+            #[cfg(not(feature = "fs_root"))]
+            let index_page = false;
+            let sniffed = if ct_len == 0 && index_page {
+                &b"text/html"[..]
+            } else if ct_len == 0 {
                 let (req_p, req_l) = match cur_slot(s) {
                     Some(c) => (c.req_path.as_ptr(), c.req_path_len as usize),
                     None => (core::ptr::null(), 0usize),
+                };
+                // The extension is the path's, not the query's: `fs_root`
+                // serves a path whatever query the page put on it.
+                #[cfg(feature = "fs_root")]
+                let req_l = {
+                    let mut q = 0usize;
+                    while q < req_l && *req_p.add(q) != b'?' {
+                        q += 1;
+                    }
+                    q
                 };
                 content_type_from_path(req_p, req_l)
             } else {
@@ -2173,11 +2331,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
         Phase::SendHeaders => {
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
-                let handler = if cur_matched_route(s) >= 0 {
-                    (*s.server.routes.as_ptr().add(cur_matched_route(s) as usize)).handler
-                } else {
-                    HANDLER_FILE
-                };
+                let handler = send_handler(s);
 
                 // HEAD: the headers just drained are the whole response (RFC
                 // 9110 §9.3.2 — identical headers to the equivalent GET,
@@ -2261,11 +2415,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
         }
 
         Phase::SendBody => {
-            let handler = if cur_matched_route(s) >= 0 {
-                (*s.server.routes.as_ptr().add(cur_matched_route(s) as usize)).handler
-            } else {
-                HANDLER_FILE
-            };
+            let handler = send_handler(s);
 
             match handler {
                 HANDLER_STATIC => {

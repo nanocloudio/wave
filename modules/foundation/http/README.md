@@ -23,7 +23,7 @@ generations it serves:
 
 | Variant | Artefact | Features |
 | --- | --- | --- |
-| `full` (default) | `http.fmod` | h1, h2, ws, h3, app |
+| `full` (default) | `http.fmod` | h1, h2, ws, h3, app, fs_root |
 | `exchange` | `http-exchange.fmod` | `full` plus the client as an exchange provider |
 | `h1_exchange` | `http-h1_exchange.fmod` | h1 and the client as an exchange provider, nothing else |
 | `h2` | `http-h2.fmod` | h1, h2, ws, app |
@@ -74,7 +74,7 @@ what its deployment uses, and an unwired port is silent rather than an error.
 `protocol`, `request_body`, `websocket`, `host_tcp`, `grpc`, then eight route blocks of
 `route_N_{path,body,handler,proxy_ip,proxy_port,source,content_type,fs_path,fs_list,fs_filter}`,
 and the high-tag set: `routes_prefix`, `listeners_prefix`, `table_volume`,
-each route's body ceiling `route_N_max_body_kib`, then the connection-lifetime
+`fs_root`, each route's body ceiling `route_N_max_body_kib`, then the connection-lifetime
 set `header_timeout_ms`, `keepalive_idle_ms`, `pressure_idle_ms`, `stall_ms`,
 `ws_idle_ms`, and the client's `authority`.
 Tags are wire positions: append, never renumber; tags 4, 101, 103, 120 and 121
@@ -85,6 +85,16 @@ at once on one connection: advertised as `SETTINGS_MAX_CONCURRENT_STREAMS` and
 enforced as the same figure, one past it refused `REFUSED_STREAM`. 1 to 16, the
 stream table's size; 0, the default, is all 16. A larger figure refuses the
 module at construction rather than advertising streams the table cannot hold.
+
+`fs_root` (parameter 131) serves a directory tree: a request no route matches,
+nor a dynamic route, is answered with `<fs_root><path>` through the FS
+provider, the query dropped. A path ending in `/`, or naming a directory,
+serves that directory's `index.html`; the content type follows the
+extension (an `index.html` is `text/html`); a `..` segment is refused with
+400 and a missing file is 404. Links resolve as the provider resolves them,
+so a root that links to directories elsewhere serves them. It is what
+`packaging/stack/wave_files.yaml` serves with. Carried by `full` and
+`exchange`; inert in the other variants, as `h3` is.
 
 `table_volume` (parameter 130) names the store every table follows — the
 dynamic routes, the listeners and the session trigger: a keyed

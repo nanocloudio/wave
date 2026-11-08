@@ -1,0 +1,28 @@
+# An open HTTP client: requests in as exchange records, responses out.
+#
+# Names no authority. Each request record carries the authority it is for,
+# and the client dials that one, so the policy over which origins may be
+# reached belongs to whatever writes the records. `net_in` / `net_out` go to
+# the network, or to a `tls` client's cleartext side for an `https://` leg.
+stack: wave_http_client
+version: 0.1.0
+
+params:
+  protocol:
+    type: integer
+    default: 0
+    min: 0
+    max: 1
+    description: 0 = HTTP/1.1, 1 = HTTP/2
+
+exports:
+  request_in: http.request_in
+  response_out: http.response_out
+  net_in: http.net_in
+  net_out: http.net_out
+
+modules:
+  - name: http
+    variant: exchange
+    mode: 1
+    protocol: ${param:protocol}

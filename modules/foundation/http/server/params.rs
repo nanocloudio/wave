@@ -453,6 +453,23 @@ pub(crate) unsafe fn set_route_fs_list(s: &mut HttpState, idx: usize, d: *const 
     }
 }
 
+/// Set `fs_root`, the directory a request no route matches is served from.
+/// A path longer than `MAX_FS_PATH` is refused (left empty) rather than
+/// truncated: a clipped root would serve another directory.
+#[cfg(feature = "fs_root")]
+pub(crate) unsafe fn set_fs_root(s: &mut HttpState, d: *const u8, len: usize) {
+    if len > MAX_FS_PATH {
+        s.server.fs_root_len = 0;
+        return;
+    }
+    let mut i = 0usize;
+    while i < len {
+        s.server.fs_root[i] = *d.add(i);
+        i += 1;
+    }
+    s.server.fs_root_len = len as u16;
+}
+
 /// Set the per-route extension filter consumed by `HANDLER_FS_LIST`.
 /// Comma-separated, case-insensitive. Empty = list every regular
 /// file the FS provider returns. No-op when the route isn't an

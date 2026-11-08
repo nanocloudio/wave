@@ -470,6 +470,10 @@ pub(crate) struct ConnSlot {
     /// `FsList`. Zeroed as each wait begins; bounded by
     /// `h1::FS_WAIT_TIMEOUT_TICKS`.
     pub(crate) fs_stat_ticks: u16,
+    /// The file `fs_root` serves is a directory's `index.html`, which the
+    /// request path names no extension for: it is served as `text/html`.
+    #[cfg(feature = "fs_root")]
+    pub(crate) fs_index: u8,
     /// Render position into the route's `body_offset..body_offset+body_len`
     /// region of the body_pool arena. Widened to u32 to match the
     /// route's `body_offset` / `body_len` widths — large inline /
@@ -1090,6 +1094,13 @@ pub(crate) struct ServerState {
     pub(crate) var_count: u8,
 
     pub(crate) routes: [Route; MAX_ROUTES],
+    /// The directory a request no route matches is served from (`fs_root`,
+    /// the `fs_root` feature): `<fs_root><path>` through the FS provider.
+    /// Empty: such a request is a 404.
+    #[cfg(feature = "fs_root")]
+    pub(crate) fs_root: [u8; MAX_FS_PATH],
+    #[cfg(feature = "fs_root")]
+    pub(crate) fs_root_len: u16,
     /// Variable table keyed by `name_hash`; updated by
     /// `drain_variables` from `var_chan`, read by `lookup_var`
     /// during template render. Shared across all connections.
