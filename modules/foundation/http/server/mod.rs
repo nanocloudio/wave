@@ -2328,7 +2328,7 @@ pub(crate) unsafe fn reset_connection(s: &mut HttpState) {
     if cur_fs_fd(s) >= 0 {
         ((*s.syscalls).provider_call)(
             cur_fs_fd(s),
-            0x0903, // FS_CLOSE
+            crate::abi::registry::fs::CLOSE, // FS_CLOSE
             core::ptr::null_mut(),
             0,
         );

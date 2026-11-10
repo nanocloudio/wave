@@ -9,11 +9,10 @@
 //!
 //! The datagram surface here is IPv4: a v6 literal is refused by `adopt`.
 
-// The single mount of the SDK contract for this file: the authority
+// The SDK contract, through the module's own `abi` mount: the authority
 // grammar lives with the wire record that carries it, so a connector
 // never writes its own parser.
-#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/net/net_proto.rs"]
-pub mod net_proto;
+pub use super::abi::contracts::net::net_proto;
 
 use net_proto::{name_ok, parse_v4};
 

@@ -248,12 +248,22 @@ unsafe fn begin_fs_root(s: &mut HttpState) -> i32 {
     let sys = &*s.syscalls;
     let mut index = n == base_len || path[n - 1] == b'/';
     if !index {
-        let dir = (sys.provider_call)(-1, 0x0907 /* FS_OPENDIR */, path.as_mut_ptr(), n);
+        let dir = (sys.provider_call)(
+            -1,
+            super::super::abi::registry::fs::OPENDIR, /* FS_OPENDIR */
+            path.as_mut_ptr(),
+            n,
+        );
         if fs_pending(dir) {
             return fs_dispatch_wait(s);
         }
         if dir >= 0 {
-            (sys.provider_call)(dir, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                dir,
+                super::super::abi::registry::fs::CLOSE, /* FS_CLOSE */
+                core::ptr::null_mut(),
+                0,
+            );
             index = true;
         }
     }
@@ -269,7 +279,12 @@ unsafe fn begin_fs_root(s: &mut HttpState) -> i32 {
         path[n..n + page.len()].copy_from_slice(page);
         n += page.len();
     }
-    let fd = (sys.provider_call)(-1, 0x0900 /* FS_OPEN */, path.as_mut_ptr(), n);
+    let fd = (sys.provider_call)(
+        -1,
+        super::super::abi::registry::fs::OPEN, /* FS_OPEN */
+        path.as_mut_ptr(),
+        n,
+    );
     if fs_pending(fd) {
         return fs_dispatch_wait(s);
     }
@@ -474,7 +489,7 @@ unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
     for _ in 0..FS_LIST_ROUNDS {
         let nb = (sys.provider_call)(
             dir_fd,
-            0x0908, /* FS_READDIR */
+            super::super::abi::registry::fs::READDIR,
             readdir_buf.as_mut_ptr(),
             readdir_buf.len(),
         );
@@ -507,7 +522,12 @@ unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
 
     if pending {
         if fs_wait_expired(s) {
-            (sys.provider_call)(dir_fd, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                dir_fd,
+                super::super::abi::registry::fs::CLOSE, /* FS_CLOSE */
+                core::ptr::null_mut(),
+                0,
+            );
             if let Some(cur) = cur_slot_mut(s) {
                 cur.fs_fd = -1;
             }
@@ -524,7 +544,12 @@ unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
         return 0;
     }
     if failed {
-        (sys.provider_call)(dir_fd, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            dir_fd,
+            super::super::abi::registry::fs::CLOSE, /* FS_CLOSE */
+            core::ptr::null_mut(),
+            0,
+        );
         if let Some(cur) = cur_slot_mut(s) {
             cur.fs_fd = -1;
         }
@@ -539,7 +564,12 @@ unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
         return 2;
     }
 
-    (sys.provider_call)(dir_fd, 0x0903 /* FS_CLOSE */, core::ptr::null_mut(), 0);
+    (sys.provider_call)(
+        dir_fd,
+        super::super::abi::registry::fs::CLOSE, /* FS_CLOSE */
+        core::ptr::null_mut(),
+        0,
+    );
     if let Some(cur) = cur_slot_mut(s) {
         cur.fs_fd = -1;
     }
@@ -676,7 +706,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if cur_fs_fd(s) >= 0 {
                     ((*s.syscalls).provider_call)(
                         cur_fs_fd(s),
-                        0x0903, // FS_CLOSE
+                        super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                         core::ptr::null_mut(),
                         0,
                     );
@@ -1306,7 +1336,12 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     k += 1;
                 }
                 let room = cap.saturating_sub(off);
-                let n = ((*s.syscalls).provider_call)(-1, 0x0C65, buf.add(off), room);
+                let n = ((*s.syscalls).provider_call)(
+                    -1,
+                    super::super::abi::registry::diag::FAN_DIAG_SNAPSHOT,
+                    buf.add(off),
+                    room,
+                );
                 if n > 0 {
                     off += n as usize;
                 }
@@ -1657,7 +1692,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // browser-fetch on wasm).
                     let fd = (sys.provider_call)(
                         -1,
-                        0x0900, // FS_OPEN
+                        super::super::abi::registry::fs::OPEN, // FS_OPEN
                         fs_path.as_mut_ptr(),
                         n,
                     );
@@ -1846,7 +1881,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         let sys = &*s.syscalls;
                         let fd = (sys.provider_call)(
                             -1,
-                            0x0900, // FS_OPEN
+                            super::super::abi::registry::fs::OPEN, // FS_OPEN
                             composed.as_mut_ptr(),
                             total,
                         );
@@ -1889,7 +1924,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     let sys = &*s.syscalls;
                     let dir_fd = (sys.provider_call)(
                         -1,
-                        0x0907, /* FS_OPENDIR */
+                        super::super::abi::registry::fs::OPENDIR,
                         fs_path.as_mut_ptr(),
                         n,
                     );
@@ -2087,7 +2122,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let mut stat = [0u8; 8];
             let st = (sys.provider_call)(
                 cur_fs_fd(s),
-                0x0904, // FS_STAT
+                super::super::abi::registry::fs::STAT, // FS_STAT
                 stat.as_mut_ptr(),
                 stat.len(),
             );
@@ -2150,7 +2185,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             if st == E_NODEV {
                 (sys.provider_call)(
                     cur_fs_fd(s),
-                    0x0903, // FS_CLOSE
+                    super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                     core::ptr::null_mut(),
                     0,
                 );
@@ -2206,7 +2241,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         let mut seek_arg = (start as i32).to_le_bytes();
                         let seek_rc = (sys.provider_call)(
                             cur_fs_fd(s),
-                            0x0902, // FS_SEEK
+                            super::super::abi::registry::fs::SEEK, // FS_SEEK
                             seek_arg.as_mut_ptr(),
                             seek_arg.len(),
                         );
@@ -2214,7 +2249,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             if fs_wait_expired(s) {
                                 (sys.provider_call)(
                                     cur_fs_fd(s),
-                                    0x0903, // FS_CLOSE
+                                    super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                                     core::ptr::null_mut(),
                                     0,
                                 );
@@ -2257,7 +2292,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     wire::h1::RangeParse::Unsatisfiable => {
                         (sys.provider_call)(
                             cur_fs_fd(s),
-                            0x0903, // FS_CLOSE
+                            super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                             core::ptr::null_mut(),
                             0,
                         );
@@ -2292,7 +2327,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if fs_wait_expired(s) {
                     (sys.provider_call)(
                         cur_fs_fd(s),
-                        0x0903, // FS_CLOSE
+                        super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                         core::ptr::null_mut(),
                         0,
                     );
@@ -2314,7 +2349,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // Unknown FS_STAT error — treat as a fetch failure.
             (sys.provider_call)(
                 cur_fs_fd(s),
-                0x0903, // FS_CLOSE
+                super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                 core::ptr::null_mut(),
                 0,
             );
@@ -2352,7 +2387,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if cur_fs_fd(s) >= 0 {
                         ((*s.syscalls).provider_call)(
                             cur_fs_fd(s),
-                            0x0903, // FS_CLOSE
+                            super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                             core::ptr::null_mut(),
                             0,
                         );

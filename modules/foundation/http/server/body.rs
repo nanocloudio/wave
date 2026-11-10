@@ -724,7 +724,7 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
                 let sys = &*s.syscalls;
                 (sys.provider_call)(
                     cur_fs_fd(s),
-                    0x0903, // FS_CLOSE
+                    super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                     core::ptr::null_mut(),
                     0,
                 );
@@ -748,7 +748,7 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
             };
             let n = (sys.provider_call)(
                 cur_fs_fd(s),
-                0x0901, // FS_READ
+                super::super::abi::registry::fs::READ, // FS_READ
                 cur_send_buf_mut_ptr(s),
                 cap,
             );
@@ -765,7 +765,7 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
             if n <= 0 {
                 (sys.provider_call)(
                     cur_fs_fd(s),
-                    0x0903, // FS_CLOSE
+                    super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                     core::ptr::null_mut(),
                     0,
                 );

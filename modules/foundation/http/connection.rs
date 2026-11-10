@@ -127,8 +127,7 @@ pub(crate) const MAX_DATA_FRAGMENT: usize = 1460;
 // net_proto and the datagram surface, and the mux opcode range (0xB0..0xCF) is
 // disjoint from theirs — which is why h3 needs no new ports: one channel pair
 // carries both contracts unambiguously.
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/net/mux.rs"]
-pub mod mux;
+pub use super::abi::contracts::net::mux;
 
 /// Header shared by every contract on a net channel.
 pub const FRAME_HDR: usize = 3;

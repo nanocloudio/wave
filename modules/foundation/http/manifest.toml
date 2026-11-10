@@ -292,12 +292,17 @@ active_when_params = ["routes_prefix", "listeners_prefix", "sessions_prefix"]
 requires_contract = "event"
 access = "write"
 
-# HANDLER_FS_FILE routes serve files by path through the FS_CONTRACT
-# (`fat32` on bare-metal, `linux_fs_dispatch` on the host). Granting
-# `fs` enables `provider_call(-1, FS_OPEN, ...)`.
+# File routes (`fs_path` / `fs_list`, HANDLER_FS_FILE / HANDLER_FS_LIST) and
+# `fs_root` serve files through the FS_CONTRACT (`fat32` on bare metal,
+# `linux_fs_dispatch` on the host). An instance with none of them never
+# calls it.
 [[resources]]
 requires_contract = "fs"
 access = "read"
+active_when_params = [
+    "fs_root",
+    "route_0_fs_path", "route_0_fs_list", "route_1_fs_path", "route_1_fs_list", "route_2_fs_path", "route_2_fs_list", "route_3_fs_path", "route_3_fs_list", "route_4_fs_path", "route_4_fs_list", "route_5_fs_path", "route_5_fs_list", "route_6_fs_path", "route_6_fs_list", "route_7_fs_path", "route_7_fs_list",
+]
 
 [observability]
 # id 2 = routes_dropped (http.routes.dropped): dynamic-route arena /
