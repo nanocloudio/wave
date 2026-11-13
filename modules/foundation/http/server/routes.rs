@@ -17,8 +17,8 @@
 use super::super::connection::net_proto::Target;
 use super::super::wire::route_key;
 use super::{
-    cur_slot, dyn_field, dyn_u32, hex_val, HttpState, TableSink, MAX_CONTENT_TYPE, MAX_DYN_KEY,
-    MAX_DYN_ROUTES, MAX_FS_PATH, MAX_PATH, MAX_ROUTES, MAX_ROUTE_BACKENDS,
+    cur_slot, dyn_field, dyn_u32, HttpState, TableSink, MAX_CONTENT_TYPE, MAX_DYN_KEY,
+    MAX_DYN_ROUTES, MAX_FS_PATH, MAX_PATH, MAX_ROUTE_BACKENDS,
 };
 
 // ── Handler kinds (stored in Route.handler) ───────────────────────────────

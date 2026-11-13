@@ -102,7 +102,7 @@ for obj in "${OBJS[@]}"; do
     # ── The two shapes that are absolute AND never dereferenced ─────────
     #
     # `_KEEP_MEMSET` / `_KEEP_MEMMOVE` are `#[used]` arrays of function
-    # pointers in fluxor's SDK (../fluxor/modules/sdk/runtime/intrinsics.rs)
+    # pointers in fluxor's SDK (../fluxor/crates/fluxor-rt/src/intrinsics.rs)
     # that exist only to stop LTO dropping the memory intrinsics. Nothing
     # reads them, so the addresses they hold are never followed.
     case "$target" in

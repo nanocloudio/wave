@@ -1,7 +1,7 @@
 // AWS Signature Version 4: one core for the side that signs and the side that
 // verifies. Bounded, no_std, no allocation. SHA-256 is SDK-owned: the mounting
-// module `include!`s `target/fluxor/fluxor-abi/sdk/crypto/sha256.rs` before
-// this file, which supplies `sha256` and `Sha256`. HMAC (RFC 2104) is
+// module imports `fluxor_sdk::crypto::sha256::*` before including this file,
+// which supplies `sha256` and `Sha256`. HMAC (RFC 2104) is
 // construction glue over it, not a primitive.
 //
 // A signature is HMAC(signing key, string to sign), where the signing key is

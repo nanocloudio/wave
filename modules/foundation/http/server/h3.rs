@@ -1124,8 +1124,7 @@ fn decode_varint_prefix(buf: &[u8]) -> Option<(u64, usize)> {
 /// Identify a unidirectional control stream by its first varint.
 /// Returns one of the `H3_UNI_STREAM_*` constants on success.
 pub fn classify_uni_stream_prefix(buf: &[u8]) -> Option<(u64, usize)> {
-    #[path = "../../../../target/fluxor/fluxor-abi/sdk/wire/varint.rs"]
-    mod varint;
+    use fluxor_abi::wire::varint;
     // SAFETY: pointer/length pair derived from a Rust slice; varint_decode
     // bounds-checks against the supplied length.
     unsafe { varint::varint_decode(buf.as_ptr(), buf.len()) }
@@ -2015,7 +2014,7 @@ pub unsafe fn test_pump_next_out(state: *mut u8, out: &mut [u8]) -> Option<usize
 // exist. This pump is per-stream from the start.
 
 /// Fluxor's `mux` contract — the multiplexed session surface, consumed
-/// verbatim rather than restated. `../fluxor/modules/sdk/contracts/net/mux.rs` names QUIC as its
+/// verbatim rather than restated. `../fluxor/crates/fluxor-abi/src/contracts/net/mux.rs` names QUIC as its
 /// canonical provider and says exactly what this module needs: "a transport
 /// exposes many logical streams over one association" and "the app owns the
 /// protocol".
@@ -4432,7 +4431,7 @@ pub fn stage_next_out(st: &H3State, out: &mut [u8]) -> Option<(usize, H3Commit)>
 // exist. This pump is per-stream from the start.
 
 /// Fluxor's `mux` contract — the multiplexed session surface, consumed
-/// verbatim rather than restated. `../fluxor/modules/sdk/contracts/net/mux.rs` names QUIC as its
+/// verbatim rather than restated. `../fluxor/crates/fluxor-abi/src/contracts/net/mux.rs` names QUIC as its
 /// canonical provider and says exactly what this module needs: "a transport
 /// exposes many logical streams over one association" and "the app owns the
 /// protocol".
@@ -4517,7 +4516,7 @@ mod alloc_vec {
 /// completes, and hand queued responses back to the transport.
 ///
 /// Wired on the module's ordinary `net_in` / `net_out` ports. HTTP/3 needs no
-/// ports of its own because `../fluxor/modules/sdk/contracts/net/mux.rs` reserves an opcode range
+/// ports of its own because `../fluxor/crates/fluxor-abi/src/contracts/net/mux.rs` reserves an opcode range
 /// disjoint from net_proto's — one channel pair carries both contracts, and a
 /// frame that is not ours is left alone (`H3StreamOutcome::Ignored`).
 ///

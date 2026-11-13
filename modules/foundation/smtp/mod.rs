@@ -60,9 +60,9 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
+    reason = "mounts the shared cores `smtp_core.rs` and `smtp_wire.rs` from \
+              modules/common whole and uses a subset of each; their other \
+              items serve the mail module and the host harness"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -73,17 +73,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Protocol logic + hex codec from `modules/common` — the same sources the host
 // vector tests exercise, path-mounted exactly as `sip` mounts `sip_core`.
@@ -98,10 +91,9 @@ mod smtp_core;
 #[path = "../../common/smtp_core.rs"]
 pub mod smtp_core;
 use smtp_core::{
-    smtp_auth_plain, smtp_body, smtp_body_chunk, smtp_body_end, smtp_data, smtp_ehlo,
-    smtp_mail_from, smtp_offers_auth_plain, smtp_on_reply, smtp_phase_code, smtp_quit,
-    smtp_rcpt_to, smtp_reply_accepts, smtp_reply_line, smtp_reply_text, SmtpAuthPlan, SmtpCmd,
-    SmtpPhase,
+    smtp_auth_plain, smtp_body_chunk, smtp_body_end, smtp_data, smtp_ehlo, smtp_mail_from,
+    smtp_offers_auth_plain, smtp_on_reply, smtp_phase_code, smtp_quit, smtp_rcpt_to,
+    smtp_reply_accepts, smtp_reply_line, smtp_reply_text, SmtpAuthPlan, SmtpCmd, SmtpPhase,
 };
 
 #[cfg(not(feature = "host-test"))]
@@ -112,8 +104,8 @@ mod smtp_wire;
 pub mod smtp_wire;
 use smtp_wire::{
     smtp_classify_code, smtp_enhanced_status, write_smtp_result, SmtpResultHead, SMTP_OUT_ACCEPTED,
-    SMTP_OUT_AUTH_UNAVAILABLE, SMTP_OUT_CLOSED, SMTP_OUT_CONNECT_FAILED, SMTP_OUT_PROTOCOL_ERROR,
-    SMTP_OUT_REJECTED_PERM, SMTP_OUT_REJECTED_TEMP, SMTP_OUT_TIMEOUT, SMTP_RES_HDR,
+    SMTP_OUT_AUTH_UNAVAILABLE, SMTP_OUT_CLOSED, SMTP_OUT_CONNECT_FAILED, SMTP_OUT_TIMEOUT,
+    SMTP_RES_HDR,
 };
 
 // The exchange records submissions arrive in and are answered with.
@@ -323,7 +315,7 @@ struct SmtpState {
     dropped_unparsable: u32,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     SmtpState;
 
     // 1: endpoint — retired. `authority` (9) names the relay.
@@ -380,11 +372,7 @@ define_params! {
     };
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<SmtpState>() as u32
-}
+fluxor_rt::module_facts! { state: SmtpState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

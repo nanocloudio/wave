@@ -5,27 +5,10 @@
 //! packet without allocating; platform hardware may replace that primitive
 //! behind the same bounded call boundary.
 
-// The SDK's AES-GCM primitive is include!'d whole; this file calls the 128-bit
-// AEAD and the raw block function and nothing else. `allow` rather than
-// `expect`: the PIC module build reaches every item through the public surface
-// and reports nothing, so an expectation would go unfulfilled there while the
-// host harness — which compiles this as an ordinary library — needs it.
-#[allow(
-    dead_code,
-    reason = "SDK crypto primitive included whole; the callers here use one AEAD and one block function"
-)]
-mod aes_gcm {
-    fn zeroize<T: AsMut<[u8]>>(value: &mut T) {
-        for byte in value.as_mut() {
-            *byte = 0;
-        }
-    }
-    include!("../../target/fluxor/fluxor-abi/sdk/crypto/aes_gcm.rs");
-}
-
-mod sha1_core {
-    include!("../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs");
-}
+// The SDK's AES-GCM primitive (the 128-bit AEAD and the raw block function)
+// and SHA-1, from the linked SDK crate.
+use fluxor_sdk::crypto::aes_gcm;
+use fluxor_sdk::crypto::sha1 as sha1_core;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SrtpReplay {

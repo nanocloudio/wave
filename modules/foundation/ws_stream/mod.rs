@@ -62,20 +62,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 // PIC library code must not panic; surface errors through the ABI.
 #![deny(clippy::unwrap_used)]
-#![allow(
-    dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 // The WsFrame envelope layout belongs to the `ws_frame` contract — the header
 // size, the u32 conn id and the all-ones unclaimed sentinel are taken from it
@@ -120,11 +113,7 @@ struct State {
     rx_scratch_len: usize,
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State, arena: 0 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -435,7 +424,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Pull new input only when pending drained. Cap per-step reads at
         // 4096 so each WS BINARY envelope handed to the http server fits
         // in a single fast-path send_buf slot (SEND_BUF_SIZE = 4100 in
-        // `../fluxor/modules/sdk/abi/config.rs` accommodates a 4096-byte payload + the
+        // `../fluxor/crates/fluxor-abi/src/config.rs` accommodates a 4096-byte payload + the
         // 4-byte server-to-client WS header). Allowing larger payloads
         // works on a quiescent network but drops chunks under sustained
         // load — we measured ~2 KiB lost per ~10 ms emit interval at
@@ -492,10 +481,5 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     0
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-pub extern "C" fn module_arena_size() -> u32 {
-    0
-}
-
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

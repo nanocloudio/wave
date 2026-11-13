@@ -75,11 +75,9 @@ use super::{
     MAX_DYN_PREFIX, NET_FRAME_HDR, POLL_IN,
 };
 
-// The handoff core: cursor encoding and the admission rule. Mounted for
+// The handoff core: cursor encoding and the admission rule. Imported for
 // those alone — the chunk walk belongs to workers.
-mod handoff {
-    include!("../../../../target/fluxor/fluxor-abi/sdk/cores/session_handoff.rs");
-}
+use fluxor_sdk::cores::session_handoff as handoff;
 pub(crate) use handoff::{cursors_admit, SessionCursors, HANDOFF_OK};
 
 // ── Ports ─────────────────────────────────────────────────────────────────

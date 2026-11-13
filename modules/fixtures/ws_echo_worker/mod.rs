@@ -27,12 +27,6 @@
 // PIC library code must not panic; surface errors through the ABI.
 #![deny(clippy::unwrap_used)]
 #![allow(
-    dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
-)]
-#![allow(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "the module ABI entry points take raw state and syscall pointers \
               whose validity is the runtime's half of the contract, and the \
@@ -41,15 +35,13 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::net::session_ctrl as sc;
 use abi::contracts::net::ws_frame;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/cores/session_handoff.rs");
+use fluxor_rt::*;
+use fluxor_sdk::cores::session_handoff::*;
 include!("../../common/ws_session_worker.rs");
 
 /// Sessions this worker holds at once.
@@ -123,10 +115,9 @@ struct State {
 
 mod params_def {
     use super::State;
-    use super::SCHEMA_MAX;
     use super::TAG_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, tag, str, 0
@@ -141,11 +132,7 @@ mod params_def {
     }
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -550,4 +537,4 @@ pub unsafe fn test_session(state: *mut u8, conn: u32) -> Option<(u8, u32, u32, u
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

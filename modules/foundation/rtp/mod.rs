@@ -40,9 +40,11 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
+    reason = "mounts the shared cores `rtp_core.rs`, `rtp_wire.rs`, \
+              `stun_core.rs`, `turn_core.rs`, `turn_media.rs`, `hex_core.rs` \
+              and `dg_authority.rs` from modules/common whole and uses a \
+              subset of each; their other items serve the stun, rtcp and \
+              jitter modules and the host harness"
 )]
 #![allow(
     unreachable_patterns,
@@ -58,17 +60,15 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::encoded as enc;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
 /// `codec` when the `codec` parameter named no payload format this module
 /// carries; `module_new` refuses to construct with it.
 const CODEC_UNSUPPORTED: u8 = 0xFF;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Where the media goes, named once as `host[:port]` — the same core the
 // other datagram connectors take their peer from.
@@ -104,14 +104,11 @@ mod rtp_wire;
 pub mod rtp_wire;
 use rtp_wire::{
     put_rtcp_stat_rx_meta, put_rtcp_stat_tx, put_rtp_rx_meta, put_rtp_rx_meta_mid, RtpReceiveMeta,
-    REC_RTP_RX_META, REC_RTP_RX_META_MID, RTCP_STAT_MAX_LEN, RTP_RX_META_LEN, RTP_RX_META_MID_LEN,
+    REC_RTP_RX_META, REC_RTP_RX_META_MID, RTCP_STAT_MAX_LEN, RTP_RX_META_MID_LEN,
 };
 
 mod turn_wire {
-    mod sdkcrypto {
-        include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs");
-    }
-    use sdkcrypto::sha1;
+    use fluxor_sdk::crypto::sha1::sha1;
     include!("../../common/stun_core.rs");
     include!("../../common/turn_core.rs");
     include!("../../common/turn_media.rs");
@@ -169,7 +166,7 @@ unsafe fn __aeabi_memmove(dest: *mut u8, src: *const u8, n: usize) {
 // ============================================================================
 
 // datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
-// ../fluxor/modules/sdk/runtime.rs (shared across consumers).
+// fluxor_rt (`../fluxor/crates/fluxor-rt/src/net.rs`, shared across consumers).
 
 /// Framing scratch: the largest metadata-bearing receive record plus its
 /// NetProto envelope.
@@ -590,10 +587,9 @@ mod params_def {
     use super::rtp_route;
     use super::RtpState;
     use super::CODEC_UNSUPPORTED;
-    use super::SCHEMA_MAX;
     use super::{p_u16, p_u32, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         RtpState;
 
         // Tags 1, 2 and 5 are retired; the next allocation is 27.
@@ -724,11 +720,7 @@ mod params_def {
 // PIC Module Interface
 // ============================================================================
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<RtpState>() as u32
-}
+fluxor_rt::module_facts! { state: RtpState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -1808,6 +1800,6 @@ unsafe fn advance_after_send(s: &mut RtpState, payload_len: usize) {
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `../fluxor/modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `../fluxor/crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

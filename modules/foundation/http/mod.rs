@@ -135,23 +135,20 @@
 #![allow(
     dead_code,
     unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
-)]
-#![allow(
-    clippy::duplicate_mod,
-    reason = "each `.rs` file is its own rustc invocation in the PIC build, so \
-              the SDK is path-mounted per file and one crate sees several copies"
+    reason = "one source serves every `[[variant]]`: the \
+              `h1`/`h2`/`h3`/`ws`/`app`/`exchange`/`session`/`fs_root` \
+              features each compile a different subset of this module's \
+              submodules and of the shared cores it mounts from \
+              modules/common, so an item or import one variant or the host \
+              harness reaches is unreferenced in another"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // The exchange contract: the records every request and its answer travel in.
 // This module speaks it in both roles — as the REQUESTER toward the application
@@ -267,10 +264,10 @@ mod params_def {
     use super::server;
     use super::wire;
     use super::HttpState;
-    use super::SCHEMA_MAX;
+
     use super::{p_u16, p_u32, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         HttpState;
 
         0, mode, u8, 0
@@ -645,12 +642,6 @@ mod params_def {
 
 // ── Exported PIC interface ────────────────────────────────────────────────
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<HttpState>() as u32
-}
-
 /// Room for what application exchanges hold while their connections cannot
 /// take it: each exchange's record queue (`server::app::QUEUE_LIMIT`), and the
 /// request bytes an h2 or h3 stream has received inside its flow-control
@@ -720,15 +711,10 @@ pub const fn arena_size(f: ArenaFeatures) -> u32 {
     BODY_BUDGET_DEFAULT.saturating_add(arena_non_body_reserve_for(f))
 }
 
-declare_module_arena_bytes!(arena_size(COMPILED_FEATURES));
-
-/// [`arena_size`] for this build. Kept as the export the loader falls back
-/// to; `pack` reads the declared figure.
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    arena_size(COMPILED_FEATURES)
-}
+// The state and, as the arena, [`arena_size`] for this build: `pack` records
+// both in the signed manifest, and `MODULE_ARENA_BYTES` is the same figure for
+// code that needs it at run time.
+fluxor_rt::module_facts! { state: HttpState, arena: arena_size(COMPILED_FEATURES) }
 
 /// The body-pool share of the default heap cap: the file-cache region plus
 /// as much again of inline `body:` routes.
@@ -795,7 +781,7 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 ///
 /// # Safety
 /// `state` / `params` / `syscalls` are kernel-owned buffers; the loader
-/// passes `state_size` ≥ `module_state_size()` and `params_len` ≥ the
+/// passes `state_size` ≥ `MODULE_STATE_BYTES` and `params_len` ≥ the
 /// declared TLV size, both zero-init.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
@@ -1126,7 +1112,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         } else {
             // Server mode. With `h3 = 1` the module speaks HTTP/3 over the
             // `mux` contract instead of HTTP/1+2 over net_proto — same ports,
-            // disjoint opcode ranges (../fluxor/modules/sdk/contracts/net/mux.rs).
+            // disjoint opcode ranges (../fluxor/crates/fluxor-abi/src/contracts/net/mux.rs).
             //
             // One clock read per pass, ahead of either path: every lifetime
             // deadline and progress stamp in this step compares against it.
@@ -1510,6 +1496,6 @@ pub unsafe extern "C" fn module_drain(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `../fluxor/modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `../fluxor/crates/fluxor-rt/src/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

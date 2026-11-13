@@ -146,7 +146,7 @@ pub(crate) mod session {
 
 // What the core itself needs back from them. Short by design: everything else
 // flows the other way, from a subsystem reaching into the slot helpers below.
-use cache::{cache_release_for_route, drain_variables, CacheEntry, VarEntry};
+use cache::{cache_release_for_route, CacheEntry, VarEntry};
 use h1::step_active_slot;
 use listeners::{is_listen_port, pump_listeners, DynListeners, NET_MSG_BIND_REFUSED};
 use proxy::{find_slot_by_backend_conn, is_proxy_relay_phase};
@@ -165,11 +165,9 @@ server_mod!(
     h3,
 );
 
-use super::abi::SyscallTable;
 use super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED,
-    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
-    NET_MSG_TRACE_CTX,
+    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND,
+    NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 use super::wire;
 use super::HttpState;
@@ -178,14 +176,14 @@ use super::{
     dev_micros, dev_millis, dev_owner_tag, dev_requester_tag, dev_self_index,
     dev_telemetry_enabled, dev_telemetry_span, fmt_u32_raw, heap_alloc, heap_free, heap_realloc,
     msg_read, net_read_frame, net_write_frame, p_u16, p_u32, p_u8, IOCTL_FLUSH, IOCTL_NOTIFY,
-    IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
+    IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
 //
 // The capacities below are the SDK's, not this module's: they are per-board
 // profiles, so a value here is one board's. See
-// `../fluxor/modules/sdk/abi/config.rs` for the full envelope.
+// `../fluxor/crates/fluxor-abi/src/config.rs` for the full envelope.
 
 pub(crate) use super::abi::config::http::{
     ARENA_WORKING_SET_CONNS, DEFAULT_BODY_POOL_SIZE, MAX_CACHE, MAX_CONCURRENT_CONNS,
@@ -198,20 +196,14 @@ pub(crate) use super::abi::config::http::{
 // Three runtime tables are programmed from the store rather than from params:
 // the dynamic route arena (`routes`), the dynamic listener set (`listeners`)
 // and the session swap trigger (`session`). All three ride the reusable
-// `cores/table_consumer` core, `include!`d here — it is an implementation, not
-// a wire contract, so it is included rather than linked (see the file header).
-// `SyscallTable` and `abi` are brought into scope for the include per the
-// core's includer contract.
+// `fluxor_sdk::cores::table_consumer` core — an implementation, not a wire
+// contract, so it comes from the SDK crate rather than the ABI.
 //
 // The store wakes them through ONE kernel event this instance creates
 // (`store_event`); it writes no channel of ours, so no port carries it.
 // `pump_store_event` takes the rung subscriptions once per step for all three,
 // and each pump then advances its own consumer.
-mod table_consumer {
-    use super::super::abi;
-    use super::super::abi::SyscallTable;
-    include!("../../../../target/fluxor/fluxor-abi/sdk/cores/table_consumer.rs");
-}
+use fluxor_sdk::cores::table_consumer;
 pub(crate) use table_consumer::{TableConsumer, TableSink};
 
 /// Key buffer for a table row — the `/dataplane/…` path that names it, and so
@@ -1437,7 +1429,7 @@ pub(crate) unsafe fn ready_clear(s: &mut HttpState, idx: usize) {
 }
 
 // ServerState lives inside HttpState, which the kernel allocates as a
-// zeroed buffer of `module_state_size()` bytes. `init()` below sets
+// zeroed buffer of `MODULE_STATE_BYTES` bytes. `init()` below sets
 // only those fields whose default is not zero.
 
 // ── Multi-conn slot helpers ───────────────────────────────────────────────
@@ -2963,7 +2955,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // walk the slots that were ready at the start of the tick.
     let ready_snapshot = s.server.ready_bits;
     // MAX_CONCURRENT_CONNS is a PROFILE constant: 1 on profile_embedded, 256 on
-    // host and bcm2712 (../fluxor/modules/sdk/abi/config.rs). clippy::modulo_one fires only on the
+    // host and bcm2712 (../fluxor/crates/fluxor-abi/src/config.rs). clippy::modulo_one fires only on the
     // embedded build, where `% 1` really is a no-op — but removing the modulo
     // would silently break round-robin fairness on every other profile. The wrap
     // is correct; it is the constant that collapses.

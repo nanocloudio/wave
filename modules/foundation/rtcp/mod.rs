@@ -33,8 +33,10 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
+    reason = "mounts the shared cores `rtcp_core.rs`, `rtp_wire.rs`, \
+              `srtp_core.rs` and `dg_authority.rs` from modules/common whole \
+              and uses a subset of each; their other items serve the rtp and \
+              jitter modules and the host harness"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -45,17 +47,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Where the reports go, named once as `host[:port]` — the same core the
 // other datagram connectors take their peer from.
@@ -222,7 +217,7 @@ fn install_dtls_export(s: &mut RtcpState) {
 /// The port the peer's authority takes when it names none.
 const DEFAULT_PEER_PORT: u16 = 5005;
 
-define_params! {
+fluxor_rt::define_params! {
     RtcpState;
 
     1, port, u16, 5005
@@ -263,11 +258,7 @@ define_params! {
     };
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<RtcpState>() as u32
-}
+fluxor_rt::module_facts! { state: RtcpState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

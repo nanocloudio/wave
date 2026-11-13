@@ -58,11 +58,8 @@ include!("../../../common/ws_frame_core.rs");
 // it, the other what travels on it once admitted.
 include!("../../../common/ws_admit.rs");
 
-mod sdkcrypto {
-    include!("../../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs");
-    include!("../../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs");
-}
-use sdkcrypto::{b64_encode, sha1};
+use fluxor_sdk::crypto::b64::b64_encode;
+use fluxor_sdk::crypto::sha1::sha1;
 
 // ── Sec-WebSocket-Accept derivation ──────────────────────────────────────
 

@@ -60,7 +60,7 @@ time `parse_route_body` would overflow; `body_offset`, `body_len`,
 `body_pool_cap`, and `body_pool_used` are all u32 so the pool can
 exceed 64 KiB if app templates demand it.
 
-`module_arena_size()` reports
+`MODULE_ARENA_BYTES` reports
 `2 × DEFAULT_BODY_POOL_SIZE +
 ARENA_WORKING_SET_CONNS × (RECV_BUF_SIZE + SEND_BUF_SIZE +
 size_of::<H2State>()) + per-alloc-overhead + slack`, so the kernel

@@ -21,20 +21,14 @@
 //! `send_buf` at offset 0; h2 writes at offset `FRAME_HEADER_LEN` so it can
 //! backfill an h2 DATA frame header.
 
-use super::super::connection::{NET_BUF_SIZE, NET_CMD_SEND};
-use super::cache::{cache_lookup_any, cache_release_for_route, lookup_var, CACHE_COMPLETE};
-use super::response::{build_error, build_header, build_header_with_len};
-use super::routes::{
-    HANDLER_FILE, HANDLER_FS_FILE, HANDLER_STATIC, HANDLER_STREAM, HANDLER_TEMPLATE,
-};
+use super::cache::lookup_var;
+use super::response::{build_error, build_header};
 use super::{
     cur_fs_fd, cur_fs_sent, cur_fs_total, cur_matched_route, cur_recv_buf_mut_ptr,
     cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_send_offset, cur_slot, cur_slot_mut,
-    dev_channel_ioctl, dev_csprng_fill, dev_log, dev_micros, dev_millis, dev_self_index,
-    dev_telemetry_enabled, dev_telemetry_span, fmt_u32_raw, log, net_send, net_write_frame,
-    release_file_chan, reset_connection, set_cur_phase, try_acquire_file_chan, ConnSlot, HttpState,
-    Phase, IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, MAX_ROUTES, MAX_VAR_VALUE, POLL_HUP,
-    POLL_IN, RECV_BUF_SIZE, SEND_BUF_SIZE,
+    dev_channel_ioctl, dev_csprng_fill, dev_micros, dev_self_index, dev_telemetry_enabled,
+    dev_telemetry_span, fmt_u32_raw, net_send, try_acquire_file_chan, ConnSlot, HttpState, Phase,
+    IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, POLL_HUP, POLL_IN, SEND_BUF_SIZE,
 };
 
 // ── Renderers ─────────────────────────────────────────────────────────────

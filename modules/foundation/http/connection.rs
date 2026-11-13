@@ -6,9 +6,9 @@
 //! here, version-blind.
 //!
 //! The actual frame I/O helpers (`net_write_frame`, `net_read_frame`,
-//! `NET_FRAME_HDR`) live in `../fluxor/modules/sdk/runtime.rs` and are pulled into
-//! the top-level module's scope by `include!`. Submodules reach them
-//! via `super::net_write_frame` etc.
+//! `NET_FRAME_HDR`) live in `../fluxor/crates/fluxor-rt/src/net.rs` and are
+//! brought into the top-level module's scope by `use fluxor_rt::*`. Submodules
+//! reach them via `super::net_write_frame` etc.
 
 // The opcodes and identity accessors come from the owning contract rather
 // than being restated here as literals. A value copied out of a contract is

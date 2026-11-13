@@ -25,9 +25,10 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
+    reason = "mounts the shared cores `jitter_core.rs`, `rtp_payload.rs` and \
+              `rtp_wire.rs` from modules/common whole and uses a subset of \
+              each; their other items serve the rtp and rtcp modules and the \
+              host harness"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -38,13 +39,11 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::contracts::encoded as enc;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // The reorder window — the single implementation, shared with the host
 // vectors (tests/harness/tests/jitter.rs).
@@ -142,22 +141,17 @@ impl JitterState {
 }
 
 mod params_def {
+    use super::p_u16;
     use super::JitterState;
-    use super::SCHEMA_MAX;
-    use super::{p_u16, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         JitterState;
         // Tags 1 and 2 are closed; the next allocation is 4.
         3, max_hold_ms, u16, 60 => |s, d, len| { s.max_hold_ms = p_u16(d, len, 0, 60); };
     }
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<JitterState>() as u32
-}
+fluxor_rt::module_facts! { state: JitterState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

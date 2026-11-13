@@ -137,7 +137,7 @@ default = true
 # `heap.arena_bytes`. A graph that sets `heap.arena_bytes` itself keeps its
 # figure, with a warning when it is below what the bodies need.
 #
-#   base     = `module_arena_size()`, the type's default cap:
+#   base     = `MODULE_ARENA_BYTES`, the type's default cap:
 #              BODY_BUDGET_DEFAULT + arena_non_body_reserve(). It depends on the
 #              board profile (per ABI) and on whether `h2` and `app` are
 #              compiled in (per variant). This row is `full`, `h2` and

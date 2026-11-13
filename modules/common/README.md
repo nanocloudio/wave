@@ -40,13 +40,13 @@ direct fixture in `tests/harness` and never presented as a deployable role.
 | `http_route_key` | The canonical `(host, port, path)` an HTTP request names — host lowercased, trailing dot and default port removed, IPv6 literal validated, path dot-segment- and percent-encoding-normalised — and the refusals: two authorities that disagree, an oversize host or path, a non-ASCII host. Plus the domain-separated digest input a load balancer hashes. Parsing, not placement | `http` (`wire::route_key`: the h1 `Host` walk, the h2/h3 `:authority`/`host` agreement, the dynamic-route host spelling); the key and digest are consumed by a load balancer (direct fixture here) |
 
 SHA-1 (`Sec-WebSocket-Accept`) and Base64 (the key nonce and accept proof) are
-**Fluxor SDK-owned**, mounted from `target/fluxor/fluxor-abi/sdk/crypto/`. Wave
-does not carry its own copy.
+**Fluxor SDK-owned**, imported from the linked `fluxor_sdk` crate
+(`fluxor_sdk::crypto::{sha1, b64}`). Wave does not carry its own copy.
 
 Mount order matters where cores call each other: `ws_core` needs `sha1` and
-`b64_encode` in scope, so the SDK crypto sources are `include!`d before it.
-`ws_session_worker` needs the SDK's `../fluxor/modules/sdk/cores/session_handoff.rs`
-(the chunk walk and the cursors) before it, and the `session_ctrl` contract reachable as `sc`.
+`b64_encode` in scope, so the SDK crypto is imported before it is `include!`d.
+`ws_session_worker` needs the SDK's `fluxor_sdk::cores::session_handoff`
+(the chunk walk and the cursors) in scope before it, and the `session_ctrl` contract reachable as `sc`.
 `sigv4_core` needs the SDK's `sha256` and `Sha256` in scope, and `s3_core` needs
-`sigv4_core`, so `s3` mounts the SDK's SHA-256, then `sigv4_core`, then `s3_core`;
-`s3_serve` mounts the SDK's SHA-256, then `sigv4_core`, then `s3_serve_core`.
+`sigv4_core`, so `s3` imports the SDK's SHA-256, then mounts `sigv4_core`, then `s3_core`;
+`s3_serve` imports the SDK's SHA-256, then mounts `sigv4_core`, then `s3_serve_core`.

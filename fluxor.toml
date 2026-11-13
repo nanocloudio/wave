@@ -4,10 +4,11 @@
 name    = "wave"
 version = "0.0.1"
 
-# fluxor provides the module SDK source (abi.rs, runtime.rs, params.rs,
-# varint.rs, wasm_entry.rs, the PIC linker script) materialised into
-# target/fluxor/fluxor-abi/sdk/, plus the `fluxor-linux` runtime binary. Wave's
-# modules `include!` that SDK; Wave never vendors a second copy of it.
+# fluxor provides the module SDK as three crates materialised by `fluxor sync`
+# under target/fluxor/ — `fluxor-abi` (ABI, contracts, wire), `fluxor-rt` (the
+# module runtime, its macros and the PIC linker script) and `fluxor-sdk`
+# (crypto, shared cores) — plus the `fluxor-linux` runtime binary. Wave's
+# modules link those crates; Wave never vendors a copy of them.
 [dependencies]
 fluxor = "0.0.1"
 
@@ -148,16 +149,16 @@ scripts = [
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/"
 reason = """A PIC module is built one `.rs` at a time by a direct `rustc` \
-invocation, and the SDK is path-mounted into each of them, so every compile \
-sees the whole ABI surface while using a subset and several compiles see the \
-same mounted file. That is a property of how a module is built, not of any one \
-module, and the ABI entry points' raw-pointer signatures are the runtime's half \
-of the same contract."""
+invocation, and mounts the shared cores under modules/common/ whole while \
+using a subset of each; `http`'s `[[variant]]` features likewise compile \
+different subsets of one source. That is a property of how a module is built, \
+not of any one module, and the ABI entry points' raw-pointer signatures are \
+the runtime's half of the module contract."""
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "tests/harness/"
 reason = """The harness mounts the module sources rather than linking them, which \
-rescales `pub(crate)` and multiplies the mounted SDK; the suppressions are \
+rescales `pub(crate)` and widens items to `pub` under `host-test`; the suppressions are \
 artefacts of mounting, not defects in a shipped module, and \
 `tests/harness/src/lib.rs` names each one. \
 `tests/harness/tests/shed_support/mod.rs` is shared helper code each suite uses \

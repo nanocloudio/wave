@@ -25,21 +25,19 @@
 //! `super::proxy` to relay. This file owns the ORDER, not the work.
 
 use super::super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED,
-    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
+    net_proto, NET_BUF_SIZE, NET_CMD_BIND, NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED,
+    NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
 };
 use super::super::wire;
 use super::body::{
-    finish_response, parse_file_index, render_index_into, render_static_into,
-    render_template_route_into, step_send_file, step_send_fs_file, step_send_index,
+    finish_response, parse_file_index, step_send_file, step_send_fs_file, step_send_index,
     step_send_static, step_send_template, step_unrouted_file_dispatch,
 };
 use super::cache::{
-    cache_alloc, cache_evict_all, cache_fetch_step, cache_lookup, cache_refuse_oversize,
-    cache_release_for_route, cache_retain_for_route, cache_try_or_fetch, drain_variables,
-    CacheLookup, CacheStepResult, CACHE_COMPLETE,
+    cache_alloc, cache_lookup, cache_refuse_oversize, cache_release_for_route, drain_variables,
+    CACHE_COMPLETE,
 };
-use super::listeners::{fill_bind_payload, is_listen_port};
+use super::listeners::fill_bind_payload;
 use super::proxy::{
     begin_proxy, proxy_build_forward_head, proxy_connect_failed, proxy_dial, proxy_relay_step,
     try_begin_dyn_proxy, PROXY_CONNECT_TIMEOUT_MS,
@@ -49,20 +47,18 @@ use super::response::{
     build_header_with_len, put_bytes, put_ipv4_decimal, put_u32_decimal,
 };
 use super::routes::{
-    content_type_from_path, match_route, match_route_path, Route, HANDLER_APP, HANDLER_FILE,
-    HANDLER_FS_FILE, HANDLER_FS_LIST, HANDLER_GRPC, HANDLER_PROXY, HANDLER_STATIC, HANDLER_STREAM,
-    HANDLER_TEMPLATE, HANDLER_WEBSOCKET, HANDLER_WEBSOCKET_ADMIT, HANDLER_WEBSOCKET_FANOUT,
+    content_type_from_path, match_route_path, Route, HANDLER_APP, HANDLER_FILE, HANDLER_FS_FILE,
+    HANDLER_FS_LIST, HANDLER_PROXY, HANDLER_STATIC, HANDLER_STREAM, HANDLER_TEMPLATE,
+    HANDLER_WEBSOCKET, HANDLER_WEBSOCKET_ADMIT, HANDLER_WEBSOCKET_FANOUT,
     HANDLER_WEBSOCKET_SESSION,
 };
 use super::ws::{
-    begin_ws_upgrade, retain_capture_envelope, ws_begin_close, ws_compose_accept,
-    ws_drain_fanout_input, ws_offer_admission, ws_poll_admission, ws_report_event,
-    ws_validate_upgrade, AdmitPoll, WS_ADMIT_TIMEOUT_TICKS,
+    begin_ws_upgrade, ws_begin_close, ws_compose_accept, ws_drain_fanout_input, ws_offer_admission,
+    ws_poll_admission, ws_report_event, ws_validate_upgrade, AdmitPoll, WS_ADMIT_TIMEOUT_TICKS,
 };
 use super::ws::{
-    http_status_line, ws_emit_next_fragment, ws_process_inbound, ws_queue_envelope_on_active,
-    ws_queue_frame, ws_queue_frame_fin, RETAINED_ENVELOPE_HDR, RETAIN_RESET_TICKS, WS_EV_CLOSED,
-    WS_EV_OPENED, WS_ORIGIN_LOCAL, WS_ORIGIN_PEER,
+    http_status_line, ws_process_inbound, ws_queue_envelope_on_active, RETAINED_ENVELOPE_HDR,
+    WS_EV_OPENED, WS_ORIGIN_LOCAL,
 };
 // The h2 helpers are gated with the state they touch: `http-web` links no
 // `H2State`, so importing them unconditionally breaks that variant while the
@@ -71,16 +67,14 @@ use super::ws::{
 use super::app;
 use super::reqbody;
 use super::{
-    active_slot_count, alloc_free_slot, close_net_conn, cur_conn_id, cur_fs_fd, cur_fs_sent,
-    cur_fs_total, cur_matched_route, cur_phase, cur_recv_buf_mut_ptr, cur_recv_buf_ptr,
-    cur_recv_len, cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_send_offset, cur_slot,
-    cur_slot_mut, cur_ws_fan_out, current_slot_index, dev_channel_ioctl, dev_log, dev_micros,
-    dev_millis, dev_telemetry_enabled, find_slot_by_conn_id, free_slot, hex_val, log,
-    net_read_frame, net_send, net_send_conn, net_write_frame, ready_clear, ready_set,
-    release_file_chan, reset_connection, set_cur_phase, try_acquire_file_chan, HttpState, Phase,
-    IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, MAX_CONCURRENT_CONNS, MAX_CONTENT_TYPE,
-    MAX_FS_PATH, MAX_PATH, NET_FRAME_HDR, POLL_HUP, POLL_IN, POLL_OUT, RECV_BUF_SIZE,
-    SEND_BUF_SIZE, SOCK_TYPE_STREAM,
+    alloc_free_slot, close_net_conn, cur_conn_id, cur_fs_fd, cur_matched_route, cur_phase,
+    cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_recv_len, cur_send_buf_mut_ptr, cur_send_buf_ptr,
+    cur_send_len, cur_send_offset, cur_slot, cur_slot_mut, cur_ws_fan_out, current_slot_index,
+    dev_channel_ioctl, dev_micros, dev_millis, dev_telemetry_enabled, find_slot_by_conn_id,
+    hex_val, log, net_read_frame, net_send, net_send_conn, net_write_frame, ready_clear,
+    release_file_chan, reset_connection, try_acquire_file_chan, HttpState, Phase, IOCTL_FLUSH,
+    IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, MAX_CONTENT_TYPE, MAX_FS_PATH, MAX_PATH, NET_FRAME_HDR,
+    POLL_HUP, POLL_IN, RECV_BUF_SIZE, SEND_BUF_SIZE,
 };
 #[cfg(feature = "h2")]
 use super::{cur_h2_mut, ensure_h2_state};

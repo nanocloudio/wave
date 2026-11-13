@@ -14,17 +14,16 @@
 //! Backend selection is `super::routes`; this file owns the dial, the failover,
 //! and the byte pump.
 
-use super::super::connection::{self, NET_CMD_SEND};
+use super::super::connection;
 use super::super::wire::route_key;
-use super::response::{build_error, put_bytes, put_ipv4_decimal, put_u32_decimal};
-use super::routes::{
-    match_dyn_route, DYN_ROUTE_DEFAULT_PORT, HANDLER_PROXY, MAX_BACKEND_AUTHORITY, MAX_DYN_HOST,
-};
+#[cfg(feature = "host-test")]
+use super::find_slot_by_conn_id;
+use super::response::{build_error, put_bytes, put_ipv4_decimal};
+use super::routes::{match_dyn_route, DYN_ROUTE_DEFAULT_PORT, MAX_BACKEND_AUTHORITY, MAX_DYN_HOST};
 use super::{
     cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_slot,
-    cur_slot_mut, current_slot_index, dev_millis, dev_requester_tag, find_slot_by_conn_id, log,
-    net_send_conn, reset_connection, set_cur_phase, HttpState, Phase, MAX_CONCURRENT_CONNS,
-    MAX_DYN_ROUTES, NET_FRAME_HDR, RECV_BUF_SIZE, SEND_BUF_SIZE,
+    cur_slot_mut, current_slot_index, dev_requester_tag, net_send_conn, HttpState, Phase,
+    MAX_CONCURRENT_CONNS, MAX_DYN_ROUTES, SEND_BUF_SIZE,
 };
 
 /// Wall-clock budget for a backend connect before failover / 502.

@@ -18,20 +18,13 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 // PIC library code must not panic; surface errors through the ABI.
 #![deny(clippy::unwrap_used)]
-#![allow(
-    dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
-)]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 use abi::contracts::exchange::{
     kind, parse_request, write_request_head, Record, RequestHead, RECORD_MAX,
@@ -70,11 +63,7 @@ struct Scratch {
     kept: [u8; RECORD_MAX],
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

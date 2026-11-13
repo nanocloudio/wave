@@ -33,9 +33,9 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
+    reason = "mounts the shared cores `stun_txn.rs` and `dg_authority.rs` from \
+              modules/common whole and uses a subset of each; their other \
+              items serve the rtp module and the host harness"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -46,25 +46,15 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // SHA-1 for MESSAGE-INTEGRITY. Mounted before the core, which calls it by
 // bare name — the same arrangement `modules/foundation/http/wire/ws.rs` uses for the WebSocket accept
 // value, and for the same reason: the SDK is the repo set's one crypto owner.
-mod sdkcrypto {
-    include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs");
-}
-use sdkcrypto::sha1;
+use fluxor_sdk::crypto::sha1::sha1;
 
 // The message mechanics, included FLAT rather than mounted as a submodule.
 // The core computes MESSAGE-INTEGRITY and calls `sha1` by bare name, which is
@@ -88,8 +78,8 @@ mod stun_txn;
 #[path = "../../common/stun_txn.rs"]
 pub mod stun_txn;
 use stun_txn::{
-    parse_stun_result, stun_txn_id, write_stun_result, StunTxn, StunTxnAction, STUN_RESULT_LEN,
-    STUN_RES_ERROR, STUN_RES_NO_ADDRESS, STUN_RES_OK, STUN_RES_TIMEOUT,
+    stun_txn_id, write_stun_result, StunTxn, StunTxnAction, STUN_RESULT_LEN, STUN_RES_ERROR,
+    STUN_RES_NO_ADDRESS, STUN_RES_OK, STUN_RES_TIMEOUT,
 };
 
 // `turn_core` is NOT included here. This module answers STUN Binding
@@ -173,7 +163,7 @@ struct StunState {
 /// The port the server's authority takes when it names none.
 const DEFAULT_SERVER_PORT: u16 = 3478;
 
-define_params! {
+fluxor_rt::define_params! {
     StunState;
 
     1, port, u16, 3478
@@ -196,11 +186,7 @@ fn client_armed(s: &StunState) -> bool {
     s.server.is_set()
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<StunState>() as u32
-}
+fluxor_rt::module_facts! { state: StunState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

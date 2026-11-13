@@ -35,11 +35,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
-)]
-#![allow(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "the module ABI entry points take raw state and syscall pointers \
               whose validity is the runtime's half of the contract, and the \
@@ -48,19 +43,12 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+use fluxor_sdk::crypto::sha256::*;
 include!("../../common/sigv4_core.rs");
 include!("../../common/s3_core.rs");
 
@@ -378,7 +366,7 @@ unsafe fn take_param(
     *held = len as u16;
 }
 
-define_params! {
+fluxor_rt::define_params! {
     S3State;
 
     3, access_key, str, 0 => |s, d, len| {
@@ -406,11 +394,7 @@ define_params! {
     };
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<S3State>() as u32
-}
+fluxor_rt::module_facts! { state: S3State }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

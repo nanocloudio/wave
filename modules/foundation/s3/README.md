@@ -15,7 +15,7 @@ An S3 operation is a single round trip — but every request carries an
 method/URI/headers/payload-hash), and a streamed body signs every chunk. It is
 not the round-trip count that forces a module here, it is the crypto: a
 bytecode codec cannot compute an HMAC/SHA-256 signature. SHA-256 itself is
-SDK-owned (`target/fluxor/fluxor-abi/sdk/crypto/sha256.rs`), per the same rule
+SDK-owned (`fluxor_sdk::crypto::sha256`), per the same rule
 as `websocket`'s SHA-1.
 
 ## Two modes, chosen by whether `request_in` is wired

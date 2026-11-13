@@ -16,7 +16,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SDK="$ROOT/target/fluxor/fluxor-abi/sdk/abi/config.rs"
+SDK="$ROOT/target/fluxor/fluxor-abi/src/config.rs"
 DOC="$ROOT/docs/reference/envelope.md"
 MODE="${1:-}"
 

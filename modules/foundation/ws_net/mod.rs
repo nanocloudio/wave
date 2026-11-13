@@ -53,18 +53,17 @@
 #![deny(clippy::unwrap_used)]
 #![allow(
     dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
+    reason = "mounts the shared core `ws_admit.rs` from modules/common whole \
+              for its record layouts and uses a subset; its other items serve \
+              the http module and the host harness"
 )]
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 // Both envelope layouts come from their contracts rather than being restated:
 // the WsFrame header and its u32 conn id from `ws_frame`, the frame header and
@@ -138,11 +137,7 @@ struct State {
     scratch: [u8; FRAME_BUF_BYTES],
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State, arena: 0 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -724,11 +719,5 @@ fn handle_ws_frame(s: &mut State, n: usize) {
     }
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    0
-}
-
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

@@ -22,12 +22,6 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![deny(clippy::unwrap_used)]
 #![allow(
-    dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
-)]
-#![allow(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "the module ABI entry points take raw state and syscall pointers \
               whose validity is the runtime's half of the contract, and the \
@@ -36,20 +30,14 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
-// SHA-256 for signatures, SHA-512 and the field helpers Ed25519 needs, and
-// Ed25519 for capability chains: all SDK-owned.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+// SHA-256 for signatures and Ed25519 for capability chains: both SDK-owned.
+use fluxor_sdk::crypto::ed25519::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../../common/sigv4_core.rs");
 include!("../../common/s3_serve_core.rs");
 
@@ -522,7 +510,7 @@ unsafe fn report(s: &mut State) {
 
 // ── Params ────────────────────────────────────────────────────────────────
 
-define_params! {
+fluxor_rt::define_params! {
     State;
 
     // The credentials file, read through the `fs` contract.
@@ -597,22 +585,16 @@ const OBJECT_VOLUME_MAX: usize = 64;
 
 // ── PIC entry points ──────────────────────────────────────────────────────
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State, arena: arena_bytes() }
+
+/// One listed part's entity tag in a completion's list.
+const PART_ETAG_STRIDE: usize = 1 + ETAG_MAX;
 
 /// The heap the module may hold at once: every exchange's response record
 /// and listing page, and every completion's part list, with a quarter again
 /// for the allocator's rounding and headers. An allocation the arena cannot
 /// meet is answered `503 SlowDown`.
-/// One listed part's entity tag in a completion's list.
-const PART_ETAG_STRIDE: usize = 1 + ETAG_MAX;
-
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
+const fn arena_bytes() -> usize {
     // A listing's page and a put's stash are never held by one exchange at
     // once: an exchange lists or puts.
     let held = if STASH_CAP > LIST_PAGE_BUF {
@@ -623,7 +605,7 @@ pub extern "C" fn module_arena_size() -> u32 {
     let per_exchange = RECORD_MAX + held;
     let per_completion = S3_PART_NUMBER_MAX as usize * (4 + PART_ETAG_STRIDE);
     let need = MAX_EXCHANGES * per_exchange + MAX_COMPLETIONS * per_completion;
-    (need + need / 4) as u32
+    need + need / 4
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]

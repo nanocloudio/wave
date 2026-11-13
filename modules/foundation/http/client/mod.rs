@@ -32,14 +32,13 @@ pub(crate) mod provider;
 pub(crate) mod h2_streams;
 
 use super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
 };
 use super::wire;
 use super::HttpState;
 use super::{
-    dev_channel_port, dev_log, dev_millis, dev_requester_tag, net_read_frame, net_read_frame_sized,
-    net_write_frame, E_AGAIN, NET_FRAME_HDR, POLL_IN, POLL_OUT, SOCK_TYPE_STREAM,
+    dev_channel_port, dev_log, dev_requester_tag, net_read_frame, net_write_frame, E_AGAIN,
+    NET_FRAME_HDR,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
@@ -347,7 +346,7 @@ pub(crate) struct ClientState {
 }
 
 // ClientState lives inside HttpState, which the kernel allocates as a
-// zeroed buffer of `module_state_size()` bytes. `init()` below sets
+// zeroed buffer of `MODULE_STATE_BYTES` bytes. `init()` below sets
 // only those fields whose default is not zero.
 
 // ── Param parsers ─────────────────────────────────────────────────────────

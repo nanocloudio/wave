@@ -26,9 +26,10 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
+    reason = "mounts the shared cores `mail_wire.rs`, `mime.rs` and \
+              `rfc5322.rs` from modules/common whole and uses a subset of \
+              each; their other items serve the smtp module and the host \
+              harness"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -39,17 +40,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[cfg(not(feature = "host-test"))]
 #[path = "../../common/rfc5322.rs"]
@@ -58,8 +52,8 @@ mod rfc5322;
 #[path = "../../common/rfc5322.rs"]
 pub mod rfc5322;
 use rfc5322::{
-    find_header, header_name_is, scan_address, scan_header, scan_msg_id, unfold_value, AddrScan,
-    HeaderScan, HeaderSpan, MsgIdScan,
+    find_header, scan_address, scan_header, scan_msg_id, unfold_value, AddrScan, HeaderScan,
+    HeaderSpan, MsgIdScan,
 };
 
 #[cfg(not(feature = "host-test"))]
@@ -69,8 +63,8 @@ mod mime;
 #[path = "../../common/mime.rs"]
 pub mod mime;
 use mime::{
-    ascii_eq_ignore_case, find_param, media_top_type_is, parse_content_type, parse_encoding,
-    scan_boundary, unquote_param, BoundaryScan, Encoding, MAX_BOUNDARY_LEN,
+    find_param, media_top_type_is, parse_content_type, parse_encoding, scan_boundary,
+    unquote_param, BoundaryScan, MAX_BOUNDARY_LEN,
 };
 
 #[cfg(not(feature = "host-test"))]
@@ -189,15 +183,11 @@ struct MailState {
     draining: u8,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     MailState;
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<MailState>() as u32
-}
+fluxor_rt::module_facts! { state: MailState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

@@ -25,9 +25,8 @@
 
 use super::routes::{HANDLER_FS_FILE, HANDLER_FS_LIST};
 use super::{
-    dev_log, fmt_u32_raw, heap_alloc, heap_free, heap_realloc, hex_val, log, p_u16, p_u32, p_u8,
-    HttpState, DEFAULT_BODY_POOL_SIZE, MAX_CONTENT_TYPE, MAX_DYN_PREFIX, MAX_FS_PATH, MAX_PATH,
-    MAX_ROUTES, TABLE_VOLUME_MAX,
+    dev_log, fmt_u32_raw, heap_realloc, log, p_u16, p_u32, p_u8, HttpState, DEFAULT_BODY_POOL_SIZE,
+    MAX_CONTENT_TYPE, MAX_DYN_PREFIX, MAX_FS_PATH, MAX_PATH, MAX_ROUTES, TABLE_VOLUME_MAX,
 };
 
 // ── Body-pool admission ───────────────────────────────────────────────────
@@ -72,7 +71,7 @@ pub(crate) struct DeclaredBodies {
     /// Their sum.
     pub(crate) total: u64,
     /// The instance's `heap.arena_bytes`, or 0 when the graph gives none
-    /// (the type's `module_arena_size` is the cap then).
+    /// (the type's `MODULE_ARENA_BYTES` is the cap then).
     pub(crate) heap_cap: u32,
 }
 
@@ -84,7 +83,7 @@ impl DeclaredBodies {
     };
 }
 
-/// Walk a TLV params blob exactly as `define_params!`' `parse_tlv` does
+/// Walk a TLV params blob exactly as `fluxor_rt::define_params!`' `parse_tlv` does
 /// (entries from offset 4, an entry dispatched only when it fits, `0xFF`
 /// ends) and total the body bytes each route will be given.
 ///
@@ -132,7 +131,7 @@ pub(crate) fn inline_body_limit(heap_cap: u32) -> u32 {
 ///
 /// The pool is the declared inline bodies plus the file-cache region, in one
 /// allocation. It must fit the instance's body budget — its heap cap
-/// (`heap.arena_bytes`, else `module_arena_size`) less the rest of the
+/// (`heap.arena_bytes`, else `MODULE_ARENA_BYTES`) less the rest of the
 /// arena's reservation — so serving the bodies never eats the connection
 /// working set. A config past that is refused, naming the route that crosses
 /// the budget, the totals and the cap that would hold it. A config with no
@@ -147,7 +146,7 @@ pub(crate) unsafe fn admit_body_pool(s: &HttpState, d: &DeclaredBodies) -> Resul
     let cap = if d.heap_cap != 0 {
         d.heap_cap
     } else {
-        super::super::module_arena_size()
+        super::super::MODULE_ARENA_BYTES as u32
     };
     let limit = inline_body_limit(cap) as u64;
     let pool = d.total + CACHE_REGION as u64;

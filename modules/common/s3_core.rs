@@ -3,8 +3,8 @@
 // the response head and body framing it reads back. Bounded, no_std, no
 // allocation.
 //
-// Signing is `sigv4_core.rs`. The mounting module `include!`s the SDK's
-// `target/fluxor/fluxor-abi/sdk/crypto/sha256.rs`, then `sigv4_core.rs`, then
+// Signing is `sigv4_core.rs`. The mounting module imports the SDK's
+// `fluxor_sdk::crypto::sha256::*`, then `include!`s `sigv4_core.rs`, then
 // this file, so `Sha256`, `sha256` and every `sv4_*` item are in scope by bare
 // name. This file holds only what a client needs on top of them.
 //

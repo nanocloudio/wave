@@ -19,10 +19,9 @@
 //! hence `HANDLER_WEBSOCKET_SESSION`, which is identical wiring with replay
 //! suppressed.
 
-use super::super::connection::NET_CMD_SEND;
 use super::super::wire::ws;
 use super::response::build_error;
-use super::routes::{HANDLER_WEBSOCKET_FANOUT, HANDLER_WEBSOCKET_SESSION};
+use super::routes::HANDLER_WEBSOCKET_FANOUT;
 // The admission record layouts, mounted beside the frame core in `wire::ws`.
 // Reached relative to this module rather than through `crate::`: the module
 // root is the crate root only in the PIC build, and a `crate::` path here
@@ -33,12 +32,9 @@ pub(crate) use super::wire::ws::{
     WS_ORIGIN_PEER,
 };
 use super::{
-    cur_conn_id, cur_matched_route, cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_recv_len,
-    cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_slot, cur_slot_mut, cur_ws_fan_out,
-    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_log, find_sentinel_ws_fanout_slot,
-    find_slot_by_conn_id, heap_alloc, heap_free, log, msg_read, net_send, net_write_frame,
-    set_cur_phase, HttpState, Phase, IOCTL_FLUSH, IOCTL_NOTIFY, MAX_CONCURRENT_CONNS, MSG_HDR_SIZE,
-    NET_FRAME_HDR, POLL_IN, RECV_BUF_SIZE, SEND_BUF_SIZE,
+    cur_conn_id, cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_recv_len, cur_send_buf_mut_ptr,
+    cur_slot, cur_slot_mut, cur_ws_fan_out, find_sentinel_ws_fanout_slot, find_slot_by_conn_id,
+    heap_alloc, heap_free, HttpState, Phase, POLL_IN, RECV_BUF_SIZE, SEND_BUF_SIZE,
 };
 
 // ── Retention buffer sizing ───────────────────────────────────────────────

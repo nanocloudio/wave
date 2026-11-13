@@ -14,9 +14,7 @@
 //! request ingest and response framing. Live wiring into the server
 //! (which runs h1/h2 over TCP today) waits for the QUIC transport.
 
-#[path = "../../../../target/fluxor/fluxor-abi/sdk/wire/varint.rs"]
-mod varint;
-use self::varint::{varint_decode, varint_encode, varint_size};
+use fluxor_abi::wire::varint::{varint_decode, varint_encode, varint_size};
 
 // ----------------------------------------------------------------------
 // Frame types (RFC 9114 §11.2)

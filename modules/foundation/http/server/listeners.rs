@@ -23,11 +23,10 @@
 //! a `tls=1` row is recorded and reported but NOT bound.
 
 use super::super::abi::SyscallTable;
-use super::super::connection::{NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE};
+use super::super::connection::{NET_BUF_SIZE, NET_CMD_BIND};
 use super::{
-    close_net_conn, dev_channel_ioctl, dev_channel_port, dev_log, dev_owner_tag, dyn_field,
-    dyn_u32, msg_read, net_write_frame, p_u16, HttpState, TableSink, MAX_DYN_KEY, MAX_DYN_PREFIX,
-    MSG_HDR_SIZE, NET_FRAME_HDR, SOCK_TYPE_STREAM,
+    close_net_conn, dev_owner_tag, dyn_field, dyn_u32, net_write_frame, HttpState, TableSink,
+    MAX_DYN_KEY, MAX_DYN_PREFIX,
 };
 
 /// linux_net's bind-refusal opcode (`../fluxor/src/platform/linux/providers.rs`):

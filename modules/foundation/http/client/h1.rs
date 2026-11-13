@@ -6,18 +6,16 @@
 //!
 
 use super::super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED,
-    NET_MSG_DATA, NET_MSG_ERROR,
+    net_proto, NET_BUF_SIZE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA,
+    NET_MSG_ERROR,
 };
-use super::super::wire::h1;
 use super::super::{
-    dev_channel_port, dev_log, dev_millis, dev_requester_tag, net_read_frame, net_read_frame_sized,
-    net_write_frame, NET_FRAME_HDR, POLL_IN, POLL_OUT,
+    dev_millis, dev_requester_tag, net_read_frame, net_read_frame_sized, NET_FRAME_HDR, POLL_IN,
 };
 use super::{
     build_request, is_foreign_frame, log, send_close_frame, HttpState, Phase, CAUSE_CONNECT,
     CAUSE_LINK, CAUSE_PEER, CAUSE_TIMEOUT, CONNECT_TIMEOUT_MS, E_AGAIN, E_CONNECT_FAILED,
-    E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED, RECV_BUF_SIZE,
+    E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED,
 };
 
 /// The numeric status of an HTTP/1.x status line — the three digits after the

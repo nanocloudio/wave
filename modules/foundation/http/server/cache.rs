@@ -18,12 +18,10 @@
 //! without knowing which generation asked — which is what lets h1, h2 and h3
 //! share one fill path.
 
-use super::routes::{HANDLER_FILE, HANDLER_STREAM, HANDLER_TEMPLATE};
 use super::{
-    cur_matched_route, cur_slot, cur_slot_mut, dev_channel_ioctl, dev_millis,
-    dev_telemetry_enabled, log, msg_read, net_read_frame, release_file_chan, set_cur_phase,
-    try_acquire_file_chan, HttpState, Phase, IOCTL_FLUSH, IOCTL_NOTIFY, MAX_CACHE, MAX_ROUTES,
-    MAX_VARS, MAX_VAR_VALUE, MSG_HDR_SIZE, POLL_HUP, POLL_IN, SEND_BUF_SIZE,
+    dev_channel_ioctl, msg_read, release_file_chan, try_acquire_file_chan, HttpState, IOCTL_FLUSH,
+    IOCTL_NOTIFY, MAX_ROUTES, MAX_VARS, MAX_VAR_VALUE, MSG_HDR_SIZE, POLL_HUP, POLL_IN,
+    SEND_BUF_SIZE,
 };
 
 /// The entry owns an allocated `body_pool` region for `route_index`.

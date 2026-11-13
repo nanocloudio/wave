@@ -11,11 +11,12 @@
 // §Refused handoffs). Control frames are consumed through `handle_ctrl` and
 // produced through `next_out`; the module moves the bytes.
 //
-// Mount order: `session_handoff.rs` first (the chunk walk and the cursors),
-// then this file, with the `session_ctrl` contract reachable as `sc`:
+// Mount order: the SDK's `session_handoff` core in scope first (the chunk
+// walk and the cursors), then this file, with the `session_ctrl` contract
+// reachable as `sc`:
 //
 //     use abi::contracts::net::session_ctrl as sc;
-//     include!("../../../target/fluxor/fluxor-abi/sdk/cores/session_handoff.rs");
+//     use fluxor_sdk::cores::session_handoff::*;
 //     include!("../../common/ws_session_worker.rs");
 //
 // The blob is the application's. On `WswEvent::ExportRequested` the module

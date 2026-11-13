@@ -29,12 +29,7 @@
 //! Appendix B (shared with HPACK via `super::huffman`). `h3.rs` consumes
 //! all of it for its request decoder and response encoder.
 
-#[path = "../../../../target/fluxor/fluxor-abi/sdk/wire/varint.rs"]
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-mod varint;
+use fluxor_abi::wire::varint;
 
 /// Lookup a static-table entry by 0-based index (RFC 9204 Appendix A).
 /// Returns (name, value) byte slices on hit, None on out-of-range.

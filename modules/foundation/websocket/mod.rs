@@ -22,11 +22,6 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    dead_code,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
-)]
-#![allow(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "the module ABI entry points take raw state and syscall pointers \
               whose validity is the runtime's half of the contract, and the \
@@ -35,27 +30,20 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Shared Wave codecs — `include!`d verbatim so the device and the host test
 // harness compile identical bytes.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/b64.rs"); // b64_encode
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha1.rs"); // sha1
+use fluxor_sdk::crypto::b64::*; // b64_encode
+use fluxor_sdk::crypto::sha1::*; // sha1
 include!("../../common/ws_frame_core.rs");
 // The records that drive this connector from outside it, and the number of
 // links it carries. Mounted rather than restated: a consumer mounts the same
 // file, so neither end can believe in a link the other does not have.
-include!("../../../target/fluxor/fluxor-abi/sdk/contracts/net/ws_control.rs");
+use fluxor_abi::contracts::net::ws_control::*;
 include!("../../common/utf8_core.rs");
 include!("../../common/ws_core.rs");
 
@@ -213,7 +201,7 @@ impl Link {
     };
 }
 
-define_params! {
+fluxor_rt::define_params! {
     WsState;
 
     // 1: endpoint — retired. 2: host — retired. `authority` (6) is both.
@@ -252,11 +240,7 @@ define_params! {
     };
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<WsState>() as u32
-}
+fluxor_rt::module_facts! { state: WsState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]

@@ -18,9 +18,10 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
-    unused_imports,
-    reason = "the SDK is path-mounted into every module, so each compile sees \
-              the whole ABI surface while using a subset"
+    reason = "mounts the shared cores `sip_wire.rs`, `sip_dialog.rs` and \
+              `dg_authority.rs` from modules/common whole and uses a subset of \
+              each; their other items serve their other consumers and the host \
+              harness"
 )]
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -31,12 +32,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Tested logic cores, mounted by `#[path]` so the module and host tests compile
 // the same bytes. Public under host-test only, on the same precedent as http's
@@ -841,10 +840,9 @@ const DEFAULT_PEER_SIP_PORT: u16 = 5060;
 
 mod params_def {
     use super::SipModState;
-    use super::SCHEMA_MAX;
     use super::{p_u16, p_u32, p_u8};
 
-    define_params! {
+    fluxor_rt::define_params! {
         SipModState;
         1, local_ip, u32, 0 => |s, d, len| { s.local_ip = p_u32(d, len, 0, 0); };
         2, local_sip_port, u16, 5060 => |s, d, len| { s.local_sip_port = p_u16(d, len, 0, 5060); };
@@ -861,11 +859,7 @@ mod params_def {
 // PIC interface
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<SipModState>() as u32
-}
+fluxor_rt::module_facts! { state: SipModState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -973,4 +967,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();
