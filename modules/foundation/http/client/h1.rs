@@ -17,6 +17,7 @@ use super::{
     CAUSE_LINK, CAUSE_PEER, CAUSE_TIMEOUT, CONNECT_TIMEOUT_MS, E_AGAIN, E_CONNECT_FAILED,
     E_NET_FAILED, E_SEND_FAILED, E_WRITE_FAILED,
 };
+use fluxor_rt::StepReturn;
 
 /// The numeric status of an HTTP/1.x status line — the three digits after the
 /// first space, as in `HTTP/1.1 503 Service Unavailable`.
@@ -38,7 +39,7 @@ pub fn parse_status_line(head: &[u8]) -> u16 {
     }
 }
 
-pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
     let now = dev_millis(&*s.syscalls);
     if !matches!(s.client.phase, Phase::Init | Phase::Done | Phase::Error) {
         let expired =
@@ -90,7 +91,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     // only a connection that cannot be kept is closed. Either
                     // way this client is not holding it any more.
                     if !super::park_connection(s) && !send_close_frame(s) {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     s.client.conn_stale = 0;
                 }
@@ -118,7 +119,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     log(s, b"[http] no authority to dial");
                     s.client.fail_cause = CAUSE_CONNECT;
                     s.client.phase = Phase::Error;
-                    return E_CONNECT_FAILED;
+                    return StepReturn::error(E_CONNECT_FAILED);
                 }
                 log(s, b"[http] connecting");
                 s.client.phase = Phase::Connecting;
@@ -128,29 +129,29 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             Phase::Connecting => {
                 if s.net_out_chan < 0 {
                     s.client.phase = Phase::Error;
-                    return E_NET_FAILED;
+                    return StepReturn::error(E_NET_FAILED);
                 }
                 // The tag (our module index) is echoed in MSG_CONNECTED so that
                 // when ip.net_out is fanned to another stream consumer (e.g. an
                 // OTLP exporter) we claim only our own outbound connection.
                 match super::dial(s) {
                     Some(true) => {}
-                    Some(false) => return 0,
+                    Some(false) => return StepReturn::Continue,
                     None => {
                         log(s, b"[http] authority cannot be dialled");
                         s.client.fail_cause = CAUSE_CONNECT;
                         s.client.phase = Phase::Error;
-                        return E_CONNECT_FAILED;
+                        return StepReturn::error(E_CONNECT_FAILED);
                     }
                 }
                 s.client.connect_start_ms = dev_millis(&*s.syscalls);
                 s.client.phase = Phase::WaitConnect;
-                return 0;
+                return StepReturn::Continue;
             }
 
             Phase::WaitConnect => {
                 if s.net_in_chan < 0 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let sys = &*s.syscalls;
                 let chan = s.net_in_chan;
@@ -171,7 +172,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         ));
                         let me = dev_requester_tag(sys);
                         if tag != 0 && tag != me {
-                            return 0; // another consumer's connection — keep waiting.
+                            return StepReturn::Continue; // another consumer's connection — keep waiting.
                         }
                         s.client.conn_id = net_proto::conn_id(core::slice::from_raw_parts(
                             buf.add(NET_FRAME_HDR),
@@ -203,7 +204,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             if super::provider::armed(s) {
                                 super::h2_streams::take_connection(s);
                                 s.client.phase = Phase::Init;
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             log(s, b"[http] h2 negotiated on an HTTP/1.1 exchange");
                             s.client.fail_cause = CAUSE_PEER;
@@ -216,7 +217,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             // half-composed request off the wire.
                             log(s, b"[http] request too long");
                             s.client.phase = Phase::Error;
-                            return E_SEND_FAILED;
+                            return StepReturn::error(E_SEND_FAILED);
                         }
                         s.client.phase = Phase::SendRequest;
                         continue;
@@ -236,7 +237,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             log(s, b"[http] connect error");
                             s.client.fail_cause = CAUSE_CONNECT;
                             s.client.phase = Phase::Error;
-                            return E_CONNECT_FAILED;
+                            return StepReturn::error(E_CONNECT_FAILED);
                         }
                     }
                 }
@@ -244,14 +245,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     log(s, b"[http] connect timeout");
                     s.client.fail_cause = CAUSE_CONNECT;
                     s.client.phase = Phase::Error;
-                    return E_CONNECT_FAILED;
+                    return StepReturn::error(E_CONNECT_FAILED);
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             Phase::SendRequest => {
                 if s.net_out_chan < 0 {
-                    return E_SEND_FAILED;
+                    return StepReturn::error(E_SEND_FAILED);
                 }
                 let sys = &*s.syscalls;
                 let out_chan = s.net_out_chan;
@@ -294,7 +295,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let written = (sys.channel_write)(out_chan, scratch, total);
 
                 if written < total as i32 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 s.client.progress_ms = now;
@@ -312,7 +313,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     s.client.response_start_ms = now;
                     s.client.phase = Phase::RecvHeaders;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             Phase::RecvHeaders | Phase::RecvBody => {
@@ -323,20 +324,20 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let sys = &*s.syscalls;
                 if s.client.h1_input_offset == s.client.h1_input_len {
                     if s.net_in_chan < 0 {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     let nbuf = s.net_buf.as_mut_ptr();
                     let (kind, len, declared) =
                         net_read_frame_sized(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
                     if kind == 0 {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if len < 2 || len != declared {
                         s.client.phase = Phase::Error;
                         continue;
                     }
                     if is_foreign_frame(s, kind, len, nbuf) {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if kind == NET_MSG_ERROR {
                         s.client.fail_cause = CAUSE_LINK;
@@ -353,7 +354,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         continue;
                     }
                     if kind != NET_MSG_DATA {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     s.client.h1_input_offset = (NET_FRAME_HDR + 2) as u16;
                     s.client.h1_input_len = (NET_FRAME_HDR + len) as u16;
@@ -397,7 +398,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         } else if s.client.response.done() {
                             s.client.phase = Phase::Done;
                         } else {
-                            return 0;
+                            return StepReturn::Continue;
                         }
                     }
                     Err(_) => {
@@ -418,7 +419,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     let taken = super::provider::body(s, src, end - off);
                     s.client.pending_offset += taken as u16;
                     if s.client.pending_offset < s.client.recv_len {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     s.client.progress_ms = now;
                     s.client.phase = Phase::RecvBody;
@@ -443,11 +444,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 
                 if written < 0 {
                     if written == E_AGAIN {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     log(s, b"[http] write failed");
                     s.client.phase = Phase::Error;
-                    return E_WRITE_FAILED;
+                    return StepReturn::error(E_WRITE_FAILED);
                 }
 
                 if written > 0 {
@@ -457,7 +458,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 if s.client.pending_offset >= s.client.recv_len {
                     s.client.phase = Phase::RecvBody;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             Phase::Done => {
@@ -466,7 +467,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // it holds the ending back a step.
                 #[cfg(feature = "exchange")]
                 if !super::provider::end(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 #[cfg(not(feature = "exchange"))]
                 let reuse = false;
@@ -476,7 +477,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     && s.client.response.reusable
                     && s.client.draining == 0;
                 if !reuse && !send_close_frame(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 #[cfg(feature = "exchange")]
                 if super::provider::armed(s) {
@@ -484,14 +485,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     // exchange, not the module. Retiring here would answer
                     // the first request and strand every one after it.
                     s.client.idle_since_ms = now;
-                    return 0;
+                    return StepReturn::Continue;
                 }
-                return 1;
+                return StepReturn::Done;
             }
 
             Phase::Error => {
                 if !send_close_frame(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // A failed exchange is still answered: the requester gets a
                 // status, an ABORT, or LINK DOWN rather than waiting out its
@@ -502,12 +503,12 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     // The same rule on the failure path: the answer ended
                     // THIS exchange. Faulting the module instead would let
                     // one refused request end every later one.
-                    return 0;
+                    return StepReturn::Continue;
                 }
-                return -1;
+                return StepReturn::error(-1);
             }
 
-            _ => return -1,
+            _ => return StepReturn::error(-1),
         }
     }
 }

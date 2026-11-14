@@ -77,9 +77,6 @@ mod ws_admit;
 
 const FRAME_BUF_BYTES: usize = abi::CHANNEL_BUFFER_SIZE;
 
-/// `module_step` return code for "did work, step me again".
-const STEP_DID_WORK: i32 = 2;
-
 const WS_OPCODE_CONTINUATION: u8 = 0x0;
 const WS_OPCODE_TEXT: u8 = 0x1;
 const WS_OPCODE_BINARY: u8 = 0x2;
@@ -432,15 +429,15 @@ unsafe fn flush(sys: &SyscallTable, chan: i32, buf: &[u8], len: &mut usize) -> b
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` is non-null (checked above) and `module_new`
     // initialised it; the kernel hands the same instance arena every step.
     let s = unsafe { &mut *(state as *mut State) };
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: null-checked immediately above; the table outlives the step.
     let sys = unsafe { &*s.syscalls };
@@ -554,9 +551,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 
     if worked {
-        STEP_DID_WORK
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }
 

@@ -1006,7 +1006,7 @@ unsafe fn pump_requests(s: &mut MailState) {
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut MailState);
         let sys = &*s.syscalls;
@@ -1059,8 +1059,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             && s.part_facts_owed == 0
             && s.active == 0
         {
-            return 1;
+            return StepReturn::Done;
         }
-        0
+        StepReturn::Continue
     }
 }

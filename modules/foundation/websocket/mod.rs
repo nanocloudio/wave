@@ -687,7 +687,7 @@ unsafe fn feed(s: &mut WsState, i: usize, sys: &SyscallTable, ev: WsEv, now: u64
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut WsState);
         let sys = &*s.syscalls;
@@ -711,7 +711,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             i += 1;
         }
-        i32::from(done)
+        if done {
+            StepReturn::Done
+        } else {
+            StepReturn::Continue
+        }
     }
 }
 

@@ -30,9 +30,6 @@ use abi::contracts::exchange::{
     kind, parse_request, write_request_head, Record, RequestHead, RECORD_MAX,
 };
 
-/// `module_step` return code for "did work, step me again".
-const STEP_DID_WORK: i32 = 2;
-
 /// Records moved per direction per step.
 const RECORDS_PER_STEP: usize = 8;
 
@@ -107,15 +104,15 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: the kernel passes the same `state` buffer it validated in
     // `module_new`, and this module is stepped single-threaded.
     let s = unsafe { &mut *(state as *mut State) };
     if s.syscalls.is_null() {
-        return 0;
+        return StepReturn::Continue;
     }
     // SAFETY: set from a non-null pointer in `module_new`.
     let sys = unsafe { &*s.syscalls };
@@ -129,9 +126,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         worked = true;
     }
     if worked {
-        STEP_DID_WORK
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }
 

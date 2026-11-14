@@ -22,6 +22,7 @@
 use super::super::wire::ws;
 use super::response::build_error;
 use super::routes::HANDLER_WEBSOCKET_FANOUT;
+use fluxor_rt::StepReturn;
 // The admission record layouts, mounted beside the frame core in `wire::ws`.
 // Reached relative to this module rather than through `crate::`: the module
 // root is the crate root only in the PIC build, and a `crate::` path here
@@ -1165,7 +1166,7 @@ pub(crate) unsafe fn ws_poll_admission(s: &mut HttpState, conn: u32) -> AdmitPol
 /// ping queued), `None` when the phase should continue normally. A limit of 0
 /// disables the policy entirely: RFC 6455 places no obligation on a server
 /// to ping, and a quiet socket is the ordinary state of most of them.
-pub(crate) unsafe fn ws_idle_policy(s: &mut HttpState) -> Option<i32> {
+pub(crate) unsafe fn ws_idle_policy(s: &mut HttpState) -> Option<StepReturn> {
     let limit = s.server.ws_idle_ms as u64;
     if limit == 0 {
         return None;
@@ -1186,7 +1187,7 @@ pub(crate) unsafe fn ws_idle_policy(s: &mut HttpState) -> Option<i32> {
     if elapsed >= limit {
         super::count_deadline(s, super::DeadlineKind::Idle);
         ws_begin_close(s, ws::CLOSE_GOING_AWAY);
-        return Some(2);
+        return Some(StepReturn::Burst);
     }
     // One ping per silence: a ping newer than the last progress is still
     // unanswered, so another would only add bytes to a socket that is not
@@ -1199,7 +1200,7 @@ pub(crate) unsafe fn ws_idle_policy(s: &mut HttpState) -> Option<i32> {
         if let Some(cur) = cur_slot_mut(s) {
             cur.ws_ping_ms = now;
         }
-        return Some(2);
+        return Some(StepReturn::Burst);
     }
     None
 }

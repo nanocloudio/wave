@@ -52,6 +52,7 @@ use super::{
     cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_send_offset, cur_slot, cur_slot_mut,
     MAX_PATH, RECV_BUF_SIZE, SEND_BUF_SIZE,
 };
+use fluxor_rt::StepReturn;
 
 /// Per-stream WebSocket reassembly buffer. Cross-DATA-frame WS frames
 /// land here until a complete RFC 6455 frame can be parsed and echoed.
@@ -646,7 +647,7 @@ pub(crate) unsafe fn enter(s: &mut HttpState) -> bool {
 /// Drive one tick of the h2 state machine. Mirrors the server.rs step
 /// contract: returns 0 normally, 1 to indicate "done — close
 /// connection", -1 on hard error.
-pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
     // Always try to flush pending outbound bytes first.
     if cur_send_len(s) > 0 && cur_send_offset(s) < cur_send_len(s) {
         let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
@@ -661,7 +662,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
         }
         if cur_send_offset(s) < cur_send_len(s) {
-            return 0;
+            return StepReturn::Continue;
         }
         if let Some(cur) = cur_slot_mut(s) {
             cur.send_offset = 0;
@@ -670,7 +671,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             cur.send_len = 0;
         }
         if cur_h2_mut(s).sub == Sub::Closing {
-            return 1;
+            return StepReturn::Done;
         }
     }
 
@@ -712,7 +713,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 );
                 queue_goaway(s, h2w::ERR_NO_ERROR);
                 cur_h2_mut(s).sub = Sub::Closing;
-                return 2;
+                return StepReturn::Burst;
             }
         }
     }
@@ -723,7 +724,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     // stream forever. With `send_buf` known drained by the flush above.
     #[cfg(feature = "app")]
     if cur_send_len(s) == 0 && cur_h2(s).sub != Sub::Closing && pump_app_streams(s) {
-        return 2;
+        return StepReturn::Burst;
     }
 
     // Retry any stream left Pending because the resource it needed was busy.
@@ -740,7 +741,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     if cur_send_len(s) == 0 && cur_h2(s).sub == Sub::Active {
         try_dispatch_pending(s);
         if cur_send_len(s) > 0 {
-            return 2;
+            return StepReturn::Burst;
         }
     }
 
@@ -757,7 +758,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         && !any_stream_open(s)
     {
         queue_goaway(s, h2w::ERR_NO_ERROR);
-        return 2;
+        return StepReturn::Burst;
     }
 
     match cur_h2(s).sub {
@@ -776,31 +777,31 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 cur.send_len = n as u16;
             }
             cur_h2_mut(s).sub = Sub::Active;
-            0
+            StepReturn::Continue
         }
         Sub::Active => active(s),
         Sub::SendingBody => step_sending_body(s),
         Sub::Closing => {
             // Pending GOAWAY already drained by the flush above.
-            1
+            StepReturn::Done
         }
     }
 }
 
 // ── Body streaming substate ───────────────────────────────────────────────
 
-unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
+unsafe fn step_sending_body(s: &mut HttpState) -> StepReturn {
     // Drive any in-progress cache fetch first. Reads from `file_chan`
     // never touch `send_buf`, so a fetch tick happens regardless of
     // whether we have outbound bytes still draining. If the fetch
     // completes mid-call the slot transitions to Sending and is
     // picked up by the round-robin below in the same tick.
     if drive_cache_fetch(s) && cur_send_len(s) > 0 {
-        return 2;
+        return StepReturn::Burst;
     }
 
     if cur_send_len(s) > 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Pick the next Sending slot via round-robin starting just after
@@ -824,15 +825,15 @@ unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
         // keeps ticking; otherwise fall back to Active to pick up
         // Pending slots / inbound frames.
         if fetching_slot(s) >= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         cur_h2_mut(s).sub = Sub::Active;
         cur_h2_mut(s).emit_cursor = -1;
         try_dispatch_pending(s);
         if cur_send_len(s) > 0 {
-            return 2;
+            return StepReturn::Burst;
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     cur_h2_mut(s).emit_cursor = emit_idx;
@@ -849,7 +850,7 @@ unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
         emit_slot_headers(s, emit_idx, body_handler, slot_file_index, slot_id);
         let slot_mut = &mut *cur_h2_mut(s).streams.as_mut_ptr().add(emit_idx as usize);
         slot_mut.headers_sent = 1;
-        return 2;
+        return StepReturn::Burst;
     }
 
     // Render a DATA chunk for this slot. Cap by send_window.
@@ -870,20 +871,20 @@ unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
                 FrameStatus::NeedMore => break,
                 FrameStatus::TooBig => {
                     queue_goaway(s, h2w::ERR_FRAME_SIZE_ERROR);
-                    return 2;
+                    return StepReturn::Burst;
                 }
             }
             if process_one_frame(s) < 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if cur_send_len(s) > 0 {
-                return 2;
+                return StepReturn::Burst;
             }
         }
         let refreshed_stream = (*cur_h2(s).streams.as_ptr().add(emit_idx as usize)).send_window;
         avail = cur_h2(s).send_window.min(refreshed_stream);
         if avail <= 0 {
-            return 0;
+            return StepReturn::Continue;
         }
     }
 
@@ -922,7 +923,7 @@ unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
     }
 
     if n == 0 && more {
-        return 0;
+        return StepReturn::Continue;
     }
 
     h2w::write_data_frame_header(buf, n, slot_id, !more);
@@ -949,7 +950,7 @@ unsafe fn step_sending_body(s: &mut HttpState) -> i32 {
             super::release_file_chan_external(s);
         }
     }
-    2
+    StepReturn::Burst
 }
 
 /// Lazy HEADERS emission for a slot. Picks the appropriate
@@ -998,7 +999,7 @@ unsafe fn emit_slot_headers(
 
 // ── Active loop ───────────────────────────────────────────────────────────
 
-unsafe fn active(s: &mut HttpState) -> i32 {
+unsafe fn active(s: &mut HttpState) -> StepReturn {
     // Refill recv flow-control windows first: if we owe peer a
     // connection-level OR per-stream WINDOW_UPDATE and `send_buf` is
     // free, emit one before anything else so the peer keeps streaming.
@@ -1010,7 +1011,7 @@ unsafe fn active(s: &mut HttpState) -> i32 {
     {
         queue_window_update(s);
         if cur_send_len(s) > 0 {
-            return 2;
+            return StepReturn::Burst;
         }
     }
 
@@ -1023,7 +1024,7 @@ unsafe fn active(s: &mut HttpState) -> i32 {
         && super::session::cur_failed(s)
     {
         queue_ws_close(s, super::session::WS_CLOSE_SESSION_FAILED);
-        return 2;
+        return StepReturn::Burst;
     }
 
     // If we left a partial WS frame queue from a previous tick, try to
@@ -1035,7 +1036,7 @@ unsafe fn active(s: &mut HttpState) -> i32 {
     {
         ws_drain_buf(s);
         if cur_send_len(s) > 0 {
-            return 2;
+            return StepReturn::Burst;
         }
     }
     // The worker's envelopes for this tunnel — and, since the drain routes by
@@ -1047,18 +1048,18 @@ unsafe fn active(s: &mut HttpState) -> i32 {
         && cur_send_len(s) == 0
         && super::ws::ws_drain_fanout_input(s)
     {
-        return 2;
+        return StepReturn::Burst;
     }
 
     // If recv_buf doesn't yet hold a full frame, yield this tick.
     // demux_inbound (run at the top of every step()) will route
     // more bytes into recv_buf for the next pass.
     match peek_frame_complete(s) {
-        FrameStatus::NeedMore => return 0,
+        FrameStatus::NeedMore => return StepReturn::Continue,
         FrameStatus::Split => {}
         FrameStatus::TooBig => {
             queue_goaway(s, h2w::ERR_FRAME_SIZE_ERROR);
-            return 2;
+            return StepReturn::Burst;
         }
         FrameStatus::Complete => {}
     }
@@ -1070,17 +1071,17 @@ unsafe fn active(s: &mut HttpState) -> i32 {
             FrameStatus::NeedMore => break,
             FrameStatus::TooBig => {
                 queue_goaway(s, h2w::ERR_FRAME_SIZE_ERROR);
-                return 2;
+                return StepReturn::Burst;
             }
         }
         if process_one_frame(s) < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         if cur_send_len(s) > 0 {
-            return 2;
+            return StepReturn::Burst;
         }
     }
-    0
+    StepReturn::Continue
 }
 
 enum FrameStatus {

@@ -21,6 +21,7 @@
 //! implementation serve both directions.
 
 use super::super::connection::{mux, FRAME_HDR};
+use fluxor_rt::StepReturn;
 // The connection-scoped HTTP/3 machinery, shared with the server role.
 // RFC 9114 §6.2.1 asks it of an ENDPOINT, not of a server, so both roles
 // use one implementation rather than two that can disagree.
@@ -632,11 +633,11 @@ pub(crate) fn abandon(s: &mut super::super::HttpState) {
 /// # Safety
 ///
 /// `s` must be a live `HttpState` with its channels resolved.
-pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
+pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> StepReturn {
     let sys = &*s.syscalls;
     let (in_chan, out_chan) = (s.net_in_chan, s.net_out_chan);
     if in_chan < 0 || out_chan < 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let now = super::super::dev_millis(sys);
@@ -668,12 +669,16 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             // `request_in` rides it again.
             super::provider::fail(s, s.client.fail_cause);
             s.client.phase = super::Phase::Error;
-            return 0;
+            return StepReturn::Continue;
         }
         if !close_session(s) {
-            return 0;
+            return StepReturn::Continue;
         }
-        return if s.client.draining != 0 { 1 } else { -1 };
+        return if s.client.draining != 0 {
+            StepReturn::Done
+        } else {
+            StepReturn::error(-1)
+        };
     }
 
     #[cfg(feature = "exchange")]
@@ -693,7 +698,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             });
             if !super::provider::head_from_fields(s, s.h3_client.status) {
                 s.h3_client.state = H3ClientState::Failed;
-                return 0;
+                return StepReturn::Continue;
             }
         }
         if s.h3_client.body_len != 0 {
@@ -706,7 +711,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
                 s.client.progress_ms = now;
             }
             if s.h3_client.body_len != 0 {
-                return 0;
+                return StepReturn::Continue;
             }
         }
         if s.h3_client.state == H3ClientState::Complete {
@@ -714,7 +719,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
                 s.h3_client.body_emitted = true;
                 s.client.phase = super::Phase::Done;
             }
-            return 0;
+            return StepReturn::Continue;
         }
     }
     let streaming = !driven;
@@ -736,7 +741,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             }
         }
         if c.body_len != 0 {
-            return 0;
+            return StepReturn::Continue;
         }
     }
 
@@ -824,7 +829,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> i32 {
             s.h3_client.body_emitted = true;
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Read what the transport delivered — session events, the server's control

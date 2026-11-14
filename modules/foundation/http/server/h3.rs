@@ -75,6 +75,7 @@ use super::super::wire::h3::{
     H3_UNI_STREAM_PUSH, H3_UNI_STREAM_QPACK_DECODER, H3_UNI_STREAM_QPACK_ENCODER,
 };
 use super::super::wire::qpack;
+use fluxor_rt::StepReturn;
 #[path = "../../../common/h3_datagram.rs"]
 mod h3_datagram;
 
@@ -4559,12 +4560,12 @@ unsafe fn sweep_idle_sessions(s: &mut super::super::HttpState) {
     }
 }
 
-pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
+pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> StepReturn {
     let sys = &*s.syscalls;
     let in_chan = s.net_in_chan;
     let out_chan = s.net_out_chan;
     if in_chan < 0 || out_chan < 0 {
-        return 0;
+        return StepReturn::Continue;
     }
     {
         let st = &mut *(&mut s.h3 as *mut H3State);
@@ -4742,9 +4743,9 @@ pub(crate) unsafe fn step_mux(s: &mut super::super::HttpState) -> i32 {
 
     let st = &mut *(&mut s.h3 as *mut H3State);
     if st.draining && drained(st) && super::aborts_delivered(s) {
-        return 1;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }
 
 /// Terminate what a drain cannot wait out, so the module can reach a state

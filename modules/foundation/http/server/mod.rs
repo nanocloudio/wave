@@ -147,6 +147,7 @@ pub(crate) mod session {
 // What the core itself needs back from them. Short by design: everything else
 // flows the other way, from a subsystem reaching into the slot helpers below.
 use cache::{cache_release_for_route, CacheEntry, VarEntry};
+use fluxor_rt::StepReturn;
 use h1::step_active_slot;
 use listeners::{is_listen_port, pump_listeners, DynListeners, NET_MSG_BIND_REFUSED};
 use proxy::{find_slot_by_backend_conn, is_proxy_relay_phase};
@@ -2908,7 +2909,7 @@ pub(crate) fn aborts_delivered(s: &HttpState) -> bool {
     }
 }
 
-pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
     // `now_ms` was sampled by `module_step` before dispatch — one clock read
     // per pass, shared by this path and the HTTP/3 mux path.
     demux_inbound(s);
@@ -2945,10 +2946,10 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
         && s.server.ws_event_len == 0
         && aborts_delivered(s)
     {
-        return 1;
+        return StepReturn::Done;
     }
 
-    let mut aggregated = 0i32;
+    let mut aggregated = StepReturn::Continue;
     // Snapshot the bitmap. The body of step_active_slot may set
     // or clear other slots' bits (e.g. demux runs implicitly via
     // any phase that re-enters the channel poll), but we only
@@ -2992,7 +2993,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 word &= word - 1;
                 s.server.cur_slot = idx as i32;
                 let r = step_active_slot(s);
-                if r > aggregated {
+                if r.raw() > aggregated.raw() {
                     aggregated = r;
                 }
             }

@@ -702,15 +702,15 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: the kernel passes the state it validated in `module_new` and
     // steps this module single-threaded.
     let s = unsafe { &mut *(state as *mut State) };
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: every syscall below goes through the table set in `module_new`.
     unsafe {
@@ -731,9 +731,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             sweep(s);
         }
         if worked {
-            2
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         }
     }
 }

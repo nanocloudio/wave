@@ -62,7 +62,6 @@ const CTRL_MAX: usize = 1024 + NET_FRAME_HDR;
 const TAG_MAX: usize = 16;
 const REPLY_MAX: usize = TAG_MAX + 1 + 10 + 1 + ACC_MAX;
 const MON_BUF_SIZE: usize = 192;
-const STEP_DID_WORK: i32 = 2;
 
 /// The application's state for one session: what the blob carries.
 #[repr(C)]
@@ -191,15 +190,15 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: the kernel passes the same `state` buffer it validated in
     // `module_new`, and this module is stepped single-threaded.
     let s = unsafe { &mut *(state as *mut State) };
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     let mut did_work = false;
     // SAFETY: every helper below dereferences only the syscall table set in
@@ -210,9 +209,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         did_work |= flush_ctrl(s);
     }
     if did_work {
-        STEP_DID_WORK
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }
 

@@ -30,6 +30,7 @@ use super::{
     dev_telemetry_span, fmt_u32_raw, net_send, try_acquire_file_chan, ConnSlot, HttpState, Phase,
     IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, POLL_HUP, POLL_IN, SEND_BUF_SIZE,
 };
+use fluxor_rt::StepReturn;
 
 // ── Renderers ─────────────────────────────────────────────────────────────
 
@@ -538,10 +539,10 @@ pub(crate) unsafe fn finish_response(s: &mut HttpState) {
     }
 }
 
-pub(crate) unsafe fn step_send_static(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step_send_static(s: &mut HttpState) -> StepReturn {
     let cur_ptr = match cur_slot_mut(s) {
         Some(c) => c as *mut ConnSlot,
-        None => return 0,
+        None => return StepReturn::Continue,
     };
     let route = &*s.server.routes.as_ptr().add(cur_matched_route(s) as usize);
     let body_start = route.body_offset as usize;
@@ -550,7 +551,7 @@ pub(crate) unsafe fn step_send_static(s: &mut HttpState) -> i32 {
 
     if pos >= body_end {
         finish_response(s);
-        return 0;
+        return StepReturn::Continue;
     }
 
     let remaining = body_end - pos;
@@ -559,12 +560,12 @@ pub(crate) unsafe fn step_send_static(s: &mut HttpState) -> i32 {
     let sent = net_send(s, ptr, to_send);
     if sent > 0 {
         (*cur_ptr).tmpl_pos += sent as u32;
-        return 2;
+        return StepReturn::Burst;
     }
-    0
+    StepReturn::Continue
 }
 
-pub(crate) unsafe fn step_send_template(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step_send_template(s: &mut HttpState) -> StepReturn {
     if cur_send_offset(s) < cur_send_len(s) {
         let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
         let ptr = cur_send_buf_ptr(s).add(cur_send_offset(s) as usize);
@@ -574,7 +575,7 @@ pub(crate) unsafe fn step_send_template(s: &mut HttpState) -> i32 {
                 cur.send_offset += sent as u16;
             }
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     let has_more = render_template_chunk(s);
@@ -586,7 +587,11 @@ pub(crate) unsafe fn step_send_template(s: &mut HttpState) -> i32 {
                 cur.send_offset = sent as u16;
             }
         }
-        return if has_more { 2 } else { 0 };
+        return if has_more {
+            StepReturn::Burst
+        } else {
+            StepReturn::Continue
+        };
     }
 
     if !has_more {
@@ -594,19 +599,19 @@ pub(crate) unsafe fn step_send_template(s: &mut HttpState) -> i32 {
             cur.phase = Phase::CloseConn;
         }
     }
-    0
+    StepReturn::Continue
 }
 
-pub(crate) unsafe fn step_send_index(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step_send_index(s: &mut HttpState) -> StepReturn {
     let cur_ptr = match cur_slot_mut(s) {
         Some(c) => c as *mut ConnSlot,
-        None => return 0,
+        None => return StepReturn::Continue,
     };
     if (*cur_ptr).index_pos >= (*cur_ptr).file_count {
         if let Some(cur) = cur_slot_mut(s) {
             cur.phase = Phase::CloseConn;
         }
-        return 0;
+        return StepReturn::Continue;
     }
 
     if cur_send_offset(s) >= cur_send_len(s) {
@@ -636,12 +641,12 @@ pub(crate) unsafe fn step_send_index(s: &mut HttpState) -> i32 {
         if let Some(cur) = cur_slot_mut(s) {
             cur.send_offset += sent as u16;
         }
-        return 2;
+        return StepReturn::Burst;
     }
-    0
+    StepReturn::Continue
 }
 
-pub(crate) unsafe fn step_send_file(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step_send_file(s: &mut HttpState) -> StepReturn {
     if cur_send_offset(s) >= cur_send_len(s) {
         let n = ((*s.syscalls).channel_read)(
             s.server.file_chan,
@@ -662,7 +667,7 @@ pub(crate) unsafe fn step_send_file(s: &mut HttpState) -> i32 {
                     cur.phase = Phase::CloseConn;
                 }
             }
-            return 0;
+            return StepReturn::Continue;
         }
     }
 
@@ -673,9 +678,9 @@ pub(crate) unsafe fn step_send_file(s: &mut HttpState) -> i32 {
         if let Some(cur) = cur_slot_mut(s) {
             cur.send_offset += sent as u16;
         }
-        return 2;
+        return StepReturn::Burst;
     }
-    0
+    StepReturn::Continue
 }
 
 /// HANDLER_FS_FILE body streamer. Drains `send_buf` to net_out;
@@ -688,7 +693,7 @@ pub(crate) unsafe fn step_send_file(s: &mut HttpState) -> i32 {
 /// scheduler's burst budget, an order of magnitude short of media
 /// streaming. Backpressure exits immediately (net_send returning 0
 /// ends the loop), so slow consumers see one-round pacing.
-pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> StepReturn {
     const FS_SEND_ROUNDS: usize = 16;
     // The round bound is the kernel's per-step grant for `net_out` in
     // send-buffer units. This loop adopts the budget rather than the kernel's
@@ -707,7 +712,7 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::CloseConn;
             }
-            return 0;
+            return StepReturn::Continue;
         }
         if cur_send_offset(s) >= cur_send_len(s) {
             // `fs_total == u32::MAX` is the streaming sentinel — read
@@ -728,7 +733,7 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
                 // Self-delimited (Content-Length already emitted) — honour
                 // the client's keep-alive intent.
                 finish_response(s);
-                return 0;
+                return StepReturn::Continue;
             }
             // Refill: streaming reads a full SEND_BUF; length-known caps
             // at the remaining bytes so we never over-read.
@@ -754,7 +759,11 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
             // A short count is not EOF either: it is sent, and the next
             // read continues from where it stopped.
             if super::h1::fs_pending(n) {
-                return if progressed { 2 } else { 0 };
+                return if progressed {
+                    StepReturn::Burst
+                } else {
+                    StepReturn::Continue
+                };
             }
             if n <= 0 {
                 (sys.provider_call)(
@@ -769,7 +778,7 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::CloseConn;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             if let Some(cur) = cur_slot_mut(s) {
                 cur.send_offset = 0;
@@ -792,12 +801,16 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> i32 {
             progressed = true;
             if (sent as usize) < remaining {
                 // Net ring filled mid-buffer — no point retrying now.
-                return 2;
+                return StepReturn::Burst;
             }
             continue;
         }
         // Net backpressure with nothing accepted this round.
-        return if progressed { 2 } else { 0 };
+        return if progressed {
+            StepReturn::Burst
+        } else {
+            StepReturn::Continue
+        };
     }
-    2
+    StepReturn::Burst
 }

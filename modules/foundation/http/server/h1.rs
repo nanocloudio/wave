@@ -60,6 +60,7 @@ use super::ws::{
     http_status_line, ws_process_inbound, ws_queue_envelope_on_active, RETAINED_ENVELOPE_HDR,
     WS_EV_OPENED, WS_ORIGIN_LOCAL,
 };
+use fluxor_rt::StepReturn;
 // The h2 helpers are gated with the state they touch: `http-web` links no
 // `H2State`, so importing them unconditionally breaks that variant while the
 // all-features host build stays green.
@@ -109,14 +110,14 @@ unsafe fn fs_wait_expired(s: &mut HttpState) -> bool {
 /// was made, so the slot stays in `DispatchRoute` and the dispatch — which is
 /// idempotent up to that call — re-asks on a later step. Past the wait bound
 /// the server answers 503 rather than holding the client forever.
-unsafe fn fs_dispatch_wait(s: &mut HttpState) -> i32 {
+unsafe fn fs_dispatch_wait(s: &mut HttpState) -> StepReturn {
     if fs_wait_expired(s) {
         build_error(s, b"503 Service Unavailable", b"Filesystem not ready\n");
         if let Some(cur) = cur_slot_mut(s) {
             cur.phase = Phase::DrainSend;
         }
     }
-    0
+    StepReturn::Continue
 }
 
 /// Why a request path could not become a filesystem path.
@@ -192,7 +193,7 @@ pub(crate) unsafe fn compose_fs_path(
 
 /// Answer a request whose path [`compose_fs_path`] refused.
 #[cfg(feature = "fs_root")]
-unsafe fn fs_path_refused(s: &mut HttpState, e: FsPathError) -> i32 {
+unsafe fn fs_path_refused(s: &mut HttpState, e: FsPathError) -> StepReturn {
     match e {
         FsPathError::TooLong => build_error(s, b"414 URI Too Long", b"URI Too Long\n"),
         FsPathError::BadByte => build_error(s, b"400 Bad Request", b"bad path\n"),
@@ -201,7 +202,7 @@ unsafe fn fs_path_refused(s: &mut HttpState, e: FsPathError) -> i32 {
     if let Some(cur) = cur_slot_mut(s) {
         cur.phase = Phase::DrainSend;
     }
-    0
+    StepReturn::Continue
 }
 
 /// Serve a request no route matched from `fs_root`: `<fs_root><path>`
@@ -212,14 +213,14 @@ unsafe fn fs_path_refused(s: &mut HttpState, e: FsPathError) -> i32 {
 /// `index.html` is `text/html`. Every call up to the open is idempotent, so a
 /// pending answer leaves the slot in `DispatchRoute` to re-ask.
 #[cfg(feature = "fs_root")]
-unsafe fn begin_fs_root(s: &mut HttpState) -> i32 {
+unsafe fn begin_fs_root(s: &mut HttpState) -> StepReturn {
     let (target_len, req_ptr, req_len) = match cur_slot(s) {
         Some(c) => (
             c.req_target_len as usize,
             c.req_path.as_ptr(),
             c.req_path_len as usize,
         ),
-        None => return 0,
+        None => return StepReturn::Continue,
     };
     if target_len > MAX_PATH {
         return fs_path_refused(s, FsPathError::TooLong);
@@ -287,7 +288,7 @@ unsafe fn begin_fs_root(s: &mut HttpState) -> i32 {
         if let Some(cur) = cur_slot_mut(s) {
             cur.phase = Phase::DrainSend;
         }
-        return 0;
+        return StepReturn::Continue;
     }
     if let Some(cur) = cur_slot_mut(s) {
         cur.matched_route = -1;
@@ -298,7 +299,7 @@ unsafe fn begin_fs_root(s: &mut HttpState) -> i32 {
         cur.fs_stat_ticks = 0;
         cur.phase = Phase::AwaitFsStat;
     }
-    0
+    StepReturn::Continue
 }
 
 /// The handler a slot's send phases run: its matched route's, the FS
@@ -449,14 +450,14 @@ pub(crate) fn fs_list_append_batch(
 /// yields and the next one re-asks; the walk resumes, it never restarts and
 /// never ends early. READDIR's 0 ends it: the directory is closed and the
 /// head is composed in front of the body.
-unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
+unsafe fn step_fs_list(s: &mut HttpState) -> StepReturn {
     let dir_fd = cur_fs_fd(s);
     let base = cur_send_buf_mut_ptr(s);
     if dir_fd < 0 || base.is_null() {
         if let Some(cur) = cur_slot_mut(s) {
             cur.phase = Phase::CloseConn;
         }
-        return 0;
+        return StepReturn::Continue;
     }
     // The filter is re-read each step from the matched route, which a
     // static route never changes mid-request.
@@ -533,9 +534,9 @@ unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::DrainSend;
             }
-            return 2;
+            return StepReturn::Burst;
         }
-        return 0;
+        return StepReturn::Continue;
     }
     if failed {
         (sys.provider_call)(
@@ -551,11 +552,11 @@ unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
         if let Some(cur) = cur_slot_mut(s) {
             cur.phase = Phase::DrainSend;
         }
-        return 2;
+        return StepReturn::Burst;
     }
     if !done {
         // Every round moved entries; more may follow. Step again.
-        return 2;
+        return StepReturn::Burst;
     }
 
     (sys.provider_call)(
@@ -589,7 +590,7 @@ unsafe fn step_fs_list(s: &mut HttpState) -> i32 {
         cur.fs_total = 0;
         cur.phase = Phase::SendHeaders;
     }
-    2
+    StepReturn::Burst
 }
 
 /// Stage `HTTP/1.1 100 Continue` in `send_buf` and mark the slot so
@@ -617,10 +618,10 @@ pub(crate) unsafe fn stage_interim_continue(s: &mut HttpState) {
 /// Arm the body reader to read and drop the current request's body within
 /// `limit`, staging `100 Continue` when the client is waiting for one, and
 /// return to dispatch once it is consumed.
-unsafe fn begin_discard(s: &mut HttpState, limit: u64) -> i32 {
+unsafe fn begin_discard(s: &mut HttpState, limit: u64) -> StepReturn {
     let (decoder, continue_first) = match cur_slot(s) {
         Some(c) => (c.body_decoder, c.body_continue_wanted != 0),
-        None => return 0,
+        None => return StepReturn::Continue,
     };
     reqbody::arm(s, decoder, limit);
     if continue_first {
@@ -630,7 +631,7 @@ unsafe fn begin_discard(s: &mut HttpState, limit: u64) -> i32 {
         cur.body_continue_wanted = 0;
         cur.phase = Phase::RecvBody;
     }
-    2
+    StepReturn::Burst
 }
 
 /// Whether this request's `Host` lines disagree about the origin it names.
@@ -649,7 +650,7 @@ unsafe fn host_refused(s: &HttpState) -> bool {
     wire::route_key::h1_host(core::slice::from_raw_parts(recv_ptr, heo)).is_err()
 }
 
-pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
     drain_variables(s);
 
     // Background-drain inbound network messages during phases that
@@ -720,13 +721,13 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
     // is closed before the phase runs — the phase would only wait on the
     // peer again. Re-step so `CloseConn` frees the slot this pass.
     if super::enforce_slot_deadline(s) {
-        return 2;
+        return StepReturn::Burst;
     }
 
     match cur_phase(s) {
         Phase::Init | Phase::Binding => {
             if s.net_out_chan < 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             let sys = &*s.syscalls;
             let chan = s.net_out_chan;
@@ -743,23 +744,23 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 NET_BUF_SIZE,
             );
             if wrote == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::WaitBound;
             }
-            return 2;
+            return StepReturn::Burst;
         }
 
         Phase::WaitBound => {
             if s.net_in_chan < 0 {
-                return 0;
+                return StepReturn::Continue;
             }
             let sys = &*s.syscalls;
             let chan = s.net_in_chan;
             let poll = (sys.channel_poll)(chan, POLL_IN);
             if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
-                return 0;
+                return StepReturn::Continue;
             }
 
             let buf = s.net_buf.as_mut_ptr();
@@ -792,13 +793,13 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         ready_clear(s, idx);
                     }
                     s.server.bound = 1;
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 NET_MSG_ERROR => {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::Error;
                     }
-                    return -1;
+                    return StepReturn::error(-1);
                 }
                 NET_MSG_ACCEPTED if payload_len >= 2 => {
                     // A connection accepted by linux_net while we were
@@ -824,7 +825,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             close_net_conn(s, conn);
                         }
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 NET_MSG_DATA if payload_len > 2 => {
                     // Append directly to the owning slot's `recv_buf`.
@@ -838,7 +839,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                         if slot.recv_buf.is_null() {
                             // Slot freed mid-stream; drop the data.
-                            return 2;
+                            return StepReturn::Burst;
                         }
                         let space = slot.recv_cap as usize - slot.recv_len as usize;
                         let to_copy = data_len.min(space);
@@ -849,7 +850,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                     }
                     // Else: orphan — drop.
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 NET_MSG_CLOSED if payload_len >= 2 => {
                     let conn = net_proto::conn_id(core::slice::from_raw_parts(
@@ -860,7 +861,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                         slot.peer_closed = 1;
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 NET_MSG_TRACE_CTX
                     if payload_len
@@ -888,9 +889,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             slot.conn_flags = *p.add(26);
                         }
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
-                _ => return 2,
+                _ => return StepReturn::Burst,
             }
         }
 
@@ -915,9 +916,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::CloseConn;
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             let len = cur_recv_len(s) as usize;
@@ -934,7 +935,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             #[cfg(feature = "h2")]
             if recv_parsed == 0 && len >= 1 && *cur_recv_buf_ptr(s) == b'P' {
                 if len < wire::h2::PREFACE.len() {
-                    return 0; // wait for the rest of the preface
+                    return StepReturn::Continue; // wait for the rest of the preface
                 }
                 let mut prefix_match = true;
                 let mut i = 0;
@@ -969,12 +970,12 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::CloseConn;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::H2Active;
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 // Not the preface; fall through to h1 parsing.
             }
@@ -1014,7 +1015,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::DrainSend;
                             }
-                            return 0;
+                            return StepReturn::Continue;
                         }
                         Some(line) => {
                             if let Some(cur) = cur_slot_mut(s) {
@@ -1030,7 +1031,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::DrainSend;
                             }
-                            return 0;
+                            return StepReturn::Continue;
                         }
                     }
                 } else if cur_recv_len(s) as usize >= RECV_BUF_SIZE {
@@ -1038,7 +1039,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::DrainSend;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
 
@@ -1113,7 +1114,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             cur.keepalive = 0;
                             cur.phase = Phase::DrainSend;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     // The head STAYS in `recv_buf` and the body is read from
                     // `header_end_off` onward: the head is the request's only
@@ -1172,7 +1173,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         // and no RNG.
                         cur.span_start_us = span_now;
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 } else if cur_recv_len(s) as usize >= RECV_BUF_SIZE {
                     let l = cur_recv_len(s) as usize;
                     if l >= 3 {
@@ -1204,7 +1205,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             cur.send_offset += sent as u16;
                         }
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 // Drained. Clear the interim response out of `send_buf` so the
                 // real response is composed into an empty buffer.
@@ -1225,7 +1226,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         cur.fs_stat_ticks = 0;
                         cur.phase = Phase::DispatchRoute;
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 reqbody::BodyStep::Progress | reqbody::BodyStep::Wait => {
                     // The peer hung up mid-body. The request will never be
@@ -1234,9 +1235,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::CloseConn;
                         }
-                        return 2;
+                        return StepReturn::Burst;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 reqbody::BodyStep::Bad => {
                     build_error(s, b"400 Bad Request", b"Bad Request\n");
@@ -1244,7 +1245,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         cur.keepalive = 0;
                         cur.phase = Phase::DrainSend;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 reqbody::BodyStep::TooLarge => {
                     // Close rather than keep-alive: the rest of the body is
@@ -1256,7 +1257,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         cur.keepalive = 0;
                         cur.phase = Phase::DrainSend;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
         }
@@ -1269,7 +1270,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::CloseConn;
             }
-            return 0;
+            return StepReturn::Continue;
         }
         #[cfg(feature = "app")]
         Phase::AppExchange => {
@@ -1289,13 +1290,13 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     cur.keepalive = 0;
                     cur.phase = Phase::DrainSend;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             if s.server.unrouted_mode == 2 {
                 // Returns false if file_chan was busy; caller stays
                 // in DispatchRoute and retries next tick.
                 let _ = step_unrouted_file_dispatch(s);
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Diagnostic endpoint `/_fan` — calls the kernel
@@ -1304,7 +1305,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // Available on every http instance without route configuration.
             let (req, plen) = match cur_slot(s) {
                 Some(c) => (c.req_path.as_ptr(), c.req_path_len as usize),
-                None => return 0,
+                None => return StepReturn::Continue,
             };
             if plen >= 5
                 && *req == b'/'
@@ -1344,7 +1345,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     cur.send_len = off as u16;
                     cur.phase = Phase::DrainSend;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Matched against the full request target where it sits in the
@@ -1367,14 +1368,14 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     cur.keepalive = 0;
                     cur.phase = Phase::DrainSend;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             if ri < 0 {
                 // No static route — consult the dynamic-route proxy
                 // table, consulted after the static arena. An empty table
                 // falls through to the fixed 404 surface.
                 if try_begin_dyn_proxy(s) {
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 if body_pending {
                     return begin_discard(s, limit);
@@ -1387,7 +1388,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::DrainSend;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             if let Some(cur) = cur_slot_mut(s) {
                 cur.matched_route = ri;
@@ -1409,7 +1410,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::DrainSend;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             match handler {
@@ -1463,14 +1464,14 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 // stay in DispatchRoute, retry next
                                 // tick. The active route is already
                                 // matched on this slot.
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             // cache_alloc refuses if another reader
                             // is retaining the existing entry —
                             // defer (release lock, retry next tick).
                             if cache_alloc(s, ri as u8) < 0 {
                                 release_file_chan(s);
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             dev_channel_ioctl(
                                 &*s.syscalls,
@@ -1556,7 +1557,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             // FLUSH/NOTIFY. Stall in DispatchRoute
                             // until the channel is free.
                             if !try_acquire_file_chan(s) {
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             dev_channel_ioctl(
                                 &*s.syscalls,
@@ -1579,7 +1580,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 if let Some(cur) = cur_slot_mut(s) {
                                     cur.phase = Phase::DrainSend;
                                 }
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             build_header(s, b"200 OK", b"application/octet-stream");
                         } else {
@@ -1587,7 +1588,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::DrainSend;
                             }
-                            return 0;
+                            return StepReturn::Continue;
                         }
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::SendHeaders;
@@ -1597,7 +1598,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::DrainSend;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
                 HANDLER_STREAM => {
@@ -1612,7 +1613,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::DrainSend;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     // Snapshot the per-route content_type before we
                     // pass `&mut s` to build_header.
@@ -1631,7 +1632,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // gate a sibling slot's IOCTL_FLUSH would wipe
                     // our pending notify mid-stream.
                     if !try_acquire_file_chan(s) {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     dev_channel_ioctl(
                         &*s.syscalls,
@@ -1654,7 +1655,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::DrainSend;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     build_header(s, b"200 OK", ct_slice);
                     if let Some(cur) = cur_slot_mut(s) {
@@ -1669,7 +1670,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::DrainSend;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     // Snapshot the path before borrowing &mut s for
                     // header construction. Content-type is re-derived
@@ -1700,7 +1701,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::DrainSend;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     // FS_STAT may pend for async providers, so the
                     // response-line decision happens in
@@ -1752,11 +1753,11 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::AppExchange;
                             }
-                            return 2;
+                            return StepReturn::Burst;
                         }
                         // The ring is momentarily full. Stay in DispatchRoute
                         // and retry — the application is alive, just behind.
-                        app::Emit::Full => return 0,
+                        app::Emit::Full => return StepReturn::Continue,
                         // The body is still arriving. A peer that has closed
                         // will send no more of it: the request can never be
                         // whole, and nobody is left to answer.
@@ -1770,9 +1771,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                     cur.keepalive = 0;
                                     cur.phase = Phase::CloseConn;
                                 }
-                                return 2;
+                                return StepReturn::Burst;
                             }
-                            return 0;
+                            return StepReturn::Continue;
                         }
                         app::Emit::Unwired => {
                             build_error(
@@ -1803,7 +1804,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                         cur.phase = Phase::DrainSend;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 HANDLER_FS_LIST => {
                     // Dual-mode: when the request path exactly matches
@@ -1854,21 +1855,21 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 if let Some(cur) = cur_slot_mut(s) {
                                     cur.phase = Phase::DrainSend;
                                 }
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             Err(FsPathError::BadByte) => {
                                 build_error(s, b"400 Bad Request", b"bad path\n");
                                 if let Some(cur) = cur_slot_mut(s) {
                                     cur.phase = Phase::DrainSend;
                                 }
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             Err(FsPathError::Traversal) => {
                                 build_error(s, b"400 Bad Request", b"path traversal rejected\n");
                                 if let Some(cur) = cur_slot_mut(s) {
                                     cur.phase = Phase::DrainSend;
                                 }
-                                return 0;
+                                return StepReturn::Continue;
                             }
                         };
 
@@ -1887,7 +1888,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::DrainSend;
                             }
-                            return 0;
+                            return StepReturn::Continue;
                         }
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.fs_fd = fd;
@@ -1896,7 +1897,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             cur.fs_stat_ticks = 0;
                             cur.phase = Phase::AwaitFsStat;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
 
                     // Fall through: exact-match listing path.
@@ -1910,7 +1911,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::DrainSend;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     let mut fs_path = [0u8; MAX_FS_PATH];
                     fs_path[..n].copy_from_slice(&route.fs_path[..n]);
@@ -1930,7 +1931,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::DrainSend;
                         }
-                        return 0;
+                        return StepReturn::Continue;
                     }
 
                     // The walk runs in `Phase::FsList`, across as many steps
@@ -1954,7 +1955,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         cur.fs_stat_ticks = 0;
                         cur.phase = Phase::FsList;
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 HANDLER_PROXY => {
                     // Build-time static proxy backend (`proxy_ip/port`).
@@ -2048,7 +2049,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         cur.ws_admit_sent = 1;
                     }
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             let conn = u32::from(cur_conn_id(s));
@@ -2190,7 +2191,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::DrainSend;
                 }
-                return 2;
+                return StepReturn::Burst;
             }
             if st >= 0 {
                 let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]);
@@ -2258,9 +2259,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                                 if let Some(cur) = cur_slot_mut(s) {
                                     cur.phase = Phase::DrainSend;
                                 }
-                                return 2;
+                                return StepReturn::Burst;
                             }
-                            return 0;
+                            return StepReturn::Continue;
                         }
                         if seek_rc < 0 {
                             if let Some(cur) = cur_slot_mut(s) {
@@ -2281,7 +2282,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::SendHeaders;
                         }
-                        return 2;
+                        return StepReturn::Burst;
                     }
                     wire::h1::RangeParse::Unsatisfiable => {
                         (sys.provider_call)(
@@ -2295,7 +2296,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             cur.phase = Phase::DrainSend;
                         }
                         build_error_416(s, size);
-                        return 2;
+                        return StepReturn::Burst;
                     }
                     wire::h1::RangeParse::None => {
                         if let Some(cur) = cur_slot_mut(s) {
@@ -2303,7 +2304,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                             cur.phase = Phase::SendHeaders;
                         }
                         build_header_fs_full(s, b"200 OK", ct_slice, size);
-                        return 2;
+                        return StepReturn::Burst;
                     }
                 }
             }
@@ -2315,7 +2316,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::SendHeaders;
                 }
-                return 2;
+                return StepReturn::Burst;
             }
             if fs_pending(st) {
                 if fs_wait_expired(s) {
@@ -2336,9 +2337,9 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::DrainSend;
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             // Unknown FS_STAT error — treat as a fetch failure.
             (sys.provider_call)(
@@ -2354,7 +2355,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::DrainSend;
             }
-            return 2;
+            return StepReturn::Burst;
         }
 
         Phase::SendHeaders => {
@@ -2392,7 +2393,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::DrainSend;
                     }
-                    return 2;
+                    return StepReturn::Burst;
                 }
 
                 match handler {
@@ -2429,7 +2430,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                     }
                 }
-                return 2;
+                return StepReturn::Burst;
             }
             let sent = net_send(
                 s,
@@ -2510,7 +2511,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
                 finish_response(s);
-                return 0;
+                return StepReturn::Continue;
             }
             let sent = net_send(
                 s,
@@ -2530,14 +2531,14 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::DrainSend;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             let poll = ((*s.syscalls).channel_poll)(s.server.file_chan, POLL_IN | POLL_HUP);
             if poll > 0 && ((poll as u32 & POLL_IN) != 0 || (poll as u32 & POLL_HUP) != 0) {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::CacheStream;
                 }
-                return 2;
+                return StepReturn::Burst;
             }
         }
 
@@ -2546,7 +2547,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::CloseConn;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             let ce_idx = 0usize;
             let ce = &mut *s.server.cache_entries.as_mut_ptr().add(ce_idx);
@@ -2582,10 +2583,10 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::DrainSend;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // Exactly full; wait for the source to end (or say more).
-                return 2;
+                return StepReturn::Burst;
             }
             if eof {
                 ce.flags |= CACHE_COMPLETE;
@@ -2623,16 +2624,16 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     cur.cache_retained = 1;
                     cur.phase = Phase::SendHeaders;
                 }
-                return 2;
+                return StepReturn::Burst;
             }
 
-            return 2;
+            return StepReturn::Burst;
         }
 
         Phase::CloseConn => {
             reset_connection(s);
             if s.server.draining != 0 {
-                return 1;
+                return StepReturn::Done;
             }
         }
 
@@ -2641,21 +2642,21 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // correlate the reply (it carries only conn + module tag).
             let me = match current_slot_index(s) {
                 Some(i) => i as i16,
-                None => return 0,
+                None => return StepReturn::Continue,
             };
             if s.server.proxy_connect_owner >= 0 && s.server.proxy_connect_owner != me {
-                return 0; // another slot mid-connect — retry next tick
+                return StepReturn::Continue; // another slot mid-connect — retry next tick
             }
             s.server.proxy_connect_owner = me;
             if !proxy_dial(s) {
-                return 0; // net_out full — retry next tick, keep ownership
+                return StepReturn::Continue; // net_out full — retry next tick, keep ownership
             }
             let now = dev_millis(&*s.syscalls) as u32;
             if let Some(cur) = cur_slot_mut(s) {
                 cur.proxy_connect_start_ms = now;
                 cur.phase = Phase::ProxyWaitConnect;
             }
-            return 2;
+            return StepReturn::Burst;
         }
 
         Phase::ProxyWaitConnect => {
@@ -2665,11 +2666,11 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     c.proxy_connect_failed != 0,
                     c.proxy_connect_start_ms,
                 ),
-                None => return 0,
+                None => return StepReturn::Continue,
             };
             if failed {
                 proxy_connect_failed(s);
-                return 2;
+                return StepReturn::Burst;
             }
             if connected {
                 if let Some(idx) = current_slot_index(s) {
@@ -2681,24 +2682,24 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::ProxySendRequest;
                 }
-                return 2;
+                return StepReturn::Burst;
             }
             let now = dev_millis(&*s.syscalls) as u32;
             if now.wrapping_sub(start) >= PROXY_CONNECT_TIMEOUT_MS {
                 proxy_connect_failed(s);
-                return 2;
+                return StepReturn::Burst;
             }
-            return 0;
+            return StepReturn::Continue;
         }
 
         Phase::ProxySendRequest => {
             let backend = match cur_slot(s) {
                 Some(c) => c.backend_conn_id,
-                None => return 0,
+                None => return StepReturn::Continue,
             };
             if backend < 0 {
                 proxy_connect_failed(s);
-                return 2;
+                return StepReturn::Burst;
             }
             let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
             if remaining == 0 {
@@ -2709,7 +2710,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     cur.send_len = 0;
                     cur.phase = Phase::ProxyRelayBody;
                 }
-                return 2;
+                return StepReturn::Burst;
             }
             let sent = net_send_conn(
                 s,
@@ -2784,7 +2785,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     // session: mint its identity and attach it to a worker.
                     super::session::on_ws_open(s);
                 }
-                return 2;
+                return StepReturn::Burst;
             }
             let sent = net_send(
                 s,
@@ -2821,7 +2822,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     cur.ws_fan_out = 0;
                     cur.phase = Phase::CloseConn;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             // Idle policy: ping at half the limit, close at the full one.
@@ -2849,7 +2850,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 let no_frag = cur_slot(s).map(|c| c.ws_frag_buf.is_null()).unwrap_or(true);
                 if send_empty && no_frag {
                     ws_begin_close(s, wire::ws::CLOSE_GOING_AWAY);
-                    return 2;
+                    return StepReturn::Burst;
                 }
                 // Mid-flush: drain remaining bytes then re-check.
                 if cur_send_len(s) > 0 && cur_send_offset(s) < cur_send_len(s) {
@@ -2871,7 +2872,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         }
                     }
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             // A session no worker will serve: the worker refused the attach,
@@ -2882,7 +2883,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 let no_frag = cur_slot(s).map(|c| c.ws_frag_buf.is_null()).unwrap_or(true);
                 if send_empty && no_frag {
                     ws_begin_close(s, super::session::WS_CLOSE_SESSION_FAILED);
-                    return 2;
+                    return StepReturn::Burst;
                 }
             }
 
@@ -2895,7 +2896,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 let no_frag = cur_slot(s).map(|c| c.ws_frag_buf.is_null()).unwrap_or(true);
                 if send_empty && no_frag {
                     ws_begin_close(s, wire::ws::CLOSE_GOING_AWAY);
-                    return 2;
+                    return StepReturn::Burst;
                 }
             }
 
@@ -3064,7 +3065,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // simply reject new conns at the demux until the WS
             // closes.
             if did_any {
-                return 2;
+                return StepReturn::Burst;
             }
 
             // Nothing more to process this tick. Inbound bytes are
@@ -3075,7 +3076,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::CloseConn;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
         }
 
@@ -3085,7 +3086,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::CloseConn;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             let sent = net_send(
                 s,
@@ -3100,7 +3101,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.phase = Phase::CloseConn;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
             } else {
                 // CLOSE-echo is best-effort: the peer initiated the
@@ -3110,14 +3111,14 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::CloseConn;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
         }
 
         Phase::H3Tunnel => {
             // Owned by `h3::step_mux`; the h1 machine never steps it. Reached
             // only if a tunnel slot were ever marked ready, which it is not.
-            return 0;
+            return StepReturn::Continue;
         }
 
         #[cfg(not(feature = "h2"))]
@@ -3129,24 +3130,24 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             if let Some(cur) = cur_slot_mut(s) {
                 cur.phase = Phase::CloseConn;
             }
-            return 0;
+            return StepReturn::Continue;
         }
         #[cfg(feature = "h2")]
         Phase::H2Active => {
             let r = super::h2::step(s);
-            if r == 1 {
+            if r == StepReturn::Done {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::CloseConn;
                 }
-                return 0;
+                return StepReturn::Continue;
             }
             return r;
         }
 
         Phase::Error => {
-            return 1;
+            return StepReturn::Done;
         }
     }
 
-    0
+    StepReturn::Continue
 }

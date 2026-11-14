@@ -215,15 +215,15 @@ unsafe fn shift_consume(buf: *mut u8, len: usize, consumed: usize) -> usize {
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `state` non-null (checked above); `module_new` initialised
     // it as `State`. Scheduler serialises module_step so re-borrow unique.
     let s = unsafe { &mut *(state as *mut State) };
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: `s.syscalls` non-null (checked above); the kernel-owned
     // table outlives this step.
@@ -478,7 +478,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
     }
 
-    0
+    StepReturn::Continue
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.

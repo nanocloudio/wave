@@ -50,6 +50,7 @@ use super::{
     cur_slot, cur_slot_mut, find_slot_by_conn_id, heap_alloc, heap_free, HttpState,
     MAX_CONCURRENT_CONNS, SEND_BUF_SIZE,
 };
+use fluxor_rt::StepReturn;
 
 /// Longest request header block forwarded, in bytes. A request whose header
 /// block is longer is refused with 431, never forwarded with fields missing:
@@ -1026,7 +1027,7 @@ pub(crate) unsafe fn on_slot_release(s: &mut HttpState, idx: usize) {
 
 /// `Phase::AppExchange`: move the request body to the application and its
 /// answer to the peer, as each side's credit and buffer allow.
-pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn h1_step(s: &mut HttpState) -> StepReturn {
     // Bytes already composed go first.
     let (send_len, send_off) = cur_slot(s)
         .map(|c| (c.send_len, c.send_offset))
@@ -1057,7 +1058,7 @@ pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
             .map(|c| c.phase != super::Phase::AppExchange)
             .unwrap_or(true)
         {
-            return 2;
+            return StepReturn::Burst;
         }
     }
 
@@ -1072,7 +1073,7 @@ pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
                 cur.app.state &= !ex::CONTINUE;
             }
         }
-        return 2;
+        return StepReturn::Burst;
     }
 
     // The request body, as far as credit goes.
@@ -1099,7 +1100,7 @@ pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
         }
         h1_close_exchange(s);
         super::body::finish_response(s);
-        return 2;
+        return StepReturn::Burst;
     }
 
     // The peer has gone: nothing left to deliver to.
@@ -1107,7 +1108,7 @@ pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
         if let Some(cur) = cur_slot_mut(s) {
             cur.phase = super::Phase::CloseConn;
         }
-        return 2;
+        return StepReturn::Burst;
     }
 
     // The application holds the turn and has let it lapse.
@@ -1132,14 +1133,14 @@ pub(crate) unsafe fn h1_step(s: &mut HttpState) -> i32 {
                 cur.phase = super::Phase::DrainSend;
             }
         }
-        return 2;
+        return StepReturn::Burst;
     }
-    0
+    StepReturn::Continue
 }
 
 /// Forward request-body bytes the application has credit for. `Some` ends the
 /// step with that return code.
-unsafe fn h1_forward(s: &mut HttpState) -> Option<i32> {
+unsafe fn h1_forward(s: &mut HttpState) -> Option<StepReturn> {
     let id = h1_id(s);
     let mut rec = [0u8; RECORD_MAX];
     // A few records per step: enough that framing between chunks costs no
@@ -1184,7 +1185,7 @@ unsafe fn h1_forward(s: &mut HttpState) -> Option<i32> {
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = super::Phase::CloseConn;
                 }
-                return Some(2);
+                return Some(StepReturn::Burst);
             }
             None
         }
@@ -1227,7 +1228,7 @@ unsafe fn h1_forward(s: &mut HttpState) -> Option<i32> {
                     cur.phase = super::Phase::DrainSend;
                 }
             }
-            Some(2)
+            Some(StepReturn::Burst)
         }
     }
 }

@@ -1141,7 +1141,7 @@ unsafe fn end_abandoned(s: &mut SmtpState) {
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut SmtpState);
         let sys = &*s.syscalls;
@@ -1383,13 +1383,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     NET_BUF,
                 ) == 0
                 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 s.conn_id = 0;
                 s.conn_present = 0;
             }
-            return 1;
+            return StepReturn::Done;
         }
-        0
+        StepReturn::Continue
     }
 }

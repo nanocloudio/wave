@@ -839,14 +839,14 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut RtpState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         dbg_beat(s);
@@ -855,8 +855,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             RtpPhase::Init => step_init(s),
             RtpPhase::BindWait => step_bind_wait(s),
             RtpPhase::Running => step_running(s),
-            RtpPhase::Error => -1,
-            _ => -1,
+            RtpPhase::Error => StepReturn::error(-1),
+            _ => StepReturn::error(-1),
         }
     }
 }
@@ -891,17 +891,17 @@ unsafe fn dbg_beat(s: &mut RtpState) {
 // State: Idle — wait for control commands (ctrl_mode only)
 // ============================================================================
 
-unsafe fn step_idle(s: &mut RtpState) -> i32 {
+unsafe fn step_idle(s: &mut RtpState) -> StepReturn {
     let sys = &*s.syscalls;
 
     let poll = (sys.channel_poll)(s.ctrl_chan, POLL_IN);
     if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let read = (sys.channel_read)(s.ctrl_chan, s.ctrl_buf.as_mut_ptr(), CTRL_MSG_SIZE);
     if read < CTRL_MSG_SIZE as i32 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let cmd = s.ctrl_buf[0];
@@ -919,28 +919,28 @@ unsafe fn step_idle(s: &mut RtpState) -> i32 {
         CTRL_START => {
             if s.peer_ip == 0 && s.peer.name().is_none() {
                 dev_log(sys, 2, b"[rtp] no endpoint".as_ptr(), 17);
-                return 0;
+                return StepReturn::Continue;
             }
             dev_log(sys, 3, b"[rtp] starting".as_ptr(), 14);
             s.phase = RtpPhase::Init;
-            return 2; // Burst — open socket immediately
+            return StepReturn::Burst; // Burst — open socket immediately
         }
         _ => {}
     }
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================
 // State: Init — send CMD_DG_BIND via net channel
 // ============================================================================
 
-unsafe fn step_init(s: &mut RtpState) -> i32 {
+unsafe fn step_init(s: &mut RtpState) -> StepReturn {
     let sys = &*s.syscalls;
 
     if s.net_out_chan < 0 {
         dev_log(sys, 1, b"[rtp] no net chan".as_ptr(), 16);
         s.phase = RtpPhase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
 
     // CMD_DG_BIND payload: [port: u16 LE] [flags: u8 = 0]
@@ -956,7 +956,7 @@ unsafe fn step_init(s: &mut RtpState) -> i32 {
         NET_BUF_SIZE,
     );
     if wrote == 0 {
-        return 0; // Channel full, retry next tick
+        return StepReturn::Continue; // Channel full, retry next tick
     }
 
     // Bind evidence: the request left this module, with
@@ -968,7 +968,7 @@ unsafe fn step_init(s: &mut RtpState) -> i32 {
     dev_log(sys, 3, l.as_ptr(), 17);
 
     s.phase = RtpPhase::BindWait;
-    2 // Burst — handle MSG_DG_BOUND immediately
+    StepReturn::Burst // Burst — handle MSG_DG_BOUND immediately
 }
 
 // ============================================================================
@@ -978,16 +978,16 @@ unsafe fn step_init(s: &mut RtpState) -> i32 {
 // attach them to each packet.
 // ============================================================================
 
-unsafe fn step_bind_wait(s: &mut RtpState) -> i32 {
+unsafe fn step_bind_wait(s: &mut RtpState) -> StepReturn {
     let sys = &*s.syscalls;
 
     if s.net_in_chan < 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
     if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     let buf = s.net_buf.as_mut_ptr();
@@ -996,10 +996,10 @@ unsafe fn step_bind_wait(s: &mut RtpState) -> i32 {
     if msg_type == DG_MSG_ERROR {
         dev_log(sys, 1, b"[rtp] bind fail".as_ptr(), 15);
         s.phase = RtpPhase::Error;
-        return -1;
+        return StepReturn::error(-1);
     }
     if msg_type != DG_MSG_BOUND || payload_len < 3 {
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Port-matched claim: a fanned provider output delivers every BOUND to
@@ -1011,19 +1011,19 @@ unsafe fn step_bind_wait(s: &mut RtpState) -> i32 {
         payload_len,
     ));
     if port != s.local_port {
-        return 0;
+        return StepReturn::Continue;
     }
     s.ep_id = ep;
     dev_log(sys, 3, b"[rtp] bound".as_ptr(), 11);
     s.phase = RtpPhase::Running;
-    2 // Burst — start data flow immediately
+    StepReturn::Burst // Burst — start data flow immediately
 }
 
 // ============================================================================
 // State: Running — TX and RX paths
 // ============================================================================
 
-unsafe fn step_running(s: &mut RtpState) -> i32 {
+unsafe fn step_running(s: &mut RtpState) -> StepReturn {
     let sys = &*s.syscalls;
 
     // Check for STOP command on ctrl channel
@@ -1037,7 +1037,7 @@ unsafe fn step_running(s: &mut RtpState) -> i32 {
                     close_connection(s);
                     dev_log(sys, 3, b"[rtp] stopped".as_ptr(), 13);
                     s.phase = RtpPhase::Idle;
-                    return 0;
+                    return StepReturn::Continue;
                 } else if cmd == CTRL_SET_ENDPOINT {
                     let port = u16::from_le_bytes([s.ctrl_buf[2], s.ctrl_buf[3]]);
                     let addr = u32::from_le_bytes([
@@ -1065,7 +1065,7 @@ unsafe fn step_running(s: &mut RtpState) -> i32 {
     // for 42 s and the peer's BYE never reached sip (2026-08-26).
     step_rx(s);
 
-    0
+    StepReturn::Continue
 }
 
 // ============================================================================

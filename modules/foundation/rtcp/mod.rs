@@ -785,17 +785,17 @@ unsafe fn pump_net(s: &mut RtcpState, now: u64) {
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut RtcpState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         if !ensure_bound(s) {
-            return 0;
+            return StepReturn::Continue;
         }
         let now = dev_millis(&*s.syscalls);
         pump_stats(s);
@@ -805,8 +805,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         flush_report(s);
         if s.draining == 1 && s.report_owed == 0 {
-            return 1;
+            return StepReturn::Done;
         }
-        0
+        StepReturn::Continue
     }
 }

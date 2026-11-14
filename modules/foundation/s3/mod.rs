@@ -1755,15 +1755,15 @@ fn emit_status(s: &S3State, text: &[u8]) {
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     if state.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: the kernel passes the state buffer `module_new` initialised,
     // and steps this module single-threaded.
     let s = unsafe { &mut *(state as *mut S3State) };
     if s.syscalls.is_null() {
-        return -1;
+        return StepReturn::error(-1);
     }
     // SAFETY: set from a non-null pointer in `module_new`.
     let now = unsafe { dev_millis(&*s.syscalls) };
@@ -1805,7 +1805,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         && s.cmd == 0
         && matches!(s.phase, DISCONNECTED | DONE)
     {
-        return 1;
+        return StepReturn::Done;
     }
-    0
+    StepReturn::Continue
 }

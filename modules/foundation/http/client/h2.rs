@@ -53,6 +53,7 @@ use super::{
     send_close_frame, Phase as H1Phase, E_CONNECT_FAILED, E_NET_FAILED, E_SEND_FAILED,
     E_WRITE_FAILED, RECV_BUF_SIZE, REQUEST_BUF_SIZE,
 };
+use fluxor_rt::StepReturn;
 
 const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
@@ -160,7 +161,7 @@ pub(crate) fn abandon(s: &mut HttpState) {
 }
 
 /// Drive one tick. Returns 0 (idle), 1 (done), or a negative error.
-pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
+pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
     // The h1 step machine uses `client.phase`; the h2 path uses
     // `client.h2_phase`. The two never run interleaved (mode dispatch
     // in mod.rs picks one at module_step). The h1 phase is left at
@@ -180,29 +181,29 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             H2Phase::Connecting => {
                 if s.net_out_chan < 0 {
                     set_phase(s, H2Phase::Error);
-                    return E_NET_FAILED;
+                    return StepReturn::error(E_NET_FAILED);
                 }
                 // Tagged with our module index (see
                 // modules/foundation/http/client/mod.rs), so a
                 // fanned `net_out` hands us only our own connection.
                 match super::dial(s) {
                     Some(true) => {}
-                    Some(false) => return 0,
+                    Some(false) => return StepReturn::Continue,
                     None => {
                         log(s, b"[http] no authority to dial");
                         s.client.fail_cause = super::CAUSE_CONNECT;
                         set_phase(s, H2Phase::Error);
-                        return E_CONNECT_FAILED;
+                        return StepReturn::error(E_CONNECT_FAILED);
                     }
                 }
                 s.client.connect_start_ms = dev_millis(&*s.syscalls);
                 set_phase(s, H2Phase::WaitConnect);
-                return 0;
+                return StepReturn::Continue;
             }
 
             H2Phase::WaitConnect => {
                 if s.net_in_chan < 0 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 let sys = &*s.syscalls;
                 let chan = s.net_in_chan;
@@ -219,7 +220,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         ));
                         let me = dev_requester_tag(sys);
                         if tag != 0 && tag != me {
-                            return 0;
+                            return StepReturn::Continue;
                         }
                         s.client.conn_id = net_proto::conn_id(core::slice::from_raw_parts(
                             buf.add(NET_FRAME_HDR),
@@ -237,7 +238,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         if negotiated != super::GEN_H2 {
                             log(s, b"[http] http/1.1 negotiated on an h2 client");
                             set_phase(s, H2Phase::Error);
-                            return E_CONNECT_FAILED;
+                            return StepReturn::error(E_CONNECT_FAILED);
                         }
                         #[cfg(feature = "exchange")]
                         super::provider::connected(s);
@@ -260,7 +261,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             log(s, b"[http] connect error");
                             s.client.fail_cause = super::CAUSE_CONNECT;
                             set_phase(s, H2Phase::Error);
-                            return E_CONNECT_FAILED;
+                            return StepReturn::error(E_CONNECT_FAILED);
                         }
                     }
                 }
@@ -268,14 +269,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     log(s, b"[http] connect timeout");
                     s.client.fail_cause = super::CAUSE_CONNECT;
                     set_phase(s, H2Phase::Error);
-                    return E_CONNECT_FAILED;
+                    return StepReturn::error(E_CONNECT_FAILED);
                 }
-                return 0;
+                return StepReturn::Continue;
             }
 
             H2Phase::SendPreface => {
                 if !drain_request_buf(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 log(s, b"[http] preface sent");
                 s.client.recv_len = 0;
@@ -285,7 +286,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 
             H2Phase::WaitSettings => {
                 if !pump_inbound(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // Look for the server's first SETTINGS frame (without
                 // ACK flag). Drain any other control frames the server
@@ -296,7 +297,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         // HEADERS in request_buf, drive SendRequest.
                         if !build_request(s) {
                             set_phase(s, H2Phase::Error);
-                            return E_SEND_FAILED;
+                            return StepReturn::error(E_SEND_FAILED);
                         }
                         set_phase(s, H2Phase::SendRequest);
                         continue;
@@ -304,15 +305,15 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     Some(false) => {
                         // peer error
                         set_phase(s, H2Phase::Error);
-                        return E_NET_FAILED;
+                        return StepReturn::error(E_NET_FAILED);
                     }
-                    None => return 0, // need more bytes
+                    None => return StepReturn::Continue, // need more bytes
                 }
             }
 
             H2Phase::SendRequest => {
                 if !drain_request_buf(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // For WS, `request_body` is the initial WS message and
                 // is sent later by `WsActive` after the upgrade — we
@@ -331,7 +332,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
 
             H2Phase::SendBody => {
                 if !drain_request_buf(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if s.client.request_body_sent >= s.client.request_body_len {
                     log(s, b"[http] request body sent (h2c)");
@@ -350,7 +351,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // its PING is acknowledged.
                 maybe_queue_window_update(s);
                 if !drain_request_buf(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // Always try to make progress on inbound bytes first.
                 pump_inbound(s);
@@ -362,9 +363,9 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     FrameAction::NeedMore if s.client.peer_closed != 0 => {
                         s.client.fail_cause = super::CAUSE_LINK;
                         set_phase(s, H2Phase::Error);
-                        return E_NET_FAILED;
+                        return StepReturn::error(E_NET_FAILED);
                     }
-                    FrameAction::NeedMore => return 0,
+                    FrameAction::NeedMore => return StepReturn::Continue,
                     FrameAction::Continue => {
                         // The response's own HEADERS: its head goes to the
                         // requester as soon as it is known.
@@ -375,7 +376,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                             && !super::provider::head_from_fields(s, s.client.last_status)
                         {
                             set_phase(s, H2Phase::Error);
-                            return E_NET_FAILED;
+                            return StepReturn::error(E_NET_FAILED);
                         }
                         // For a WS upgrade, the response HEADERS
                         // (status=200) means the stream now tunnels
@@ -404,11 +405,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         if super::provider::answering(s) && !super::provider::head_given(s) {
                             super::provider::head_from_fields(s, s.client.last_status);
                         }
-                        return 1;
+                        return StepReturn::Done;
                     }
                     FrameAction::Error => {
                         set_phase(s, H2Phase::Error);
-                        return E_NET_FAILED;
+                        return StepReturn::error(E_NET_FAILED);
                     }
                 }
             }
@@ -417,7 +418,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // Drain any pending outbound bytes (the initial WS
                 // frame or a queued CLOSE).
                 if s.client.request_sent < s.client.request_len && !drain_request_buf(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // First action after the upgrade: send `request_body`
                 // as a masked WS TEXT frame inside an h2 DATA frame.
@@ -440,7 +441,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     log_done(s);
                     let _ = send_close_frame(s);
                     set_phase(s, H2Phase::Done);
-                    return 1;
+                    return StepReturn::Done;
                 }
                 // Bidirectional mode: if `in[1]` is wired and has
                 // outgoing data, wrap and queue it. HUP queues a
@@ -452,14 +453,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 // If we owe a WINDOW_UPDATE, get it onto the wire so
                 // the server keeps streaming WS frames.
                 if maybe_queue_window_update(s) && !drain_request_buf(s) {
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 // Otherwise pump inbound frames and process WS DATA
                 // inline (process_ws_data may queue our own CLOSE).
                 pump_inbound(s);
                 let action = process_one_frame(s);
                 match action {
-                    FrameAction::NeedMore => return 0,
+                    FrameAction::NeedMore => return StepReturn::Continue,
                     FrameAction::Continue => continue,
                     FrameAction::DataPending => continue,
                     FrameAction::Done => {
@@ -472,11 +473,11 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         if super::provider::answering(s) && !super::provider::head_given(s) {
                             super::provider::head_from_fields(s, s.client.last_status);
                         }
-                        return 1;
+                        return StepReturn::Done;
                     }
                     FrameAction::Error => {
                         set_phase(s, H2Phase::Error);
-                        return E_NET_FAILED;
+                        return StepReturn::error(E_NET_FAILED);
                     }
                 }
             }
@@ -501,14 +502,14 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     s.client.pending_offset += taken as u16;
                     s.client.bytes_received += taken as u32;
                     if pending + taken < plen {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     consume_data_frame(s);
                     if end {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
-                        return 1;
+                        return StepReturn::Done;
                     }
                     set_phase(s, H2Phase::WaitResponse);
                     continue;
@@ -524,7 +525,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
-                        return 1;
+                        return StepReturn::Done;
                     }
                     set_phase(s, H2Phase::WaitResponse);
                     continue;
@@ -533,7 +534,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                 let out_chan = s.client.out_chan;
                 let poll = (sys.channel_poll)(out_chan, POLL_OUT);
                 if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 let payload_len = data_frame_payload_len(s);
@@ -547,7 +548,7 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                         log_done(s);
                         let _ = send_close_frame(s);
                         set_phase(s, H2Phase::Done);
-                        return 1;
+                        return StepReturn::Done;
                     }
                     set_phase(s, H2Phase::WaitResponse);
                     continue;
@@ -562,25 +563,25 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
                     (sys.channel_write)(out_chan, src, remaining.min(super::OUTPUT_CHUNK));
                 if written < 0 {
                     if written == E_AGAIN {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     log(s, b"[http] write failed");
                     set_phase(s, H2Phase::Error);
-                    return E_WRITE_FAILED;
+                    return StepReturn::error(E_WRITE_FAILED);
                 }
                 s.client.pending_offset += written as u16;
                 s.client.bytes_received += written as u32;
-                return 0;
+                return StepReturn::Continue;
             }
 
             H2Phase::Done => {
                 let _ = send_close_frame(s);
-                return 1;
+                return StepReturn::Done;
             }
 
             H2Phase::Error => {
                 let _ = send_close_frame(s);
-                return -1;
+                return StepReturn::error(-1);
             }
         }
     }

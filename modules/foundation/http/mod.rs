@@ -912,16 +912,16 @@ fn client_armed(s: &HttpState) -> bool {
 /// guarantees no concurrent step invocation.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: `state` was initialised by `module_new`; the scheduler
     // serialises module_step calls so the `&mut *` re-borrow is unique.
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut HttpState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
 
         s.step_count = s.step_count.wrapping_add(1);
@@ -958,7 +958,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let _ = client::send_close_frame(s);
         }
 
-        let rc = if s.mode == MODE_CLIENT {
+        let rc: StepReturn = if s.mode == MODE_CLIENT {
             // Graph-driven client: read `request_in` and place what is owed on
             // `response_out` every step, then start the next request when the
             // phase machine is free, so an idle client picks work up promptly
@@ -981,9 +981,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     #[cfg(feature = "h2")]
                     let closed = closed && client::h2_streams::quiet(s);
                     return if closed && client::provider::quiet(s) {
-                        1
+                        StepReturn::Done
                     } else {
-                        0
+                        StepReturn::Continue
                     };
                 }
                 // HTTP/2 carries many exchanges on one connection, and runs
@@ -992,7 +992,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if client::h2_streams::holds_requests(s) {
                     client::h2_streams::step(s);
                     tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 if !client::provider::busy(s) && !client::provider::probing(s) {
                     #[cfg(feature = "h3")]
@@ -1019,7 +1019,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             || !s.client.response.reusable);
                     if held || !client::provider::start(s) {
                         tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
                 // A probe of a lost link is a TCP connection and nothing more,
@@ -1027,7 +1027,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if client::provider::probing(s) {
                     let _ = client::h1::step(s);
                     tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
 
@@ -1039,7 +1039,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 #[cfg(feature = "exchange")]
                 let r = if client::provider::armed(s) {
                     client::provider::flush_partial(s);
-                    0
+                    StepReturn::Continue
                 } else {
                     r
                 };
@@ -1060,7 +1060,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // closed rather than silently speaking h1 on an h2 wire.
             #[cfg(not(feature = "h2"))]
             let r = if s.client.protocol == 1 {
-                -1
+                StepReturn::error(-1)
             } else {
                 client::h1::step(s)
             };
@@ -1069,14 +1069,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // composing goes out rather than waiting for a fuller one.
             #[cfg(feature = "exchange")]
             let r = if client::provider::armed(s) {
-                if r < 0 || s.client.phase == client::Phase::Error {
+                if r.is_error() || s.client.phase == client::Phase::Error {
                     s.client.phase = client::Phase::Error;
                     client::provider::fail(s, s.client.fail_cause);
                 } else if s.client.phase == client::Phase::Done {
                     let _ = client::provider::end(s);
                 }
                 client::provider::flush_partial(s);
-                0
+                StepReturn::Continue
             } else {
                 r
             };
@@ -1102,9 +1102,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Quiescence is also the CLOSE having been taken: a refused one
                 // retries next step rather than abandoning the connection.
                 if client::send_close_frame(s) {
-                    1
+                    StepReturn::Done
                 } else {
-                    0
+                    StepReturn::Continue
                 }
             } else {
                 r
@@ -1129,7 +1129,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             #[cfg(not(feature = "h3"))]
             // Without the h3 feature there is no HTTP/3 to serve; fail closed
             // rather than silently serving h1 on a graph that asked for h3.
-            let r = if s.h3_mode != 0 { -1 } else { server::step(s) };
+            let r = if s.h3_mode != 0 {
+                StepReturn::error(-1)
+            } else {
+                server::step(s)
+            };
             r
         };
 
