@@ -44,8 +44,8 @@
 //!
 //! Each direction holds at most one frame in flight, and new input is read
 //! only once both are clear. A WebSocket payload larger than one `MSG_DATA`
-//! may carry ([`net_proto::MAX_DATA_FRAGMENT`]) is emitted across several
-//! frames from the same held buffer. Nothing is dropped: a write that cannot
+//! may carry (`net_out`'s record bound, [`NET_OUT_MAX_RECORD`]) is emitted
+//! across several frames from the same held buffer. Nothing is dropped: a write that cannot
 //! land leaves the buffer as it was and the step returns.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
@@ -93,6 +93,10 @@ const NO_CONN: u32 = ws_frame::CONN_UNCLAIMED;
 
 /// `ENOSYS`, as a `net_proto` error byte.
 const ERRNO_NOSYS: i8 = -38;
+/// `EINVAL`, as a `net_proto` error byte.
+const ERRNO_INVAL: i8 = -22;
+/// Data bytes one `MSG_DATA` toward the consumer carries.
+const DATA_MAX: usize = net_proto::data_capacity(NET_OUT_MAX_RECORD);
 
 #[repr(C)]
 struct State {
@@ -124,7 +128,7 @@ struct State {
     tx_pending_len: usize,
 
     /// An inbound payload being handed over as `MSG_DATA`, which takes more
-    /// than one frame when it is longer than `MAX_DATA_FRAGMENT`.
+    /// than one frame when it is longer than [`DATA_MAX`].
     data_conn: u32,
     data_buf: [u8; FRAME_BUF_BYTES],
     data_len: usize,
@@ -134,7 +138,14 @@ struct State {
     scratch: [u8; FRAME_BUF_BYTES],
 }
 
-fluxor_rt::module_facts! { state: State, arena: 0 }
+fluxor_rt::module_facts! {
+    state: State,
+    arena: 0,
+    records: [
+        in 0 NET_IN_ACCEPTS_RECORD = FRAME_BUF_BYTES,
+        out 0 NET_OUT_MAX_RECORD = abi::contracts::net::datagram::TRANSPORT_RECORD_MAX,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -390,7 +401,7 @@ unsafe fn read_record(
         // the stream is off its boundaries — flushing is what puts it back on
         // one, rather than reading a body length out of the next record's
         // header for the rest of the session.
-        dev_channel_ioctl(sys, chan, IOCTL_FLUSH, core::ptr::null_mut(), 0);
+        dev_channel_flush(sys, chan);
         return None;
     }
     while have < total {
@@ -492,8 +503,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // `net_out` ─────────────────────────────────────────────────────────
     if s.net_pending_len == 0 && s.data_off < s.data_len {
         // The tail of an inbound payload too long for one `MSG_DATA`.
-        let take = (s.data_len - s.data_off).min(net_proto::MAX_DATA_FRAGMENT);
-        let mut payload = [0u8; net_proto::CONN_ID_LEN + net_proto::MAX_DATA_FRAGMENT];
+        let take = (s.data_len - s.data_off).min(DATA_MAX);
+        let mut payload = [0u8; net_proto::CONN_ID_LEN + DATA_MAX];
         match u16::try_from(s.data_conn & 0xFFFF) {
             Ok(conn) => {
                 net_proto::put_conn_id(&mut payload, conn);
@@ -565,20 +576,29 @@ fn handle_command(s: &mut State, n: usize) {
         return;
     }
     let body_at = net_proto::FRAME_HDR;
+    let body = &s.scratch[body_at..body_at + len];
     match msg {
-        net_proto::CMD_BIND if len >= 2 => {
-            let port = u16::from_le_bytes([s.scratch[body_at], s.scratch[body_at + 1]]);
+        net_proto::CMD_BIND => {
+            let Some((port, flags)) = net_proto::bind_parts(body) else {
+                return;
+            };
+            if flags & !net_proto::flag::REQUESTABLE != 0 {
+                // A sideband nobody can ask for: refused on the bind's own
+                // (untagged) error.
+                let err = net_proto::error(0, ERRNO_INVAL, net_proto::REQUESTER_TAG_NONE);
+                stage_net(s, net_proto::MSG_ERROR, &err);
+                return;
+            }
             s.bound_port = port;
             s.bound = true;
             // SAFETY: `s.syscalls` was null-checked by `module_step`.
             unsafe { dev_log(&*s.syscalls, 3, b"[ws_net] bound".as_ptr(), 14) };
             // The route is the bind, so it has already succeeded. `conn_id` on
             // a `MSG_BOUND` names no connection; the port is what the
-            // consumer matches its accepts against.
-            let mut payload = [0u8; net_proto::CONN_ID_LEN + 2];
-            net_proto::put_conn_id(&mut payload, 0);
-            payload[net_proto::CONN_ID_LEN..].copy_from_slice(&port.to_le_bytes());
-            stage_net(s, net_proto::MSG_BOUND, &payload);
+            // consumer matches its accepts against. No sideband is granted:
+            // a WebSocket route carries no trace context and keeps no cursor.
+            let bound = net_proto::bound(0, port, 0);
+            stage_net(s, net_proto::MSG_BOUND, &bound);
         }
         net_proto::CMD_SEND if len > net_proto::CONN_ID_LEN => {
             let conn = u32::from(net_proto::conn_id(&s.scratch[body_at..]));
@@ -594,8 +614,11 @@ fn handle_command(s: &mut State, n: usize) {
                 s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(count as u32);
             }
         }
-        net_proto::CMD_CLOSE if len >= net_proto::CONN_ID_LEN => {
-            let conn = u32::from(net_proto::conn_id(&s.scratch[body_at..]));
+        net_proto::CMD_CLOSE => {
+            let Some((conn, _abort)) = net_proto::close_parts(body) else {
+                return;
+            };
+            let conn = u32::from(conn);
             // Staged BEFORE the connection is forgotten. Forgetting it first
             // leaves `stage_ws` with an id it holds nothing for, and the close
             // then has no addressee — which used to mean it was sent to the
@@ -605,16 +628,16 @@ fn handle_command(s: &mut State, n: usize) {
             stage_ws(s, conn, WS_OPCODE_CLOSE, &[]);
             conn_remove(s, conn);
         }
-        net_proto::CMD_CONNECT | net_proto::CMD_CONNECT_TO => {
+        net_proto::CMD_CONNECT_TO => {
             // A served route has no outbound side. Answered rather than
             // dropped so a consumer that dials fails at once, on the tag it
             // dialled with, instead of waiting out a deadline.
-            let tag = s.scratch.get(body_at + len - 1).copied().unwrap_or(0);
-            let mut payload = [0u8; net_proto::CONN_ID_LEN + 2];
-            net_proto::put_conn_id(&mut payload, 0);
-            payload[net_proto::CONN_ID_LEN] = ERRNO_NOSYS as u8;
-            payload[net_proto::CONN_ID_LEN + 1] = tag;
-            stage_net(s, net_proto::MSG_ERROR, &payload);
+            let tag = net_proto::read_connect_to(body).map_or_else(
+                || net_proto::malformed_connect_to_tag(body),
+                |c| c.requester_tag,
+            );
+            let err = net_proto::error(0, ERRNO_NOSYS, tag);
+            stage_net(s, net_proto::MSG_ERROR, &err);
         }
         _ => {}
     }
@@ -640,11 +663,11 @@ fn handle_ws_event(s: &mut State, n: usize) {
 ///
 /// `generation` is the session `http` reported the connection under — the
 /// number the stage below it (`tls`) gave the session and names it by on
-/// `peer_identity`. It is appended exactly as a session stage appends it, so a
+/// `peer_identity`. It is carried exactly as a session stage carries it, so a
 /// consumer that binds a peer to a session (`remote_channel` under
 /// `require_peer: 1`) can join the two. 0 means nothing below numbered the
-/// session, and then nothing is appended: a consumer must not be told a
-/// session was numbered when it was not.
+/// session: a consumer must not be told a session was numbered when it was
+/// not.
 fn accept_conn(s: &mut State, conn: u32, generation: u16) {
     if conn_live(s, conn) || !conn_add(s, conn) {
         return;
@@ -654,15 +677,18 @@ fn accept_conn(s: &mut State, conn: u32, generation: u16) {
     };
     // Port-qualified, so a consumer fanned alongside others claims only the
     // connections accepted on its own bind.
-    let mut payload = [0u8; net_proto::ACCEPTED_FIXED + 2];
-    net_proto::put_conn_id(&mut payload, id);
-    payload[net_proto::CONN_ID_LEN..net_proto::ACCEPTED_FIXED]
-        .copy_from_slice(&s.bound_port.to_le_bytes());
-    let len = if generation == 0 {
-        net_proto::ACCEPTED_FIXED
-    } else {
-        net_proto::put_session_generation(&mut payload, net_proto::ACCEPTED_FIXED, generation)
-            .unwrap_or(net_proto::ACCEPTED_FIXED)
+    let mut payload = [0u8; net_proto::ACCEPTED_FIXED];
+    let accepted = net_proto::Accepted {
+        conn_id: id,
+        local_port: s.bound_port,
+        opening: net_proto::Opening {
+            flags_granted: 0,
+            generation,
+            alpn: &[],
+        },
+    };
+    let Some(len) = net_proto::put_accepted(&mut payload, &accepted) else {
+        return;
     };
     stage_net(s, net_proto::MSG_ACCEPTED, &payload[..len]);
 }
@@ -676,8 +702,10 @@ fn close_conn(s: &mut State, conn: u32) {
     let Ok(id) = u16::try_from(conn & 0xFFFF) else {
         return;
     };
-    let mut payload = [0u8; net_proto::CONN_ID_LEN];
+    // The WebSocket is gone: nothing more can be sent on it.
+    let mut payload = [0u8; net_proto::CLOSED_LEN];
     net_proto::put_conn_id(&mut payload, id);
+    payload[net_proto::CONN_ID_LEN] = net_proto::CLOSED_GONE;
     stage_net(s, net_proto::MSG_CLOSED, &payload);
 }
 

@@ -81,8 +81,8 @@ aarch64|http-web.fmod|207000|191646 (2026-09-05, +9.1K since the 2026-08-16 row:
 aarch64|http-app.fmod|212000|196158 (2026-09-05, +9.1K since the 2026-08-16 row: request metrics and the connection lifetime deadlines)
 aarch64|http-exchange.fmod|367000|349111 (2026-09-10: the session anchor and the h2 tunnel seam; ceiling re-based 5% above measured)
 aarch64|s3.fmod|44600|42478 (2026-10-03, +22.8K: bodies of any size streamed in the HTTP application records, aws-chunked chunk signing, response framing by length, chunks or close; ceiling re-based 5% above measured)
-aarch64|s3_serve.fmod|122400|116568 (2026-10-03, first row; SigV4, the S3 operations over storage.object, multipart staging, listings; ceiling 5% above measured)
-aarch64|smtp.fmod|19700|18682 (2026-10-06: submissions as exchanges: request records, credit for streamed bodies, the answer under response credit; ceiling re-based 5% above measured)
+aarch64|s3_serve.fmod|130500|124274 (2026-11-18, +7.7K: storage.object on flat argument records (Fluxor Stage 3): codecs for every op, data spans, the fence trailer, and the exchange answer head with its meta; ceiling re-based 5% above measured)
+aarch64|smtp.fmod|22100|21039 (2026-11-18, +2.4K: the neutral exchange head (Fluxor Stage 3): verb and meta records, the meta TLV codec and outcome mapping in place of the HTTP-shaped head; ceiling re-based 5% above measured)
 aarch64|websocket.fmod|22700|21619 (2026-11-13, +2480 B since the previous measurement, chiefly because the SDK becomes linked crates (Fluxor 9fb61099): contract and runtime helpers such as encoded::write_unit and net_read_frame are now out-of-line calls into fluxor_abi/fluxor_rt instead of include!-inlined, plus the 32 B FLUXOR_ABI_SURFACE digest; ceiling re-based 5% above measured)
 '
 

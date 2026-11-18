@@ -217,7 +217,7 @@ pub struct RequestLine {
 /// truncated, or too short to contain the minimum viable request.
 ///
 /// The method is returned rather than enforced. An unrecognised-but-well-formed
-/// token yields [`method::METHOD_NONE`] with the target still parsed, so the
+/// token yields [`method::NONE`] with the target still parsed, so the
 /// caller can answer **501 Not Implemented** — which is what RFC 9110 §9.1 asks
 /// for — instead of the 400 that a parse failure would produce. Only a
 /// genuinely malformed line (no method token, no space-delimited target, a
@@ -963,7 +963,7 @@ pub unsafe fn write_request_head(
     if !path_bytes.starts_with(b"/")
         || path_bytes.iter().any(|b| *b <= 32 || *b == 127)
         || options.authority.iter().any(|b| *b <= 32 || *b == 127)
-        || method == method::METHOD_CONNECT
+        || method == method::CONNECT
     {
         return 0;
     }

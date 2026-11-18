@@ -28,6 +28,9 @@ name = "request_in"
 direction = "input"
 content_type = "ExchangeRequest"
 buffer_size = { default = 8192, aarch64 = 65536 }
+# The requests are HTTP: methods for verbs, header fields for meta.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "response_out"

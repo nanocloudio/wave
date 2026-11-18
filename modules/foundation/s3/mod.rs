@@ -54,9 +54,14 @@ include!("../../common/s3_core.rs");
 
 // The exchange records this connector answers, as a provider.
 use abi::contracts::exchange::{
-    abort, flag, parse_request, seal_body, write_abort, write_credit, write_response_head,
-    ExchangeId, Record, ResponseHead, HDR, METHOD_DELETE, METHOD_GET, METHOD_HEAD, METHOD_POST,
-    METHOD_PUT, RECORD_MAX,
+    abort, flag, meta_field_len, op, parse_request, seal_body, write_abort, write_credit,
+    write_response_head, ExchangeId, MetaWriter, Record, RequestRecord, HDR, META_CONTENT_TYPE,
+    RECORD_MAX,
+};
+// The connector speaks the exchange's HTTP binding: a verb is a request
+// method, a detail a response status, and meta fields are header fields.
+use abi::contracts::exchange_http::{
+    self as http, header_lines_from_meta, meta_from_header_lines, method, method_name, Http,
 };
 
 // The NetProto opcodes and identity accessors come from the owning contract,
@@ -67,8 +72,6 @@ use abi::contracts::net::net_proto::{
     CMD_SEND as NET_CMD_SEND, MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED,
     MSG_DATA as NET_MSG_DATA, MSG_ERROR as NET_MSG_ERROR,
 };
-// The method byte of a request HEAD is the exchange contract's vocabulary.
-use abi::contracts::exchange::method_name;
 
 /// The port a dial takes when `authority` names none.
 const DEFAULT_PORT: u16 = 80;
@@ -81,11 +84,11 @@ const E_BAD_AUTHORITY: i32 = -22;
 /// Construction refused: a credential parameter past its buffer.
 const E_BAD_PARAM: i32 = -22;
 
-/// One transport frame, read or written.
-const NET_BUF: usize = 2048;
-/// Request bytes per `CMD_SEND` frame: one TCP segment's worth, which keeps
-/// every frame within `net_out`'s declared `max_record`.
-const SEND_MAX: usize = net_proto::MAX_DATA_FRAGMENT;
+/// One transport frame, read or written: the largest `net_in` accepts.
+const NET_BUF: usize = NET_IN_ACCEPTS_RECORD;
+/// Request bytes per `CMD_SEND` frame: what `net_out`'s declared
+/// `max_record` carries.
+const SEND_MAX: usize = net_proto::data_capacity(NET_OUT_MAX_RECORD);
 /// Longest credential field or authority held.
 const NAME_BUF: usize = 128;
 /// Longest request target a caller may name. The canonical query is sorted in
@@ -108,6 +111,9 @@ const RESP_HEAD_MAX: usize = 4096;
 /// Longest `Content-Type` forwarded in its own field; a longer one stays among
 /// the forwarded headers.
 const CT_MAX: usize = 255;
+/// The response HEAD's meta: the content type's field and one field per
+/// forwarded header line, each no longer than the line it came from.
+const META_MAX: usize = meta_field_len(META_CONTENT_TYPE.len(), CT_MAX) + RESP_HEAD_MAX;
 const CONNECT_TIMEOUT_MS: u64 = 10_000;
 /// The endpoint's progress deadline: no byte to or from it for this long
 /// while the connector waits on it ends the exchange (504 before any response
@@ -272,11 +278,12 @@ struct S3State {
     resp_head: [u8; RESP_HEAD_MAX],
     resp_head_len: u16,
     resp_status: u16,
-    /// The forwarded `Content-Type` (`fwd[..fwd_ct]`) and header lines
-    /// (`fwd[fwd_ct..fwd_ct + fwd_hdr]`).
+    /// Scratch for the response head split into its `Content-Type`
+    /// (`fwd[..CT_MAX]`) and its forwarded header lines (`fwd[CT_MAX..]`).
     fwd: [u8; CT_MAX + RESP_HEAD_MAX],
-    fwd_ct: u16,
-    fwd_hdr: u16,
+    /// The response HEAD's meta run (`meta[..meta_len]`).
+    meta: [u8; META_MAX],
+    meta_len: u16,
     /// The response HEAD record is owed.
     head_owed: u8,
     /// The response HEAD record has gone out: a failure from here on is an
@@ -394,7 +401,10 @@ fluxor_rt::define_params! {
     };
 }
 
-fluxor_rt::module_facts! { state: S3State }
+fluxor_rt::module_facts! {
+    state: S3State,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = 2048, out 0 NET_OUT_MAX_RECORD = 1600],
+}
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -549,8 +559,7 @@ fn reset_exchange(s: &mut S3State) {
     s.chunked = S3Chunked::new();
     s.resp_head_len = 0;
     s.resp_status = 0;
-    s.fwd_ct = 0;
-    s.fwd_hdr = 0;
+    s.meta_len = 0;
     s.head_owed = 0;
     s.head_sent = 0;
     s.status_owed = 0;
@@ -581,10 +590,13 @@ fn stage_connect(s: &mut S3State, now: u64) {
     let n = match net_proto::Target::parse(authority(s)) {
         Some((target, _)) => net_proto::write_connect_to(
             &mut payload,
-            SOCK_TYPE_STREAM,
-            s.port,
-            &target,
-            Some(s.tag),
+            &net_proto::ConnectTo {
+                sock_type: SOCK_TYPE_STREAM,
+                flags: 0,
+                port: s.port,
+                target,
+                requester_tag: s.tag,
+            },
         ),
         None => 0,
     };
@@ -632,9 +644,7 @@ fn drop_connection(s: &mut S3State, now: u64) {
         s.cmd_len = 0;
     }
     if s.conn_present != 0 {
-        let mut close = [0u8; 2];
-        net_proto::put_conn_id(&mut close, s.conn_id);
-        stage_command(s, NET_CMD_CLOSE, &close, now);
+        stage_command(s, NET_CMD_CLOSE, &net_proto::close(s.conn_id, false), now);
     }
     s.conn_present = 0;
     s.conn_id = 0;
@@ -793,15 +803,7 @@ fn produce(s: &mut S3State, now: u64) {
         } else {
             // Every owed status is this connector's own: the server's
             // answers go out as the response itself, never through here.
-            let head = ResponseHead {
-                id,
-                flags: flag::RAISED,
-                status: s.status_owed,
-                content_type: &[],
-                headers: &[],
-                body: &[],
-            };
-            write_response_head(&head, &mut s.out)
+            http::write_refusal(&id, s.status_owed, &mut s.out)
         };
         s.out_len = n.unwrap_or(0) as u16;
         s.out_terminal = 1;
@@ -814,17 +816,14 @@ fn produce(s: &mut S3State, now: u64) {
         return;
     }
     if s.head_owed != 0 {
-        let ct_len = (s.fwd_ct as usize).min(CT_MAX);
-        let hdr_end = (ct_len + s.fwd_hdr as usize).min(s.fwd.len());
-        let head = ResponseHead {
+        let meta_len = (s.meta_len as usize).min(META_MAX);
+        let Some(at) = http::head(
             id,
-            flags: 0,
-            status: s.resp_status,
-            content_type: s.fwd.get(..ct_len).unwrap_or(&[]),
-            headers: s.fwd.get(ct_len..hdr_end).unwrap_or(&[]),
-            body: &[],
-        };
-        let Some(at) = write_response_head(&head, &mut s.out) else {
+            s.resp_status,
+            s.meta.get(..meta_len).unwrap_or(&[]),
+            &[],
+        )
+        .and_then(|head| write_response_head::<Http>(&head, &mut s.out)) else {
             fail_exchange(s, 502, abort::FAILED, now);
             return;
         };
@@ -937,7 +936,7 @@ enum Taken {
 /// pending slot already full.
 fn take_record(s: &mut S3State, now: u64) -> bool {
     let len = (s.inrec_len as usize).min(RECORD_MAX);
-    let taken = match s.inrec.get(..len).and_then(parse_request) {
+    let taken = match s.inrec.get(..len).and_then(parse) {
         None => {
             s.records_malformed = s.records_malformed.wrapping_add(1);
             return true;
@@ -995,11 +994,17 @@ fn take_record(s: &mut S3State, now: u64) -> bool {
     true
 }
 
+/// One request-direction record, as a party speaking the HTTP binding reads
+/// it; `None` when it is malformed.
+fn parse(rec: &[u8]) -> Option<RequestRecord<'_>> {
+    parse_request::<Http>(rec).ok()
+}
+
 fn pending_id(s: &S3State) -> Option<ExchangeId> {
     if s.pend_len == 0 {
         return None;
     }
-    match parse_request(s.pend.get(..s.pend_len as usize)?)? {
+    match parse(s.pend.get(..s.pend_len as usize)?)? {
         Record::Head(h) => Some(h.id),
         _ => None,
     }
@@ -1056,13 +1061,13 @@ fn start_pending(s: &mut S3State, now: u64) {
     let overrun = s.pend_overrun;
     s.pend_len = 0;
     reset_exchange(s);
-    let Some(Record::Head(h)) = s.pend.get(..len).and_then(parse_request) else {
+    let Some(Record::Head(h)) = s.pend.get(..len).and_then(parse) else {
         s.terminated = s.terminated.wrapping_add(1);
         return;
     };
     s.ex = EX_DIAL;
     s.id = h.id;
-    s.method = h.method;
+    s.method = h.verb;
     s.resp_credit = (h.resp_credit as u64).saturating_add(credit);
     // MORE: BODY records follow, under credit, after what the HEAD carried.
     let more = h.flags & flag::MORE != 0;
@@ -1079,14 +1084,16 @@ fn start_pending(s: &mut S3State, now: u64) {
         refuse(s, 503);
         return;
     }
-    if !matches!(
-        h.method,
-        METHOD_GET | METHOD_PUT | METHOD_HEAD | METHOD_DELETE | METHOD_POST
-    ) {
+    if h.op != op::CALL
+        || !matches!(
+            h.verb,
+            method::GET | method::PUT | method::HEAD | method::DELETE | method::POST
+        )
+    {
         refuse(s, 400);
         return;
     }
-    if h.target.len() > MAX_TARGET || h.headers.len() > MAX_CALLER_HEADERS {
+    if h.target.len() > MAX_TARGET || h.meta.len() > MAX_CALLER_HEADERS {
         refuse(s, 413);
         return;
     }
@@ -1094,7 +1101,15 @@ fn start_pending(s: &mut S3State, now: u64) {
         refuse(s, 400);
         return;
     }
-    let declared = match s3_caller_headers(h.headers) {
+    // The caller's meta fields are the header lines the request is signed
+    // with; a run that does not render as lines (a value holding a line
+    // break, or past the buffer) is not one the connector sends.
+    let Some(hdrs_len) = header_lines_from_meta(h.meta, &mut s.caller_hdrs) else {
+        refuse(s, 400);
+        return;
+    };
+    s.caller_hdrs_len = hdrs_len as u16;
+    let declared = match s3_caller_headers(s.caller_hdrs.get(..hdrs_len).unwrap_or(&[])) {
         Ok(l) => l,
         Err(_) => {
             refuse(s, 400);
@@ -1124,10 +1139,6 @@ fn start_pending(s: &mut S3State, now: u64) {
         dst.copy_from_slice(h.target);
     }
     s.target_len = h.target.len() as u16;
-    if let Some(dst) = s.caller_hdrs.get_mut(..h.headers.len()) {
-        dst.copy_from_slice(h.headers);
-    }
-    s.caller_hdrs_len = h.headers.len() as u16;
     if overrun != 0 {
         s.abort_owed = abort::CREDIT_OVERRUN;
         s.ex = EX_ENDING;
@@ -1186,7 +1197,7 @@ fn queue_signed_head(s: &mut S3State) -> bool {
     };
     let wire_len = if s.streaming != 0 {
         s3_aws_chunked_len(s.req_len, S3_CHUNK as u64)
-    } else if s.has_body != 0 || s.method == METHOD_PUT || s.method == METHOD_POST {
+    } else if s.has_body != 0 || s.method == method::PUT || s.method == method::POST {
         Some(s.req_len)
     } else {
         None
@@ -1441,7 +1452,7 @@ fn on_head(s: &mut S3State, now: u64) {
         s.resp_head_len = 0;
         return;
     }
-    let Some(body) = s3_response_body(head, status, s.method == METHOD_HEAD) else {
+    let Some(body) = s3_response_body(head, status, s.method == method::HEAD) else {
         fail_exchange(s, 502, abort::FAILED, now);
         return;
     };
@@ -1450,12 +1461,26 @@ fn on_head(s: &mut S3State, now: u64) {
         fail_exchange(s, 502, abort::FAILED, now);
         return;
     };
-    // The forwarded headers start right after the content type.
-    if ct_len < CT_MAX {
-        s.fwd.copy_within(CT_MAX..CT_MAX + hdr_len, ct_len);
+    // The caller is handed the content type as its own field, then the
+    // forwarded header lines as fields of their own.
+    let mut w = MetaWriter::new(&mut s.meta);
+    if ct_len != 0 {
+        w.put(META_CONTENT_TYPE, s.fwd.get(..ct_len).unwrap_or(&[]));
     }
-    s.fwd_ct = ct_len as u16;
-    s.fwd_hdr = hdr_len as u16;
+    let Some(ct_meta) = w.finish() else {
+        fail_exchange(s, 502, abort::FAILED, now);
+        return;
+    };
+    let lines = s.fwd.get(CT_MAX..CT_MAX + hdr_len).unwrap_or(&[]);
+    let Some(rest) = s
+        .meta
+        .get_mut(ct_meta..)
+        .and_then(|out| meta_from_header_lines(lines, out))
+    else {
+        fail_exchange(s, 502, abort::FAILED, now);
+        return;
+    };
+    s.meta_len = (ct_meta + rest) as u16;
     s.resp_status = status;
     s.rs = match body {
         S3Body::None => RS_NONE,
@@ -1523,17 +1548,18 @@ fn pump_net(s: &mut S3State, now: u64) {
         let payload_end = (NET_FRAME_HDR + plen).min(NET_BUF);
         let payload = s.rxf.get(NET_FRAME_HDR..payload_end).unwrap_or(&[]);
         match msg {
-            NET_MSG_CONNECTED if plen >= net_proto::CONN_ID_LEN => {
-                let (cid, tag) = net_proto::connected_parts(payload);
-                if tag != s.tag {
+            NET_MSG_CONNECTED => {
+                let Some(c) = net_proto::connected_parts(payload) else {
+                    continue;
+                };
+                let cid = c.conn_id;
+                if c.requester_tag != s.tag {
                     continue;
                 }
                 if s.phase != CONNECTING {
                     // A dial this connector withdrew from completed anyway.
                     if s.cmd == 0 {
-                        let mut close = [0u8; 2];
-                        net_proto::put_conn_id(&mut close, cid);
-                        stage_command(s, NET_CMD_CLOSE, &close, now);
+                        stage_command(s, NET_CMD_CLOSE, &net_proto::close(cid, false), now);
                     }
                     continue;
                 }
@@ -1560,12 +1586,14 @@ fn pump_net(s: &mut S3State, now: u64) {
                 s.eof = 1;
                 on_closed(s, now);
             }
-            NET_MSG_ERROR if plen >= net_proto::ERROR_FIXED => {
+            NET_MSG_ERROR => {
                 // `[conn_id u16][errno i8][requester_tag u16]`. A connect-phase
                 // failure is matched on the tag alone (its conn_id is
                 // meaningless); an established connection's on an untagged
                 // error naming it.
-                let (cid, _errno, tag) = net_proto::error_parts(payload);
+                let Some((cid, _errno, tag)) = net_proto::error_parts(payload) else {
+                    continue;
+                };
                 let ours = (s.phase == CONNECTING && tag == s.tag)
                     || (s.conn_present != 0
                         && tag == net_proto::REQUESTER_TAG_NONE
@@ -1690,7 +1718,7 @@ fn check_deadlines(s: &mut S3State, now: u64) {
 
 /// Queue the signed `GET /` (ListBuckets).
 fn probe_request(s: &mut S3State, now: u64) {
-    s.method = METHOD_GET;
+    s.method = method::GET;
     s.target[0] = b'/';
     s.target_len = 1;
     s.caller_hdrs_len = 0;

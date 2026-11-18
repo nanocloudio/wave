@@ -623,16 +623,16 @@ unsafe fn step_sip(s: &mut SipModState) {
         if poll > 0 && (poll as u32) & POLL_IN != 0 {
             let (msg_type, plen) =
                 net_read_frame(sys, s.sip_net_in, s.net_buf.as_mut_ptr(), NET_BUF_SIZE);
-            if msg_type == DG_MSG_BOUND && plen >= 3 {
+            if msg_type == DG_MSG_BOUND {
                 // A fanned provider output delivers every BOUND to every
                 // leg. Claim ONLY the bind we asked for, by port — grabbing
                 // the first BOUND polled claims another module's endpoint
                 // and then filters every later datagram against the wrong
                 // identity (Pi 5 rig, 2026-08-26).
-                let (ep, port) = abi::contracts::net::datagram::dg_bound_parts(
+                let bound = abi::contracts::net::datagram::dg_bound_parts(
                     core::slice::from_raw_parts(s.net_buf.as_ptr().add(NET_FRAME_HDR), plen),
                 );
-                if port == s.local_sip_port {
+                if let Some((ep, _)) = bound.filter(|&(_, port)| port == s.local_sip_port) {
                     s.sip_ep_id = ep;
                     let mut l = [0u8; 18];
                     l[..13].copy_from_slice(b"[sip] sip ep=");

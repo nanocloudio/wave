@@ -10,7 +10,7 @@ hardware_targets = ["bcm2712", "linux"]
 # relay → `s3` → any S3 endpoint. The relay is a PROVIDER toward `http`
 # (`request_in` / `response_out`) and a REQUESTER toward the connector
 # (`request_out` / `response_in`). Every record passes unchanged except a
-# request HEAD, which loses the inbound connection's own header lines (`host`,
+# request HEAD, which loses the inbound connection's own meta fields (`host`,
 # framing, `expect`, a signature) and its peer, since the connector writes
 # those for the request it signs. `tools/e2e/s3_serve.sh` drives the connector
 # against `s3_serve` this way.
@@ -21,6 +21,9 @@ direction = "input"
 content_type = "ExchangeRequest"
 max_record = 8192
 buffer_size = 8192
+# A relay carries the HTTP verbs `http` sends on to the connector unread.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "response_in"
@@ -44,6 +47,8 @@ direction = "output"
 content_type = "ExchangeRequest"
 max_record = 8192
 buffer_size = 8192
+[ports.facts]
+binding = ["http"]
 
 [observability]
 exempt = "conformance fixture: observed through the E2E assertions it exists to serve"

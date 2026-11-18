@@ -15,6 +15,9 @@ direction    = "input"
 content_type = "ExchangeRequest"
 max_record   = 8192
 buffer_size  = 65536
+# The requests are HTTP: methods for verbs, header fields for meta.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name         = "response_out"

@@ -103,10 +103,7 @@ use super::super::wire::method;
 use super::super::wire::route_key;
 use super::super::wire::ws;
 use super::super::HttpState;
-use super::super::{
-    dev_channel_ioctl, dev_log, net_write_frame, IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY,
-    NET_FRAME_HDR,
-};
+use super::super::{dev_log, net_write_frame, NET_FRAME_HDR};
 
 // ── Sub-state within `Phase::H2Active` ────────────────────────────────────
 
@@ -155,7 +152,7 @@ pub(crate) enum SlotState {
 pub(crate) struct StreamSlot {
     pub(crate) id: u32,
     pub(crate) state: SlotState,
-    /// The request's method as a `wire::method::METHOD_*` value — the same
+    /// The request's method as a `wire::method` value — the same
     /// vocabulary h1 uses, so a request means the same thing on either
     /// generation.
     pub(crate) method_kind: u8,
@@ -571,11 +568,11 @@ unsafe fn drive_cache_fetch(s: &mut HttpState) -> bool {
     let me = s.server.cur_slot;
     // Cross-slot serialisation: drive_cache_fetch is the retry
     // loop for `Busy` — if we don't yet hold `file_chan_owner`,
-    // we never issued the FLUSH/NOTIFY for this stream and
+    // we never issued the FLUSH/SELECT for this stream and
     // `cache_fetch_step` would just return Pending forever
     // (POLL_IN never fires on a channel we haven't notified).
     // Re-attempt cache_try_or_fetch; on success it acquires the
-    // lock + issues IOCTLs and transitions us to the normal
+    // lock + selects the source and transitions us to the normal
     // Pending → Ready flow.
     if me >= 0 && s.server.file_chan_owner != me as i16 {
         let matched = (*cur_h2(s).streams.as_ptr().add(slot_idx as usize)).matched_route;
@@ -593,7 +590,7 @@ unsafe fn drive_cache_fetch(s: &mut HttpState) -> bool {
                 return false;
             }
             CacheLookup::Pending => {
-                // Acquired + IOCTLs issued; fall through to
+                // Acquired + source selected; fall through to
                 // cache_fetch_step.
             }
             CacheLookup::Busy => {
@@ -1647,7 +1644,7 @@ unsafe fn handle_headers(
 
     // Extended CONNECT (RFC 8441) — WS-over-h2 upgrade. Must not have
     // END_STREAM and we cap WS at one stream per connection.
-    if method_kind == method::METHOD_CONNECT && protocol_ws == 1 {
+    if method_kind == method::CONNECT && protocol_ws == 1 {
         if end_stream || cur_h2(s).ws_active != 0 {
             let n = h2w::write_rst_stream(
                 cur_send_buf_mut_ptr(s),
@@ -2248,7 +2245,7 @@ unsafe fn try_dispatch_pending(s: &mut HttpState) {
 /// heuristic — say a first-byte-prefix scan — would mis-classify
 /// `/files/x` as non-exclusive when a `/` static route is
 /// registered first, letting both streams bypass the `file_owner`
-/// mutex and race on FLUSH/NOTIFY.
+/// mutex and race on FLUSH/SELECT.
 unsafe fn needs_exclusive_for_request(s: &HttpState, slot_idx: i8) -> bool {
     let slot = &*cur_h2(s).streams.as_ptr().add(slot_idx as usize);
     let plen = slot.req_path_len as usize;
@@ -2436,7 +2433,7 @@ unsafe fn emit_app_request(s: &mut HttpState, idx: i8) -> super::app::Emit {
         slot.end_stream_in != 0,
         super::app::declared_request_length(headers),
         super::app::inline_room(target, headers, peer),
-        slot.method_kind == super::super::wire::method::METHOD_CONNECT
+        slot.method_kind == super::super::wire::method::CONNECT
             || super::app::wants_continue(headers),
     );
     if plan == super::app::BodyPlan::Wait {
@@ -2447,7 +2444,7 @@ unsafe fn emit_app_request(s: &mut HttpState, idx: i8) -> super::app::Emit {
     } else {
         &[]
     };
-    let head = super::super::exchange::RequestHead {
+    let head = super::app::AppRequest {
         id: app_id(s, idx as usize).exchange_id(),
         flags: if plan == super::app::BodyPlan::Stream {
             super::super::exchange::flag::MORE
@@ -2455,6 +2452,8 @@ unsafe fn emit_app_request(s: &mut HttpState, idx: i8) -> super::app::Emit {
             0
         },
         method: slot.method_kind,
+        opens: 0,
+        route: super::app::route::APP,
         target,
         headers,
         peer,
@@ -2777,12 +2776,12 @@ unsafe fn compose_app_frames(s: &mut HttpState, i: usize) -> bool {
         let ends = super::app::record_ends(rec);
         let verb = (*st).method_kind;
         if is_head && !(*st).app_queue.front_head_done() {
-            let Some(super::super::exchange::Record::Head(h)) =
-                super::super::exchange::parse_response(rec)
+            let Some(super::super::exchange::Record::Head(h)) = super::app::parse_response(rec)
             else {
                 break;
             };
-            let carries = super::app::status_allows_body(h.status, verb);
+            let carries =
+                super::app::status_allows_body(super::super::exchange_http::status_of(&h), verb);
             (*st).resp_carries = carries as u8;
             let end_here = ends && (!carries || body.is_empty());
             let Some(n) =
@@ -2889,9 +2888,9 @@ unsafe fn finish_app_stream(s: &mut HttpState, i: usize, mut used: usize) {
 }
 
 /// Frame a response HEAD as one HEADERS frame at `dst`: `:status`,
-/// `content-type`, then the application's own fields, lowercased, without the
-/// connection-specific ones h2 forbids (RFC 9113 §8.2.2). `None` when it does
-/// not fit.
+/// `content-type`, then the application's own meta fields, without the
+/// connection-specific ones h2 forbids (RFC 9113 §8.2.2) and the binding's own
+/// `:` fields. `None` when it does not fit.
 #[cfg(feature = "app")]
 unsafe fn app_headers_frame(
     dst: *mut u8,
@@ -2906,7 +2905,7 @@ unsafe fn app_headers_frame(
         return None;
     }
     let mut o = start;
-    let code = h.status.min(999);
+    let code = super::super::exchange_http::status_of(h).min(999);
     let status = [
         b'0' + (code / 100) as u8,
         b'0' + ((code / 10) % 10) as u8,
@@ -2917,25 +2916,20 @@ unsafe fn app_headers_frame(
         return None;
     }
     o += n;
-    let ct: &[u8] = if h.content_type.is_empty() {
+    let ct: &[u8] = if h.content_type().is_empty() {
         b"application/octet-stream"
     } else {
-        h.content_type
+        h.content_type()
     };
     let n = encode_header(dst.add(o), cap - o, b"content-type", ct);
     if n == 0 {
         return None;
     }
     o += n;
-    let mut lower = [0u8; 64];
-    for (name, value) in super::super::exchange::header_lines(h.headers) {
-        if name.len() > lower.len() {
-            return None;
+    for (name, value) in super::super::exchange::meta_fields(h.meta) {
+        if name.first() == Some(&b':') {
+            continue;
         }
-        for (d, c) in lower.iter_mut().zip(name) {
-            *d = c.to_ascii_lowercase();
-        }
-        let name = &lower[..name.len()];
         if matches!(
             name,
             b"connection"
@@ -3019,19 +3013,8 @@ unsafe fn begin_file_response(s: &mut HttpState, slot_idx: i8, matched_route: i8
     if let Some(cur) = super::cur_slot_mut(s) {
         cur.file_index = fi;
     }
-    let sys = &*s.syscalls;
 
     if fi == -1 {
-        if s.server.file_chan >= 0 {
-            let mut count: u32 = 0;
-            let count_ptr = &mut count as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_POLL_NOTIFY, count_ptr, 4);
-            if r >= 0 {
-                if let Some(cur) = super::cur_slot_mut(s) {
-                    cur.file_count = count as u16;
-                }
-            }
-        }
         if let Some(cur) = super::cur_slot_mut(s) {
             cur.index_pos = 0;
         }
@@ -3044,7 +3027,7 @@ unsafe fn begin_file_response(s: &mut HttpState, slot_idx: i8, matched_route: i8
             return;
         }
         // Cross-slot serialisation: take the server-level
-        // `file_chan_owner` lock before issuing FLUSH/NOTIFY.
+        // `file_chan_owner` lock before issuing FLUSH/SELECT.
         // h2 HANDLER_FILE doesn't have a Fetching-style retry
         // state, so on contention we emit 503 — the client can
         // retry. (h2 cache fetch uses `Busy → Fetching` for
@@ -3061,16 +3044,7 @@ unsafe fn begin_file_response(s: &mut HttpState, slot_idx: i8, matched_route: i8
             free_slot(s, slot_idx);
             return;
         }
-        dev_channel_ioctl(
-            sys,
-            s.server.file_chan,
-            IOCTL_FLUSH,
-            core::ptr::null_mut(),
-            0,
-        );
-        let mut pos = fi as u32;
-        let pos_ptr = &mut pos as *mut u32 as *mut u8;
-        let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_NOTIFY, pos_ptr, 4);
+        let r = super::file_select(s, fi as u32);
         if r < 0 {
             super::release_file_chan_external(s);
             emit_response(s, stream_id, b"404", b"text/plain", b"Not Found\n");

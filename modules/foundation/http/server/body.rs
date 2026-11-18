@@ -26,9 +26,9 @@ use super::response::{build_error, build_header};
 use super::{
     cur_fs_fd, cur_fs_sent, cur_fs_total, cur_matched_route, cur_recv_buf_mut_ptr,
     cur_send_buf_mut_ptr, cur_send_buf_ptr, cur_send_len, cur_send_offset, cur_slot, cur_slot_mut,
-    dev_channel_ioctl, dev_csprng_fill, dev_micros, dev_self_index, dev_telemetry_enabled,
-    dev_telemetry_span, fmt_u32_raw, net_send, try_acquire_file_chan, ConnSlot, HttpState, Phase,
-    IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, POLL_HUP, POLL_IN, SEND_BUF_SIZE,
+    dev_csprng_fill, dev_micros, dev_self_index, dev_telemetry_enabled, dev_telemetry_span,
+    file_select, fmt_u32_raw, net_send, try_acquire_file_chan, ConnSlot, HttpState, Phase,
+    POLL_HUP, POLL_IN, SEND_BUF_SIZE,
 };
 use fluxor_rt::StepReturn;
 
@@ -264,29 +264,6 @@ pub(crate) unsafe fn step_unrouted_file_dispatch(s: &mut HttpState) -> bool {
     };
 
     if plen == 1 && *buf == b'/' {
-        if s.server.file_chan >= 0 {
-            // POLL_NOTIFY is read-only and doesn't trample pending
-            // FLUSH/NOTIFY state, but we still gate behind the
-            // cross-slot lock so a concurrent slot can't observe
-            // a half-modified channel state.
-            if !try_acquire_file_chan(s) {
-                return false;
-            }
-            let mut count: u32 = 0;
-            let count_ptr = &mut count as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(
-                &*s.syscalls,
-                s.server.file_chan,
-                IOCTL_POLL_NOTIFY,
-                count_ptr,
-                4,
-            );
-            if r >= 0 {
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.file_count = count as u16;
-                }
-            }
-        }
         build_header(s, b"200 OK", b"text/plain");
         if let Some(cur) = cur_slot_mut(s) {
             cur.index_pos = 0;
@@ -326,22 +303,13 @@ pub(crate) unsafe fn step_unrouted_file_dispatch(s: &mut HttpState) -> bool {
             cur.matched_route = -1;
         }
         if s.server.file_chan >= 0 {
-            // Cross-slot serialisation for the FLUSH/NOTIFY pair.
+            // Cross-slot serialisation for the FLUSH/SELECT pair.
             // If another slot owns the channel, leave the slot in
             // DispatchRoute and retry next tick.
             if !try_acquire_file_chan(s) {
                 return false;
             }
-            dev_channel_ioctl(
-                &*s.syscalls,
-                s.server.file_chan,
-                IOCTL_FLUSH,
-                core::ptr::null_mut(),
-                0,
-            );
-            let mut pos = idx as u32;
-            let pos_ptr = &mut pos as *mut u32 as *mut u8;
-            let r = dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr, 4);
+            let r = file_select(s, idx as u32);
             if r < 0 {
                 build_error(s, b"404 Not Found", b"Not Found\n");
                 if let Some(cur) = cur_slot_mut(s) {
@@ -522,7 +490,7 @@ pub(crate) unsafe fn finish_response(s: &mut HttpState) {
         cur.head_ms = now;
         // Per-REQUEST, not per-connection: a keep-alive connection serves
         // many, and a stale HEAD would suppress the body of the GET after it.
-        cur.req_method = super::super::wire::method::METHOD_NONE;
+        cur.req_method = super::super::wire::method::NONE;
         cur.matched_route = -1;
     }
     // Release this request's decoded body, for the same reason: the next
@@ -726,6 +694,8 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> StepReturn {
                     super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                     core::ptr::null_mut(),
                     0,
+                    core::ptr::null_mut(),
+                    0,
                 );
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.fs_fd = -1;
@@ -747,7 +717,9 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> StepReturn {
             };
             let n = (sys.provider_call)(
                 cur_fs_fd(s),
-                super::super::abi::registry::fs::READ, // FS_READ
+                super::super::abi::registry::fs::READ,
+                core::ptr::null_mut(),
+                0,
                 cur_send_buf_mut_ptr(s),
                 cap,
             );
@@ -769,6 +741,8 @@ pub(crate) unsafe fn step_send_fs_file(s: &mut HttpState) -> StepReturn {
                 (sys.provider_call)(
                     cur_fs_fd(s),
                     super::super::abi::registry::fs::CLOSE, // FS_CLOSE
+                    core::ptr::null_mut(),
+                    0,
                     core::ptr::null_mut(),
                     0,
                 );

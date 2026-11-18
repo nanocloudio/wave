@@ -694,18 +694,13 @@ unsafe fn pump_trigger_table(s: &mut HttpState) {
     if prefix_len == 0 {
         return;
     }
-    if s.server.store_event < 0 {
-        return;
-    }
     let sys = &*s.syscalls;
-    let ev = s.server.store_event;
     {
         let store = &s.server.table_volume[..usize::from(s.server.table_volume_len)];
         let a = &mut s.server.sc;
         let prefix = &a.sessions_prefix[..prefix_len];
         let scratch = &mut s.server.routes_scratch;
-        a.stc
-            .advance(sys, store, ev, prefix, scratch, &mut a.desired);
+        a.stc.step(sys, store, prefix, scratch, &mut a.desired);
     }
     let a = &mut s.server.sc;
     if a.desired.seen != 0 && a.desired.live != a.active_w && a.swap_active == 0 {

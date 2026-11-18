@@ -149,7 +149,7 @@ pub(crate) mod session {
 use cache::{cache_release_for_route, CacheEntry, VarEntry};
 use fluxor_rt::StepReturn;
 use h1::step_active_slot;
-use listeners::{is_listen_port, pump_listeners, DynListeners, NET_MSG_BIND_REFUSED};
+use listeners::{is_listen_port, pump_listeners, DynListeners};
 use proxy::{find_slot_by_backend_conn, is_proxy_relay_phase};
 use routes::{
     match_route, match_route_path, DynRoutes, Route, HANDLER_STATIC, HANDLER_TEMPLATE,
@@ -173,11 +173,10 @@ use super::connection::{
 use super::wire;
 use super::HttpState;
 use super::{
-    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_input_flow_budget, dev_log,
-    dev_micros, dev_millis, dev_owner_tag, dev_requester_tag, dev_self_index,
-    dev_telemetry_enabled, dev_telemetry_span, fmt_u32_raw, heap_alloc, heap_free, heap_realloc,
-    msg_read, net_read_frame, net_write_frame, p_u16, p_u32, p_u8, IOCTL_FLUSH, IOCTL_NOTIFY,
-    IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN,
+    dev_bind_port, dev_channel_flush, dev_channel_port, dev_csprng_fill, dev_input_flow_budget,
+    dev_log, dev_micros, dev_millis, dev_requester_tag, dev_self_index, dev_telemetry_enabled,
+    dev_telemetry_span, fmt_u32_raw, heap_alloc, heap_free, heap_realloc, msg_read, net_read_frame,
+    net_write_frame, p_u16, p_u32, p_u8, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
@@ -200,10 +199,9 @@ pub(crate) use super::abi::config::http::{
 // `fluxor_sdk::cores::table_consumer` core — an implementation, not a wire
 // contract, so it comes from the SDK crate rather than the ABI.
 //
-// The store wakes them through ONE kernel event this instance creates
-// (`store_event`); it writes no channel of ours, so no port carries it.
-// `pump_store_event` takes the rung subscriptions once per step for all three,
-// and each pump then advances its own consumer.
+// Each consumer holds its own subscription handle, which the store rings on a
+// change; it writes no channel of ours, so no port carries it. Each pump
+// steps its own consumer: poll the subscription, then read what is owed.
 use fluxor_sdk::cores::table_consumer;
 pub(crate) use table_consumer::{TableConsumer, TableSink};
 
@@ -402,9 +400,9 @@ pub(crate) struct ConnSlot {
     pub(crate) recv_parsed: u8,
     pub(crate) req_path_len: u16,
     /// Method of the request currently being served, as a
-    /// `wire::method::METHOD_*` value. Set in `Phase::RecvRequest`,
+    /// `wire::method` value. Set in `Phase::RecvRequest`,
     /// consumed by dispatch (HEAD suppresses the response body) and by
-    /// the body reader. Reset to `METHOD_NONE` per request, not per
+    /// the body reader. Reset to `method::NONE` per request, not per
     /// connection: a keep-alive connection serves many, and a stale
     /// method would suppress the body of the GET that followed a HEAD.
     pub(crate) req_method: u8,
@@ -766,7 +764,7 @@ pub(crate) unsafe fn drain_peer_identities(s: &mut HttpState) {
     }
     let sys = &*s.syscalls;
     let rounds = rounds_for_grant(
-        dev_input_flow_budget(sys, chan, PEER_IDENTITY_PORT_INDEX),
+        dev_input_flow_budget(sys, PEER_IDENTITY_PORT_INDEX),
         pid::MAX_TOTAL,
         PER_STEP,
         64,
@@ -1021,8 +1019,8 @@ pub(crate) struct ServerState {
     /// File-backed content channel used by `HANDLER_FILE`,
     /// `HANDLER_STREAM`, and `HANDLER_TEMPLATE`'s cache-fill path.
     /// One channel shared across all slots; serialised via
-    /// `file_chan_owner` so concurrent fetches don't race on
-    /// `IOCTL_FLUSH`/`IOCTL_NOTIFY`. `HANDLER_FS_FILE` (handler 7)
+    /// `file_chan_owner` so concurrent fetches don't race on its
+    /// `FLUSH` + `stream_select` `SELECT` pair. `HANDLER_FS_FILE` (handler 7)
     /// bypasses this entirely via per-slot `fs_fd` through the
     /// FS_CONTRACT and is the recommended path for new deployments.
     pub(crate) file_chan: i32,
@@ -1034,7 +1032,10 @@ pub(crate) struct ServerState {
     /// in `slot_release_buffers` (any close path).
     pub(crate) file_chan_owner: i16,
     _file_chan_pad: [u8; 2],
-    pub(crate) out_chan: i32,
+    /// `stream_select` handle bound on the `file_data` input port, through
+    /// which a fetch names the item the producer streams next. Bound on the
+    /// first fetch; `-1` until then.
+    pub(crate) file_select: i32,
     /// Output channel for `ws_out` (manifest port out[2]). Carries
     /// `WsFrame` records when a route uses `HANDLER_WEBSOCKET_FANOUT`.
     /// `-1` if the port is unwired.
@@ -1393,11 +1394,6 @@ pub(crate) struct ServerState {
     pub(crate) ltc: TableConsumer,
     /// Desired-listener table + reconciler bind records.
     pub(crate) listeners: DynListeners,
-
-    /// The kernel event every store subscription of this instance names
-    /// (routes, listeners, session trigger). Created on the first step
-    /// that has a table to follow; `-1` until then.
-    pub(crate) store_event: i32,
 }
 
 /// Store-prefix buffer for `routes_prefix`.
@@ -1519,17 +1515,22 @@ pub(crate) unsafe fn find_sentinel_ws_fanout_slot(s: &HttpState) -> Option<usize
 /// pointers) by `slot_release_buffers` on the close path — this
 /// function therefore only needs to acquire fresh buffers and set
 /// the conn id.
-/// The session generation on the `MSG_ACCEPTED` sitting in `net_buf`, or 0
-/// when the stage below numbers no sessions.
+/// `(conn_id, local_port, session generation)` of the `MSG_ACCEPTED`
+/// sitting in `net_buf`; `None` unless its payload is exactly one. The
+/// generation is 0 when the stage below numbers no sessions.
 ///
 /// # Safety
 ///
 /// `net_buf` holds a frame whose payload is `payload_len` bytes long.
-pub(crate) unsafe fn accepted_generation(s: &HttpState, payload_len: usize) -> u16 {
-    net_proto::session_generation(
-        core::slice::from_raw_parts(s.net_buf.as_ptr().add(NET_FRAME_HDR), payload_len),
-        net_proto::ACCEPTED_FIXED,
-    )
+pub(crate) unsafe fn accepted_in_net_buf(
+    s: &HttpState,
+    payload_len: usize,
+) -> Option<(u16, u16, u16)> {
+    let a = net_proto::accepted_parts(core::slice::from_raw_parts(
+        s.net_buf.as_ptr().add(NET_FRAME_HDR),
+        payload_len,
+    ))?;
+    Some((a.conn_id, a.local_port, a.opening.generation))
 }
 
 pub(crate) unsafe fn alloc_free_slot(
@@ -2034,7 +2035,7 @@ pub(crate) unsafe fn init(s: &mut HttpState, pool_bytes: u32) {
     s.server.var_chan = -1;
     s.server.file_chan = -1;
     s.server.file_chan_owner = -1;
-    s.server.out_chan = -1;
+    s.server.file_select = -1;
     s.server.ws_out_chan = -1;
     s.server.ws_admit_out_chan = -1;
     s.server.peer_chan = -1;
@@ -2054,11 +2055,9 @@ pub(crate) unsafe fn init(s: &mut HttpState, pool_bytes: u32) {
     s.server.app_out_chan = -1;
     s.server.app_in_chan = -1;
     s.server.latest_fanout_slot = -1;
-    // Store subscriptions: the event is created on the first pump that has
-    // a table to follow. The route arena, listener table, their shadows and
-    // the TableConsumers are zero-init (kernel zero-fills state) —
-    // equivalent to `DynRoutes::new()` / `TableConsumer::new()`.
-    s.server.store_event = -1;
+    // The route arena, listener table, their shadows and the
+    // TableConsumers are zero-init (kernel zero-fills state) — equivalent to
+    // `DynRoutes::new()` / `TableConsumer::new()`.
     s.server.proxy_connect_owner = -1;
     s.server.sc.init();
     s.server.port = 80;
@@ -2110,12 +2109,10 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
     //   in[1]  = variable updates  (FmpMessage)
     //   in[2]  = file data         (OctetStream)
     //   in[3]  = ws_in             (WsFrame, fan-out only)
-    //   out[1] = file ctrl         (OctetStream)
     //   out[2] = ws_out            (WsFrame, fan-out only)
     s.server.var_chan = dev_channel_port(sys, 0, 1);
-    s.server.file_chan = dev_channel_port(sys, 0, 2);
+    s.server.file_chan = dev_channel_port(sys, 0, FILE_DATA_PORT_INDEX);
     s.server.ws_in_chan = dev_channel_port(sys, 0, 3);
-    s.server.out_chan = dev_channel_port(sys, 1, 1);
     s.server.ws_out_chan = dev_channel_port(sys, 1, 2);
     // Retention buffer: server-wide snapshot of the most recent burst on
     // `ws_in`, so a connection that joins a fan-out sees the producer's last
@@ -2162,17 +2159,6 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) {
             s.server.unrouted_mode = 1;
         } else if s.server.file_chan >= 0 {
             s.server.unrouted_mode = 2;
-        }
-    }
-
-    if s.server.file_chan >= 0 {
-        let mut count: u32 = 0;
-        let count_ptr = &mut count as *mut u32 as *mut u8;
-        let r = dev_channel_ioctl(sys, s.server.file_chan, IOCTL_POLL_NOTIFY, count_ptr, 4);
-        if r >= 0 {
-            if let Some(cur) = cur_slot_mut(s) {
-                cur.file_count = count as u16;
-            }
         }
     }
 
@@ -2244,6 +2230,43 @@ pub(crate) unsafe fn log(s: &HttpState, msg: &[u8]) {
     dev_log(&*s.syscalls, 3, msg.as_ptr(), msg.len());
 }
 
+/// Input port index of `file_data` (manifest: index 2).
+pub(crate) const FILE_DATA_PORT_INDEX: u8 = 2;
+
+/// Restart the `file_data` stream at item `pos`: `FLUSH` what `file_chan`
+/// holds (it belongs to the stream being abandoned), then `stream_select`
+/// `SELECT(pos)` through the handle bound on the `file_data` port, bound on
+/// first use. The producer then writes the item and ends it with its HUP.
+/// Returns the `SELECT` result: 0, or a negative errno (`EINVAL` for an item
+/// the producer does not hold, the bind's errno when the producer serves no
+/// `stream_select`).
+pub(crate) unsafe fn file_select(s: &mut HttpState, pos: u32) -> i32 {
+    use super::abi::contracts::stream_select;
+    let sys = &*s.syscalls;
+    if s.server.file_select < 0 {
+        let h = dev_bind_port(
+            sys,
+            stream_select::CLASS,
+            super::abi::kernel_abi::bind::PORT_IN,
+            FILE_DATA_PORT_INDEX,
+        );
+        if h < 0 {
+            return h;
+        }
+        s.server.file_select = h;
+    }
+    dev_channel_flush(sys, s.server.file_chan);
+    let mut arg = stream_select::select::encode(u64::from(pos));
+    (sys.provider_call)(
+        s.server.file_select,
+        stream_select::SELECT,
+        arg.as_mut_ptr(),
+        arg.len(),
+        core::ptr::null_mut(),
+        0,
+    )
+}
+
 /// Try to claim exclusive use of `file_chan` for the active slot.
 /// Returns `true` if the channel is now ours (either freshly claimed
 /// or already held by us). Returns `false` if another slot owns it —
@@ -2251,10 +2274,10 @@ pub(crate) unsafe fn log(s: &HttpState, msg: &[u8]) {
 /// tick.
 ///
 /// Multi-conn safety: HANDLER_FILE / HANDLER_STREAM / HANDLER_TEMPLATE's
-/// cache-fill path issue `IOCTL_FLUSH` + `IOCTL_NOTIFY` and then read
-/// the response body across multiple step()s. Without serialisation
-/// a second slot's FLUSH wipes the first's pending notify mid-fetch,
-/// shredding the body. This guard linearises the channel.
+/// cache-fill path issue [`file_select`] and then read the response body
+/// across multiple step()s. Without serialisation a second slot's select
+/// restarts the stream mid-fetch, shredding the first's body. This guard
+/// linearises the channel.
 #[inline]
 pub(crate) unsafe fn try_acquire_file_chan(s: &mut HttpState) -> bool {
     let me = s.server.cur_slot;
@@ -2324,6 +2347,8 @@ pub(crate) unsafe fn reset_connection(s: &mut HttpState) {
             crate::abi::registry::fs::CLOSE, // FS_CLOSE
             core::ptr::null_mut(),
             0,
+            core::ptr::null_mut(),
+            0,
         );
     }
     // Proxy relay teardown: close the upstream backend conn (if any,
@@ -2373,14 +2398,13 @@ pub(crate) unsafe fn close_net_conn(s: &mut HttpState, conn_id: u16) {
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
-    let mut payload = [0u8; 2];
-    net_proto::put_conn_id(&mut payload, conn_id);
+    let payload = net_proto::close(conn_id, false);
     net_write_frame(
         sys,
         chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        2,
+        payload.len(),
         buf,
         NET_BUF_SIZE,
     );
@@ -2493,16 +2517,18 @@ unsafe fn demux_inbound(s: &mut HttpState) {
     let chan = s.net_in_chan;
     // Bound the loop so a stuck channel can't monopolise a tick;
     // anything left over rolls into the next demux call. The bound is the
-    // kernel's per-step grant for `net_in` in MSS-sized frames, floored at
-    // 16, so an edge with a declared rate class drains at that rate and one
-    // without keeps a fixed per-step bound.
-    let rounds = rounds_for_grant(
-        dev_input_flow_budget(sys, chan, 0),
-        super::connection::MAX_DATA_FRAGMENT,
-        16,
-        256,
-    );
-    for _ in 0..rounds {
+    // kernel's per-step grant for `net_in`, in bytes, counted frame by frame
+    // as they are read: at least 16 frames a step (an edge without a rate
+    // class grants 0) and at most 256, so an edge with a declared rate class
+    // drains at that rate whatever its frames carry.
+    const FLOOR: usize = 16;
+    const CAP: usize = 256;
+    let grant = dev_input_flow_budget(sys, 0) as usize;
+    let mut moved = 0usize;
+    for round in 0..CAP {
+        if round >= FLOOR && moved >= grant {
+            return;
+        }
         let poll = (sys.channel_poll)(chan, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             return;
@@ -2524,6 +2550,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
         }
         let peeked_msg = hdr[0];
         let peeked_payload_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+        moved += NET_FRAME_HDR + peeked_payload_len;
         if peeked_msg == NET_MSG_DATA && peeked_payload_len > 2 {
             // Need at least the conn_id bytes to find the target.
             if peeked < NET_FRAME_HDR as i32 + 2 {
@@ -2588,23 +2615,15 @@ unsafe fn demux_inbound(s: &mut HttpState) {
         let buf = s.net_buf.as_mut_ptr();
         let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
         match msg_type {
-            NET_MSG_ACCEPTED if payload_len >= 2 => {
-                let conn = net_proto::conn_id(core::slice::from_raw_parts(
-                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                    payload_len,
-                ));
-                // Multi-anchor demux: when the accept carries a listener
-                // port (payload_len >= 4), claim it only if it matches our
-                // bound port — a fanned net_out delivers every consumer's
-                // accepts to all of them. A port-less frame (single-anchor
-                // producer) is always ours. A non-matching accept is
-                // ignored (the owning anchor closes/claims it).
-                let ours = payload_len < 4 || {
-                    let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
-                    let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
-                    is_listen_port(s, (lo as u16) | ((hi as u16) << 8))
+            NET_MSG_ACCEPTED => {
+                let Some((conn, port, generation)) = accepted_in_net_buf(s, payload_len) else {
+                    continue;
                 };
-                if ours {
+                // Multi-anchor demux: claim the accept only if its listener
+                // port is one of ours — a fanned net_out delivers every
+                // consumer's accepts to all of them. A non-matching accept is
+                // ignored (the owning anchor closes/claims it).
+                if is_listen_port(s, port) {
                     if s.server.draining != 0 {
                         // Admission stops at the drain, and it stops HERE
                         // rather than at the top of `step`: inbound bytes for
@@ -2614,9 +2633,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                         // dropping it is what stops a continuous arrival
                         // stream from holding quiescence open indefinitely.
                         close_net_conn(s, conn);
-                    } else if let Some(idx) =
-                        alloc_free_slot(s, conn, accepted_generation(s, payload_len))
-                    {
+                    } else if let Some(idx) = alloc_free_slot(s, conn, generation) {
                         let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                         slot.phase = Phase::RecvRequest;
                     } else {
@@ -2631,27 +2648,14 @@ unsafe fn demux_inbound(s: &mut HttpState) {
             // A dynamic listener's mid-life bind completed. Post-
             // `bound`, a MSG_BOUND is only ever a pooled-listener bind (the
             // static bind is consumed pre-`bound` by slot 0's WaitBound).
-            // Payload `[conn_id:1][port:2 LE]`.
-            NET_MSG_BOUND if payload_len >= 4 => {
-                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+            NET_MSG_BOUND => {
+                let bound = net_proto::bound_parts(core::slice::from_raw_parts(
                     s.net_buf.as_ptr().add(NET_FRAME_HDR),
                     payload_len,
-                )) as i32;
-                let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
-                let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
-                let port = (lo as u16) | ((hi as u16) << 8);
-                s.server.listeners.mark_bound(port, conn);
-            }
-            // A mid-life bind was refused — the port is outside the edge
-            // owner's lease pool. linux_net
-            // frames it `[port:2 LE][errno:1]`. Acted on ONLY with the
-            // feature configured, so the metal `ip` module's 0x07
-            // (RETRANSMIT) is never misread on the byte-identical path.
-            NET_MSG_BIND_REFUSED if s.server.listeners_prefix_len != 0 && payload_len >= 2 => {
-                let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
-                let port = (lo as u16) | ((hi as u16) << 8);
-                s.server.listeners.mark_refused(port);
+                ));
+                if let Some((conn, port, _)) = bound {
+                    s.server.listeners.mark_bound(port, i32::from(conn));
+                }
             }
             NET_MSG_DATA if payload_len > 2 => {
                 let conn = net_proto::conn_id(core::slice::from_raw_parts(
@@ -2704,9 +2708,9 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 }
                 // Else: orphan — slot already closed; drop the data.
             }
-            NET_MSG_CONNECTED if payload_len >= 2 => {
+            NET_MSG_CONNECTED => {
                 // Reply to a serialised proxy dial. `MSG_CONNECTED` carries
-                // `[conn_id u16][requester_tag u16]`. The tag is our module
+                // `[conn_id u16][requester_tag u16]…`. The tag is our module
                 // index + 1 and is identical across slots, so it cannot say
                 // WHICH slot dialled — the pending `proxy_connect_owner` is
                 // that correlator — but it does say whether the connection is
@@ -2714,15 +2718,14 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 // co-wired client) another consumer's connect would otherwise
                 // be latched as this server's backend, binding one request's
                 // client to another module's socket.
-                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                let Some((conn, tag)) = net_proto::connected_parts(core::slice::from_raw_parts(
                     s.net_buf.as_ptr().add(NET_FRAME_HDR),
                     payload_len,
-                ));
+                ))
+                .map(|c| (c.conn_id, c.requester_tag)) else {
+                    continue;
+                };
                 let me = dev_requester_tag(sys);
-                let (_, tag) = net_proto::connected_parts(core::slice::from_raw_parts(
-                    s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                    payload_len,
-                ));
                 if tag == 0 || tag == me {
                     let owner = s.server.proxy_connect_owner;
                     if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
@@ -2732,7 +2735,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                     }
                 }
             }
-            NET_MSG_ERROR if payload_len >= 2 => {
+            NET_MSG_ERROR => {
                 // An ERROR is one of two different events and they are told
                 // apart by which field identifies the owner.
                 //
@@ -2750,20 +2753,13 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 // `proxy_connect_owner`, or a peer reset anywhere would abort
                 // an unrelated backend dial and charge a spurious failover
                 // against a healthy upstream.
-                let conn = net_proto::conn_id(core::slice::from_raw_parts(
+                let Some((conn, _, tag)) = net_proto::error_parts(core::slice::from_raw_parts(
                     s.net_buf.as_ptr().add(NET_FRAME_HDR),
                     payload_len,
-                ));
-                let tag = if payload_len >= 3 {
-                    net_proto::error_parts(core::slice::from_raw_parts(
-                        s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                        payload_len,
-                    ))
-                    .2
-                } else {
-                    net_proto::REQUESTER_TAG_NONE
+                )) else {
+                    continue;
                 };
-                if tag != 0 {
+                if tag != net_proto::REQUESTER_TAG_NONE {
                     // TAGGED: a connect-phase failure, attributed to the
                     // requester that dialled. Ours only if the tag is ours —
                     // on a fanned `net_in` this is what stops a co-wired
@@ -2788,6 +2784,10 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                     // is staged, then tears down.
                     let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                     slot.backend_closed = 1;
+                } else if s.server.listeners.mark_binding_refused() {
+                    // Untagged and owned by no connection: a refused bind,
+                    // which names no port. The reconciler keeps one mid-life
+                    // bind outstanding, so it is that one.
                 } else if dev_requester_tag(sys) == 0 {
                     // Untagged, and owned by no slot of ours. This is only OUR
                     // connect failure if we dialled untagged too — `proxy_dial`
@@ -2838,60 +2838,23 @@ unsafe fn demux_inbound(s: &mut HttpState) {
 /// Iteration starts at `step_cursor` and walks the bitmap forward
 /// (wrapping at the end). Each tick advances the cursor by one
 /// slot so no single conn can starve others on consecutive ticks.
-/// Take the store's rung subscriptions for every table consumer of this
-/// instance, once per step: create the shared event on the first step that
-/// has a table to follow, then `event::POLL` it and `TAKE_RUNG`, marking each
-/// named consumer pending. No-op when no table is configured, keeping the
-/// server byte-identical.
-pub(crate) unsafe fn pump_store_event(s: &mut HttpState) {
-    #[cfg(feature = "session")]
-    let sessions_on = s.server.sc.sessions_prefix_len != 0;
-    #[cfg(not(feature = "session"))]
-    let sessions_on = false;
-    if s.server.routes_prefix_len == 0 && s.server.listeners_prefix_len == 0 && !sessions_on {
-        return;
-    }
-    let sys = &*s.syscalls;
-    if s.server.store_event < 0 {
-        // Asked again next step if the event pool is spent.
-        s.server.store_event = table_consumer::create_event(sys);
-        if s.server.store_event < 0 {
-            return;
-        }
-    }
-    let ev = s.server.store_event;
-    // Disjoint field borrows of `s.server`.
-    let server = &mut s.server;
-    let store = &server.table_volume[..usize::from(server.table_volume_len)];
-    #[cfg(feature = "session")]
-    table_consumer::take_rung(
-        sys,
-        store,
-        ev,
-        &mut [&mut server.tc, &mut server.ltc, &mut server.sc.stc],
-    );
-    #[cfg(not(feature = "session"))]
-    table_consumer::take_rung(sys, store, ev, &mut [&mut server.tc, &mut server.ltc]);
-}
-
 /// Pump the dynamic-route table consumer one step: run the subscribe /
 /// read / shadow-relist state machine against `routes_prefix`. No-op when
 /// the feature is off (`routes_prefix_len == 0`), keeping the server
 /// byte-identical.
 pub(crate) unsafe fn pump_dyn_routes(s: &mut HttpState) {
     let prefix_len = s.server.routes_prefix_len as usize;
-    if prefix_len == 0 || s.server.store_event < 0 {
+    if prefix_len == 0 {
         return;
     }
     let sys = &*s.syscalls;
-    let ev = s.server.store_event;
     // Disjoint field borrows of `s.server`.
     let prefix = &s.server.routes_prefix[..prefix_len];
     let store = &s.server.table_volume[..usize::from(s.server.table_volume_len)];
     let scratch = &mut s.server.routes_scratch;
     let tc = &mut s.server.tc;
     let dyn_routes = &mut s.server.dyn_routes;
-    tc.advance(sys, store, ev, prefix, scratch, dyn_routes);
+    tc.step(sys, store, prefix, scratch, dyn_routes);
 }
 
 /// Whether every abort owed to the application has been delivered: an
@@ -2919,7 +2882,6 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
     // `drain_responses` hands each record to the exchange it names.
     #[cfg(feature = "app")]
     app::drain_responses(s);
-    pump_store_event(s);
     pump_dyn_routes(s);
     pump_listeners(s);
     // Re-offer lifecycle events a full `ws_event_out` refused earlier. Before

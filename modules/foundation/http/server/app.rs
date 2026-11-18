@@ -41,10 +41,11 @@
 //! application's credit.
 
 use super::super::exchange::{
-    abort as abort_reason, flag, header, link, parse_response, seal_body, write_abort,
-    write_credit, write_request_head, ExchangeId, Record, RequestHead, BODY_MAX, HDR, RECORD_MAX,
-    REQ_HEAD_FIXED,
+    abort as abort_reason, flag, link, meta_field_len, meta_get, op, seal_body, write_abort,
+    write_credit, write_request_head, ExchangeId, MetaWriter, Record, RequestHead, ResponseRecord,
+    BODY_MAX, HDR, RECORD_MAX, REQ_HEAD_FIXED,
 };
+use super::super::exchange_http::{self as http_binding, Http};
 use super::super::wire::method;
 use super::{
     cur_slot, cur_slot_mut, find_slot_by_conn_id, heap_alloc, heap_free, HttpState,
@@ -168,6 +169,64 @@ impl AppId {
     }
 }
 
+/// How the server routed a request it hands to the application: the HTTP
+/// binding's `:route` field, absent for an application route.
+pub(crate) mod route {
+    /// An application route (`HANDLER_APP`): no `:route` field.
+    pub(crate) const APP: u8 = 0;
+    /// A file route this generation does not serve itself.
+    pub(crate) const FILE: u8 = 1;
+    /// A proxy route this generation does not serve itself.
+    pub(crate) const PROXY: u8 = 2;
+}
+
+/// The most meta bytes the `:route` field adds to a request HEAD.
+const ROUTE_META_MAX: usize = meta_field_len(
+    http_binding::META_ROUTE.len(),
+    if http_binding::ROUTE_FILE.len() > http_binding::ROUTE_PROXY.len() {
+        http_binding::ROUTE_FILE.len()
+    } else {
+        http_binding::ROUTE_PROXY.len()
+    },
+);
+
+/// A request as a generation hands it to the application: what the exchange
+/// HEAD is composed from. The header block is the request's own
+/// `name: value\r\n` lines, sent as the HEAD's meta.
+#[derive(Clone, Copy)]
+pub(crate) struct AppRequest<'a> {
+    pub(crate) id: ExchangeId,
+    pub(crate) flags: u8,
+    /// The request's method (`wire::method`).
+    pub(crate) method: u8,
+    /// The verb of the session an extended CONNECT opens (`WS_CONNECT`,
+    /// `WT_CONNECT`), or 0.
+    pub(crate) opens: u8,
+    /// One of [`route`].
+    pub(crate) route: u8,
+    pub(crate) target: &'a [u8],
+    pub(crate) headers: &'a [u8],
+    pub(crate) peer: &'a [u8],
+    pub(crate) resp_credit: u32,
+    pub(crate) body: &'a [u8],
+}
+
+/// The `(op, verb)` a request with `method` travels as: a CONNECT opens a
+/// session (the extended CONNECT's own verb when `opens` names one), every
+/// other method is a call.
+pub(crate) fn op_verb(m: u8, opens: u8) -> (u8, u8) {
+    if m == method::CONNECT {
+        (op::OPEN, if opens != 0 { opens } else { method::CONNECT })
+    } else {
+        (op::CALL, m)
+    }
+}
+
+/// The application's response, decoded as the HTTP party this server is.
+pub(crate) fn parse_response(rec: &[u8]) -> Option<ResponseRecord<'_>> {
+    super::super::exchange::parse_response::<Http>(rec).ok()
+}
+
 /// Exchange state bits.
 pub(crate) mod ex {
     /// The HEAD went out: the application knows this exchange.
@@ -203,7 +262,7 @@ pub(crate) struct Exchange {
     /// granted back.
     pub(crate) resp_owed: u32,
     pub(crate) state: u8,
-    /// The response HEAD's flags (`HOLD`, `WEBSOCKET`, …).
+    /// The response HEAD's flags (`HOLD`, `RAISED`, …).
     pub(crate) resp_flags: u8,
     pub(crate) _pad: [u8; 2],
 }
@@ -549,22 +608,56 @@ pub(crate) enum Emit {
     BodyBad,
 }
 
-/// Request-body bytes a HEAD carrying these fields has room for inline.
+/// Request-body bytes a HEAD carrying these fields has room for inline. A
+/// header block's meta is never longer than the block, so the room is never
+/// overstated.
 pub(crate) fn inline_room(target: &[u8], headers: &[u8], peer: &[u8]) -> usize {
-    RECORD_MAX.saturating_sub(HDR + REQ_HEAD_FIXED + target.len() + headers.len() + peer.len())
+    RECORD_MAX.saturating_sub(
+        HDR + REQ_HEAD_FIXED + target.len() + headers.len() + ROUTE_META_MAX + peer.len(),
+    )
 }
 
 /// Whether a request's header block asks for `100 Continue` before its body.
 pub(crate) fn wants_continue(headers: &[u8]) -> bool {
-    header(headers, b"expect").is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"))
+    http_binding::header(headers, b"expect")
+        .is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"))
 }
 
-/// Compose a request HEAD into `rec`, its length or the refusal it earns.
-pub(crate) fn compose_head(head: &RequestHead<'_>, rec: &mut [u8]) -> Result<usize, Emit> {
-    if head.headers.len() > MAX_FWD_HEADERS || head.target.len() > MAX_TARGET {
+/// Compose a request HEAD into `rec`, its length or the refusal it earns:
+/// the header block becomes the HEAD's meta (each field keyed by its name in
+/// lower case), followed by the `:route` field for a delegated route.
+pub(crate) fn compose_head(req: &AppRequest<'_>, rec: &mut [u8]) -> Result<usize, Emit> {
+    if req.headers.len() > MAX_FWD_HEADERS || req.target.len() > MAX_TARGET {
         return Err(Emit::TooLarge);
     }
-    write_request_head(head, rec).ok_or(Emit::TooLarge)
+    let mut meta = [0u8; MAX_FWD_HEADERS + ROUTE_META_MAX];
+    let mut n = http_binding::meta_from_header_lines(req.headers, &mut meta[..MAX_FWD_HEADERS])
+        .ok_or(Emit::TooLarge)?;
+    let value: &[u8] = if req.route == route::FILE {
+        http_binding::ROUTE_FILE
+    } else if req.route == route::PROXY {
+        http_binding::ROUTE_PROXY
+    } else {
+        &[]
+    };
+    if !value.is_empty() {
+        let mut w = MetaWriter::new(&mut meta[n..]);
+        w.put(http_binding::META_ROUTE, value);
+        n += w.finish().ok_or(Emit::TooLarge)?;
+    }
+    let (op, verb) = op_verb(req.method, req.opens);
+    let head = RequestHead {
+        id: req.id,
+        flags: req.flags,
+        op,
+        verb,
+        target: req.target,
+        meta: &meta[..n],
+        peer: req.peer,
+        resp_credit: req.resp_credit,
+        body: req.body,
+    };
+    write_request_head::<Http>(&head, rec).ok_or(Emit::TooLarge)
 }
 
 /// Send a composed request HEAD, opening an exchange the application then
@@ -588,7 +681,7 @@ pub(crate) unsafe fn send_head(s: &mut HttpState, rec: &[u8]) -> Emit {
 }
 
 /// Compose and send a request HEAD whose inline body, if any, is in hand.
-pub(crate) unsafe fn emit_head(s: &mut HttpState, head: &RequestHead<'_>) -> Emit {
+pub(crate) unsafe fn emit_head(s: &mut HttpState, head: &AppRequest<'_>) -> Emit {
     if s.server.app_out_chan < 0 {
         return Emit::Unwired;
     }
@@ -645,7 +738,7 @@ pub(crate) fn plan_buffered(
 
 /// The `content-length` a request's header block declares, when it parses.
 pub(crate) fn declared_request_length(headers: &[u8]) -> Option<u64> {
-    declared_length(headers)
+    decimal(http_binding::header(headers, b"content-length")?)
 }
 
 /// A fresh exchange, as its HEAD goes out.
@@ -871,10 +964,12 @@ pub(crate) unsafe fn h1_begin(
         conn: conn_id as u32,
         stream,
     };
-    let head = RequestHead {
+    let head = AppRequest {
         id: id.exchange_id(),
         flags: 0,
         method: verb,
+        opens: 0,
+        route: route::APP,
         target,
         headers,
         peer,
@@ -1302,9 +1397,10 @@ unsafe fn h1_compose_head(s: &mut HttpState, rec: &[u8]) -> bool {
         return false;
     };
     let verb = cur_slot(s).map(|c| c.req_method).unwrap_or(0);
-    let carries = status_allows_body(h.status, verb);
+    let status = http_binding::status_of(&h);
+    let carries = status_allows_body(status, verb);
     let streaming = h.flags & flag::MORE != 0;
-    let declared = declared_length(h.headers);
+    let declared = declared_response_length(h.meta);
     // The framing the peer reads the body by:
     //  - no body (HEAD, 204, 304): the application's own `Content-Length`,
     //    which for HEAD is the length the GET would carry;
@@ -1312,7 +1408,7 @@ unsafe fn h1_compose_head(s: &mut HttpState, rec: &[u8]) -> bool {
     //  - streamed: the application's declared length, or, without one, the
     //    end of the connection.
     let length: Option<u64> = if !carries {
-        if method::method_sends_response_body(verb) && !matches!(h.status, 304) {
+        if method::method_sends_response_body(verb) && !matches!(status, 304) {
             None
         } else {
             declared
@@ -1330,12 +1426,12 @@ unsafe fn h1_compose_head(s: &mut HttpState, rec: &[u8]) -> bool {
             cur.keepalive = 0;
         }
     }
-    let ct: &[u8] = if h.content_type.is_empty() {
+    let ct: &[u8] = if h.content_type().is_empty() {
         b"application/octet-stream"
     } else {
-        h.content_type
+        h.content_type()
     };
-    let ok = super::response::build_app_header(s, h.status, ct, length, h.headers);
+    let ok = super::response::build_app_header(s, status, ct, length, h.meta);
     if let Some(cur) = cur_slot_mut(s) {
         cur.resp_carries_body = carries as u8;
         cur.resp_length_known = (carries && length.is_some()) as u8;
@@ -1344,9 +1440,13 @@ unsafe fn h1_compose_head(s: &mut HttpState, rec: &[u8]) -> bool {
     ok
 }
 
-/// The `Content-Length` an application declared in its own header block.
-pub(crate) fn declared_length(headers: &[u8]) -> Option<u64> {
-    let v = super::super::exchange::header(headers, b"content-length")?;
+/// The `content-length` an application declared in its response meta.
+pub(crate) fn declared_response_length(meta: &[u8]) -> Option<u64> {
+    decimal(meta_get(meta, b"content-length")?)
+}
+
+/// A `content-length` value: decimal digits only.
+fn decimal(v: &[u8]) -> Option<u64> {
     if v.is_empty() {
         return None;
     }

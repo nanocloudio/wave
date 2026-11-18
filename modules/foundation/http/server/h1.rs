@@ -24,9 +24,10 @@
 //! emit, `super::response` to stage a head, `super::ws` to upgrade,
 //! `super::proxy` to relay. This file owns the ORDER, not the work.
 
+use super::super::abi::contracts::storage::fs;
 use super::super::connection::{
-    net_proto, NET_BUF_SIZE, NET_CMD_BIND, NET_MSG_ACCEPTED, NET_MSG_BOUND, NET_MSG_CLOSED,
-    NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
+    net_proto, stream_trace, NET_BUF_SIZE, NET_CMD_BIND, NET_MSG_ACCEPTED, NET_MSG_BOUND,
+    NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
 };
 use super::super::wire;
 use super::body::{
@@ -37,7 +38,7 @@ use super::cache::{
     cache_alloc, cache_lookup, cache_refuse_oversize, cache_release_for_route, drain_variables,
     CACHE_COMPLETE,
 };
-use super::listeners::fill_bind_payload;
+use super::listeners::bind_payload;
 use super::proxy::{
     begin_proxy, proxy_build_forward_head, proxy_connect_failed, proxy_dial, proxy_relay_step,
     try_begin_dyn_proxy, PROXY_CONNECT_TIMEOUT_MS,
@@ -71,11 +72,10 @@ use super::{
     alloc_free_slot, close_net_conn, cur_conn_id, cur_fs_fd, cur_matched_route, cur_phase,
     cur_recv_buf_mut_ptr, cur_recv_buf_ptr, cur_recv_len, cur_send_buf_mut_ptr, cur_send_buf_ptr,
     cur_send_len, cur_send_offset, cur_slot, cur_slot_mut, cur_ws_fan_out, current_slot_index,
-    dev_channel_ioctl, dev_micros, dev_millis, dev_telemetry_enabled, find_slot_by_conn_id,
-    hex_val, log, net_read_frame, net_send, net_send_conn, net_write_frame, ready_clear,
-    release_file_chan, reset_connection, try_acquire_file_chan, HttpState, Phase, IOCTL_FLUSH,
-    IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, MAX_CONTENT_TYPE, MAX_FS_PATH, MAX_PATH, NET_FRAME_HDR,
-    POLL_HUP, POLL_IN, RECV_BUF_SIZE, SEND_BUF_SIZE,
+    dev_micros, dev_millis, dev_telemetry_enabled, file_select, find_slot_by_conn_id, hex_val, log,
+    net_read_frame, net_send, net_send_conn, net_write_frame, ready_clear, release_file_chan,
+    reset_connection, try_acquire_file_chan, HttpState, Phase, MAX_CONTENT_TYPE, MAX_FS_PATH,
+    MAX_PATH, NET_FRAME_HDR, POLL_HUP, POLL_IN, RECV_BUF_SIZE, SEND_BUF_SIZE,
 };
 #[cfg(feature = "h2")]
 use super::{cur_h2_mut, ensure_h2_state};
@@ -248,6 +248,8 @@ unsafe fn begin_fs_root(s: &mut HttpState) -> StepReturn {
             super::super::abi::registry::fs::OPENDIR, /* FS_OPENDIR */
             path.as_mut_ptr(),
             n,
+            core::ptr::null_mut(),
+            0,
         );
         if fs_pending(dir) {
             return fs_dispatch_wait(s);
@@ -256,6 +258,8 @@ unsafe fn begin_fs_root(s: &mut HttpState) -> StepReturn {
             (sys.provider_call)(
                 dir,
                 super::super::abi::registry::fs::CLOSE, /* FS_CLOSE */
+                core::ptr::null_mut(),
+                0,
                 core::ptr::null_mut(),
                 0,
             );
@@ -279,6 +283,8 @@ unsafe fn begin_fs_root(s: &mut HttpState) -> StepReturn {
         super::super::abi::registry::fs::OPEN, /* FS_OPEN */
         path.as_mut_ptr(),
         n,
+        core::ptr::null_mut(),
+        0,
     );
     if fs_pending(fd) {
         return fs_dispatch_wait(s);
@@ -485,6 +491,8 @@ unsafe fn step_fs_list(s: &mut HttpState) -> StepReturn {
         let nb = (sys.provider_call)(
             dir_fd,
             super::super::abi::registry::fs::READDIR,
+            core::ptr::null_mut(),
+            0,
             readdir_buf.as_mut_ptr(),
             readdir_buf.len(),
         );
@@ -522,6 +530,8 @@ unsafe fn step_fs_list(s: &mut HttpState) -> StepReturn {
                 super::super::abi::registry::fs::CLOSE, /* FS_CLOSE */
                 core::ptr::null_mut(),
                 0,
+                core::ptr::null_mut(),
+                0,
             );
             if let Some(cur) = cur_slot_mut(s) {
                 cur.fs_fd = -1;
@@ -544,6 +554,8 @@ unsafe fn step_fs_list(s: &mut HttpState) -> StepReturn {
             super::super::abi::registry::fs::CLOSE, /* FS_CLOSE */
             core::ptr::null_mut(),
             0,
+            core::ptr::null_mut(),
+            0,
         );
         if let Some(cur) = cur_slot_mut(s) {
             cur.fs_fd = -1;
@@ -562,6 +574,8 @@ unsafe fn step_fs_list(s: &mut HttpState) -> StepReturn {
     (sys.provider_call)(
         dir_fd,
         super::super::abi::registry::fs::CLOSE, /* FS_CLOSE */
+        core::ptr::null_mut(),
+        0,
         core::ptr::null_mut(),
         0,
     );
@@ -704,6 +718,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                         core::ptr::null_mut(),
                         0,
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.fs_fd = -1;
@@ -732,14 +748,13 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
             let sys = &*s.syscalls;
             let chan = s.net_out_chan;
             let buf = s.net_buf.as_mut_ptr();
-            let mut payload = [0u8; 4];
-            let plen = fill_bind_payload(sys, s.server.port, &mut payload);
+            let payload = bind_payload(s.server.port);
             let wrote = net_write_frame(
                 sys,
                 chan,
                 NET_CMD_BIND,
                 payload.as_ptr(),
-                plen,
+                payload.len(),
                 buf,
                 NET_BUF_SIZE,
             );
@@ -768,17 +783,15 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
             match msg_type {
                 // Multi-anchor demux: on a shared `net_in` fan IP emits one
                 // MSG_BOUND per anchor's CMD_BIND. Treat only the bound for
-                // OUR listener port as ours; a frame carrying no port names
-                // no anchor to tell apart, so it is accepted. Ignoring a
-                // neighbour's bound here prevents this
-                // server from flipping to WaitAccept / `bound` on someone
-                // else's listen completing first.
+                // OUR listener port as ours. Ignoring a neighbour's bound
+                // here prevents this server from flipping to WaitAccept /
+                // `bound` on someone else's listen completing first.
                 NET_MSG_BOUND
-                    if payload_len < 4 || {
-                        let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
-                        let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
-                        ((lo as u16) | ((hi as u16) << 8)) == s.server.port
-                    } =>
+                    if net_proto::bound_parts(core::slice::from_raw_parts(
+                        s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                        payload_len,
+                    ))
+                    .is_some_and(|(_, port, _)| port == s.server.port) =>
                 {
                     log(s, b"[http] bound, waiting for connections");
                     if let Some(cur) = cur_slot_mut(s) {
@@ -801,24 +814,17 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                     }
                     return StepReturn::error(-1);
                 }
-                NET_MSG_ACCEPTED if payload_len >= 2 => {
+                NET_MSG_ACCEPTED => {
                     // A connection accepted by linux_net while we were
                     // still binding. Allocate a slot directly — the
                     // slot table is the queue. Multi-anchor demux: claim
                     // only accepts on our bound port (see the demux path).
-                    let conn = net_proto::conn_id(core::slice::from_raw_parts(
-                        s.net_buf.as_ptr().add(NET_FRAME_HDR),
-                        payload_len,
-                    ));
-                    let ours = payload_len < 4 || {
-                        let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
-                        let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 3);
-                        ((lo as u16) | ((hi as u16) << 8)) == s.server.port
+                    let Some((conn, port, generation)) = super::accepted_in_net_buf(s, payload_len)
+                    else {
+                        return StepReturn::Burst;
                     };
-                    if ours {
-                        if let Some(idx) =
-                            alloc_free_slot(s, conn, super::accepted_generation(s, payload_len))
-                        {
+                    if port == s.server.port {
+                        if let Some(idx) = alloc_free_slot(s, conn, generation) {
                             let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                             slot.phase = Phase::RecvRequest;
                         } else {
@@ -863,30 +869,23 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                     }
                     return StepReturn::Burst;
                 }
-                NET_MSG_TRACE_CTX
-                    if payload_len
-                        >= super::super::abi::contracts::net::net_proto::TRACE_CTX_LEN =>
-                {
+                NET_MSG_TRACE_CTX => {
                     // Observability: the upstream (IP via TLS) trace context for
                     // this connection — `[conn_id][trace_id 16][tls_span_id 8]`.
                     // Store as the connection default; each request without its
                     // own `traceparent` parents `http.server.request` under it.
                     if dev_telemetry_enabled(&*s.syscalls) {
-                        let p = s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                        let conn = net_proto::conn_id(core::slice::from_raw_parts(p, payload_len));
-                        if let Some(idx) = find_slot_by_conn_id(s, conn) {
-                            let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
-                            core::ptr::copy_nonoverlapping(
-                                p.add(2),
-                                slot.conn_trace_id.as_mut_ptr(),
-                                16,
-                            );
-                            core::ptr::copy_nonoverlapping(
-                                p.add(18),
-                                slot.conn_parent_id.as_mut_ptr(),
-                                8,
-                            );
-                            slot.conn_flags = *p.add(26);
+                        let ctx = stream_trace::ctx_parts(core::slice::from_raw_parts(
+                            s.net_buf.as_ptr().add(NET_FRAME_HDR),
+                            payload_len,
+                        ));
+                        if let Some((conn, trace_id, parent_id, flags)) = ctx {
+                            if let Some(idx) = find_slot_by_conn_id(s, conn) {
+                                let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+                                slot.conn_trace_id = trace_id;
+                                slot.conn_parent_id = parent_id;
+                                slot.conn_flags = flags;
+                            }
                         }
                     }
                     return StepReturn::Burst;
@@ -1009,8 +1008,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         // implement is 501, not 400: the request is not
                         // malformed, it asks for something unsupported (RFC
                         // 9110 §9.1). The parser reports the distinction by
-                        // returning METHOD_NONE with the path intact.
-                        Some(line) if line.method == wire::method::METHOD_NONE => {
+                        // returning `method::NONE` with the path intact.
+                        Some(line) if line.method == wire::method::NONE => {
                             build_error(s, b"501 Not Implemented", b"Not Implemented\n");
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::DrainSend;
@@ -1299,55 +1298,6 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                 return StepReturn::Continue;
             }
 
-            // Diagnostic endpoint `/_fan` — calls the kernel
-            // `FAN_DIAG_SNAPSHOT` opcode and serves the resulting ASCII
-            // line (fan-out / fan-in pump counters + log_ring state).
-            // Available on every http instance without route configuration.
-            let (req, plen) = match cur_slot(s) {
-                Some(c) => (c.req_path.as_ptr(), c.req_path_len as usize),
-                None => return StepReturn::Continue,
-            };
-            if plen >= 5
-                && *req == b'/'
-                && *req.add(1) == b'_'
-                && *req.add(2) == b'f'
-                && *req.add(3) == b'a'
-                && *req.add(4) == b'n'
-            {
-                // Close-delimited (provider body ends at EOF) —
-                // keep wire + slot in sync.
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.keepalive = 0;
-                }
-                let buf = cur_send_buf_mut_ptr(s);
-                let cap = SEND_BUF_SIZE;
-                let mut off = 0usize;
-                let header =
-                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n";
-                let mut k = 0;
-                while k < header.len() && off < cap {
-                    *buf.add(off) = header[k];
-                    off += 1;
-                    k += 1;
-                }
-                let room = cap.saturating_sub(off);
-                let n = ((*s.syscalls).provider_call)(
-                    -1,
-                    super::super::abi::registry::diag::FAN_DIAG_SNAPSHOT,
-                    buf.add(off),
-                    room,
-                );
-                if n > 0 {
-                    off += n as usize;
-                }
-                if let Some(cur) = cur_slot_mut(s) {
-                    cur.send_offset = 0;
-                    cur.send_len = off as u16;
-                    cur.phase = Phase::DrainSend;
-                }
-                return StepReturn::Continue;
-            }
-
             // Matched against the full request target where it sits in the
             // head, so a path longer than `req_path` routes as itself rather
             // than as its first `MAX_PATH` bytes.
@@ -1458,7 +1408,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                             // Cache miss → file_chan fetch. Serialise
                             // across slots so concurrent template
                             // misses don't trample each other's
-                            // FLUSH/NOTIFY.
+                            // FLUSH/SELECT.
                             if !try_acquire_file_chan(s) {
                                 // Another slot owns the channel —
                                 // stay in DispatchRoute, retry next
@@ -1473,22 +1423,7 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                                 release_file_chan(s);
                                 return StepReturn::Continue;
                             }
-                            dev_channel_ioctl(
-                                &*s.syscalls,
-                                s.server.file_chan,
-                                IOCTL_FLUSH,
-                                core::ptr::null_mut(),
-                                0,
-                            );
-                            let mut pos = src_idx as u32;
-                            let pos_ptr = &mut pos as *mut u32 as *mut u8;
-                            dev_channel_ioctl(
-                                &*s.syscalls,
-                                s.server.file_chan,
-                                IOCTL_NOTIFY,
-                                pos_ptr,
-                                4,
-                            );
+                            file_select(s, src_idx as u32);
                             if let Some(cur) = cur_slot_mut(s) {
                                 cur.phase = Phase::FetchContent;
                             }
@@ -1527,22 +1462,6 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         cur.file_index = fi;
                     }
                     if fi == -1 {
-                        if s.server.file_chan >= 0 {
-                            let mut count: u32 = 0;
-                            let count_ptr = &mut count as *mut u32 as *mut u8;
-                            let r = dev_channel_ioctl(
-                                &*s.syscalls,
-                                s.server.file_chan,
-                                IOCTL_POLL_NOTIFY,
-                                count_ptr,
-                                4,
-                            );
-                            if r >= 0 {
-                                if let Some(cur) = cur_slot_mut(s) {
-                                    cur.file_count = count as u16;
-                                }
-                            }
-                        }
                         build_header(s, b"200 OK", b"text/plain");
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.index_pos = 0;
@@ -1554,27 +1473,12 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         if s.server.file_chan >= 0 {
                             // Serialise: concurrent HANDLER_FILE
                             // requests across slots must not race on
-                            // FLUSH/NOTIFY. Stall in DispatchRoute
+                            // FLUSH/SELECT. Stall in DispatchRoute
                             // until the channel is free.
                             if !try_acquire_file_chan(s) {
                                 return StepReturn::Continue;
                             }
-                            dev_channel_ioctl(
-                                &*s.syscalls,
-                                s.server.file_chan,
-                                IOCTL_FLUSH,
-                                core::ptr::null_mut(),
-                                0,
-                            );
-                            let mut pos = fi as u32;
-                            let pos_ptr = &mut pos as *mut u32 as *mut u8;
-                            let r = dev_channel_ioctl(
-                                &*s.syscalls,
-                                s.server.file_chan,
-                                IOCTL_NOTIFY,
-                                pos_ptr,
-                                4,
-                            );
+                            let r = file_select(s, fi as u32);
                             if r < 0 {
                                 build_error(s, b"404 Not Found", b"Not Found\n");
                                 if let Some(cur) = cur_slot_mut(s) {
@@ -1629,29 +1533,14 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                     };
                     // Serialise: HANDLER_STREAM body-send reads from
                     // file_chan across multiple step()s. Without this
-                    // gate a sibling slot's IOCTL_FLUSH would wipe
-                    // our pending notify mid-stream.
+                    // gate a sibling slot's select would restart the
+                    // stream mid-body.
                     if !try_acquire_file_chan(s) {
                         return StepReturn::Continue;
                     }
-                    dev_channel_ioctl(
-                        &*s.syscalls,
-                        s.server.file_chan,
-                        IOCTL_FLUSH,
-                        core::ptr::null_mut(),
-                        0,
-                    );
-                    let mut pos = src_idx as u32;
-                    let pos_ptr = &mut pos as *mut u32 as *mut u8;
-                    let r = dev_channel_ioctl(
-                        &*s.syscalls,
-                        s.server.file_chan,
-                        IOCTL_NOTIFY,
-                        pos_ptr,
-                        4,
-                    );
+                    let r = file_select(s, src_idx as u32);
                     if r < 0 {
-                        build_error(s, b"500 Internal Server Error", b"Stream NOTIFY failed\n");
+                        build_error(s, b"500 Internal Server Error", b"Stream select failed\n");
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::DrainSend;
                         }
@@ -1690,6 +1579,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         super::super::abi::registry::fs::OPEN, // FS_OPEN
                         fs_path.as_mut_ptr(),
                         n,
+                        core::ptr::null_mut(),
+                        0,
                     );
                     // Not opened yet (mount not up, entry not cached) is not
                     // a missing file: re-ask on a later step.
@@ -1879,6 +1770,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                             super::super::abi::registry::fs::OPEN, // FS_OPEN
                             composed.as_mut_ptr(),
                             total,
+                            core::ptr::null_mut(),
+                            0,
                         );
                         if fs_pending(fd) {
                             return fs_dispatch_wait(s);
@@ -1922,6 +1815,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         super::super::abi::registry::fs::OPENDIR,
                         fs_path.as_mut_ptr(),
                         n,
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if fs_pending(dir_fd) {
                         return fs_dispatch_wait(s);
@@ -2114,12 +2009,14 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
             const E_NODEV: i32 = -19;
             const E_NOSYS: i32 = -38;
             let sys = &*s.syscalls;
-            let mut stat = [0u8; 8];
+            let mut stat = [0u8; fs::stat::LEN];
             let st = (sys.provider_call)(
                 cur_fs_fd(s),
                 super::super::abi::registry::fs::STAT, // FS_STAT
                 stat.as_mut_ptr(),
                 stat.len(),
+                core::ptr::null_mut(),
+                0,
             );
 
             let ct_owner: Option<&Route> = if cur_matched_route(s) >= 0 {
@@ -2183,6 +2080,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                     super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                     core::ptr::null_mut(),
                     0,
+                    core::ptr::null_mut(),
+                    0,
                 );
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.fs_fd = -1;
@@ -2193,8 +2092,17 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                 }
                 return StepReturn::Burst;
             }
-            if st >= 0 {
-                let size = u32::from_le_bytes([stat[0], stat[1], stat[2], stat[3]]);
+            // The streamer counts in `u32` with `u32::MAX` as its
+            // unknown-length sentinel: a size it cannot carry is a fetch
+            // failure, answered below.
+            let known = if st >= 0 {
+                fs::Stat::decode(&stat)
+                    .and_then(|r| u32::try_from(r.size).ok())
+                    .filter(|&n| n != u32::MAX)
+            } else {
+                None
+            };
+            if let Some(size) = known {
                 // In keep-alive mode recv_buf may also hold pipelined
                 // bytes from the next request; cap the Range scan at
                 // the current request's head so a follow-up `Range:`
@@ -2233,18 +2141,22 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         // A pending SEEK moved nothing, so the slot stays
                         // here and re-asks on a later step (STAT again,
                         // then the same SEEK) — never a degrade to 200.
-                        let mut seek_arg = (start as i32).to_le_bytes();
+                        let mut seek_arg = fs::seek::encode(u64::from(start));
                         let seek_rc = (sys.provider_call)(
                             cur_fs_fd(s),
                             super::super::abi::registry::fs::SEEK, // FS_SEEK
                             seek_arg.as_mut_ptr(),
                             seek_arg.len(),
+                            core::ptr::null_mut(),
+                            0,
                         );
                         if fs_pending(seek_rc) {
                             if fs_wait_expired(s) {
                                 (sys.provider_call)(
                                     cur_fs_fd(s),
                                     super::super::abi::registry::fs::CLOSE, // FS_CLOSE
+                                    core::ptr::null_mut(),
+                                    0,
                                     core::ptr::null_mut(),
                                     0,
                                 );
@@ -2290,6 +2202,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                             super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                             core::ptr::null_mut(),
                             0,
+                            core::ptr::null_mut(),
+                            0,
                         );
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.fs_fd = -1;
@@ -2325,6 +2239,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         super::super::abi::registry::fs::CLOSE, // FS_CLOSE
                         core::ptr::null_mut(),
                         0,
+                        core::ptr::null_mut(),
+                        0,
                     );
                     if let Some(cur) = cur_slot_mut(s) {
                         cur.fs_fd = -1;
@@ -2345,6 +2261,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
             (sys.provider_call)(
                 cur_fs_fd(s),
                 super::super::abi::registry::fs::CLOSE, // FS_CLOSE
+                core::ptr::null_mut(),
+                0,
                 core::ptr::null_mut(),
                 0,
             );
@@ -2383,6 +2301,8 @@ pub(crate) unsafe fn step_active_slot(s: &mut HttpState) -> StepReturn {
                         ((*s.syscalls).provider_call)(
                             cur_fs_fd(s),
                             super::super::abi::registry::fs::CLOSE, // FS_CLOSE
+                            core::ptr::null_mut(),
+                            0,
                             core::ptr::null_mut(),
                             0,
                         );

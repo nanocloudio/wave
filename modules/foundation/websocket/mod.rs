@@ -240,7 +240,10 @@ fluxor_rt::define_params! {
     };
 }
 
-fluxor_rt::module_facts! { state: WsState }
+fluxor_rt::module_facts! {
+    state: WsState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = 1600],
+}
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -344,8 +347,7 @@ unsafe fn close_transport(s: &mut WsState, i: usize) -> bool {
     if s.links[i].conn_present == 0 {
         return true;
     }
-    let mut close = [0u8; 2];
-    net_proto::put_conn_id(&mut close, s.links[i].conn_id);
+    let close = net_proto::close(s.links[i].conn_id, false);
     if net_write_frame(
         &*s.syscalls,
         s.net_out,
@@ -570,9 +572,16 @@ unsafe fn drain_messages(s: &mut WsState, i: usize, now: u64) {
 /// for an authority no dial carries, which construction already refused.
 fn connect_payload(s: &WsState, payload: &mut [u8]) -> usize {
     match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
-        Some((target, _)) => {
-            net_proto::write_connect_to(payload, SOCK_TYPE_STREAM, s.port, &target, Some(s.tag))
-        }
+        Some((target, _)) => net_proto::write_connect_to(
+            payload,
+            &net_proto::ConnectTo {
+                sock_type: SOCK_TYPE_STREAM,
+                flags: 0,
+                port: s.port,
+                target,
+                requester_tag: s.tag,
+            },
+        ),
         None => 0,
     }
 }
@@ -728,12 +737,12 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 /// id, which is the link's own.
 unsafe fn link_for(s: &WsState, msg: u8, payload: &[u8], plen: usize) -> Option<usize> {
     match msg {
-        NET_MSG_CONNECTED if plen >= net_proto::CONN_ID_LEN => {
-            let (_cid, tag) = net_proto::connected_parts(payload);
-            (tag == s.tag).then(|| dialling(s)).flatten()
+        NET_MSG_CONNECTED => {
+            let c = net_proto::connected_parts(payload)?;
+            (c.requester_tag == s.tag).then(|| dialling(s)).flatten()
         }
-        NET_MSG_ERROR if plen >= net_proto::ERROR_FIXED => {
-            let (cid, _errno, tag) = net_proto::error_parts(payload);
+        NET_MSG_ERROR => {
+            let (cid, _errno, tag) = net_proto::error_parts(payload)?;
             if tag == s.tag {
                 dialling(s)
             } else if tag == net_proto::REQUESTER_TAG_NONE {
@@ -859,8 +868,10 @@ unsafe fn pump_net_in(s: &mut WsState, sys: &SyscallTable, now: u64) {
             };
             match msg {
                 NET_MSG_CONNECTED => {
-                    let (cid, _tag) = net_proto::connected_parts(payload);
-                    s.links[i].conn_id = cid;
+                    let Some(c) = net_proto::connected_parts(payload) else {
+                        continue;
+                    };
+                    s.links[i].conn_id = c.conn_id;
                     s.links[i].conn_present = 1;
                     feed(s, i, sys, WsEv::Connected, now);
                 }
@@ -1014,7 +1025,7 @@ unsafe fn pump_link(s: &mut WsState, i: usize, sys: &SyscallTable, now: u64) -> 
         }
 
         if s.links[i].conn_present != 0 && s.links[i].req_sent < s.links[i].req_len {
-            let max_chunk = 1600 - NET_FRAME_HDR - 2;
+            let max_chunk = net_proto::data_capacity(NET_OUT_MAX_RECORD);
             while s.links[i].req_sent < s.links[i].req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
                 if poll <= 0 || (poll as u32 & 0x02) == 0 {

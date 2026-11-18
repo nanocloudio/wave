@@ -13,8 +13,9 @@
 //! one result.
 //!
 //! **Driven.** The module is an exchange provider (`abi::contracts::exchange`).
-//! A submission arrives as a request on `request_in` — method POST, `target`
-//! the one recipient, a `mail-from` header naming the envelope sender, the
+//! A submission arrives as a request on `request_in` — a CALL with the HTTP
+//! verb POST, `target` the one recipient, a `mail-from` meta field naming the
+//! envelope sender, the
 //! message as the body — and is answered exactly once on `response_out` under
 //! the requester's exchange id, the answer's body an `SmtpResult`. One
 //! long-running instance performs many submissions without its graph being
@@ -110,10 +111,10 @@ use smtp_wire::{
 
 // The exchange records submissions arrive in and are answered with.
 use abi::contracts::exchange::{
-    abort, flag, header, parse_request, status, write_abort, write_body, write_credit,
-    write_refusal, write_response_head, ExchangeId, Record, ResponseHead, BODY_MAX, METHOD_POST,
-    RECORD_MAX,
+    abort, flag, meta_get, op, parse_request, write_abort, write_body, write_credit,
+    write_response_head, ExchangeId, Record, BODY_MAX, RECORD_MAX,
 };
+use abi::contracts::exchange_http::{self as http, method, status, Http};
 
 // The NetProto opcodes and identity accessors come from the owning contract,
 // never redeclared locally, so a change to the wire is a compile error here
@@ -569,7 +570,7 @@ unsafe fn emit_result(s: &mut SmtpState, outcome: u8, reached: SmtpPhase) {
 fn answer_status(outcome: u8) -> u16 {
     match outcome {
         SMTP_OUT_CONNECT_FAILED | SMTP_OUT_CLOSED => status::BAD_GATEWAY,
-        SMTP_OUT_TIMEOUT => status::TIMEOUT,
+        SMTP_OUT_TIMEOUT => status::GATEWAY_TIMEOUT,
         _ => status::OK,
     }
 }
@@ -628,17 +629,10 @@ unsafe fn flush_result(s: &mut SmtpState) {
         let raised = if code == status::OK { 0 } else { flag::RAISED };
         let flags = raised | if fits { 0 } else { flag::MORE };
         let carried: &[u8] = if fits { body } else { &[] };
-        let n = write_response_head(
-            &ResponseHead {
-                id: s.id,
-                flags,
-                status: code,
-                content_type: &[],
-                headers: &[],
-                body: carried,
-            },
-            &mut s.answer,
-        );
+        let n = http::head(s.id, code, &[], carried).and_then(|mut h| {
+            h.flags = flags;
+            write_response_head::<Http>(&h, &mut s.answer)
+        });
         (n, fits)
     } else if fits {
         (write_body(&s.id, 0, body, &mut s.answer), true)
@@ -913,14 +907,13 @@ unsafe fn close_connection(s: &mut SmtpState) {
     if s.conn_present == 0 {
         return;
     }
-    let mut close = [0u8; 2];
-    net_proto::put_conn_id(&mut close, s.conn_id);
+    let close = net_proto::close(s.conn_id, false);
     net_write_frame(
         &*s.syscalls,
         s.net_out,
         NET_CMD_CLOSE,
         close.as_ptr(),
-        2,
+        close.len(),
         s.nbuf.as_mut_ptr(),
         NET_BUF,
     );
@@ -996,7 +989,7 @@ unsafe fn flush_owed(s: &mut SmtpState) -> bool {
     }
     if s.refusal != 0 {
         let mut rec = [0u8; 32];
-        if let Some(n) = write_refusal(&s.refusal_id, s.refusal, &mut rec) {
+        if let Some(n) = http::write_refusal(&s.refusal_id, s.refusal, &mut rec) {
             if (sys.channel_write)(s.response_out, rec.as_ptr(), n) <= 0 {
                 return false;
             }
@@ -1044,7 +1037,7 @@ unsafe fn pump_requests(s: &mut SmtpState, now: u64) {
 /// Take the record in `rec`.
 unsafe fn take_record(s: &mut SmtpState, now: u64) {
     let rec: &[u8] = core::slice::from_raw_parts(s.rec.as_ptr(), s.rec_len as usize);
-    let Some(record) = parse_request(rec) else {
+    let Ok(record) = parse_request::<Http>(rec) else {
         // Without a parse there is no id, and so nobody to answer.
         s.dropped_unparsable = s.dropped_unparsable.wrapping_add(1);
         return;
@@ -1057,12 +1050,13 @@ unsafe fn take_record(s: &mut SmtpState, now: u64) {
             // connection and SMTP is lockstep, so a second is answered busy
             // rather than queued, and a requester may repeat it.
             if s.draining != 0 || s.op_active != 0 {
-                refuse(s, h.id, status::BUSY);
+                refuse(s, h.id, status::SERVICE_UNAVAILABLE);
                 return;
             }
-            let from = header(h.headers, b"mail-from").unwrap_or(&[]);
-            if h.method != METHOD_POST
-                || h.flags & (flag::BROADCAST | flag::WEBSOCKET | flag::WEBTRANSPORT) != 0
+            let from = meta_get(h.meta, b"mail-from").unwrap_or(&[]);
+            if h.op != op::CALL
+                || h.verb != method::POST
+                || h.flags & flag::BROADCAST != 0
                 || from.is_empty()
                 || h.target.is_empty()
             {
@@ -1070,7 +1064,7 @@ unsafe fn take_record(s: &mut SmtpState, now: u64) {
                 return;
             }
             if from.len() > NAME_BUF || h.target.len() > NAME_BUF || h.body.len() > CHUNK_BUF {
-                refuse(s, h.id, status::TOO_LARGE);
+                refuse(s, h.id, status::PAYLOAD_TOO_LARGE);
                 return;
             }
             s.id = h.id;
@@ -1159,10 +1153,13 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             let n = match net_proto::Target::parse(&s.authority[..s.authority_len as usize]) {
                 Some((target, _)) => net_proto::write_connect_to(
                     &mut payload,
-                    SOCK_TYPE_STREAM,
-                    s.port,
-                    &target,
-                    Some(s.tag),
+                    &net_proto::ConnectTo {
+                        sock_type: SOCK_TYPE_STREAM,
+                        flags: 0,
+                        port: s.port,
+                        target,
+                        requester_tag: s.tag,
+                    },
                 ),
                 None => 0,
             };
@@ -1199,12 +1196,11 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
                 let payload = core::slice::from_raw_parts(s.nbuf.as_ptr().add(NET_FRAME_HDR), plen);
                 match msg {
-                    NET_MSG_CONNECTED
-                        if s.phase == SmtpPhase::Connecting && plen >= net_proto::CONN_ID_LEN =>
-                    {
-                        let (cid, tag) = net_proto::connected_parts(payload);
-                        if tag == s.tag {
-                            s.conn_id = cid;
+                    NET_MSG_CONNECTED if s.phase == SmtpPhase::Connecting => {
+                        if let Some(c) =
+                            net_proto::connected_parts(payload).filter(|c| c.requester_tag == s.tag)
+                        {
+                            s.conn_id = c.conn_id;
                             s.conn_present = 1;
                             s.phase = SmtpPhase::Greet; // await 220
                             s.started_ms = now;
@@ -1256,19 +1252,13 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                         // module's connect failure, and its meaningless
                         // conn_id colliding with ours must not read as our
                         // established connection failing.
-                        let (err_cid, err_tag) = if plen >= net_proto::ERROR_FIXED {
-                            let (c, _e, t) = net_proto::error_parts(payload);
-                            (c, t)
-                        } else {
-                            (0, net_proto::REQUESTER_TAG_NONE)
-                        };
+                        let parts = net_proto::error_parts(payload);
                         let connecting = s.phase == SmtpPhase::Connecting
-                            && plen >= net_proto::ERROR_FIXED + net_proto::REQUESTER_TAG_LEN
-                            && err_tag == s.tag;
+                            && parts.is_some_and(|(_, _, tag)| tag == s.tag);
                         let established = s.conn_present != 0
-                            && plen >= net_proto::ERROR_FIXED
-                            && err_tag == net_proto::REQUESTER_TAG_NONE
-                            && err_cid == s.conn_id;
+                            && parts.is_some_and(|(cid, _, tag)| {
+                                tag == net_proto::REQUESTER_TAG_NONE && cid == s.conn_id
+                            });
                         if (connecting || established)
                             && !matches!(s.phase, SmtpPhase::Done | SmtpPhase::Failed)
                         {
@@ -1371,14 +1361,13 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             && s.ctl_len == 0
         {
             if s.conn_present != 0 {
-                let mut close = [0u8; 2];
-                net_proto::put_conn_id(&mut close, s.conn_id);
+                let close = net_proto::close(s.conn_id, false);
                 if net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    2,
+                    close.len(),
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 ) == 0

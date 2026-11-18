@@ -135,13 +135,15 @@ pub(crate) unsafe fn build_header(s: &mut HttpState, status: &[u8], content_type
 /// than leaving it out. The space is not optional — a client parsing the
 /// status line strictly (this module's own) refuses a line without it.
 ///
-/// `extra` is the application's own header block: complete `Name: value\r\n`
-/// lines, appended verbatim. The application owns response semantics, so it
-/// owns `Location`, `WWW-Authenticate`, `Docker-Content-Digest` and anything
-/// else its API defines. The four headers `is_framing_header` names are NOT the
-/// application's to set — they describe this connection's framing and content,
-/// which this module emits from the record's own fields — so any copies in
-/// `extra` are dropped rather than duplicated onto the wire.
+/// `meta` is the response HEAD's meta run: each field becomes a
+/// `name: value\r\n` line, in order. The application owns response
+/// semantics, so it owns `location`, `www-authenticate`,
+/// `docker-content-digest` and anything else its API defines. The four
+/// fields `is_framing_field` names are NOT the application's to set — they
+/// describe this connection's framing and content, which this module emits
+/// itself — so they are not copied onto the wire, and neither is a binding
+/// field (a key starting `:`). A value holding a CR or LF would end its line
+/// and smuggle in another, so such a head is refused.
 ///
 /// `content_length` is the framing the peer reads the body by; `None` makes
 /// the response close-delimited, and clears keep-alive. False when the head
@@ -151,7 +153,7 @@ pub(crate) unsafe fn build_app_header(
     status: u16,
     content_type: &[u8],
     content_length: Option<u64>,
-    extra: &[u8],
+    meta: &[u8],
 ) -> bool {
     let keepalive =
         content_length.is_some() && cur_slot(s).map(|c| c.keepalive != 0).unwrap_or(false);
@@ -188,9 +190,12 @@ pub(crate) unsafe fn build_app_header(
     }
     off = put_bytes(dst, cap, off, b"\r\n");
 
-    // Application headers, line by line, skipping any that would contradict
+    // Application fields, line by line, skipping any that would contradict
     // the framing headers above.
-    off = put_app_headers(dst, cap, off, extra);
+    off = match put_app_fields(dst, cap, off, meta) {
+        Some(at) => at,
+        None => cap,
+    };
     off = put_bytes(dst, cap, off, b"\r\n");
     // A head that reached the end of the buffer was cut somewhere; one cut
     // head is a different response, so it is refused whole.
@@ -208,45 +213,36 @@ pub(crate) unsafe fn build_app_header(
     true
 }
 
-/// Append an application's header block line by line, dropping any line that
-/// would contradict the framing headers this module emits.
-unsafe fn put_app_headers(dst: *mut u8, cap: usize, mut off: usize, extra: &[u8]) -> usize {
-    let mut line_start = 0usize;
-    let mut i = 0usize;
-    while i < extra.len() {
-        let at_end = i + 1 >= extra.len();
-        let is_crlf = i + 1 < extra.len() && extra[i] == b'\r' && extra[i + 1] == b'\n';
-        if is_crlf || at_end {
-            let line_end = if is_crlf { i } else { extra.len() };
-            let line = &extra[line_start..line_end];
-            if !line.is_empty() && !is_framing_header(line) {
-                off = put_bytes(dst, cap, off, line);
-                off = put_bytes(dst, cap, off, b"\r\n");
-            }
-            i = if is_crlf { i + 2 } else { extra.len() };
-            line_start = i;
+/// Append an application's meta fields as header lines, dropping any field
+/// that would contradict the framing headers this module emits and the
+/// binding's own `:` fields. `None` when a value holds a CR or LF.
+unsafe fn put_app_fields(dst: *mut u8, cap: usize, mut off: usize, meta: &[u8]) -> Option<usize> {
+    for (name, value) in super::super::exchange::meta_fields(meta) {
+        if name.first() == Some(&b':') || is_framing_field(name) {
             continue;
         }
-        i += 1;
+        if value.iter().any(|&c| c == b'\r' || c == b'\n') {
+            return None;
+        }
+        off = put_bytes(dst, cap, off, name);
+        off = put_bytes(dst, cap, off, b": ");
+        off = put_bytes(dst, cap, off, value);
+        off = put_bytes(dst, cap, off, b"\r\n");
     }
-    off
+    Some(off)
 }
 
-/// Whether a header line names something this module, not the application,
-/// decides: the three framing headers plus `Content-Type`, which arrives as its
-/// own envelope field. Emitting the application's copy alongside our own would
-/// leave two `Content-Length` values on the wire — which RFC 9112 §6.3 treats
-/// exactly as it treats a `Content-Length`/`Transfer-Encoding` conflict.
-fn is_framing_header(line: &[u8]) -> bool {
-    let name_end = match line.iter().position(|c| *c == b':') {
-        Some(i) => i,
-        None => return true, // not a header line at all; drop it
-    };
-    let name = &line[..name_end];
-    name.eq_ignore_ascii_case(b"content-length")
-        || name.eq_ignore_ascii_case(b"connection")
-        || name.eq_ignore_ascii_case(b"transfer-encoding")
-        || name.eq_ignore_ascii_case(b"content-type")
+/// Whether a meta field (its key lower case) names something this module, not
+/// the application, decides: the three framing headers plus `content-type`,
+/// which this module writes itself from the same field. Emitting the
+/// application's copy alongside our own would leave two `Content-Length`
+/// values on the wire — which RFC 9112 §6.3 treats exactly as it treats a
+/// `Content-Length`/`Transfer-Encoding` conflict.
+pub(crate) fn is_framing_field(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"content-length" | b"connection" | b"transfer-encoding" | b"content-type"
+    )
 }
 
 /// Like `build_header` but also emits a `Content-Length: <n>` header.

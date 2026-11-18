@@ -30,10 +30,10 @@ direction    = "output"
 content_type = "OctetStream"
 
 # Submissions (in[1]): exchange request records — the module is a PROVIDER of
-# the exchange contract. A HEAD with method POST, `target` the one recipient,
-# a `mail-from` header naming the envelope sender, and the message (headers
-# and body) as its body, inline and in BODY records under the credit this
-# module grants.
+# the exchange contract, speaking its HTTP binding. A CALL with the verb POST,
+# `target` the one recipient, a `mail-from` meta field naming the envelope
+# sender, and the message (headers and body) as its body, inline and in BODY
+# records under the credit this module grants.
 [[ports]]
 name         = "request_in"
 index        = 1
@@ -41,6 +41,8 @@ direction    = "input"
 content_type = "ExchangeRequest"
 max_record   = 8192
 buffer_size  = 16384
+[ports.facts]
+binding = ["http"]
 
 # Answers (out[2]): exactly one per submission, under the requester's exchange
 # id. The body is an `SmtpResult` (modules/common/smtp_wire.rs): the outcome

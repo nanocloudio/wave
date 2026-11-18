@@ -156,6 +156,7 @@ use fluxor_rt::*;
 // asks through the client (`client/provider.rs`). Mounted once by the SDK and
 // named here so the server, the client and the wire layer read one definition.
 pub(crate) use abi::contracts::exchange;
+pub(crate) use abi::contracts::exchange_http;
 
 // `pub` under host-test only, matching how `server` is exposed: the suites are
 // separate crates and need real `pub` to reach in, while the firmware links one
@@ -389,7 +390,7 @@ mod params_def {
         s.client.authority_len = len as u16;
     };
     113, method, u8, 1 => |s, d, len| {
-        let code = p_u8(d, len, 0, wire::method::METHOD_GET);
+        let code = p_u8(d, len, 0, wire::method::GET);
         if wire::method::method_name(code).is_empty() { s.client.request_invalid = 1; }
         s.client.method = code;
     };
@@ -713,8 +714,15 @@ pub const fn arena_size(f: ArenaFeatures) -> u32 {
 
 // The state and, as the arena, [`arena_size`] for this build: `pack` records
 // both in the signed manifest, and `MODULE_ARENA_BYTES` is the same figure for
-// code that needs it at run time.
-fluxor_rt::module_facts! { state: HttpState, arena: arena_size(COMPILED_FEATURES) }
+// code that needs it at run time. Both net ports move one frame of the
+// `NET_BUF_SIZE` scratch, header included: every inbound frame is read into it
+// whole (a transport's record, or a mux frame from `quic`), and every command
+// is assembled in it.
+fluxor_rt::module_facts! {
+    state: HttpState,
+    arena: arena_size(COMPILED_FEATURES),
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = NET_BUF_SIZE],
+}
 
 /// The body-pool share of the default heap cap: the file-cache region plus
 /// as much again of inline `body:` routes.

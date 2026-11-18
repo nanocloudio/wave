@@ -31,6 +31,8 @@ pub(crate) mod provider;
 #[cfg(all(feature = "exchange", feature = "h2"))]
 pub(crate) mod h2_streams;
 
+use super::abi::contracts::exchange_http;
+pub(crate) use super::connection::NET_IN_DATA_MAX;
 use super::connection::{
     net_proto, NET_BUF_SIZE, NET_CMD_CLOSE, NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR,
 };
@@ -43,13 +45,16 @@ use super::{
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
 
-/// Inbound bytes held for the phase machine. An HTTP/2 frame other than
-/// DATA is read whole, so this bounds the response header block a stream
-/// takes; the graph-driven client takes the larger one its responses carry.
+/// Inbound bytes held for the phase machine: the frame bytes it may hold
+/// while a frame is still arriving, plus room for one whole `net_in`
+/// record's data, which a read waits for room to take. An HTTP/2 frame other
+/// than DATA is read whole, so the held part bounds the response header
+/// block a stream takes; the graph-driven client takes the larger one its
+/// responses carry.
 #[cfg(not(feature = "exchange"))]
-pub(crate) const RECV_BUF_SIZE: usize = 2048;
+pub(crate) const RECV_BUF_SIZE: usize = 2048 + NET_IN_DATA_MAX;
 #[cfg(feature = "exchange")]
-pub(crate) const RECV_BUF_SIZE: usize = 8192;
+pub(crate) const RECV_BUF_SIZE: usize = 8192 + NET_IN_DATA_MAX;
 
 /// A path plus its query string.
 ///
@@ -152,9 +157,9 @@ pub(crate) fn preferred_generation(s: &HttpState) -> u8 {
 }
 
 /// Record the generation the session stage negotiated for a connection, from
-/// its `MSG_CONNECTED` payload, and return the one it speaks.
-pub(crate) fn negotiate(s: &mut HttpState, payload: &[u8]) -> u8 {
-    let alpn = super::connection::connected_alpn(payload);
+/// the protocol its `MSG_CONNECTED` names (empty for none), and return the one
+/// it speaks.
+pub(crate) fn negotiate(s: &mut HttpState, alpn: &[u8]) -> u8 {
     let generation = generation_for(s.client.protocol, alpn);
     if !alpn.is_empty() {
         s.client.negotiated = generation + 1;
@@ -270,9 +275,9 @@ pub(crate) struct ClientState {
     /// 1 when the connection in hand came through a session stage that
     /// negotiated a protocol — TLS, so its requests are `https`.
     pub(crate) session_tls: u8,
-    /// The request verb, a `wire::method` code. `post_params` defaults it to
-    /// `METHOD_GET`; a graph-driven request overwrites it per exchange. Zero
-    /// (`METHOD_NONE`) is not a verb and composes no request head.
+    /// The request verb, an `exchange_http::method` code. `post_params`
+    /// defaults it to `GET`; a graph-driven request overwrites it per
+    /// exchange. Zero is not a verb and composes no request head.
     pub(crate) method: u8,
     /// HTTP/2 client sub-state. Interpreted as `client_h2::H2Phase` when
     /// `protocol == 1`; ignored otherwise.
@@ -420,11 +425,10 @@ pub(crate) unsafe fn post_params(s: &mut HttpState) -> i32 {
         s.client.path[0] = b'/';
         s.client.path_len = 1;
     }
-    // Zeroed state means `METHOD_NONE`, which composes no head at all.
-    // Nothing in the param set names a verb, so a param-configured request
-    // is a GET.
-    if s.client.method == wire::method::METHOD_NONE {
-        s.client.method = wire::method::METHOD_GET;
+    // Zeroed state names no verb, which composes no head at all. Nothing in
+    // the param set names a verb, so a param-configured request is a GET.
+    if s.client.method == 0 {
+        s.client.method = exchange_http::method::GET;
     }
 
     #[cfg(feature = "exchange")]
@@ -530,14 +534,13 @@ pub(crate) unsafe fn send_close_frame(s: &mut HttpState) -> bool {
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
-    let mut payload = [0u8; 2];
-    net_proto::put_conn_id(&mut payload, s.client.conn_id);
+    let payload = net_proto::close(s.client.conn_id, false);
     if net_write_frame(
         sys,
         chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        2,
+        payload.len(),
         buf,
         NET_BUF_SIZE,
     ) == 0
@@ -611,15 +614,14 @@ pub(crate) unsafe fn close_parked(s: &mut HttpState) -> bool {
     s.client.parked_present = 0;
     s.client.parked_authority_len = 0;
     let sys = &*s.syscalls;
-    let mut payload = [0u8; 2];
-    net_proto::put_conn_id(&mut payload, id);
+    let payload = net_proto::close(id, false);
     let mut buf = [0u8; NET_BUF_SIZE];
     net_write_frame(
         sys,
         s.net_out_chan,
         NET_CMD_CLOSE,
         payload.as_ptr(),
-        2,
+        payload.len(),
         buf.as_mut_ptr(),
         NET_BUF_SIZE,
     ) != 0

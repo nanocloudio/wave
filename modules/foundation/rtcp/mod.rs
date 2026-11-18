@@ -404,11 +404,11 @@ unsafe fn ensure_bound(s: &mut RtcpState) -> bool {
         let poll = (sys.channel_poll)(s.net_in, POLL_IN);
         if poll > 0 && (poll as u32) & POLL_IN != 0 {
             let (msg_type, plen) = net_read_frame(sys, s.net_in, s.net_buf.as_mut_ptr(), NET_BUF);
-            if msg_type == DG_MSG_BOUND && plen >= 3 {
-                let (ep, port) = abi::contracts::net::datagram::dg_bound_parts(
+            if msg_type == DG_MSG_BOUND {
+                let bound = abi::contracts::net::datagram::dg_bound_parts(
                     core::slice::from_raw_parts(s.net_buf.as_ptr().add(NET_FRAME_HDR), plen),
                 );
-                if port == s.port {
+                if let Some((ep, _)) = bound.filter(|&(_, port)| port == s.port) {
                     s.ep_id = ep;
                 }
             }
@@ -584,11 +584,10 @@ unsafe fn send_to_peer(s: &mut RtcpState, data: *const u8, len: usize) -> usize 
             let mut held = [0u8; DG_AUTHORITY_MAX];
             let n = name.len();
             held[..n].copy_from_slice(name);
-            dev_dg_send_to_name_owned(
+            dev_dg_send_to_name(
                 sys,
                 s.net_out,
                 s.ep_id,
-                0,
                 &held[..n],
                 port,
                 data,

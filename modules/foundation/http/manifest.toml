@@ -164,6 +164,9 @@ content_type = "NetProto"
 # plus in-flight headroom; embedded workloads stage 1600-byte payloads
 # on a 2 KiB budget.
 buffer_size = { default = 2048, aarch64 = 16384 }
+# One frame of the `NET_BUF_SIZE` scratch every inbound frame is read into,
+# header included; `module_facts!` states the same (`NET_IN_ACCEPTS_RECORD`).
+accepts_record = { default = 1600, aarch64 = 8192 }
 
 [[ports]]
 name = "variables"
@@ -172,21 +175,31 @@ direction = "input"
 content_type = "FmpMessage"
 buffer_size = 256
 
+# Body bytes for file-backed routes (HANDLER_FILE / HANDLER_STREAM and the
+# template cache fill). The producer serves `stream_select` here: the server
+# binds it through this port and `SELECT`s the item a route names
+# (`source_index`); each item ends with the stream's HUP.
 [[ports]]
 name = "file_data"
 index = 2
 direction = "input"
 content_type = "OctetStream"
 buffer_size = { default = 2048, aarch64 = 16384 }
+contract = "stream_select"
 
 [[ports]]
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
 buffer_size = { default = 2048, aarch64 = 16384 }
+# One frame of the `NET_BUF_SIZE` scratch every command is assembled in,
+# header included; `module_facts!` states the same (`NET_OUT_MAX_RECORD`).
+max_record = { default = 1600, aarch64 = 8192 }
 
+# Client mode: the response body (`client::mod`). Server mode writes
+# nothing here.
 [[ports]]
-name = "file_ctrl"
+name = "body_out"
 index = 1
 direction = "output"
 content_type = "OctetStream"
@@ -224,9 +237,8 @@ content_type = "WsFrame"
 buffer_size = { default = 65600, aarch64 = 131072 }
 max_record  = 8192
 
-# Indices in[4]/out[4] and in[5]/out[5] are unused: they carried the route
-# and listener subscription self-edges, gone now that the store signals the
-# module's own kernel event (see the `event` resource below). They stay
+# Indices in[4]/out[4] and in[5]/out[5] are unused: a table consumer's
+# subscription is a handle the store rings, so no port carries it. They stay
 # unused rather than renumbered, so no other wiring moves.
 
 # HTTP application fan-out — populated only when a route uses HANDLER_APP
@@ -253,6 +265,10 @@ content_type = "ExchangeRequest"
 # records rather than bigger ones. A body of any size crosses as many records.
 max_record = 8192
 buffer_size = { default = 8192, aarch64 = 65536 }
+# The requests carry HTTP methods as their verbs: the application on the
+# other end speaks the HTTP binding.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "response_in"
@@ -283,14 +299,6 @@ selector_param = "table_volume"
 # the composer does not count the claim for it (an api plane's `http` that
 # feeds the graph's default store is not refused for a read it never does).
 active_when_params = ["routes_prefix", "listeners_prefix", "sessions_prefix"]
-
-# The one kernel event the table consumers (routes, listeners, session
-# trigger) name in their subscriptions: the store signals it when a watched
-# prefix changes, and writes no channel of this module's. Created on the
-# first step that has a table configured.
-[[resources]]
-requires_contract = "event"
-access = "write"
 
 # File routes (`fs_path` / `fs_list`, HANDLER_FS_FILE / HANDLER_FS_LIST) and
 # `fs_root` serve files through the FS_CONTRACT (`fat32` on bare metal,
@@ -499,11 +507,13 @@ buffer_size = 8192
 #
 # The client as a PROVIDER of the exchange contract — the role that ANSWERS,
 # which the capability name `stream.ordered_ack.exchange` states. A requester
-# writes request records on `request_in` (method, target, headers with
-# `content-type` among them, body inline or in BODY records under the credit
-# this client grants); the client performs the HTTP request and answers on
-# `response_out` with the origin's status, content type, headers and a body
-# streamed under the requester's credit, echoing the requester's exchange id.
+# writes request records on `request_in` (the HTTP method as the verb, the
+# target, header fields as meta with `content-type` among them, body inline or
+# in BODY records under the credit this client grants); the client performs
+# the HTTP request and answers on `response_out` with the origin's status as
+# the detail (its outcome class beside it), its header fields as meta and a
+# body streamed under the requester's credit, echoing the requester's
+# exchange id.
 # A pinned client (`authority` set) reports its backend link as LINK DOWN / UP.
 # `client/provider.rs` states the request and answer conventions in full.
 #
@@ -522,6 +532,9 @@ direction = "input"
 content_type = "ExchangeRequest"
 max_record = 8192
 buffer_size = 16384
+# The client performs HTTP requests: it speaks the HTTP binding.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "response_out"

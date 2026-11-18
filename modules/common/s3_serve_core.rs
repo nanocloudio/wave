@@ -85,8 +85,8 @@ pub fn s3_resource(target: &[u8]) -> S3Resource<'_> {
     S3Resource { bucket, key, query }
 }
 
-/// Classify a request by method (the exchange contract vocabulary's names, as
-/// bytes) and resource. An operation whose query holds anything it does not act
+/// Classify a request by method (the exchange HTTP binding's method tokens,
+/// as bytes) and resource. An operation whose query holds anything it does not act
 /// on is [`S3Op::NotImplemented`]: see [`s3_query_served`].
 pub fn s3_classify(method: &[u8], r: &S3Resource<'_>) -> S3Op {
     let op = s3_classify_named(method, r);

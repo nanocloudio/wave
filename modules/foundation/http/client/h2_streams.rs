@@ -68,13 +68,14 @@ use super::super::connection::{
     net_proto, NET_BUF_SIZE, NET_CMD_SEND, NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA,
     NET_MSG_ERROR,
 };
-use super::super::exchange::{abort, flag, status, ExchangeId, BODY_MAX};
+use super::super::exchange::{abort, flag, ExchangeId, BODY_MAX};
 use super::super::wire::h2 as h2w;
 use super::super::wire::hpack;
 use super::super::HttpState;
 use super::super::{
     dev_millis, dev_requester_tag, net_read_frame, net_read_frame_sized, NET_FRAME_HDR, POLL_IN,
 };
+use super::exchange_http::status;
 use super::{
     log, provider, send_close_frame, AUTHORITY_MAX, CAUSE_CONNECT, CAUSE_LINK, CAUSE_TIMEOUT,
     CONNECT_TIMEOUT_MS, GEN_H1, GEN_H2, RECV_BUF_SIZE, REQUEST_BUF_SIZE,
@@ -350,7 +351,7 @@ unsafe fn begin(s: &mut HttpState, now: u64) {
             (h2w::SETTINGS_INITIAL_WINDOW_SIZE, 0),
             (
                 h2w::SETTINGS_MAX_HEADER_LIST_SIZE,
-                provider::RESP_HDRS_MAX as u32,
+                provider::RESP_META_MAX as u32,
             ),
         ],
     );
@@ -491,14 +492,18 @@ unsafe fn connecting(s: &mut HttpState, now: u64) {
         }
         let payload = core::slice::from_raw_parts(buf.add(NET_FRAME_HDR), payload_len);
         let me = dev_requester_tag(sys);
-        if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
-            let (conn, tag) = net_proto::connected_parts(payload);
-            if tag != 0 && tag != me {
+        let connected = if msg_type == NET_MSG_CONNECTED {
+            net_proto::connected_parts(payload)
+        } else {
+            None
+        };
+        if let Some(c) = connected {
+            if c.requester_tag != 0 && c.requester_tag != me {
                 continue;
             }
-            s.client.conn_id = conn;
+            s.client.conn_id = c.conn_id;
             s.client.conn_present = 1;
-            let generation = super::negotiate(s, payload);
+            let generation = super::negotiate(s, c.opening.alpn);
             log(s, b"[http] connected");
             let _ = provider::connected(s);
             if generation == GEN_H1 {
@@ -515,8 +520,12 @@ unsafe fn connecting(s: &mut HttpState, now: u64) {
             begin(s, now);
             return;
         }
-        if msg_type == NET_MSG_ERROR && payload_len >= 3 {
-            let (_, _, tag) = net_proto::error_parts(payload);
+        let failed = if msg_type == NET_MSG_ERROR {
+            net_proto::error_parts(payload)
+        } else {
+            None
+        };
+        if let Some((_, _, tag)) = failed {
             if tag == 0 || tag == me {
                 log(s, b"[http] connect error");
                 s.client.streams.phase = IDLE;
@@ -616,7 +625,7 @@ unsafe fn pump_inbound(s: &mut HttpState) -> Inbound {
     if s.net_in_chan < 0 {
         return Inbound::None;
     }
-    if s.client.recv_len as usize + super::super::connection::MAX_DATA_FRAGMENT > RECV_BUF_SIZE {
+    if s.client.recv_len as usize + super::NET_IN_DATA_MAX > RECV_BUF_SIZE {
         return Inbound::None;
     }
     let sys = &*s.syscalls;
@@ -1056,7 +1065,7 @@ unsafe fn reset_by_peer(s: &mut HttpState, sid: u32, code: u32) {
     };
     // Refused before it was processed: repeating it is safe.
     let raised = if code == h2w::ERR_REFUSED_STREAM {
-        status::BUSY
+        status::SERVICE_UNAVAILABLE
     } else {
         status::BAD_GATEWAY
     };
@@ -1073,7 +1082,7 @@ unsafe fn go_away(s: &mut HttpState, last: u32) {
     for i in 0..STREAMS {
         let t = &st.streams[i];
         if t.state == OPEN && t.sid > last {
-            detach(st, i, OWE_STATUS, status::BUSY, 0);
+            detach(st, i, OWE_STATUS, status::SERVICE_UNAVAILABLE, 0);
         }
     }
     log(s, b"[http] h2 goaway");
@@ -1141,7 +1150,7 @@ unsafe fn deadlines(s: &mut HttpState, now: u64) {
             let (owe, val) = if t.head_given != 0 {
                 (OWE_ABORT, abort::STALLED as u16)
             } else {
-                (OWE_STATUS, status::TIMEOUT)
+                (OWE_STATUS, status::GATEWAY_TIMEOUT)
             };
             detach(st, i, owe, val, h2w::ERR_CANCEL);
         }
@@ -1347,7 +1356,7 @@ unsafe fn claim(s: &mut HttpState, now: u64) -> bool {
     let has_body = s.client.request_body_len > 0;
     let Some(len) = encode_request(s, sid, !has_body) else {
         log(s, b"[http] request head does not fit a HEADERS frame");
-        let _ = provider::refuse_unopened(s, status::TOO_LARGE);
+        let _ = provider::refuse_unopened(s, status::PAYLOAD_TOO_LARGE);
         return false;
     };
     let Some((id, credit, held)) = provider::hand_off(s) else {
@@ -1389,7 +1398,7 @@ unsafe fn encode_request(s: &mut HttpState, sid: u32, end_stream: bool) -> Optio
         *o += n;
         n != 0
     };
-    let method = super::super::wire::method::method_name(s.client.method);
+    let method = super::exchange_http::method_name(s.client.method);
     let scheme: &[u8] = if s.client.session_tls != 0 {
         b"https"
     } else {
@@ -1413,7 +1422,7 @@ unsafe fn encode_request(s: &mut HttpState, sid: u32, end_stream: bool) -> Optio
         s.client.request_headers.as_ptr(),
         s.client.request_headers_len as usize,
     );
-    for (name, value) in super::super::exchange::header_lines(block) {
+    for (name, value) in super::exchange_http::header_lines(block) {
         if name.len() > FIELD_NAME_MAX {
             return None;
         }
@@ -1525,7 +1534,7 @@ pub(crate) unsafe fn drain(s: &mut HttpState) {
                 let (owe, val) = if st.streams[i].head_given != 0 {
                     (OWE_ABORT, abort::DRAINING as u16)
                 } else {
-                    (OWE_STATUS, status::BUSY)
+                    (OWE_STATUS, status::SERVICE_UNAVAILABLE)
                 };
                 detach(st, i, owe, val, 0);
             }

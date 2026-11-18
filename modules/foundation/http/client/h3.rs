@@ -607,7 +607,7 @@ pub(crate) fn next_request(s: &mut super::super::HttpState) {
     c.expected_len = None;
     c.trailers = false;
     c.informational = 0;
-    c.head_only = s.client.method == super::super::wire::method::METHOD_HEAD;
+    c.head_only = s.client.method == super::exchange_http::method::HEAD;
     c.request_sent = false;
     c.request_offset = 0;
     c.fin_sent = false;
@@ -645,7 +645,7 @@ pub(crate) unsafe fn step_mux_client(s: &mut super::super::HttpState) -> StepRet
         s.client.phase = super::Phase::SendRequest;
         s.client.request_start_ms = now;
         s.client.progress_ms = now;
-        s.h3_client.head_only = s.client.method == super::super::wire::method::METHOD_HEAD;
+        s.h3_client.head_only = s.client.method == super::exchange_http::method::HEAD;
     }
     let expired = |start, budget: u32| budget != 0 && now.wrapping_sub(start) >= u64::from(budget);
     if s.client.draining != 0
@@ -955,7 +955,7 @@ pub fn configured_request(head: &RequestHead<'_>, out: &mut [u8]) -> usize {
     if n == 0 {
         return 0;
     }
-    for (name, value) in super::super::exchange::header_lines(head.headers) {
+    for (name, value) in super::exchange_http::header_lines(head.headers) {
         if name.len() > FIELD_NAME_MAX || value.iter().any(|b| *b < 32 && *b != b'\t') {
             return 0;
         }
@@ -1022,7 +1022,7 @@ unsafe fn client_send_request(s: &mut super::super::HttpState) {
         return;
     }
     if !s.h3_client.request_sent {
-        let method = super::super::wire::method::method_name(s.client.method);
+        let method = super::exchange_http::method_name(s.client.method);
         // The authority of the connection in hand: the module's, or the
         // record's on an open client. `configured_request` refuses an empty
         // one, so a client with nothing to name fails the request here.

@@ -38,9 +38,10 @@ use fluxor_rt::*;
 
 // The exchange records the gateway speaks; this fixture is their provider.
 use abi::contracts::exchange::{
-    flag, parse_request, write_body, write_credit, write_response_head, ExchangeId, Record,
-    ResponseHead, RECORD_MAX,
+    flag, parse_request, write_body, write_credit, write_response_head, ExchangeId, MetaWriter,
+    Record, META_CONTENT_TYPE, RECORD_MAX,
 };
+use abi::contracts::exchange_http::{self as http, status, Http};
 
 /// `module_step` return code for "did work, step me again".
 ///
@@ -68,7 +69,7 @@ const STREAM_CHUNK_BYTES: usize = 2048;
 struct Exchange {
     used: bool,
     id: ExchangeId,
-    method: u8,
+    verb: u8,
     path: [u8; PATH_MAX],
     path_len: usize,
     body: [u8; ECHO_MAX],
@@ -87,7 +88,7 @@ struct Exchange {
 const IDLE: Exchange = Exchange {
     used: false,
     id: ExchangeId::NONE,
-    method: 0,
+    verb: 0,
     path: [0; PATH_MAX],
     path_len: 0,
     body: [0; ECHO_MAX],
@@ -207,7 +208,7 @@ impl State {
     fn take(&mut self, sys: &SyscallTable) -> bool {
         let mut touched = None;
         let raw = &self.buf[..self.held_len];
-        let Some(rec) = parse_request(raw) else {
+        let Ok(rec) = parse_request::<Http>(raw) else {
             // A record that does not parse is dropped: the gateway's own
             // deadline answers the exchange, which is the honest outcome for
             // a broken contract.
@@ -221,7 +222,7 @@ impl State {
                 let mut e = IDLE;
                 e.used = true;
                 e.id = h.id;
-                e.method = h.method;
+                e.verb = h.verb;
                 e.path_len = h.target.len().min(PATH_MAX);
                 e.path[..e.path_len].copy_from_slice(&h.target[..e.path_len]);
                 // The body the HEAD carried inline, then BODY records while
@@ -310,11 +311,11 @@ impl State {
     /// Answer exchange `i` whole. False when the channel refused it.
     fn answer(&mut self, sys: &SyscallTable, i: usize) -> bool {
         let e = &self.ex[i];
-        let status = parse_status(&e.path[..e.path_len]).unwrap_or(200);
+        let named = parse_status(&e.path[..e.path_len]).unwrap_or(status::OK);
         let mut body = [0u8; ECHO_MAX + PATH_MAX + 64];
         let mut o = 0usize;
         o = put(&mut body, o, b"method=");
-        o = put(&mut body, o, method_name(e.method));
+        o = put(&mut body, o, method_name(e.verb));
         o = put(&mut body, o, b" path=");
         o = put(&mut body, o, &e.path[..e.path_len]);
         o = put(&mut body, o, b" body=");
@@ -323,15 +324,23 @@ impl State {
         let mut digits = [0u8; 20];
         let dn = decimal(e.total, &mut digits);
         o = put(&mut body, o, &digits[..dn]);
-        let head = ResponseHead {
-            id: e.id,
-            flags: 0,
-            status,
-            content_type: b"text/plain",
-            headers: &[],
-            body: &body[..o],
+        let mut meta = [0u8; META_BUF];
+        let Some(meta_len) = content_type_meta(&mut meta, b"text/plain") else {
+            return false;
         };
-        let n = write_response_head(&head, &mut self.out).unwrap_or(0);
+        // A status the binding does not carry (1xx, or past 599) is answered
+        // 500: the application named something no HTTP client can be sent.
+        let head = http::head(e.id, named, &meta[..meta_len], &body[..o]).or_else(|| {
+            http::head(
+                e.id,
+                status::INTERNAL_SERVER_ERROR,
+                &meta[..meta_len],
+                &body[..o],
+            )
+        });
+        let n = head
+            .and_then(|h| write_response_head::<Http>(&h, &mut self.out))
+            .unwrap_or(0);
         self.write(sys, n)
     }
 
@@ -351,15 +360,17 @@ impl State {
         let n = if e.stream_sent == 0 {
             // The first record is the head; it carries the content type and
             // the first chunk.
-            let head = ResponseHead {
-                id: e.id,
-                flags,
-                status: 200,
-                content_type: b"application/octet-stream",
-                headers: &[],
-                body: &chunk,
+            let mut meta = [0u8; META_BUF];
+            let Some(meta_len) = content_type_meta(&mut meta, b"application/octet-stream") else {
+                return false;
             };
-            write_response_head(&head, &mut self.out).unwrap_or(0)
+            match http::head(e.id, status::OK, &meta[..meta_len], &chunk) {
+                Some(mut head) => {
+                    head.flags = flags;
+                    write_response_head::<Http>(&head, &mut self.out).unwrap_or(0)
+                }
+                None => 0,
+            }
         } else {
             write_body(&e.id, flags, &chunk, &mut self.out).unwrap_or(0)
         };
@@ -381,6 +392,16 @@ impl State {
         // by the encoder that filled it.
         unsafe { (sys.channel_write)(self.response_out, self.out.as_ptr(), n) > 0 }
     }
+}
+
+/// Room for the one meta field this fixture answers with.
+const META_BUF: usize = 64;
+
+/// A meta run holding only `content-type: ct`; its length.
+fn content_type_meta(out: &mut [u8], ct: &[u8]) -> Option<usize> {
+    let mut w = MetaWriter::new(out);
+    w.put(META_CONTENT_TYPE, ct);
+    w.finish()
 }
 
 /// Append `src` at `off`, clamped to the buffer.
@@ -454,23 +475,23 @@ fn parse_status(path: &[u8]) -> Option<u16> {
 /// http module's own literal rather than shared: a fixture that `include!`d
 /// the gateway's table could not detect the gateway encoding a method
 /// wrongly, because both sides would be wrong together.
-const TOKENS: &[u8] = b"GETCONNECTPOSTHEADPUTPATCHDELETEOPTIONSNONE";
+const TOKENS: &[u8] = b"GETHEADPOSTPUTPATCHDELETEOPTIONSCONNECTNONE";
 
-/// `(offset, length)` into [`TOKENS`] per `wire::method::METHOD_*` value,
+/// `(offset, length)` into [`TOKENS`] per `exchange_http::method` value,
 /// indexed by the value. Index 0 and anything past the table read as `NONE`.
 const TOKEN_SPAN: [(u8, u8); 9] = [
-    (39, 4), // METHOD_NONE
+    (39, 4), // no verb
     (0, 3),  // GET
-    (3, 7),  // CONNECT
-    (10, 4), // POST
-    (14, 4), // HEAD
-    (18, 3), // PUT
-    (21, 5), // PATCH
-    (26, 6), // DELETE
-    (32, 7), // OPTIONS
+    (3, 4),  // HEAD
+    (7, 4),  // POST
+    (11, 3), // PUT
+    (14, 5), // PATCH
+    (19, 6), // DELETE
+    (25, 7), // OPTIONS
+    (32, 7), // CONNECT
 ];
 
-/// `wire::method::METHOD_*` → token.
+/// `exchange_http::method` value → token.
 ///
 /// Spans of one literal rather than a match returning eight different
 /// `&'static [u8]`, for the reason the http module's own table states: that

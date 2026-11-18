@@ -44,13 +44,18 @@ include!("../../common/s3_serve_core.rs");
 // The exchange records this module answers, as a provider.
 use abi::contracts::exchange::{
     self as exchange, abort, flag, parse_request, write_body, write_credit, write_response_head,
-    ExchangeId, Record, RequestHead, ResponseHead, BODY_MAX, RECORD_MAX,
+    ExchangeId, MetaWriter, Record, RequestHead, BODY_MAX, META_CONTENT_TYPE, RECORD_MAX,
+};
+// Requests and answers speak the exchange's HTTP binding: the verb is the
+// method, the detail the status, and meta fields are the header fields.
+use abi::contracts::exchange_http::{
+    self as http, header_lines_from_meta, meta_from_header_lines, method, Http,
 };
 
 use abi::contracts::mesh::capability as cap;
 use abi::contracts::storage::handle::STORAGE_KEY_MAX;
 use abi::contracts::storage::object as obj;
-use abi::fence::{Fence, WIRE_MAX_LEN};
+use abi::fence::{trailer, Fence, WIRE_MAX_LEN};
 use abi::kernel_abi::errno;
 
 // ── Ceilings ──────────────────────────────────────────────────────────────
@@ -115,6 +120,13 @@ const KEEPALIVE_MS: u64 = 5000;
 const NAME_MAX: usize = STORAGE_KEY_MAX;
 /// Longest `Content-Type` an object may be stored with; longer is `InvalidArgument`.
 const CT_MAX: usize = 128;
+/// A request's meta fields rendered as `name: value\r\n` lines, which is what
+/// SigV4 canonicalises: each line is one byte longer than its field, and a
+/// field is at least four bytes, so the lines of a record's meta fit in this.
+const HEADER_LINES_MAX: usize = RECORD_MAX + RECORD_MAX / 4;
+/// The meta of a response HEAD this module writes: the content type's field
+/// and the fields of at most 768 bytes of header lines.
+const HEAD_META_MAX: usize = 1024;
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -282,7 +294,8 @@ struct Exchange {
     /// The body's last record has been taken; the put commits once the
     /// stash has drained.
     put_last: bool,
-    // Provider handles and buffers whose addresses a pending call names.
+    // The provider handle, the fence a write reported, and the request a
+    // pending call is asked again with.
     handle: i32,
     fence: [u8; WIRE_MAX_LEN],
     arg: [u8; 2 * NAME_MAX + 64],
@@ -431,6 +444,10 @@ struct State {
     /// `object_volume` was longer than the bytes held for it. A truncated
     /// name selects a different provider, so construction refuses it.
     object_volume_bad: bool,
+    /// The handle bound to `object_volume`'s provider (`kernel::BIND`), every
+    /// grant minted through it; valid while `object_bound`.
+    object: i32,
+    object_bound: bool,
     max_object: u64,
     part_min: u64,
     // Loading.
@@ -455,6 +472,8 @@ struct State {
     rec: [u8; RECORD_MAX],
     held: bool,
     held_len: usize,
+    /// The held HEAD's meta fields as header lines, while it is dispatched.
+    lines: [u8; HEADER_LINES_MAX],
     /// Upload ids whose staging is still to be removed.
     reap: [[u8; S3_UPLOAD_ID_LEN]; MAX_UPLOADS],
     reap_bucket: [[u8; S3_BUCKET_MAX]; MAX_UPLOADS],
@@ -745,7 +764,29 @@ unsafe fn log(s: &State, msg: &[u8]) {
 }
 
 unsafe fn call(sys: *const SyscallTable, handle: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
-    ((*sys).provider_call)(handle, op, arg, len)
+    dev_call(&*sys, handle, op, arg, len)
+}
+
+/// A call whose bulk bytes travel in its `data` span.
+unsafe fn call_data(
+    sys: *const SyscallTable,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    len: usize,
+    data: *mut u8,
+    data_len: usize,
+) -> i32 {
+    dev_call_data(&*sys, handle, op, arg, len, data, data_len)
+}
+
+/// Keep the fence a write's trailer reports, encoded, for its answer; all
+/// zero when it reports none.
+fn keep_fence(fence: &mut [u8; WIRE_MAX_LEN], arg: &[u8]) {
+    fence.fill(0);
+    if let Some(f) = trailer::get(arg) {
+        let _ = f.encode(fence);
+    }
 }
 
 unsafe fn now_ms(s: &State) -> u64 {
@@ -801,10 +842,12 @@ unsafe fn load(s: &mut State) {
         s.boot = Boot::Failed;
         return;
     }
-    let n = call(
+    let n = call_data(
         s.syscalls,
         s.fd,
         fs::READ,
+        core::ptr::null_mut(),
+        0,
         s.file.as_mut_ptr().add(s.file_len),
         room,
     );
@@ -927,30 +970,45 @@ unsafe fn verify(s: &mut State) {
 unsafe fn present(s: &mut State) {
     while s.present_at < s.cred_count {
         let i = s.present_at;
-        let mut arg = [0u8; 3 + NAME_MAX + 2 + cap::MAX_CHAIN_BYTES];
-        let c = &s.creds[i];
-        let Some(n) =
-            obj::grant::encode_present(&mut arg, c.scope(), &c.chain[..c.chain_len as usize])
-        else {
+        // The grant is minted by the provider `object_volume` selects,
+        // through a handle bound to it once. The grant is routed — it names
+        // that provider — so every operation run under it reaches the same
+        // one through a plain call.
+        let via = if s.object_volume_len == 0 {
+            -1
+        } else {
+            if !s.object_bound {
+                let h = dev_bind_name(
+                    &*s.syscalls,
+                    abi::registry::storage_object::ID,
+                    &s.object_volume[..s.object_volume_len],
+                );
+                if h < 0 {
+                    log(s, b"[s3_serve] no storage provider carries object_volume");
+                    s.boot = Boot::Failed;
+                    return;
+                }
+                s.object = h;
+                s.object_bound = true;
+            }
+            s.object
+        };
+        let mut arg = [0u8; obj::grant::PRESENT_ARG_MAX];
+        let c = &mut s.creds[i];
+        let Some(n) = obj::grant::encode_present(&mut arg, c.scope()) else {
             s.boot = Boot::Failed;
             return;
         };
-        // The grant is minted by the provider `object_volume` selects. Its
-        // handle is routed — it names that provider — so every operation
-        // run under it reaches the same one through a plain call.
-        let rc = if s.object_volume_len == 0 {
-            call(s.syscalls, -1, obj::PRESENT, arg.as_mut_ptr(), n)
-        } else {
-            let sel = &s.object_volume[..s.object_volume_len];
-            ((*s.syscalls).provider_call_sel)(
-                sel.as_ptr(),
-                sel.len(),
-                -1,
-                obj::PRESENT,
-                arg.as_mut_ptr(),
-                n,
-            )
-        };
+        let chain_len = c.chain_len as usize;
+        let rc = call_data(
+            s.syscalls,
+            via,
+            obj::PRESENT,
+            arg.as_mut_ptr(),
+            n,
+            c.chain.as_mut_ptr(),
+            chain_len,
+        );
         if rc == errno::EAGAIN {
             return;
         }
@@ -1019,9 +1077,8 @@ unsafe fn reclaim(s: &mut State) {
             let page_bytes = core::slice::from_raw_parts(s.page.as_ptr(), page_len);
             if let Some(p) = obj::list::decode_page(page_bytes) {
                 for e in p.entries() {
-                    let mut arg = [0u8; NAME_MAX + 32];
-                    let mut fence = [0u8; WIRE_MAX_LEN];
-                    if let Some(n) = delete_arg(&mut arg, e.key, &mut fence) {
+                    let mut arg = [0u8; DELETE_ARG_MAX];
+                    if let Some(n) = delete_arg(&mut arg, e.key) {
                         let _ = obj::write_answer(call(
                             s.syscalls,
                             c.grant,
@@ -1048,44 +1105,29 @@ unsafe fn reclaim(s: &mut State) {
     s.boot = Boot::Probe;
 }
 
-/// Encode a `PUT_STREAMED_OPEN` argument block into `arg`, returning its
-/// length. The one place this layout is written: three callers open a streamed
-/// put — an object, a part, and the probe below — and a second spelling of a
-/// wire layout is how two of them drift apart.
+/// Encode a `PUT_STREAMED_OPEN` argument into `arg`, returning its length.
+/// Three callers open a streamed put — an object, a part, and the probe below
+/// — and all of them go through here.
 ///
-/// `declared` is the expected size, a hint the provider may ignore; `etag` is
-/// empty unless `precondition` is `ETAG`. The request keeps nothing beside the
-/// object: `dispatch` refuses a request that asks it to.
+/// `etag` is empty unless `precondition` is `ETAG`. The request keeps nothing
+/// beside the object: `dispatch` refuses a request that asks it to.
 fn encode_put_open(
     arg: &mut [u8],
     key: &[u8],
     content_type: &[u8],
-    declared: u64,
     precondition: u8,
     etag: &[u8],
 ) -> Option<usize> {
-    let n = 2 + key.len() + 1 + content_type.len() + 8 + 2 + etag.len() + obj::KEPT_FIXED_LEN;
-    if n > arg.len() || key.len() > u16::MAX as usize || content_type.len() > u8::MAX as usize {
-        return None;
-    }
-    let mut p = 0usize;
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    arg[p] = content_type.len() as u8;
-    p += 1;
-    arg[p..p + content_type.len()].copy_from_slice(content_type);
-    p += content_type.len();
-    arg[p..p + 8].copy_from_slice(&declared.to_le_bytes());
-    p += 8;
-    arg[p] = precondition;
-    arg[p + 1] = etag.len() as u8;
-    p += 2;
-    arg[p..p + etag.len()].copy_from_slice(etag);
-    p += etag.len();
-    p += obj::Kept::none().encode(&mut arg[p..])?;
-    Some(p)
+    obj::put::encode_record(
+        arg,
+        &obj::put::Request {
+            key,
+            content_type,
+            precondition,
+            etag,
+            kept: obj::Kept::none(),
+        },
+    )
 }
 
 /// Ask the provider whether it can take a streamed write, before accepting a
@@ -1114,8 +1156,8 @@ unsafe fn probe(s: &mut State) {
         );
         return;
     };
-    let mut arg = [0u8; NAME_MAX + 32];
-    let Some(p) = encode_put_open(&mut arg, &key[..kl], &[], 0, obj::precondition::ANY, &[]) else {
+    let mut arg = [0u8; obj::put::RECORD_MAX];
+    let Some(p) = encode_put_open(&mut arg, &key[..kl], &[], obj::precondition::ANY, &[]) else {
         s.boot = Boot::Failed;
         log(
             s,
@@ -1176,21 +1218,24 @@ unsafe fn list_page(
     max_keys: u16,
     out_cap: usize,
 ) -> Result<(usize, ()), i32> {
-    let mut fence = [0u8; WIRE_MAX_LEN];
     let req = obj::list::Request {
         prefix,
         cursor,
         max_keys,
-        out_ptr: s.page.as_mut_ptr() as u64,
-        out_cap: out_cap.min(LIST_PAGE_BUF) as u32,
-        fence_out_ptr: fence.as_mut_ptr() as u64,
-        fence_out_cap: WIRE_MAX_LEN as u16,
     };
-    let mut arg = [0u8; obj::list::REQUEST_FIXED_LEN + 2 * NAME_MAX];
+    let mut arg = [0u8; obj::list::arg_len(NAME_MAX, NAME_MAX)];
     let Some(n) = obj::list::encode_request(&mut arg, &req) else {
         return Err(errno::EINVAL);
     };
-    let rc = call(s.syscalls, grant, obj::LIST, arg.as_mut_ptr(), n);
+    let rc = call_data(
+        s.syscalls,
+        grant,
+        obj::LIST,
+        arg.as_mut_ptr(),
+        n,
+        s.page.as_mut_ptr(),
+        out_cap.min(LIST_PAGE_BUF),
+    );
     if rc < 0 {
         Err(rc)
     } else {
@@ -1198,20 +1243,19 @@ unsafe fn list_page(
     }
 }
 
-/// A `DELETE` request, unconditional.
-fn delete_arg(arg: &mut [u8], key: &[u8], fence: &mut [u8; WIRE_MAX_LEN]) -> Option<usize> {
-    let n = 2 + key.len() + 2 + 10;
-    if n > arg.len() || key.len() > u16::MAX as usize {
-        return None;
-    }
-    arg[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    arg[2..2 + key.len()].copy_from_slice(key);
-    let p = 2 + key.len();
-    arg[p] = obj::precondition::ANY;
-    arg[p + 1] = 0;
-    arg[p + 2..p + 10].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 10..p + 12].copy_from_slice(&(WIRE_MAX_LEN as u16).to_le_bytes());
-    Some(p + 12)
+/// The longest unconditional `DELETE` `arg`, trailer included.
+const DELETE_ARG_MAX: usize = obj::delete::arg_len(NAME_MAX, 0);
+
+/// A `DELETE` request, unconditional, with room for the fence trailer.
+fn delete_arg(arg: &mut [u8], key: &[u8]) -> Option<usize> {
+    obj::delete::encode_request(
+        arg,
+        &obj::delete::Request {
+            key,
+            precondition: obj::precondition::ANY,
+            etag: &[],
+        },
+    )
 }
 
 // ── Records in ────────────────────────────────────────────────────────────
@@ -1248,7 +1292,7 @@ unsafe fn take_records(s: &mut State) -> bool {
 /// HEAD could not be written yet).
 unsafe fn take(s: &mut State) -> bool {
     let raw: &[u8] = core::slice::from_raw_parts(s.rec.as_ptr(), s.held_len);
-    let Some(rec) = parse_request(raw) else {
+    let Ok(rec) = parse_request::<Http>(raw) else {
         return true;
     };
     match rec {
@@ -1342,15 +1386,11 @@ unsafe fn refuse_now(s: &mut State, id: &ExchangeId, credit: u32) -> bool {
     h.put(b"\r\n");
     let hl = h.len;
     let mut rec = [0u8; 1024];
-    let head = ResponseHead {
-        id: *id,
-        flags: 0,
-        status: err.status(),
-        content_type: b"application/xml",
-        headers: &hdr[..hl],
-        body: &body[..len],
-    };
-    let Some(n) = write_response_head(&head, &mut rec) else {
+    let mut meta = [0u8; HEAD_META_MAX];
+    let Some(n) = head_meta(b"application/xml", &hdr[..hl], &mut meta)
+        .and_then(|ml| http::head(*id, err.status(), &meta[..ml], &body[..len]))
+        .and_then(|head| write_response_head::<Http>(&head, &mut rec))
+    else {
         return true;
     };
     ((*s.syscalls).channel_write)(s.response_out, rec.as_ptr(), n) > 0
@@ -1364,7 +1404,7 @@ unsafe fn begin(s: &mut State, i: usize, h: &RequestHead<'_>) -> bool {
     let e = &mut s.ex[i];
     e.phase = Phase::Answer;
     e.id = h.id;
-    e.method = h.method;
+    e.method = h.verb;
     // A body is open while BODY records follow it, or while the HEAD's own
     // inline bytes are still to be taken below.
     let more = h.flags & flag::MORE != 0;
@@ -1406,9 +1446,18 @@ unsafe fn begin(s: &mut State, i: usize, h: &RequestHead<'_>) -> bool {
         }
     }
     let target: &[u8] = core::slice::from_raw_parts(h.target.as_ptr(), h.target.len());
-    let headers: &[u8] = core::slice::from_raw_parts(h.headers.as_ptr(), h.headers.len());
     let peer: &[u8] = core::slice::from_raw_parts(h.peer.as_ptr(), h.peer.len());
-    if let Err(err) = dispatch(s, i, target, headers, peer) {
+    // SigV4 signs header lines, so the meta fields are read as the lines they
+    // render: names in lower case and values trimmed, which is the canonical
+    // form it signs anyway. A run holding a line break renders as no lines.
+    let dispatched = match header_lines_from_meta(h.meta, &mut s.lines) {
+        Some(n) => {
+            let headers: &[u8] = core::slice::from_raw_parts(s.lines.as_ptr(), n);
+            dispatch(s, i, target, headers, peer)
+        }
+        None => Err(S3Err::InvalidArgument),
+    };
+    if let Err(err) = dispatched {
         fail(s, i, err);
     }
     // The body bytes the HEAD carried, taken as the first body record. They
@@ -1433,7 +1482,7 @@ unsafe fn dispatch(
     headers: &[u8],
     peer: &[u8],
 ) -> Result<(), S3Err> {
-    let method = exchange::method_name(s.ex[i].method);
+    let method = http::method_name(s.ex[i].method);
     let r = s3_resource(target);
     let op = s3_classify(method, &r);
     s.ex[i].op = op;
@@ -1449,7 +1498,7 @@ unsafe fn dispatch(
     // caller asked to be immutable or sealed into one that is neither, and tells
     // the caller it succeeded.
     let chunked = s.ex[i].payload == Payload::Chunked;
-    if exchange::header_lines(headers).any(|(name, value)| {
+    if http::header_lines(headers).any(|(name, value)| {
         s3_name_asks_keeping(name) || s3_header_dropped(op, name, value, chunked)
     }) {
         return Err(S3Err::NotImplemented);
@@ -1723,7 +1772,7 @@ unsafe fn fail(s: &mut State, i: usize, err: S3Err) {
     }
     let resource_len = r.len;
     s3_error_xml(err, err.code(), &resource[..resource_len], &rid, &mut o);
-    let len = if !o.over && (o.len as u32) <= e.resp_credit && e.method != exchange::METHOD_HEAD {
+    let len = if !o.over && (o.len as u32) <= e.resp_credit && e.method != method::HEAD {
         o.len
     } else {
         0
@@ -1770,15 +1819,17 @@ unsafe fn stage_head(
         s.tlm_aborts = s.tlm_aborts.wrapping_add(1);
         return false;
     }
-    let head = ResponseHead {
-        id: e.id,
-        flags: if last { 0 } else { flag::MORE },
-        status,
-        content_type: ct,
-        headers,
-        body,
+    let mut meta = [0u8; HEAD_META_MAX];
+    let Some(head) = head_meta(ct, headers, &mut meta)
+        .and_then(|ml| http::head(e.id, status, &meta[..ml], body))
+    else {
+        return false;
     };
-    match write_response_head(&head, out) {
+    let head = exchange::ResponseHead {
+        flags: if last { 0 } else { flag::MORE },
+        ..head
+    };
+    match write_response_head::<Http>(&head, out) {
         Some(n) => {
             e.out_len = n;
             e.out_state = Out::Pending;
@@ -1789,6 +1840,19 @@ unsafe fn stage_head(
         }
         None => false,
     }
+}
+
+/// A response HEAD's meta in `out`: the `content-type` field (none when `ct`
+/// is empty), then one field per `name: value\r\n` line of `lines`. Its
+/// length, or `None` when it does not fit.
+fn head_meta(ct: &[u8], lines: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut w = MetaWriter::new(out);
+    if !ct.is_empty() {
+        w.put(META_CONTENT_TYPE, ct);
+    }
+    let n = w.finish()?;
+    let m = meta_from_header_lines(lines, out.get_mut(n..)?)?;
+    Some(n + m)
 }
 
 /// Stage a response BODY.
@@ -2045,8 +2109,8 @@ unsafe fn begin_put(s: &mut State, i: usize, headers: &[u8], part: bool) -> Resu
     }
     e.put_last = !e.body_open;
     let key = &e.name[..e.name_len];
-    let mut arg = [0u8; NAME_MAX + 320];
-    let p = encode_put_open(&mut arg, key, ct, declared, precondition, &etag[..etag_len])
+    let mut arg = [0u8; obj::put::RECORD_MAX];
+    let p = encode_put_open(&mut arg, key, ct, precondition, &etag[..etag_len])
         .ok_or(S3Err::KeyTooLong)?;
     if p > e.arg.len() {
         return Err(S3Err::KeyTooLong);
@@ -2137,9 +2201,12 @@ unsafe fn put_piece(k: &mut PutSink, d: &[u8]) {
     k.taken += d.len() as u64;
     let mut refused = false;
     if k.off == k.len && k.handle >= 0 {
-        let rc = ((*k.sys).provider_call)(
+        let rc = call_data(
+            k.sys,
             k.handle,
             obj::PUT_STREAMED_WRITE,
+            core::ptr::null_mut(),
+            0,
             d.as_ptr() as *mut u8,
             d.len(),
         );
@@ -2199,9 +2266,12 @@ unsafe fn put_drain(s: &mut State, i: usize) -> bool {
         } else {
             rest.min(BODY_MAX)
         };
-        let rc = ((*sys).provider_call)(
+        let rc = call_data(
+            sys,
             e.handle,
             obj::PUT_STREAMED_WRITE,
+            core::ptr::null_mut(),
+            0,
             e.stash.add(e.stash_off as usize),
             n,
         );
@@ -2334,9 +2404,8 @@ unsafe fn finish_put_body(s: &mut State, i: usize) {
         Payload::Unsigned => {}
     }
     let e = &mut s.ex[i];
-    e.arg[..8].copy_from_slice(&(e.fence.as_mut_ptr() as u64).to_le_bytes());
-    e.arg[8..10].copy_from_slice(&(WIRE_MAX_LEN as u16).to_le_bytes());
-    e.arg_len = 10;
+    e.arg[..obj::COMMIT_ARG_LEN].fill(0);
+    e.arg_len = obj::COMMIT_ARG_LEN;
     e.phase = Phase::PutCommit;
     put_commit(s, i);
 }
@@ -2354,6 +2423,8 @@ unsafe fn put_commit(s: &mut State, i: usize) -> bool {
     )) {
         obj::WriteAnswer::Pending => false,
         obj::WriteAnswer::Decided(0) => {
+            let e = &mut s.ex[i];
+            keep_fence(&mut e.fence, &e.arg[..e.arg_len]);
             call(
                 s.syscalls,
                 s.ex[i].handle,
@@ -2438,25 +2509,19 @@ fn fence_header(fence: &[u8; WIRE_MAX_LEN], h: &mut S3Out<'_>) {
 unsafe fn head_object(s: &mut State, i: usize) -> Result<(), i32> {
     let grant = s.creds[s.ex[i].cred as usize].grant;
     let e = &mut s.ex[i];
-    let mut out = [0u8; 8 + 8 + 1 + 255 + 1 + 255 + obj::KEPT_FIXED_LEN + obj::KEY_REF_MAX];
-    // The read's own fence: the exchange's `fence` keeps what a write
-    // reported, which is what its answer names.
-    let mut fence = [0u8; WIRE_MAX_LEN];
-    let key = &e.name[..e.name_len];
-    let mut arg = [0u8; NAME_MAX + 32];
-    arg[..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    arg[2..2 + key.len()].copy_from_slice(key);
-    let mut p = 2 + key.len();
-    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 8..p + 12].copy_from_slice(&(out.len() as u32).to_le_bytes());
-    arg[p + 12..p + 20].copy_from_slice(&(fence.as_mut_ptr() as u64).to_le_bytes());
-    arg[p + 20..p + 22].copy_from_slice(&(WIRE_MAX_LEN as u16).to_le_bytes());
-    p += 22;
+    // The record comes back over the request, the read's own fence in the
+    // trailer: the exchange's `fence` keeps what a write reported, which is
+    // what its answer names.
+    let mut arg = [0u8; obj::head::ARG_LEN];
+    let Some(p) = obj::head::encode_request(&mut arg, &e.name[..e.name_len]) else {
+        return Err(errno::EINVAL);
+    };
     let rc = call(s.syscalls, grant, obj::HEAD, arg.as_mut_ptr(), p);
     if rc < 0 {
         return Err(rc);
     }
-    let Some((h, _ct, etag, _kept)) = obj::range::decode_head(&out[..rc as usize]) else {
+    let Some((h, _ct, etag, _kept)) = arg.get(..rc as usize).and_then(obj::range::decode_head)
+    else {
         return Err(errno::ERROR);
     };
     let e = &mut s.ex[i];
@@ -2603,8 +2668,7 @@ unsafe fn read_head(s: &mut State, i: usize) -> bool {
 /// while the provider answers `EAGAIN`.
 unsafe fn read_open(s: &mut State, i: usize) -> bool {
     let grant = s.creds[s.ex[i].cred as usize].grant;
-    let e = &mut s.ex[i];
-    let h = call(s.syscalls, grant, obj::GET, e.name.as_mut_ptr(), e.name_len);
+    let h = open_object(s, i, grant);
     if h == errno::EAGAIN {
         return false;
     }
@@ -2616,6 +2680,17 @@ unsafe fn read_open(s: &mut State, i: usize) -> bool {
     stage_read_head(s, i, false);
     s.ex[i].phase = Phase::GetBody;
     true
+}
+
+/// `GET` the exchange's object `name` for ranged reads: the handle, or an
+/// errno.
+unsafe fn open_object(s: &mut State, i: usize, grant: i32) -> i32 {
+    let e = &s.ex[i];
+    let mut arg = [0u8; obj::key::ARG_MAX];
+    let Some(n) = obj::key::encode(&mut arg, &e.name[..e.name_len]) else {
+        return errno::EINVAL;
+    };
+    call(s.syscalls, grant, obj::GET, arg.as_mut_ptr(), n)
 }
 
 /// Stage a read's response HEAD from the exchange's object metadata, range
@@ -2677,16 +2752,15 @@ unsafe fn get_body(s: &mut State, i: usize) -> bool {
     let data_at = exchange::HDR;
     let mut got = 0usize;
     while got < n {
-        let mut arg = [0u8; 20];
-        arg[..8].copy_from_slice(&(e.offset + got as u64).to_le_bytes());
-        arg[8..12].copy_from_slice(&((n - got) as u32).to_le_bytes());
-        arg[12..20].copy_from_slice(&(out.as_mut_ptr().add(data_at + got) as u64).to_le_bytes());
-        let rc = call(
+        let mut arg = obj::range_get::encode(e.offset + got as u64);
+        let rc = call_data(
             s.syscalls,
             e.handle,
             obj::RANGE_GET,
             arg.as_mut_ptr(),
             arg.len(),
+            out.as_mut_ptr().add(data_at + got),
+            n - got,
         );
         if rc == errno::EAGAIN {
             break;
@@ -2728,14 +2802,10 @@ unsafe fn delete_step(s: &mut State, i: usize) -> bool {
     let grant = s.creds[s.ex[i].cred as usize].grant;
     let e = &mut s.ex[i];
     if e.arg_len == 0 {
+        // Kept in the exchange: a delete not decided yet is asked again with
+        // the same bytes.
         let key = &e.name[..e.name_len];
-        let mut fence = e.fence;
-        let n = delete_arg(&mut e.arg, key, &mut fence).unwrap_or(0);
-        // The fence pointer must name the exchange's own buffer, which stays
-        // put while the provider may answer on a later ask.
-        let p = 2 + e.name_len + 2;
-        e.arg[p..p + 8].copy_from_slice(&(e.fence.as_mut_ptr() as u64).to_le_bytes());
-        e.arg_len = n;
+        e.arg_len = delete_arg(&mut e.arg, key).unwrap_or(0);
     }
     match obj::write_answer(call(
         s.syscalls,
@@ -2747,6 +2817,8 @@ unsafe fn delete_step(s: &mut State, i: usize) -> bool {
         obj::WriteAnswer::Pending => false,
         obj::WriteAnswer::Decided(rc) if rc == 0 || rc == errno::ENXIO || rc == errno::ENOENT => {
             // S3 answers a delete of a missing key as done.
+            let e = &mut s.ex[i];
+            keep_fence(&mut e.fence, &e.arg[..e.arg_len]);
             let e = &s.ex[i];
             let mut hdr = [0u8; 256];
             let mut h = S3Out::new(&mut hdr);
@@ -3088,7 +3160,26 @@ unsafe fn list_send(s: &mut State, i: usize) -> bool {
     let pending = s.ex[i].list.pending as usize;
     let done = s.ex[i].list.done;
     let credit = s.ex[i].resp_credit as usize;
-    let room = BODY_MAX - 64;
+    let head_sent = s.ex[i].head_sent;
+    let mut hdr = [0u8; 64];
+    let mut hl = 0usize;
+    // The first chunk rides the response HEAD, after its meta; the rest go
+    // in BODY records.
+    let room = if head_sent {
+        BODY_MAX
+    } else {
+        let mut h = S3Out::new(&mut hdr);
+        h.put(b"x-amz-request-id: ");
+        h.put(&s.ex[i].request_id);
+        h.put(b"\r\n");
+        hl = h.len;
+        let mut meta = [0u8; HEAD_META_MAX];
+        let Some(ml) = head_meta(b"application/xml", &hdr[..hl], &mut meta) else {
+            fail(s, i, S3Err::InternalError);
+            return true;
+        };
+        RECORD_MAX.saturating_sub(exchange::response_body_at(ml))
+    };
     let n = pending.min(credit).min(room);
     if n == 0 {
         return false;
@@ -3096,21 +3187,17 @@ unsafe fn list_send(s: &mut State, i: usize) -> bool {
     let mut chunk = [0u8; BODY_MAX];
     chunk[..n].copy_from_slice(core::slice::from_raw_parts(s.ex[i].list.page, n));
     let rest = pending - n;
+    let last = done && rest == 0;
+    if head_sent {
+        stage_body(s, i, &chunk[..n], last);
+    } else if !stage_head(s, i, 200, b"application/xml", &hdr[..hl], &chunk[..n], last) {
+        // Nothing was staged: the rendered bytes stay pending.
+        return false;
+    }
+    // Staged: the chunk leaves the pending document.
     let page = s.ex[i].list.page;
     core::ptr::copy(page.add(n), page, rest);
     s.ex[i].list.pending = rest as u16;
-    let last = done && rest == 0;
-    if !s.ex[i].head_sent {
-        let mut hdr = [0u8; 64];
-        let mut h = S3Out::new(&mut hdr);
-        h.put(b"x-amz-request-id: ");
-        h.put(&s.ex[i].request_id);
-        h.put(b"\r\n");
-        let hl = h.len;
-        stage_head(s, i, 200, b"application/xml", &hdr[..hl], &chunk[..n], last);
-    } else {
-        stage_body(s, i, &chunk[..n], last);
-    }
     if last {
         s.ex[i].phase = Phase::Answer;
     }
@@ -3146,42 +3233,34 @@ unsafe fn begin_create_upload(s: &mut State, i: usize) -> Result<(), S3Err> {
     bucket[..bucket_len].copy_from_slice(&e.name[..bucket_len]);
     let mut marker = [0u8; NAME_MAX];
     let ml = s3_upload_name(&bucket[..bucket_len], &id, 0, &mut marker).ok_or(S3Err::KeyTooLong)?;
-    // [key_len][key][ct_len=0][body_ptr][body_len][precondition ABSENT][0][Kept none][fence ptr][cap]
-    let body_ptr = e.name.as_ptr() as u64;
-    let body_len = e.name_len as u64;
-    let a = &mut e.arg;
-    let mut p = 0usize;
-    a[p..p + 2].copy_from_slice(&(ml as u16).to_le_bytes());
-    p += 2;
-    a[p..p + ml].copy_from_slice(&marker[..ml]);
-    p += ml;
-    a[p] = 0;
-    p += 1;
-    a[p..p + 8].copy_from_slice(&body_ptr.to_le_bytes());
-    a[p + 8..p + 16].copy_from_slice(&body_len.to_le_bytes());
-    p += 16;
-    a[p] = obj::precondition::ABSENT;
-    a[p + 1] = 0;
-    p += 2;
-    p += obj::Kept::none()
-        .encode(&mut a[p..])
-        .ok_or(S3Err::KeyTooLong)?;
-    a[p..p + 8].copy_from_slice(&(e.fence.as_mut_ptr() as u64).to_le_bytes());
-    a[p + 8..p + 10].copy_from_slice(&(WIRE_MAX_LEN as u16).to_le_bytes());
-    p += 10;
-    e.arg_len = p;
+    // Created only if absent; its body, the object's name, travels as the
+    // call's `data` on every ask.
+    e.arg_len = obj::put::encode(
+        &mut e.arg,
+        &obj::put::Request {
+            key: &marker[..ml],
+            content_type: &[],
+            precondition: obj::precondition::ABSENT,
+            etag: &[],
+            kept: obj::Kept::none(),
+        },
+    )
+    .ok_or(S3Err::KeyTooLong)?;
     e.phase = Phase::UploadCreate;
     Ok(())
 }
 
 unsafe fn upload_create(s: &mut State, i: usize) -> bool {
     let grant = s.creds[s.ex[i].cred as usize].grant;
-    match obj::write_answer(call(
+    let e = &mut s.ex[i];
+    match obj::write_answer(call_data(
         s.syscalls,
         grant,
         obj::PUT,
-        s.ex[i].arg.as_mut_ptr(),
-        s.ex[i].arg_len,
+        e.arg.as_mut_ptr(),
+        e.arg_len,
+        e.name.as_mut_ptr(),
+        e.name_len,
     )) {
         obj::WriteAnswer::Pending => false,
         obj::WriteAnswer::Decided(0) => {
@@ -3395,15 +3474,8 @@ unsafe fn complete_open(s: &mut State, i: usize) -> bool {
     let slot = s.ex[i].upload_slot as usize;
     let u = s.uploads[slot];
     let key = &u.name[..u.name_len as usize];
-    let mut arg = [0u8; NAME_MAX + 32];
-    let Some(p) = encode_put_open(
-        &mut arg,
-        key,
-        &[],
-        s.ex[i].received,
-        obj::precondition::ANY,
-        &[],
-    ) else {
+    let mut arg = [0u8; obj::put::RECORD_MAX];
+    let Some(p) = encode_put_open(&mut arg, key, &[], obj::precondition::ANY, &[]) else {
         fail(s, i, S3Err::KeyTooLong);
         return true;
     };
@@ -3470,9 +3542,8 @@ unsafe fn complete_copy(s: &mut State, i: usize) -> bool {
     let k = s.ex[i].part_at;
     if k == s.ex[i].parts_len {
         let e = &mut s.ex[i];
-        e.arg[..8].copy_from_slice(&(e.fence.as_mut_ptr() as u64).to_le_bytes());
-        e.arg[8..10].copy_from_slice(&(WIRE_MAX_LEN as u16).to_le_bytes());
-        e.arg_len = 10;
+        e.arg[..obj::COMMIT_ARG_LEN].fill(0);
+        e.arg_len = obj::COMMIT_ARG_LEN;
         e.phase = Phase::CompleteCommit;
         return true;
     }
@@ -3483,8 +3554,7 @@ unsafe fn complete_copy(s: &mut State, i: usize) -> bool {
             return true;
         }
         let grant = s.creds[s.ex[i].cred as usize].grant;
-        let e = &mut s.ex[i];
-        let h = call(s.syscalls, grant, obj::GET, e.name.as_mut_ptr(), e.name_len);
+        let h = open_object(s, i, grant);
         if h == errno::EAGAIN {
             return false;
         }
@@ -3497,11 +3567,16 @@ unsafe fn complete_copy(s: &mut State, i: usize) -> bool {
     }
     let rh = s.ex[i].mtime as i32;
     let mut buf = [0u8; BODY_MAX];
-    let mut arg = [0u8; 20];
-    arg[..8].copy_from_slice(&s.ex[i].offset.to_le_bytes());
-    arg[8..12].copy_from_slice(&(buf.len() as u32).to_le_bytes());
-    arg[12..20].copy_from_slice(&(buf.as_mut_ptr() as u64).to_le_bytes());
-    let n = call(s.syscalls, rh, obj::RANGE_GET, arg.as_mut_ptr(), arg.len());
+    let mut arg = obj::range_get::encode(s.ex[i].offset);
+    let n = call_data(
+        s.syscalls,
+        rh,
+        obj::RANGE_GET,
+        arg.as_mut_ptr(),
+        arg.len(),
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
     if n == errno::EAGAIN {
         return false;
     }
@@ -3515,10 +3590,12 @@ unsafe fn complete_copy(s: &mut State, i: usize) -> bool {
         s.ex[i].part_at += 1;
         return true;
     }
-    let rc = call(
+    let rc = call_data(
         s.syscalls,
         s.ex[i].handle,
         obj::PUT_STREAMED_WRITE,
+        core::ptr::null_mut(),
+        0,
         buf.as_mut_ptr(),
         n as usize,
     );
@@ -3580,6 +3657,8 @@ unsafe fn complete_commit(s: &mut State, i: usize) -> bool {
     )) {
         obj::WriteAnswer::Pending => false,
         obj::WriteAnswer::Decided(0) => {
+            let e = &mut s.ex[i];
+            keep_fence(&mut e.fence, &e.arg[..e.arg_len]);
             call(
                 s.syscalls,
                 s.ex[i].handle,
@@ -3746,9 +3825,8 @@ unsafe fn sweep(s: &mut State) {
         let mut next_len = 0usize;
         if let Some(p) = obj::list::decode_page(page) {
             for e in p.entries() {
-                let mut arg = [0u8; NAME_MAX + 32];
-                let mut fence = [0u8; WIRE_MAX_LEN];
-                if let Some(n) = delete_arg(&mut arg, e.key, &mut fence) {
+                let mut arg = [0u8; DELETE_ARG_MAX];
+                if let Some(n) = delete_arg(&mut arg, e.key) {
                     let _ = obj::write_answer(call(
                         s.syscalls,
                         grant,
@@ -3775,9 +3853,8 @@ unsafe fn sweep(s: &mut State) {
             return;
         }
     }
-    let mut arg = [0u8; NAME_MAX + 32];
-    let mut fence = [0u8; WIRE_MAX_LEN];
-    if let Some(n) = delete_arg(&mut arg, &marker[..ml], &mut fence) {
+    let mut arg = [0u8; DELETE_ARG_MAX];
+    if let Some(n) = delete_arg(&mut arg, &marker[..ml]) {
         let _ = obj::write_answer(call(s.syscalls, grant, obj::DELETE, arg.as_mut_ptr(), n));
     }
     pop_reap(s);

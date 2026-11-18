@@ -6,8 +6,8 @@
 //! `http` the relay is a provider (`request_in` / `response_out`), toward the
 //! connector a requester (`request_out` / `response_in`), and the exchange id
 //! `http` chose is the one the connector echoes. So every record passes
-//! through unchanged but one: a request HEAD loses the header
-//! lines that belong to the inbound connection (`host`, its framing, its
+//! through unchanged but one: a request HEAD loses the meta
+//! fields that belong to the inbound connection (`host`, its framing, its
 //! `expect`, any signature of its own) and its peer, because the connector
 //! writes those for the request it signs and refuses a caller that sends them.
 //!
@@ -27,7 +27,8 @@ use fluxor_abi as abi;
 use fluxor_rt::*;
 
 use abi::contracts::exchange::{
-    kind, parse_request, write_request_head, Record, RequestHead, RECORD_MAX,
+    kind, meta_fields, parse_request, write_request_head, MetaWriter, Record, Relayed, RequestHead,
+    RECORD_MAX,
 };
 
 /// Records moved per direction per step.
@@ -50,7 +51,7 @@ struct State {
     up: Lane,
     /// Connector → `http`.
     down: Lane,
-    /// A rewritten request HEAD, and the header lines it keeps.
+    /// A rewritten request HEAD, and the meta fields it keeps.
     scratch: Scratch,
 }
 
@@ -186,48 +187,47 @@ fn pump(sys: &SyscallTable, lane: &mut Lane, scratch: &mut Scratch, up: bool) ->
 }
 
 /// Re-encode a request HEAD into `scratch.record` without the inbound
-/// connection's own header lines and peer. Its length, 0 when it does not
+/// connection's own meta fields and peer. Its length, 0 when it does not
 /// parse.
+///
+/// The relay reads no binding: verbs and the fields it keeps pass through for
+/// the connector to judge.
 fn strip_head(rec: &[u8], scratch: &mut Scratch) -> usize {
-    let Some(Record::Head(h)) = parse_request(rec) else {
+    let Ok(Record::Head(h)) = parse_request::<Relayed>(rec) else {
         return 0;
     };
-    let mut n = 0usize;
-    let mut rest = h.headers;
-    while !rest.is_empty() {
-        let end = rest
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .map_or(rest.len(), |e| e + 2);
-        let line = &rest[..end];
-        rest = &rest[end..];
-        let Some(colon) = line.iter().position(|&c| c == b':') else {
-            continue;
-        };
-        if inbound_only(&line[..colon]) {
+    let mut w = MetaWriter::new(&mut scratch.kept);
+    for (key, val) in meta_fields(h.meta) {
+        if inbound_only(key) {
             continue;
         }
-        scratch.kept[n..n + line.len()].copy_from_slice(line);
-        n += line.len();
+        w.put(key, val);
     }
+    let Some(n) = w.finish() else {
+        return 0;
+    };
     // The body the HEAD carried rides on with it: the HEAD only got shorter.
     let head = RequestHead {
         id: h.id,
         flags: h.flags,
-        method: h.method,
+        op: h.op,
+        verb: h.verb,
         target: h.target,
-        headers: &scratch.kept[..n],
+        meta: &scratch.kept[..n],
         peer: &[],
         resp_credit: h.resp_credit,
         body: h.body,
     };
-    write_request_head(&head, &mut scratch.record).unwrap_or(0)
+    write_request_head::<Relayed>(&head, &mut scratch.record).unwrap_or(0)
 }
 
-/// A header that describes the inbound connection or its own signature, which
-/// the connector writes afresh for the request it sends.
+/// A field that describes the inbound connection or its own signature, which
+/// the connector writes afresh for the request it sends, or a fact of the
+/// server's own routing (a `:` key) that means nothing past it. Meta keys are
+/// lower case.
 fn inbound_only(name: &[u8]) -> bool {
-    name.eq_ignore_ascii_case(b"host")
+    name.first() == Some(&b':')
+        || name.eq_ignore_ascii_case(b"host")
         || name.eq_ignore_ascii_case(b"authorization")
         || name.eq_ignore_ascii_case(b"connection")
         || name.eq_ignore_ascii_case(b"keep-alive")

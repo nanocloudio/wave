@@ -16,28 +16,29 @@
 // `tools/ci/identity_accessor_guard.sh` refuses one. The local NET_-prefixed
 // names are kept so call sites read unchanged; `net_proto`
 // itself is re-exported for the accessors (`conn_id`, `put_conn_id`,
-// `connected_parts`, `error_parts`, `accepted_parts`).
+// `connected_parts`, `error_parts`, `accepted_parts`, `bound_parts`).
 pub(crate) use super::abi::contracts::net::net_proto;
-/// Observability trace context: received from IP (plain HTTP) or TLS (HTTPS)
-/// to parent `http.server.request` under the upstream span. 0x07/0x08 are the
-/// IP-private RETRANSMIT/ACK opcodes.
-pub(crate) use net_proto::MSG_TRACE_CTX as NET_MSG_TRACE_CTX;
+/// The `stream_trace` sideband: a connection's trace context, received from
+/// IP (plain HTTP) or TLS (HTTPS) on a connection granted
+/// `net_proto::flag::TRACE`, to parent `http.server.request` under the
+/// upstream span.
+pub(crate) use super::abi::contracts::net::stream_trace;
 pub(crate) use net_proto::{
     CMD_BIND as NET_CMD_BIND, CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO,
     CMD_SEND as NET_CMD_SEND, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
     MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
     MSG_ERROR as NET_MSG_ERROR,
 };
+pub(crate) use stream_trace::MSG_TRACE_CTX as NET_MSG_TRACE_CTX;
 
 /// The application protocol the session stage in front negotiated for a
 /// connection (TLS ALPN: `h2`, `http/1.1`), from the `MSG_CONNECTED` payload
 /// that hands the connection over; empty when it negotiated none, when no
-/// session stage is in front, or when the record stops short.
+/// session stage is in front, or when the record is not a `MSG_CONNECTED`.
 ///
-/// The layout is the net contract's — `[generation][alpn_len][alpn]` after
-/// the fixed fields — read by its own reader.
+/// The layout is the net contract's, read by its own reader.
 pub(crate) fn connected_alpn(payload: &[u8]) -> &[u8] {
-    net_proto::session_alpn(payload, net_proto::CONNECTED_FIXED)
+    net_proto::connected_parts(payload).map_or(&[], |c| c.opening.alpn)
 }
 
 /// The port a dial takes when its authority names none.
@@ -66,10 +67,13 @@ pub(crate) unsafe fn dial(
     let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
     let n = net_proto::write_connect_to(
         &mut payload,
-        super::SOCK_TYPE_STREAM,
-        port.unwrap_or(DEFAULT_PORT),
-        &target,
-        Some(tag),
+        &net_proto::ConnectTo {
+            sock_type: net_proto::SOCK_TYPE_STREAM,
+            flags: 0,
+            port: port.unwrap_or(DEFAULT_PORT),
+            target,
+            requester_tag: tag,
+        },
     );
     if n == 0 {
         return None;
@@ -109,11 +113,9 @@ pub(crate) const NET_BUF_SIZE: usize = 8192;
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) const NET_BUF_SIZE: usize = 1600;
 
-/// Largest `data` portion of one `MSG_DATA` frame (mirrors
-/// `net_proto::MAX_DATA_FRAGMENT`). The receive-side admission threshold uses
-/// THIS — not `NET_BUF_SIZE` (the much larger outbound scratch) — so an h2
-/// client with a small `recv_buf` still admits inbound frames.
-pub(crate) const MAX_DATA_FRAGMENT: usize = 1460;
+/// Largest `data` portion of one `MSG_DATA` frame on `net_in`: what a
+/// record of the port's `accepts_record` carries.
+pub(crate) const NET_IN_DATA_MAX: usize = net_proto::data_capacity(super::NET_IN_ACCEPTS_RECORD);
 
 // ── Multiplexed-session contract (HTTP/3) ──
 //

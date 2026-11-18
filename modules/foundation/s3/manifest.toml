@@ -7,6 +7,7 @@ name         = "net_in"
 direction    = "input"
 content_type = "NetProto"
 buffer_size  = 2048
+accepts_record = 2048
 
 [[ports]]
 name         = "net_out"
@@ -23,12 +24,13 @@ content_type = "TextPlain"
 buffer_size  = 2048
 
 # Driven mode: the connector is a PROVIDER of the exchange contract
-# (`abi::contracts::exchange`), performing one exchange at a time. A requester
-# writes REQUEST-direction records here: HEAD (method, `/bucket/key[?query]`,
-# extra header lines, response credit, and the body inline when it fits), BODY
-# (MORE until the last) under the credit the connector grants, CREDIT (more
-# response credit) and ABORT. A body that does not ride whole in the HEAD needs
-# a `content-length` header (400 without one).
+# (`abi::contracts::exchange`) speaking its HTTP binding, performing one
+# exchange at a time. A requester writes REQUEST-direction records here: HEAD (a
+# CALL whose verb is the method, `/bucket/key[?query]`, extra header fields as
+# meta, response credit, and the body inline when it fits), BODY (MORE until the
+# last) under the credit the connector grants, CREDIT (more response credit) and
+# ABORT. A body that does not ride whole in the HEAD needs a `content-length`
+# field (400 without one).
 #
 # Both ports unwired = the boot ListBuckets probe.
 [[ports]]
@@ -38,12 +40,14 @@ direction    = "input"
 content_type = "ExchangeRequest"
 max_record   = 8192
 buffer_size  = 8192
+[ports.facts]
+binding = ["http"]
 
-# RESPONSE-direction records: the endpoint's HEAD (status, content type,
-# headers minus the connection's framing, first body bytes), BODY (MORE until
-# the last) within the caller's response credit, CREDIT (request-body credit,
-# granted as the body's bytes leave for the transport), and ABORT when an
-# exchange fails after its response began.
+# RESPONSE-direction records: the endpoint's HEAD (status as its detail, the
+# content type and headers minus the connection's framing as meta, first body
+# bytes), BODY (MORE until the last) within the caller's response credit,
+# CREDIT (request-body credit, granted as the body's bytes leave for the
+# transport), and ABORT when an exchange fails after its response began.
 [[ports]]
 name         = "response_out"
 index        = 2

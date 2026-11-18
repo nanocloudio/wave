@@ -720,7 +720,10 @@ mod params_def {
 // PIC Module Interface
 // ============================================================================
 
-fluxor_rt::module_facts! { state: RtpState }
+fluxor_rt::module_facts! {
+    state: RtpState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = 1603],
+}
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -998,7 +1001,7 @@ unsafe fn step_bind_wait(s: &mut RtpState) -> StepReturn {
         s.phase = RtpPhase::Error;
         return StepReturn::error(-1);
     }
-    if msg_type != DG_MSG_BOUND || payload_len < 3 {
+    if msg_type != DG_MSG_BOUND {
         return StepReturn::Continue;
     }
 
@@ -1006,10 +1009,11 @@ unsafe fn step_bind_wait(s: &mut RtpState) -> StepReturn {
     // every leg, and taking the first one claims another module's endpoint
     // (Pi 5 rig, 2026-08-26). A BOUND for a port we did not ask for is
     // another consumer's answer — keep waiting for ours.
-    let (ep, port) = abi::contracts::net::datagram::dg_bound_parts(core::slice::from_raw_parts(
-        buf.add(NET_FRAME_HDR),
-        payload_len,
-    ));
+    let Some((ep, port)) = abi::contracts::net::datagram::dg_bound_parts(
+        core::slice::from_raw_parts(buf.add(NET_FRAME_HDR), payload_len),
+    ) else {
+        return StepReturn::Continue;
+    };
     if port != s.local_port {
         return StepReturn::Continue;
     }
@@ -1735,17 +1739,16 @@ unsafe fn send_rtp_packet(s: &mut RtpState, payload_len: usize) {
         if let Some(name) = s.peer.name() {
             held[..n].copy_from_slice(name);
         }
-        let sent = dev_dg_send_to_name_owned(
+        let sent = dev_dg_send_to_name(
             sys,
             s.net_out_chan,
             s.ep_id,
-            0,
             &held[..n],
             port,
             pkt,
             wire_total,
             s.net_buf.as_mut_ptr(),
-            NET_BUF_SIZE,
+            NET_OUT_MAX_RECORD,
         );
         if sent == 0 {
             dev_log(sys, 2, b"[rtp] send err".as_ptr(), 14);
@@ -1755,7 +1758,7 @@ unsafe fn send_rtp_packet(s: &mut RtpState, payload_len: usize) {
     }
     let scratch = s.net_buf.as_mut_ptr();
     let frame_payload_len = DG_V4_PREFIX + wire_total;
-    if s.ep_id != 0xFF && frame_payload_len + NET_FRAME_HDR <= NET_BUF_SIZE {
+    if s.ep_id != 0xFF && frame_payload_len + NET_FRAME_HDR <= NET_OUT_MAX_RECORD {
         *scratch = DG_CMD_SEND_TO;
         *scratch.add(1) = (frame_payload_len & 0xFF) as u8;
         *scratch.add(2) = ((frame_payload_len >> 8) & 0xFF) as u8;

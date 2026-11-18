@@ -52,8 +52,8 @@ shared request path — so it is worth doing against a specific flash target the
 | --- | --- | --- | --- | --- |
 | `net_in` / `net_out` | 0 | in / out | `NetProto` | Transport events and commands |
 | `variables` | 1 | input | `FmpMessage` | Template variable updates |
-| `file_data` | 2 | input | `OctetStream` | Body bytes for file-backed routes |
-| `file_ctrl` | 1 | output | `OctetStream` | File request control |
+| `file_data` | 2 | input | `OctetStream` | Body bytes for file-backed routes; the producer serves `stream_select` here |
+| `body_out` | 1 | output | `OctetStream` | Client mode: the response body |
 | `ws_out` / `ws_in` | 2 / 3 | out / in | `WsFrame` | WebSocket fan-out (handler 5) |
 | `request_out` / `response_in` | 6 | out / in | `ExchangeRequest` / `ExchangeResponse` | Application fan-out (handler 11): the server as exchange requester |
 | `ws_admit_out` / `ws_admit_in` | 7 | out / in | `OctetStream` | WebSocket admission request and decision |
@@ -259,7 +259,12 @@ The module is the REQUESTER of fluxor's exchange contract
 one request and its response, and both are streamed as records: a HEAD, then
 BODY records while a body continues, each record naming its exchange by a
 14-byte id the module packs (`[origin][0][conn u32][stream u64]`) and the
-application echoes. A request body already received whole that fits one record
+application echoes. The HEAD speaks the HTTP binding (`exchange_http`): the
+method is its verb (a CONNECT an OPEN, every other method a CALL), the request's
+header fields its meta, keyed by their lower-case names; the application
+answers with an outcome and the HTTP status as its detail (an answer with no
+detail is written with the outcome's canonical status), and its meta fields
+become the response's header lines. A request body already received whole that fits one record
 rides inline in the HEAD, which then ends the request; only a client waiting
 for `100 Continue`, or a body longer than a record, has its body follow on the
 application's credit. Every connection on every generation shares the one
@@ -473,8 +478,8 @@ limit. A trickled header does not restart its head deadline.
 ## HTTP/1 client connections
 
 The client speaks HTTP/1.1. `Host:` is the authority of the connection in
-hand, verbatim. `method` (parameter 113) takes the exchange contract's method
-codes, and defaults to GET.
+hand, verbatim. `method` (parameter 113) takes the HTTP binding's method codes
+(`exchange_http::method`), and defaults to GET.
 
 An open client keeps one connection and parks one more for the authority it
 was opened for, so alternating between two origins does not redial each time;
@@ -572,8 +577,9 @@ piece of work: a request slot is released the moment its response drains, and a
 tunnel must outlive the 200 that opened it. Client frames must be masked
 (RFC 6455 §5.3), PING draws a PONG, and CLOSE ends the tunnel.
 
-**File and proxy routes over h3** are handed to the application, flagged
-`ROUTE_FILE` or `ROUTE_PROXY`, when one is wired to `request_out`: those handlers
+**File and proxy routes over h3** are handed to the application, their HEAD
+carrying the HTTP binding's `:route` field (`file` or `proxy`), when one is
+wired to `request_out`: those handlers
 thread more than a cursor through `server::cur_slot_mut` — file handles, relay
 connection state — and a graph that wants them over h3 serves them downstream.
 With no application wired, dispatch answers **501** and names the handler: not

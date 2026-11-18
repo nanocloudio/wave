@@ -72,19 +72,30 @@ ORIGIN=$!
 for _ in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done
 ss -ltn 2>/dev/null | grep -q ":$PORT " || fail "origin never bound :$PORT"
 
-# One exchange request HEAD, its body inline:
-#   [kind=1][flags=0][id:14][method][target_len:u16][hdr_len:u16][peer_len:u16]
-#   [resp_credit:u32][target…][headers…][body…]
+# One exchange request HEAD, its body inline, under the neutral head:
+#   [kind=1][flags=0][id:14][op=CALL][verb][target_len:u16][meta_len:u16]
+#   [peer_len:u16][resp_credit:u32][target…][meta…][body…]
+# Each header the requester names is one meta field, `[key_len:u8][key]
+# [val_len:u16][val]`, keyed by its name in lower case. HDRS is a list of
+# `name: value` fields separated by `\r\n`; a field's value is taken
+# verbatim, escapes and all, so a test can put a CR or LF in one.
 request() {
   VERB="$1" REQ_PATH="$2" HDRS="$3" BODY="$4" XID="$5" python3 - <<'INNER'
 import os, struct
 verb = int(os.environ["VERB"])
 path = os.environ["REQ_PATH"].encode()
-hdrs = os.environ["HDRS"].encode().decode("unicode_escape").encode("latin1")
+raw = os.environ["HDRS"]
+meta = b""
+for field in [f for f in raw.split("\\r\\n") if f]:
+    name, _, value = field.partition(":")
+    key = name.strip().lower().encode()
+    val = value.lstrip(" ").encode().decode("unicode_escape").encode("latin1")
+    meta += bytes([len(key)]) + key + struct.pack('<H', len(val)) + val
 body = os.environ["BODY"].encode()
 xid = struct.pack('<Q', int(os.environ["XID"])) + bytes(6)
-head = bytes([1, 0]) + xid + bytes([verb]) + struct.pack('<HHHI', len(path), len(hdrs), 0, 65536)
-print((head + path + hdrs + body).hex())
+CALL = 1
+head = bytes([1, 0]) + xid + bytes([CALL, verb]) + struct.pack('<HHHI', len(path), len(meta), 0, 65536)
+print((head + path + meta + body).hex())
 INNER
 }
 
@@ -121,24 +132,35 @@ decode_answer() {
 import os, struct, sys
 raw = open(sys.argv[1], "rb").read()
 assert raw[:1] == b"\x01", f"not a response HEAD: {raw[:16]!r}"
-want = 0x80 if os.environ["RAISED"] else 0
+RAISED = 0x08
+want = RAISED if os.environ["RAISED"] else 0
 assert raw[1] & 0x01 == 0, f"the answer is not whole in one record: flags {raw[1]}"
 assert raw[1] == want, f"flags {raw[1]:#x}, wanted {want:#x} (RAISED marks a refusal)"
 xid = struct.unpack_from('<Q', raw, 2)[0]
 assert xid == int(os.environ["XID"]) and raw[10:16] == bytes(6), f"id {raw[2:16]!r}"
-status, ct_len, hdr_len = struct.unpack_from('<HBH', raw, 16)
-assert status == int(os.environ["STATUS"]), f"status {status}"
+outcome, detail, meta_len = struct.unpack_from('<BHH', raw, 16)
+# The HTTP binding: the status is the detail, else the outcome's own.
+CANONICAL = {1: 200, 2: 400, 3: 404, 4: 403, 5: 409, 6: 413, 7: 503}
+status = detail if detail else CANONICAL.get(outcome, 0)
+assert status == int(os.environ["STATUS"]), f"status {status} (outcome {outcome}, detail {detail})"
 at = 21
-ct = raw[at:at + ct_len]
-headers = raw[at + ct_len:at + ct_len + hdr_len]
-body = raw[at + ct_len + hdr_len:]
+meta = raw[at:at + meta_len]
+body = raw[at + meta_len:]
+fields = []
+m = 0
+while m < len(meta):
+    kl = meta[m]; key = meta[m + 1:m + 1 + kl]; m += 1 + kl
+    vl = struct.unpack_from('<H', meta, m)[0]; val = meta[m + 2:m + 2 + vl]; m += 2 + vl
+    fields.append((key, val))
+ct = next((v for k, v in fields if k == b"content-type"), b"")
+headers = b"".join(k + b": " + v + b"\r\n" for k, v in fields if not k.startswith(b":"))
 extra = os.environ["EXTRA"]
 if extra:
     exec(extra)
 INNER
 }
 
-# METHOD_GET = 1, METHOD_POST = 3 (the exchange contract's method vocabulary).
+# Verbs of the HTTP binding (`exchange_http::method`): GET = 1, POST = 3.
 i=0
 for case in "1 GET /hello" "3 POST /submit"; do
   set -- $case
@@ -159,8 +181,8 @@ for case in "1 GET /hello" "3 POST /submit"; do
 
   decode_answer "$i" 200 "$(cat <<INNER
 assert ct == b'text/plain', f'content type {ct!r}'
-assert b'X-Origin-Note: seen\r\n' in headers, f'headers {headers!r}'
-assert b'Connection' not in headers, f'a framing field was forwarded {headers!r}'
+assert b'x-origin-note: seen\r\n' in headers, f'headers {headers!r}'
+assert b'connection' not in headers, f'a framing field was forwarded {headers!r}'
 assert body == b'echo:$path', f'body {body!r}'
 INNER
 )" || fail "$name: the answer did not decode"
@@ -185,7 +207,7 @@ assert count(b"x-wave-test") == 1, f"requester field not once: {fields}"
 assert count(b"accept") == 1, f"requester field not once: {fields}"
 assert count(b"host") == 1, f"host not once: {fields}"
 assert count(b"connection") == 1, f"connection not once: {fields}"
-assert b"X-Wave-Test: present" in fields, f"verbatim bytes not kept: {fields}"
+assert any(f.lower() == b"x-wave-test: present" for f in fields), f"value not kept: {fields}"
 INNER
 echo "   ok  the requester's fields reached the origin, beside the client's own, each once"
 decode_answer 9 200 "assert body == b'echo:/typed', f'body {body!r}'" \
@@ -207,14 +229,14 @@ refused() {
   echo "   ok  answered 400, raised by the client, no request on the wire"
 }
 
-refused "a block whose blank line would end the head" \
-        'X-A: 1\r\n\r\nGET /evil HTTP/1.1\r\nHost: x\r\n' 11
-refused "a block naming a field the client frames with" \
-        'Transfer-Encoding: chunked\r\n' 12
-refused "a block splitting a line on a bare LF" \
-        'X-A: 1\nX-B: 2\r\n' 13
+refused "a value whose CR LF would end the head" \
+        'X-A: 1\x0d\x0a\x0d\x0aGET /evil HTTP/1.1' 11
+refused "a field the client frames with" \
+        'Transfer-Encoding: chunked' 12
+refused "a value splitting a line on a bare LF" \
+        'X-A: 1\x0aX-B: 2' 13
 refused "a host other than the pinned authority" \
-        'Host: elsewhere.example\r\n' 14
+        'Host: elsewhere.example' 14
 
 echo
 echo "PASS: exchange client end to end — request in, request on the wire, answer out."

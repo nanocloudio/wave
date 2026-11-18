@@ -2,10 +2,10 @@
 //!
 //! h1, h2 and h3 all resolve a method against one table, so a request means
 //! the same thing whichever generation carried it. That table is the exchange
-//! contract's: a request record carries its method as one byte, and every
-//! reader of that byte — this server, an application answering its requests,
-//! and each connector that performs a request — must decode it identically. The values are STABLE and PUBLIC; appending a
-//! method is safe, renumbering one is a wire-format break.
+//! contract's HTTP binding (`exchange_http`): a request record carries its
+//! method as its one-byte `verb`, and every reader of that byte — this server,
+//! an application answering its requests, and each connector that performs a
+//! request — must decode it identically.
 //!
 //! What stays here is what only a server needs: how far a request-line
 //! parser scans for a method token, and which methods carry a body it must
@@ -15,12 +15,18 @@
 //! `#[repr(u8)]` enum would make every decode a fallible transmute at the
 //! receiver for no gain over a `u8` plus these constants.
 
-/// The method vocabulary and its lookups are the exchange contract's,
-/// re-exported here so every generation resolves a method through one name.
-pub use super::super::exchange::{
-    method_from_token, method_name, METHOD_CONNECT, METHOD_DELETE, METHOD_GET, METHOD_HEAD,
-    METHOD_NONE, METHOD_OPTIONS, METHOD_PATCH, METHOD_POST, METHOD_PUT,
+/// The method vocabulary and its lookups are the HTTP binding's, re-exported
+/// here so every generation resolves a method through one name.
+pub use super::super::abi::contracts::exchange_http::method::{
+    CONNECT, DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, WS_CONNECT, WT_CONNECT,
 };
+pub use super::super::abi::contracts::exchange_http::{
+    method_for_protocol, method_from_token, method_name,
+};
+
+/// No method this table names: a request line whose token is not one, or a
+/// slot that has not parsed a request yet. The binding's verb 0.
+pub const NONE: u8 = 0;
 
 /// How far a request-line parser scans for the space that ends the method
 /// token before giving up and calling the line malformed.
@@ -52,14 +58,14 @@ pub const MAX_METHOD_SCAN: usize = 24;
 /// body is EXPECTED, and the body reader consults it only to decide whether an
 /// absent `Content-Length` is worth a 411.
 pub fn method_expects_request_body(m: u8) -> bool {
-    matches!(m, METHOD_POST | METHOD_PUT | METHOD_PATCH)
+    matches!(m, POST | PUT | PATCH)
 }
 
 /// Whether the response to this method carries a body. HEAD is the whole point:
 /// RFC 9110 §9.3.2 requires the same headers as the equivalent GET —
 /// `Content-Length` included — with the body suppressed.
 pub fn method_sends_response_body(m: u8) -> bool {
-    m != METHOD_HEAD
+    m != HEAD
 }
 
 /// Whether this method is dispatchable to an ordinary route handler. CONNECT is
@@ -67,5 +73,5 @@ pub fn method_sends_response_body(m: u8) -> bool {
 /// upgrade (RFC 8441 / 9220 WebSocket) or refuses it, and never resolves it
 /// against the route table's path match.
 pub fn method_is_dispatchable(m: u8) -> bool {
-    m != METHOD_NONE && m != METHOD_CONNECT
+    m != NONE && m != CONNECT
 }

@@ -178,9 +178,9 @@ pub struct H3StreamSlot {
     /// application. Allocated once and kept, like `rx_buf`.
     pub fields: *mut u8,
     pub fields_len: usize,
-    /// Request flags for the application (`exchange::flag::ROUTE_*`, `WEBSOCKET`,
-    /// `WEBTRANSPORT`).
-    pub app_flags: u8,
+    /// How the request handed to the application was routed
+    /// (`app::route`).
+    pub app_route_kind: u8,
     /// The response may carry a body (not HEAD, 204, 304).
     pub resp_carries: bool,
     /// The matched route hands the request to the application.
@@ -292,7 +292,7 @@ impl H3StreamSlot {
             peer_fin: false,
             fields: core::ptr::null_mut(),
             fields_len: 0,
-            app_flags: 0,
+            app_route_kind: 0,
             resp_carries: false,
             app_route: false,
             too_large: false,
@@ -342,7 +342,7 @@ impl H3StreamSlot {
         self.ack_owed = 0;
         self.peer_fin = false;
         self.fields_len = 0;
-        self.app_flags = 0;
+        self.app_route_kind = 0;
         self.resp_carries = false;
         self.app_route = false;
         self.too_large = false;
@@ -2222,16 +2222,26 @@ unsafe fn open_exchange(s: &mut super::super::HttpState, st: &mut H3State, idx: 
     } else {
         &[]
     };
-    let flags = sl.app_flags
-        | if plan == BodyPlan::Stream {
-            super::super::exchange::flag::MORE
-        } else {
-            0
-        };
-    let head = super::super::exchange::RequestHead {
+    let flags = if plan == BodyPlan::Stream {
+        super::super::exchange::flag::MORE
+    } else {
+        0
+    };
+    let opens = if req.method_kind != H3_METHOD_CONNECT {
+        0
+    } else if req.protocol_ws {
+        super::super::wire::method::WS_CONNECT
+    } else if req.protocol_webtransport {
+        super::super::wire::method::WT_CONNECT
+    } else {
+        0
+    };
+    let head = super::app::AppRequest {
         id: h3_id(sl).exchange_id(),
         flags,
         method: req.method,
+        opens,
+        route: sl.app_route_kind,
         target: req.path_bytes(),
         headers: fields,
         peer: &[],
@@ -2359,7 +2369,7 @@ fn fail_exchange(st: &mut H3State, idx: usize, status: &[u8], body: &[u8]) {
 /// HEADERS when next, then DATA as far as it fits.
 #[cfg(feature = "app")]
 unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, idx: usize) {
-    use super::super::exchange::{abort as abort_reason, flag, parse_response, Record};
+    use super::super::exchange::{abort as abort_reason, outcome, Record};
     let id = h3_id(&st.slots[idx]);
     let peer_limit = app_peer_limit(st, st.slots[idx].session_id);
     let sl: *mut H3StreamSlot = &mut st.slots[idx];
@@ -2368,18 +2378,15 @@ unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, id
         let (body, is_head) = super::app::record_body(rec);
         let ends = super::app::record_ends(rec);
         if is_head && !(*sl).app_queue.front_head_done() {
-            let Some(Record::Head(h)) = parse_response(rec) else {
+            let Some(Record::Head(h)) = super::app::parse_response(rec) else {
                 break;
             };
+            let status = super::super::exchange_http::status_of(&h);
+            let session =
+                (*sl).request.method_kind == H3_METHOD_CONNECT && h.outcome == outcome::OK;
             // An accepted WebSocket is this module's tunnel from here on; the
             // application's part in it is done.
-            if h.flags & flag::WEBSOCKET != 0 {
-                if h.status != 200 || (*sl).request.method_kind != H3_METHOD_CONNECT {
-                    s.server.app_violations = s.server.app_violations.wrapping_add(1);
-                    super::app::abort(s, id, abort_reason::CREDIT_OVERRUN);
-                    fail_exchange(st, idx, b"502", b"Bad Gateway\n");
-                    return;
-                }
+            if session && (*sl).request.protocol_ws {
                 let n = build_response(b"200", &[], &[], &mut (*sl).send_buf);
                 (*sl).send_len = n;
                 (*sl).send_off = 0;
@@ -2391,10 +2398,10 @@ unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, id
                 (*sl).state = H3StreamState::HeadersSent;
                 return;
             }
-            if h.flags & flag::WEBTRANSPORT != 0 {
+            if session && (*sl).request.protocol_webtransport {
                 (*sl).webtransport_active = true;
             }
-            let carries = super::app::status_allows_body(h.status, (*sl).request.method);
+            let carries = super::app::status_allows_body(status, (*sl).request.method);
             (*sl).resp_carries = carries;
             match encode_app_headers(&h, peer_limit, &mut (*sl).send_buf) {
                 Ok(n) => used = n,
@@ -2464,8 +2471,9 @@ unsafe fn compose_response(s: &mut super::super::HttpState, st: &mut H3State, id
 }
 
 /// Encode a response HEAD as one HEADERS frame at the start of `out`:
-/// `:status`, `content-type`, then the application's own fields, lowercased,
-/// without the connection-specific ones HTTP/3 forbids (RFC 9114 §4.2).
+/// `:status`, `content-type`, then the application's own meta fields,
+/// without the connection-specific ones HTTP/3 forbids (RFC 9114 §4.2) and the
+/// binding's own `:` fields.
 /// `Err(true)` when the peer's field-section limit refuses it, `Err(false)`
 /// when it does not fit.
 #[cfg(feature = "app")]
@@ -2474,16 +2482,16 @@ fn encode_app_headers(
     peer_limit: u32,
     out: &mut [u8],
 ) -> Result<usize, bool> {
-    let code = h.status.min(999);
+    let code = super::super::exchange_http::status_of(h).min(999);
     let status = [
         b'0' + (code / 100) as u8,
         b'0' + ((code / 10) % 10) as u8,
         b'0' + (code % 10) as u8,
     ];
-    let ct: &[u8] = if h.content_type.is_empty() {
+    let ct: &[u8] = if h.content_type().is_empty() {
         b"application/octet-stream"
     } else {
-        h.content_type
+        h.content_type()
     };
     let mut block = [0u8; H3_SEND_BUF];
     let mut off = qpack::qpack_emit_block_prefix(&mut block);
@@ -2501,15 +2509,10 @@ fn encode_app_headers(
         return Err(false);
     }
     off += n;
-    let mut lower = [0u8; 64];
-    for (name, value) in super::super::exchange::header_lines(h.headers) {
-        if name.len() > lower.len() {
-            return Err(false);
+    for (name, value) in super::super::exchange::meta_fields(h.meta) {
+        if name.first() == Some(&b':') {
+            continue;
         }
-        for (d, c) in lower.iter_mut().zip(name) {
-            *d = c.to_ascii_lowercase();
-        }
-        let name = &lower[..name.len()];
         if matches!(
             name,
             b"connection"
@@ -2547,7 +2550,8 @@ pub(crate) unsafe fn app_record(
     id: &super::app::AppId,
     raw: &[u8],
 ) {
-    use super::super::exchange::{parse_response, Record};
+    use super::super::exchange::Record;
+    use super::app::parse_response;
     let st = &mut *(&mut s.h3 as *mut H3State);
     if let Some(Record::Datagram { context, data, .. }) = parse_response(raw) {
         if data.len() > h3_datagram::H3_DATAGRAM_MAX_PAYLOAD {
@@ -2989,23 +2993,17 @@ unsafe fn dispatch_stream(
     // routes, and the file and proxy routes h3 does not serve itself.
     #[cfg(feature = "app")]
     if matched >= 0 && delegated(s, matched) {
-        use super::super::exchange::flag;
+        use super::app::route;
         let handler = (*s.server.routes.as_ptr().add(matched as usize)).handler;
-        let mut flags = 0u8;
-        if handler == super::routes::HANDLER_FILE {
-            flags |= flag::ROUTE_FILE;
-        }
-        if handler == super::routes::HANDLER_PROXY {
-            flags |= flag::ROUTE_PROXY;
-        }
-        if req.method_kind == H3_METHOD_CONNECT && req.protocol_ws {
-            flags |= flag::WEBSOCKET;
-        }
-        if req.method_kind == H3_METHOD_CONNECT && req.protocol_webtransport {
-            flags |= flag::WEBTRANSPORT;
-        }
+        let kind = if handler == super::routes::HANDLER_FILE {
+            route::FILE
+        } else if handler == super::routes::HANDLER_PROXY {
+            route::PROXY
+        } else {
+            route::APP
+        };
         let slot = &mut st.slots[idx];
-        slot.app_flags = flags;
+        slot.app_route_kind = kind;
         slot.state = H3StreamState::AppPending;
         // Body bytes that arrived with the head are the application's.
         return H3StreamOutcome::Buffered;

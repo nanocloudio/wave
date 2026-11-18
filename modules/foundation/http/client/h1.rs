@@ -77,8 +77,8 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
                 s.client.request_start_ms = now;
                 s.client.progress_ms = now;
                 s.client.response = super::super::wire::response::ResponseDecoder::new(
-                    s.client.method == super::super::wire::method::METHOD_HEAD,
-                    s.client.method == super::super::wire::method::METHOD_CONNECT,
+                    s.client.method == super::exchange_http::method::HEAD,
+                    super::exchange_http::method::opens(s.client.method),
                 );
                 s.client.h1_input_len = 0;
                 s.client.h1_input_offset = 0;
@@ -159,35 +159,32 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
                 if poll > 0 && (poll as u32 & POLL_IN) != 0 {
                     let buf = s.net_buf.as_mut_ptr();
                     let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-                    if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
-                        // Claim only our own outbound connection: MSG_CONNECTED
-                        // is `[conn_id][requester_tag]`; the tag echoes our
-                        // CMD_CONNECT_TO index. Untagged — which is what a sole
-                        // consumer sees — or our tag → ours; any other tag
-                        // belongs to a co-wired consumer sharing this fanned
-                        // queue, so ignore it.
-                        let (_, tag) = net_proto::connected_parts(core::slice::from_raw_parts(
+                    let connected = if msg_type == NET_MSG_CONNECTED {
+                        net_proto::connected_parts(core::slice::from_raw_parts(
                             buf.add(NET_FRAME_HDR),
                             payload_len,
-                        ));
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(c) = connected {
+                        // Claim only our own outbound connection: the
+                        // requester tag echoes our CMD_CONNECT_TO's. Untagged
+                        // — which is what a sole consumer sees — or our tag →
+                        // ours; any other tag belongs to a co-wired consumer
+                        // sharing this fanned queue, so ignore it.
                         let me = dev_requester_tag(sys);
-                        if tag != 0 && tag != me {
+                        if c.requester_tag != 0 && c.requester_tag != me {
                             return StepReturn::Continue; // another consumer's connection — keep waiting.
                         }
-                        s.client.conn_id = net_proto::conn_id(core::slice::from_raw_parts(
-                            buf.add(NET_FRAME_HDR),
-                            payload_len,
-                        ));
+                        s.client.conn_id = c.conn_id;
                         s.client.conn_present = 1;
                         s.client.progress_ms = now;
                         log(s, b"[http] connected");
                         // The generation is the connection's: a session
                         // stage that negotiated h2 has promised the origin
                         // HTTP/2 on it.
-                        let generation = super::negotiate(
-                            s,
-                            core::slice::from_raw_parts(buf.add(NET_FRAME_HDR), payload_len),
-                        );
+                        let generation = super::negotiate(s, c.opening.alpn);
                         // A probe of a lost link proves the link and goes no
                         // further: there is no request behind it.
                         #[cfg(feature = "exchange")]
@@ -222,17 +219,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
                         s.client.phase = Phase::SendRequest;
                         continue;
                     } else if msg_type == NET_MSG_ERROR {
-                        // Connect failure carries our tag at payload[3]
-                        // ([conn_id][errno][tag]); ignore another consumer's.
-                        let etag = if payload_len >= 3 {
-                            net_proto::error_parts(core::slice::from_raw_parts(
-                                buf.add(NET_FRAME_HDR),
-                                payload_len,
-                            ))
-                            .2
-                        } else {
-                            net_proto::REQUESTER_TAG_NONE
-                        };
+                        // A connect failure carries our requester tag; ignore
+                        // another consumer's.
+                        let etag = net_proto::error_parts(core::slice::from_raw_parts(
+                            buf.add(NET_FRAME_HDR),
+                            payload_len,
+                        ))
+                        .map_or(net_proto::REQUESTER_TAG_NONE, |(_, _, tag)| tag);
                         if etag == 0 || etag == dev_requester_tag(sys) {
                             log(s, b"[http] connect error");
                             s.client.fail_cause = CAUSE_CONNECT;

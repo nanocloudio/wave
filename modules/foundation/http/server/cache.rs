@@ -19,9 +19,8 @@
 //! share one fill path.
 
 use super::{
-    dev_channel_ioctl, msg_read, release_file_chan, try_acquire_file_chan, HttpState, IOCTL_FLUSH,
-    IOCTL_NOTIFY, MAX_ROUTES, MAX_VARS, MAX_VAR_VALUE, MSG_HDR_SIZE, POLL_HUP, POLL_IN,
-    SEND_BUF_SIZE,
+    file_select, msg_read, release_file_chan, try_acquire_file_chan, HttpState, MAX_ROUTES,
+    MAX_VARS, MAX_VAR_VALUE, MSG_HDR_SIZE, POLL_HUP, POLL_IN, SEND_BUF_SIZE,
 };
 
 /// The entry owns an allocated `body_pool` region for `route_index`.
@@ -297,7 +296,7 @@ pub(crate) enum CacheLookup {
     /// Cache hit; `route.body_offset` / `route.body_len` now point at
     /// the cached arena region. Caller can render immediately.
     Hit,
-    /// Cache miss; an `IOCTL_NOTIFY` has been queued on `file_chan`.
+    /// Cache miss; the route's source has been selected on `file_chan`.
     /// Caller must run `cache_fetch_step` until it returns `Ready`.
     Pending,
     /// `file_chan` isn't wired or `source_index < 0` — caller should
@@ -344,10 +343,10 @@ pub(crate) unsafe fn cache_try_or_fetch(s: &mut HttpState, route_idx: i8) -> Cac
     }
     // Cross-slot serialisation: only one slot may hold `file_chan`
     // at a time. If another slot is mid-fetch, return Busy without
-    // issuing IOCTL or claiming a cache slot — caller marks the
+    // selecting or claiming a cache slot — caller marks the
     // stream Fetching and `drive_cache_fetch` will retry on the
     // next tick. Without this gate, two concurrent h2 streams or
-    // an h1 + h2 race would both call FLUSH/NOTIFY and shred each
+    // an h1 + h2 race would both call FLUSH/SELECT and shred each
     // other's pending fetch.
     if !try_acquire_file_chan(s) {
         return CacheLookup::Busy;
@@ -361,16 +360,7 @@ pub(crate) unsafe fn cache_try_or_fetch(s: &mut HttpState, route_idx: i8) -> Cac
         release_file_chan(s);
         return CacheLookup::Busy;
     }
-    dev_channel_ioctl(
-        &*s.syscalls,
-        s.server.file_chan,
-        IOCTL_FLUSH,
-        core::ptr::null_mut(),
-        0,
-    );
-    let mut pos = src_idx as u32;
-    let pos_ptr = &mut pos as *mut u32 as *mut u8;
-    dev_channel_ioctl(&*s.syscalls, s.server.file_chan, IOCTL_NOTIFY, pos_ptr, 4);
+    file_select(s, src_idx as u32);
     CacheLookup::Pending
 }
 

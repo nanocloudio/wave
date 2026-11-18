@@ -211,30 +211,28 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
                 if poll > 0 && (poll as u32 & POLL_IN) != 0 {
                     let buf = s.net_buf.as_mut_ptr();
                     let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-                    if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
-                        // Claim only our own outbound connection by requester tag
-                        // (see client.rs). Untagged or our tag → ours.
-                        let (_, tag) = net_proto::connected_parts(core::slice::from_raw_parts(
+                    let connected = if msg_type == NET_MSG_CONNECTED {
+                        net_proto::connected_parts(core::slice::from_raw_parts(
                             buf.add(NET_FRAME_HDR),
                             payload_len,
-                        ));
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(c) = connected {
+                        // Claim only our own outbound connection by requester tag
+                        // (see `h1`). Untagged or our tag → ours.
                         let me = dev_requester_tag(sys);
-                        if tag != 0 && tag != me {
+                        if c.requester_tag != 0 && c.requester_tag != me {
                             return StepReturn::Continue;
                         }
-                        s.client.conn_id = net_proto::conn_id(core::slice::from_raw_parts(
-                            buf.add(NET_FRAME_HDR),
-                            payload_len,
-                        ));
+                        s.client.conn_id = c.conn_id;
                         s.client.conn_present = 1;
                         s.client.peer_closed = 0;
                         log(s, b"[http] connected (h2c)");
                         // A session stage that negotiated HTTP/1.1 has
                         // promised the origin that, not h2.
-                        let negotiated = super::negotiate(
-                            s,
-                            core::slice::from_raw_parts(buf.add(NET_FRAME_HDR), payload_len),
-                        );
+                        let negotiated = super::negotiate(s, c.opening.alpn);
                         if negotiated != super::GEN_H2 {
                             log(s, b"[http] http/1.1 negotiated on an h2 client");
                             set_phase(s, H2Phase::Error);
@@ -246,17 +244,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> StepReturn {
                         set_phase(s, H2Phase::SendPreface);
                         continue;
                     } else if msg_type == NET_MSG_ERROR {
-                        // Connect failure carries our tag at payload[3]; ignore
+                        // A connect failure carries our requester tag; ignore
                         // another consumer's error on a fanned net_in.
-                        let etag = if payload_len >= 3 {
-                            net_proto::error_parts(core::slice::from_raw_parts(
-                                buf.add(NET_FRAME_HDR),
-                                payload_len,
-                            ))
-                            .2
-                        } else {
-                            net_proto::REQUESTER_TAG_NONE
-                        };
+                        let etag = net_proto::error_parts(core::slice::from_raw_parts(
+                            buf.add(NET_FRAME_HDR),
+                            payload_len,
+                        ))
+                        .map_or(net_proto::REQUESTER_TAG_NONE, |(_, _, tag)| tag);
                         if etag == 0 || etag == dev_requester_tag(sys) {
                             log(s, b"[http] connect error");
                             s.client.fail_cause = super::CAUSE_CONNECT;
@@ -904,7 +898,7 @@ unsafe fn build_request(s: &mut HttpState) -> bool {
     let method: &[u8] = if is_ws {
         b"CONNECT"
     } else if driven {
-        super::super::wire::method::method_name(s.client.method)
+        super::exchange_http::method_name(s.client.method)
     } else if has_body {
         b"POST"
     } else {
@@ -954,7 +948,7 @@ unsafe fn build_request(s: &mut HttpState) -> bool {
     // writes itself.
     let hl = s.client.request_headers_len as usize;
     let block = core::slice::from_raw_parts(s.client.request_headers.as_ptr(), hl);
-    for (name, value) in super::super::exchange::header_lines(block) {
+    for (name, value) in super::exchange_http::header_lines(block) {
         let mut lower = [0u8; FIELD_NAME_MAX];
         if name.len() > FIELD_NAME_MAX {
             return false;
@@ -1239,11 +1233,12 @@ unsafe fn pump_inbound(s: &mut HttpState) -> bool {
         return false;
     }
     // Backpressure: refuse to pump if recv_buf can't hold a worst-case
-    // MSG_DATA payload. The bound is the net_proto fragment CAP, NOT the (much
-    // larger) outbound scratch `NET_BUF_SIZE` — using the latter against a
-    // 2048-byte recv_buf would refuse forever (h2 inbound stalls on aarch64).
-    // The channel queue then absorbs the backlog and ultimately TCP slows the peer.
-    let worst_case = super::super::connection::MAX_DATA_FRAGMENT;
+    // MSG_DATA payload. The bound is the data of the largest record `net_in`
+    // accepts, NOT the (much larger) outbound scratch `NET_BUF_SIZE` — using
+    // the latter against a 2048-byte recv_buf would refuse forever (h2 inbound
+    // stalls on aarch64). The channel queue then absorbs the backlog and
+    // ultimately TCP slows the peer.
+    let worst_case = super::NET_IN_DATA_MAX;
     if s.client.recv_len as usize + worst_case > RECV_BUF_SIZE {
         return false;
     }

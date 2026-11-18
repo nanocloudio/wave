@@ -12,7 +12,9 @@
 //!
 //! The kernel's endpoint-lease gate enforces
 //! "bind ∈ lease set": a port the edge owner was not granted is refused with
-//! `MSG_BIND_REFUSED`, so the listener never comes up. The grant model is a
+//! an untagged `MSG_ERROR` naming no connection, so the listener never comes
+//! up. That refusal names no port, so the reconciler keeps at most one
+//! mid-life bind outstanding and the refusal is that bind's. The grant model is a
 //! pre-leased port POOL — the edge owner's plan carries one lease per pool port
 //! (an `export` per port, ../fluxor/tools/src/compose.rs) and mid-life bind draws from it at
 //! runtime, so no runtime lease-grant is needed.
@@ -22,20 +24,11 @@
 //! port mid-life too — the static 443 bind is forwarded through tls today — so
 //! a `tls=1` row is recorded and reported but NOT bound.
 
-use super::super::abi::SyscallTable;
-use super::super::connection::{NET_BUF_SIZE, NET_CMD_BIND};
+use super::super::connection::{net_proto, NET_BUF_SIZE, NET_CMD_BIND};
 use super::{
-    close_net_conn, dev_owner_tag, dyn_field, dyn_u32, net_write_frame, HttpState, TableSink,
-    MAX_DYN_KEY, MAX_DYN_PREFIX,
+    close_net_conn, dyn_field, dyn_u32, net_write_frame, HttpState, TableSink, MAX_DYN_KEY,
+    MAX_DYN_PREFIX,
 };
-
-/// linux_net's bind-refusal opcode (`../fluxor/src/platform/linux/providers.rs`):
-/// `[port:u16 LE][errno:u8]`.
-///
-/// Distinct from the metal `ip` module's 0x07 (RETRANSMIT), and acted on ONLY
-/// when the dynamic-listener feature is configured (the linux edge), so the
-/// metal path stays byte-identical.
-pub(crate) const NET_MSG_BIND_REFUSED: u8 = 0x07;
 
 /// Additional listeners beyond the static `port`, bound from the
 /// pre-leased pool. Small: listener churn is operator-rate.
@@ -44,11 +37,11 @@ pub(crate) const MAX_DYN_LISTENERS: usize = 8;
 // Reconciler bind states for one pooled listener.
 /// Desired, CMD_BIND not yet issued.
 const LISTENER_IDLE: u8 = 0;
-/// CMD_BIND issued; awaiting MSG_BOUND / MSG_BIND_REFUSED.
+/// CMD_BIND issued; awaiting MSG_BOUND or the bind's refusal.
 const LISTENER_BINDING: u8 = 1;
 /// MSG_BOUND seen — accepts on this port are claimed.
 const LISTENER_BOUND: u8 = 2;
-/// MSG_BIND_REFUSED seen (port not leased) — not retried, never accepts.
+/// The bind was refused (port not leased) — not retried, never accepts.
 const LISTENER_REFUSED: u8 = 3;
 
 /// One desired listener row (table-consumer half). `tls=1` is recorded
@@ -231,12 +224,25 @@ impl DynListeners {
         }
     }
 
-    /// A mid-life `CMD_BIND` was refused — `port` is outside the edge owner's
-    /// lease pool. Terminal: the reconciler does
-    /// not retry, because the lease set does not change at runtime.
-    pub(crate) fn mark_refused(&mut self, port: u16) {
-        if let Some(bi) = self.bound_slot_for(port) {
-            self.bound[bi].state = LISTENER_REFUSED;
+    /// The outstanding mid-life bind, if one is.
+    fn binding_slot(&self) -> Option<usize> {
+        self.bound
+            .iter()
+            .position(|b| b.used == 1 && b.state == LISTENER_BINDING)
+    }
+
+    /// A bind refusal arrived: the outstanding mid-life `CMD_BIND` was
+    /// refused — its port is outside the edge owner's lease pool. Terminal:
+    /// the reconciler does not retry, because the lease set does not change
+    /// at runtime. False when no mid-life bind is outstanding (the refusal
+    /// is not this table's).
+    pub(crate) fn mark_binding_refused(&mut self) -> bool {
+        match self.binding_slot() {
+            Some(bi) => {
+                self.bound[bi].state = LISTENER_REFUSED;
+                true
+            }
+            None => false,
         }
     }
 }
@@ -267,8 +273,8 @@ impl DynListeners {
 #[cfg(feature = "host-test")]
 /// Enable the dynamic-listener subsystem on a booted module (as if
 /// `listeners_prefix` were configured), so `pump_listeners` reconciles
-/// injected desired rows. The consumer is marked subscribed and idle, and
-/// the store event resolved, so it never touches the store in a harness.
+/// injected desired rows. The consumer is marked subscribed and idle, so it
+/// never touches the store in a harness.
 ///
 /// # Safety
 /// See [`test_inject_dyn_route`].
@@ -276,7 +282,6 @@ pub unsafe fn test_enable_listeners(state: *mut u8) {
     let s = &mut *(state as *mut HttpState);
     s.server.listeners_prefix[0] = b'/';
     s.server.listeners_prefix_len = 1;
-    s.server.store_event = i32::MAX; // non-negative: skip CREATE
     s.server.ltc.sub = super::table_consumer::SUB_OPEN; // skip SUBSCRIBE/relist
 }
 
@@ -345,16 +350,15 @@ pub(crate) unsafe fn set_listeners_prefix(s: &mut HttpState, d: *const u8, len: 
 ///
 /// The mid-life bind is issued only once the static listener is bound
 /// (`bound == 1`): the shared `net_out` / `net_in` pair carries the init
-/// bind first, and its `MSG_BOUND`/`MSG_BIND_REFUSED` for a dynamic port
+/// bind first, and its `MSG_BOUND` or refusal for a dynamic port
 /// then arrives through `demux_inbound` (which runs post-`bound`).
 pub(crate) unsafe fn pump_listeners(s: &mut HttpState) {
     let prefix_len = s.server.listeners_prefix_len as usize;
     if prefix_len == 0 {
         return;
     }
-    if s.server.store_event >= 0 {
+    {
         let sys = &*s.syscalls;
-        let ev = s.server.store_event;
         // Disjoint field borrows of `s.server`. The listener CHANGES pages
         // reuse `routes_scratch` — the pumps run in turn and each applies a
         // page before the next is read, so the transient buffer is free to
@@ -364,7 +368,7 @@ pub(crate) unsafe fn pump_listeners(s: &mut HttpState) {
         let scratch = &mut s.server.routes_scratch;
         let ltc = &mut s.server.ltc;
         let listeners = &mut s.server.listeners;
-        ltc.advance(sys, store, ev, prefix, scratch, listeners);
+        ltc.step(sys, store, prefix, scratch, listeners);
     }
 
     // Reconcile only after the static bind: the mid-life CMD_BIND rides
@@ -378,11 +382,15 @@ pub(crate) unsafe fn pump_listeners(s: &mut HttpState) {
 /// issue `CMD_BIND` for a newly desired `tls=0` port, `CMD_CLOSE` the
 /// linux_net listener conn for a withdrawn one. Idempotent — a port
 /// already tracked (any bind state) is left alone; the lease gate refuses
-/// an unleased port and the refusal surfaces as `MSG_BIND_REFUSED` in the
-/// demux (which flips the record to `LISTENER_REFUSED`, never retried).
+/// an unleased port and the refusal surfaces as an untagged `MSG_ERROR` in
+/// the demux (which flips the record to `LISTENER_REFUSED`, never retried).
+/// One bind is outstanding at a time, so that refusal names its bind.
 unsafe fn reconcile_listeners(s: &mut HttpState) {
     // 1. Bind newly-desired ports. Skip `tls=1` (P3 scope: cleartext).
     for li in 0..MAX_DYN_LISTENERS {
+        if s.server.listeners.binding_slot().is_some() {
+            break; // one bind outstanding at a time
+        }
         let (port, tls, used) = {
             let r = &s.server.listeners.live[li];
             (r.port, r.tls, r.used)
@@ -438,29 +446,13 @@ unsafe fn reconcile_listeners(s: &mut HttpState) {
     }
 }
 
-/// Fill a `NET_CMD_BIND` payload for `port`, owner-stamped when this instance
-/// belongs to a workload that owns its own address.
-///
-/// The base payload is `[port:u16 LE]`, which binds the host or wildcard
-/// address. An instance whose owner tag is non-zero appends
-/// `[owner_tag:u16 LE]`; the `ip` module resolves that tag to the workload's
-/// owned address and refuses an unowned one with `EACCES`. A host-owned
-/// instance reads owner slot 0 and appends nothing, so its payload is the
-/// two-byte form.
-///
-/// Returns the payload length, 2 or 4.
+/// The `NET_CMD_BIND` payload for `port`: `[port u16][flags]`, asking for
+/// the trace-context sideband on every connection the listener accepts. The
+/// transport makes the bind as the owner the kernel attests for `net_out`,
+/// so a workload instance binds its own address without naming it.
 #[inline]
-pub(crate) unsafe fn fill_bind_payload(sys: &SyscallTable, port: u16, out: &mut [u8; 4]) -> usize {
-    out[0] = (port & 0xFF) as u8;
-    out[1] = (port >> 8) as u8;
-    let owner_tag = dev_owner_tag(sys);
-    if owner_tag != 0 {
-        out[2] = (owner_tag & 0xFF) as u8;
-        out[3] = (owner_tag >> 8) as u8;
-        4
-    } else {
-        2
-    }
+pub(crate) fn bind_payload(port: u16) -> [u8; net_proto::BIND_LEN] {
+    net_proto::bind(port, net_proto::flag::TRACE)
 }
 
 /// Issue a mid-life `CMD_BIND [port:u16 LE]` on `net_out` for a pooled
@@ -472,14 +464,13 @@ unsafe fn listener_send_bind(s: &mut HttpState, port: u16) -> bool {
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
     let buf = s.net_buf.as_mut_ptr();
-    let mut payload = [0u8; 4];
-    let plen = fill_bind_payload(sys, port, &mut payload);
+    let payload = bind_payload(port);
     net_write_frame(
         sys,
         chan,
         NET_CMD_BIND,
         payload.as_ptr(),
-        plen,
+        payload.len(),
         buf,
         NET_BUF_SIZE,
     ) != 0

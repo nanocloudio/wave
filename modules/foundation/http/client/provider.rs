@@ -2,31 +2,34 @@
 //!
 //! A requester writes exchange request records on `request_in`; this client
 //! performs each as an HTTP request against its origin and answers on
-//! `response_out` under the requester's exchange id. Nothing here speaks HTTP:
-//! it collects a request, hands its method, target, headers and body to the
-//! generation's phase machine, and frames what that machine produces into
-//! response records.
+//! `response_out` under the requester's exchange id. It speaks the HTTP
+//! binding of the exchange records (`exchange_http`) and declares it on
+//! `request_in`: it collects a request, hands its method, target, fields and
+//! body to the generation's phase machine, and frames what that machine
+//! produces into response records.
 //!
 //! # A request
 //!
-//! - `method`: `METHOD_GET` … `METHOD_OPTIONS`. `METHOD_CONNECT`,
-//!   `METHOD_PUBLISH` and an unknown method are answered 400.
+//! - `op` CALL with `verb` one of `exchange_http::method` `GET` … `OPTIONS`.
+//!   An OPEN (`CONNECT`, `WS_CONNECT`, `WT_CONNECT`), a PUBLISH and a CALL
+//!   naming no method are answered 400.
 //! - `target`: the request target, `/path[?query]`, sent verbatim; empty
 //!   means `/`. Anything else, or a byte outside `0x21..=0x7e`, is 400.
-//! - `headers`: `name: value\r\n` lines sent as given, `content-type`
-//!   included. `host` chooses the authority (below) and is written by this
-//!   client; a `content-length` must equal the body's length and is written
-//!   by this client too. A field this client frames the request with
-//!   (`connection`, `keep-alive`, `transfer-encoding`, `te`, `trailer`,
-//!   `upgrade`, `proxy-connection`, `expect`) is 400, as is a block that is
-//!   not well-formed field lines: those bytes land in the request head and
-//!   decide where it ends.
+//! - `meta`: header fields, each sent as the line `key: value`,
+//!   `content-type` included. `host` chooses the authority (below) and is
+//!   written by this client; a `content-length` must equal the body's length
+//!   and is written by this client too. A field this client frames the
+//!   request with (`connection`, `keep-alive`, `transfer-encoding`, `te`,
+//!   `trailer`, `upgrade`, `proxy-connection`, `expect`) is 400, as is a key
+//!   that is not a field name or a value holding a CR, LF or NUL: those bytes
+//!   land in the request head and decide where it ends. The binding's own
+//!   `:` keys are not sent.
 //! - `body`: inline in the HEAD, or after it in BODY records under the
 //!   credit this client grants — all of it at once, up to the body bound.
 //!   The request is performed once it is whole.
-//! - flags: `BROADCAST`, `WEBSOCKET` and `WEBTRANSPORT` are 400. `HOLD`
-//!   asks for a held exchange (a watch): answered `HOLD | MORE`, ended by its
-//!   origin, and not cut short by `client_total_ms` once its head has come.
+//! - flags: `BROADCAST` is 400. `HOLD` asks for a held exchange (a watch):
+//!   answered `HOLD | MORE`, ended by its origin, and not cut short by
+//!   `client_total_ms` once its head has come.
 //!
 //! # Where a request goes
 //!
@@ -39,10 +42,12 @@
 //!
 //! # The answer
 //!
-//! The response HEAD carries the origin's status verbatim, its
-//! `content-type`, and its header block without the fields that framed the
-//! response on the wire (`connection`, `keep-alive`, `transfer-encoding`,
-//! `te`, `trailer`, `upgrade`, `proxy-connection`); `content-length` stays.
+//! The response HEAD carries the origin's status verbatim as its detail (and
+//! the outcome the binding puts it in), and its header fields as meta,
+//! `content-type` among them, without the fields that framed the response on
+//! the wire (`connection`, `keep-alive`, `transfer-encoding`, `te`,
+//! `trailer`, `upgrade`, `proxy-connection`); `content-length` stays. A
+//! status the binding does not carry is answered 502.
 //! The body follows the head inline and in BODY records, never past the
 //! credit the requester grants, so a response of any length streams. A
 //! response that arrives whole within one record is answered in one HEAD.
@@ -80,30 +85,29 @@
 //! performed at once as the connection carries streams, with one more
 //! collected behind them.
 
-use super::super::connection::net_proto::Target;
+use super::super::abi::contracts::net::net_proto::Target;
 use super::super::exchange::{
-    abort, flag, header_lines, link, parse_request, status, write_abort, write_credit, write_link,
-    write_refusal, write_response_head, Collector, ExchangeId, Record, Refuse, ResponseHead, HDR,
-    METHOD_DELETE, METHOD_GET, METHOD_HEAD, METHOD_OPTIONS, METHOD_PATCH, METHOD_POST, METHOD_PUT,
+    abort, flag, link, meta_fields, op, parse_request, write_abort, write_credit, write_link,
+    write_response_head, Collector, ExchangeId, MetaWriter, Record, Refuse, HDR, META_KEY_MAX,
     RECORD_MAX, RESP_HEAD_FIXED,
 };
 use super::super::{dev_channel_port, dev_millis, ExchangeOutbox, HttpState};
+use super::exchange_http::{self, method, status, Http};
 use super::{
     log, Phase, AUTHORITY_MAX, CAUSE_CONNECT, CAUSE_LINK, CAUSE_PEER, CAUSE_TIMEOUT, MAX_PATH_LEN,
     REQUEST_BODY_SIZE, REQUEST_HEADERS_MAX,
 };
 
-/// Collects one request whole while another is performed.
+/// Collects one request whole while another is performed. Its meta is held
+/// to the wire block it becomes: a field takes one byte fewer as meta than as
+/// a header line.
 pub(crate) type RequestCollector =
-    Collector<1, MAX_PATH_LEN, REQUEST_HEADERS_MAX, REQUEST_BODY_SIZE>;
+    Collector<Http, 1, MAX_PATH_LEN, REQUEST_HEADERS_MAX, REQUEST_BODY_SIZE>;
 
-/// The longest content type a response HEAD carries: the field's own bound.
-pub(crate) const RESP_CT_MAX: usize = 255;
-/// The response header block a generation that decodes fields one at a time
-/// (h2, h3) assembles. h1 forwards from the decoder's own block.
-pub(crate) const RESP_HDRS_MAX: usize = 2048;
-/// The largest control record: a refusal HEAD with no content type, headers
-/// or body. CREDIT and LINK are smaller.
+/// The response meta any generation assembles from the origin's fields.
+pub(crate) const RESP_META_MAX: usize = 2048;
+/// The largest control record: a refusal HEAD with no meta or body. CREDIT
+/// and LINK are smaller.
 const CTL_MAX: usize = HDR + RESP_HEAD_FIXED;
 /// Request records read per step.
 const RECORDS_PER_STEP: usize = 8;
@@ -222,12 +226,10 @@ pub(crate) struct Provider {
     probe_at_ms: u64,
     probe_wait_ms: u32,
 
-    /// The response's content type and header block, for the generations
-    /// that decode fields one at a time.
-    pub(crate) resp_ct: [u8; RESP_CT_MAX],
-    pub(crate) resp_ct_len: u16,
-    pub(crate) resp_hdrs: [u8; RESP_HDRS_MAX],
-    pub(crate) resp_hdrs_len: u16,
+    /// The response's fields as meta, for the generations that decode
+    /// fields one at a time.
+    resp_meta: [u8; RESP_META_MAX],
+    resp_meta_len: u16,
     /// The response's fields passed what is held for them.
     pub(crate) resp_over: u8,
 }
@@ -293,7 +295,7 @@ unsafe fn ctl_send(s: &mut HttpState, len: usize) -> bool {
 
 /// Refuse `id` with `code`, raised here and nothing else, on the control record.
 unsafe fn ctl_refuse(s: &mut HttpState, id: ExchangeId, code: u16) -> bool {
-    let Some(n) = write_refusal(&id, code, &mut s.client.ex.ctl_rec) else {
+    let Some(n) = exchange_http::write_refusal(&id, code, &mut s.client.ex.ctl_rec) else {
         return false;
     };
     ctl_send(s, n)
@@ -405,9 +407,18 @@ pub(crate) unsafe fn service(s: &mut HttpState) {
 /// Take one request record of `n` bytes from `in_rec`.
 unsafe fn take_record(s: &mut HttpState, n: usize) {
     let x = &mut s.client.ex;
-    let Some(record) = parse_request(&x.in_rec[..n]) else {
-        // Without a parse there is no id, and so nobody to answer.
-        return;
+    // A record that breaks the binding's rules is the collector's to refuse
+    // when it names an exchange; anything else without a parse has nobody to
+    // answer.
+    let record = match parse_request::<Http>(&x.in_rec[..n]) {
+        Ok(record) => record,
+        Err(_) => {
+            let _ = x.collector.accept(&x.in_rec[..n]);
+            if let Some((rid, why)) = s.client.ex.collector.take_refusal() {
+                ctl_refuse(s, rid, exchange_http::canonical_status(why.outcome()));
+            }
+            return;
+        }
     };
     // What the record says, read out so the state can be taken again.
     let (id, is_head, aborted, credit) = match record {
@@ -464,7 +475,7 @@ unsafe fn take_record(s: &mut HttpState, n: usize) {
             ctl_send(s, len);
         }
     } else if let Some((rid, why)) = s.client.ex.collector.take_refusal() {
-        ctl_refuse(s, rid, why.status());
+        ctl_refuse(s, rid, exchange_http::canonical_status(why.outcome()));
     }
 }
 
@@ -527,10 +538,11 @@ unsafe fn adopt(s: &mut HttpState) -> bool {
     let id = req.id;
     let verdict = check(
         s,
-        req.method,
+        req.op,
+        req.verb,
         req.flags,
         req.target,
-        req.headers,
+        req.meta,
         req.body.len(),
     );
     let code = match verdict {
@@ -551,13 +563,13 @@ unsafe fn adopt(s: &mut HttpState) -> bool {
     let Some(req) = s.client.ex.collector.request(0) else {
         return false;
     };
-    let method = req.method;
+    let verb = req.verb;
     let held = u8::from(req.flags & flag::HOLD != 0);
     let resp_credit = req.resp_credit;
     let target_len = req.target.len();
     let body_len = req.body.len();
     let (t, b) = (req.target.as_ptr(), req.body.as_ptr());
-    let (h, hl) = (req.headers.as_ptr(), req.headers.len());
+    let (m, ml) = (req.meta.as_ptr(), req.meta.len());
     if target_len == 0 {
         s.client.path[0] = b'/';
         s.client.path_len = 1;
@@ -568,36 +580,31 @@ unsafe fn adopt(s: &mut HttpState) -> bool {
     core::ptr::copy_nonoverlapping(b, s.client.request_body.as_mut_ptr(), body_len);
     s.client.request_body_len = body_len as u16;
     s.client.request_body_sent = 0;
-    // The requester's block, without what this client writes itself.
-    let block = core::slice::from_raw_parts(h, hl);
+    // The requester's fields as the header lines they go on the wire as,
+    // without what this client writes itself. `check` held the lines to
+    // `REQUEST_HEADERS_MAX`.
+    let meta = core::slice::from_raw_parts(m, ml);
     let mut out = 0usize;
-    let mut host: (usize, usize) = (0, 0);
-    let mut at = 0usize;
-    for line in block.split(|&c| c == b'\n') {
-        let start = at;
-        at += line.len() + 1;
-        let Some(colon) = line.iter().position(|&c| c == b':') else {
-            continue;
-        };
-        let name = &line[..colon];
-        if name.eq_ignore_ascii_case(b"host") {
-            let (vs, ve) = value_span(line, colon);
-            host = (start + vs, start + ve);
+    let mut host: &[u8] = &[];
+    for (key, value) in meta_fields(meta) {
+        if key == b"host" {
+            host = value;
             continue;
         }
-        if name.eq_ignore_ascii_case(b"content-length") {
+        if key == b"content-length" || key.first() == Some(&b':') {
             continue;
         }
-        let whole = line.len() + 1;
-        s.client.request_headers[out..out + whole].copy_from_slice(&block[start..start + whole]);
-        out += whole;
+        for part in [key, b": ", value, b"\r\n"] {
+            s.client.request_headers[out..out + part.len()].copy_from_slice(part);
+            out += part.len();
+        }
     }
     s.client.request_headers_len = out as u16;
-    s.client.method = method;
+    s.client.method = verb;
 
     // The authority: a pinned client's own, or the request's `host`.
     if !pinned(s) {
-        let a = &block[host.0..host.1];
+        let a = host;
         let n = a.len();
         if s.client.conn_present != 0
             && &s.client.conn_authority[..s.client.conn_authority_len as usize] != a
@@ -625,49 +632,35 @@ unsafe fn adopt(s: &mut HttpState) -> bool {
     x.held = held;
     x.abort_owed = 0;
     x.out_len = 0;
-    x.resp_ct_len = 0;
-    x.resp_hdrs_len = 0;
+    x.resp_meta_len = 0;
     x.resp_over = 0;
     rearm(s);
     true
-}
-
-/// The value of a `name: value` line whose colon is at `colon`, trimmed.
-fn value_span(line: &[u8], colon: usize) -> (usize, usize) {
-    let mut vs = colon + 1;
-    let mut ve = line.len();
-    if ve > vs && line[ve - 1] == b'\r' {
-        ve -= 1;
-    }
-    while vs < ve && (line[vs] == b' ' || line[vs] == b'\t') {
-        vs += 1;
-    }
-    while ve > vs && (line[ve - 1] == b' ' || line[ve - 1] == b'\t') {
-        ve -= 1;
-    }
-    (vs, ve)
 }
 
 /// Whether this client performs a request with these fields, or the status it
 /// is refused with.
 fn check(
     s: &HttpState,
-    method: u8,
+    op: u8,
+    verb: u8,
     flags: u8,
     target: &[u8],
-    headers: &[u8],
+    meta: &[u8],
     body_len: usize,
 ) -> Result<(), u16> {
-    if !matches!(
-        method,
-        METHOD_GET
-            | METHOD_HEAD
-            | METHOD_POST
-            | METHOD_PUT
-            | METHOD_PATCH
-            | METHOD_DELETE
-            | METHOD_OPTIONS
-    ) || flags & (flag::BROADCAST | flag::WEBSOCKET | flag::WEBTRANSPORT) != 0
+    if op != op::CALL
+        || !matches!(
+            verb,
+            method::GET
+                | method::HEAD
+                | method::POST
+                | method::PUT
+                | method::PATCH
+                | method::DELETE
+                | method::OPTIONS
+        )
+        || flags & flag::BROADCAST != 0
     {
         return Err(status::BAD_REQUEST);
     }
@@ -676,49 +669,40 @@ fn check(
     {
         return Err(status::BAD_REQUEST);
     }
-    // Field lines, each `name: value` ending CRLF, and nothing else: a blank
-    // line would end the head early and put what followed on the wire as a
-    // second request; a bare CR or LF splits a line where the origin reads
-    // one.
-    if !headers.is_empty() && !headers.ends_with(b"\r\n") {
-        return Err(status::BAD_REQUEST);
-    }
+    // Each field goes on the wire as the line `key: value`, so its bytes
+    // decide where the head ends: a key must be a field name, and a CR, LF or
+    // NUL in a value would split a line where the origin reads one or end the
+    // head early.
     let mut host: Option<&[u8]> = None;
-    for line in headers.split(|&c| c == b'\n') {
-        if line.is_empty() {
-            // The split's tail after the final LF.
+    let mut lines = 0usize;
+    for (name, value) in meta_fields(meta) {
+        if name.first() == Some(&b':') {
             continue;
         }
-        let Some(line) = line.strip_suffix(b"\r") else {
-            return Err(status::BAD_REQUEST);
-        };
-        let Some(colon) = line.iter().position(|&c| c == b':') else {
-            return Err(status::BAD_REQUEST);
-        };
-        let name = &line[..colon];
-        if name.is_empty()
-            || !name.iter().all(|&c| tchar(c))
-            || line[colon + 1..]
-                .iter()
-                .any(|&c| c == b'\r' || c == b'\n' || c == 0)
+        if !name.iter().all(|&c| tchar(c))
+            || value.iter().any(|&c| c == b'\r' || c == b'\n' || c == 0)
         {
             return Err(status::BAD_REQUEST);
         }
         if framing_field(name) {
             return Err(status::BAD_REQUEST);
         }
-        let (vs, ve) = value_span(line, colon);
-        let value = &line[vs..ve];
-        if name.eq_ignore_ascii_case(b"content-length") {
+        if name != b"host" && name != b"content-length" {
+            lines += name.len() + 2 + value.len() + 2;
+        }
+        if name == b"content-length" {
             if parse_decimal(value) != Some(body_len as u64) {
                 return Err(status::BAD_REQUEST);
             }
-        } else if name.eq_ignore_ascii_case(b"host") {
+        } else if name == b"host" {
             if host.is_some() {
                 return Err(status::BAD_REQUEST);
             }
             host = Some(value);
         }
+    }
+    if lines > REQUEST_HEADERS_MAX {
+        return Err(status::PAYLOAD_TOO_LARGE);
     }
     let own = &s.client.authority[..s.client.authority_len as usize];
     match host {
@@ -729,7 +713,7 @@ fn check(
         }
         Some(h) => {
             if h.len() > AUTHORITY_MAX {
-                return Err(status::TOO_LARGE);
+                return Err(status::PAYLOAD_TOO_LARGE);
             }
             if Target::parse(h).is_none() {
                 return Err(status::BAD_REQUEST);
@@ -768,35 +752,20 @@ pub(crate) fn head_given(s: &HttpState) -> bool {
     s.client.ex.head_given != 0
 }
 
-/// Compose the response HEAD: the origin's `status`, `content_type`, and a
-/// header block already rid of hop-by-hop fields. Its body follows through
-/// [`body`]. False when it does not fit one record, in which case the
-/// exchange has been answered 502.
-pub(crate) unsafe fn head(
-    s: &mut HttpState,
-    code: u16,
-    content_type: &[u8],
-    headers: &[u8],
-) -> bool {
+/// Compose the response HEAD: the origin's status `code` and its fields as
+/// `meta`, already rid of hop-by-hop fields. Its body follows through
+/// [`body`]. False when the binding does not carry the status or the head
+/// does not fit one record, in which case the exchange has been answered
+/// 502.
+unsafe fn head(s: &mut HttpState, code: u16, meta: &[u8]) -> bool {
     if !answering(s) || head_given(s) {
         return true;
     }
     let x = &mut s.client.ex;
-    let composed = if content_type.len() > RESP_CT_MAX {
-        None
-    } else {
-        write_response_head(
-            &ResponseHead {
-                id: x.id,
-                flags: flag::MORE | if x.held != 0 { flag::HOLD } else { 0 },
-                status: code,
-                content_type,
-                headers,
-                body: &[],
-            },
-            &mut x.out_rec,
-        )
-    };
+    let composed = exchange_http::head(x.id, code, meta, &[]).and_then(|mut h| {
+        h.flags = flag::MORE | if x.held != 0 { flag::HOLD } else { 0 };
+        write_response_head::<Http>(&h, &mut x.out_rec)
+    });
     match composed {
         Some(n) => {
             x.out_len = n as u16;
@@ -805,48 +774,52 @@ pub(crate) unsafe fn head(
             true
         }
         None => {
-            log(s, b"[http] response head does not fit one record");
+            log(s, b"[http] response head is not one record of this binding");
             refuse_live(s, status::BAD_GATEWAY);
             false
         }
     }
 }
 
+/// Append the meta field for header `name: value` to `meta[..at]`, its key
+/// the name in lower case; the new length, or `None` when it does not fit or
+/// the name is no meta key.
+fn put_field(meta: &mut [u8], at: usize, name: &[u8], value: &[u8]) -> Option<usize> {
+    if name.is_empty() || name.len() > META_KEY_MAX {
+        return None;
+    }
+    let mut key = [0u8; META_KEY_MAX];
+    let key = &mut key[..name.len()];
+    for (k, c) in key.iter_mut().zip(name) {
+        *k = c.to_ascii_lowercase();
+    }
+    let mut w = MetaWriter::new(meta.get_mut(at..)?);
+    w.put(key, value);
+    Some(at + w.finish()?)
+}
+
 /// Compose the HEAD for an HTTP/1.1 response from the decoder's header block:
-/// the content type lifted out, the hop-by-hop fields dropped.
+/// each field a meta field, the hop-by-hop fields dropped.
 pub(crate) unsafe fn head_from_block(s: &mut HttpState, code: u16) -> bool {
     let block_len = s.client.response.head_len as usize;
-    let mut kept = [0u8; super::super::wire::response::RESPONSE_HEAD_MAX];
-    let mut ct = [0u8; RESP_CT_MAX];
-    let mut ct_len = 0usize;
+    let mut meta = [0u8; RESP_META_MAX];
     let mut n = 0usize;
     // Read in place: the decoder's block is not touched again before the
     // head is composed from the copy below.
     let block = core::slice::from_raw_parts(s.client.response.head_bytes.as_ptr(), block_len);
-    for (name, value) in header_lines(block) {
-        if name.eq_ignore_ascii_case(b"content-type") {
-            if value.len() > RESP_CT_MAX {
-                refuse_live(s, status::BAD_GATEWAY);
-                return false;
-            }
-            ct[..value.len()].copy_from_slice(value);
-            ct_len = value.len();
-            continue;
-        }
+    for (name, value) in exchange_http::header_lines(block) {
         if hop_field(name) {
             continue;
         }
-        let need = name.len() + 2 + value.len() + 2;
-        if n + need > kept.len() {
-            refuse_live(s, status::BAD_GATEWAY);
-            return false;
-        }
-        for part in [name, b": ", value, b"\r\n"] {
-            kept[n..n + part.len()].copy_from_slice(part);
-            n += part.len();
+        match put_field(&mut meta, n, name, value) {
+            Some(end) => n = end,
+            None => {
+                refuse_live(s, status::BAD_GATEWAY);
+                return false;
+            }
         }
     }
-    head(s, code, &ct[..ct_len], &kept[..n])
+    head(s, code, &meta[..n])
 }
 
 /// Record one field of a response decoded a field at a time (h2, h3).
@@ -855,27 +828,10 @@ pub(crate) fn note_field(s: &mut HttpState, name: &[u8], value: &[u8]) {
     if name.starts_with(b":") || hop_field(name) {
         return;
     }
-    if name.eq_ignore_ascii_case(b"content-type") {
-        if value.len() > RESP_CT_MAX {
-            x.resp_over = 1;
-            return;
-        }
-        x.resp_ct[..value.len()].copy_from_slice(value);
-        x.resp_ct_len = value.len() as u16;
-        return;
+    match put_field(&mut x.resp_meta, x.resp_meta_len as usize, name, value) {
+        Some(end) => x.resp_meta_len = end as u16,
+        None => x.resp_over = 1,
     }
-    let at = x.resp_hdrs_len as usize;
-    let need = name.len() + 2 + value.len() + 2;
-    if at + need > RESP_HDRS_MAX {
-        x.resp_over = 1;
-        return;
-    }
-    let mut p = at;
-    for part in [name, b": ", value, b"\r\n"] {
-        x.resp_hdrs[p..p + part.len()].copy_from_slice(part);
-        p += part.len();
-    }
-    x.resp_hdrs_len = p as u16;
 }
 
 /// Compose the HEAD from the fields [`note_field`] recorded.
@@ -884,13 +840,10 @@ pub(crate) unsafe fn head_from_fields(s: &mut HttpState, code: u16) -> bool {
         refuse_live(s, status::BAD_GATEWAY);
         return false;
     }
-    let ct_len = s.client.ex.resp_ct_len as usize;
-    let hl = s.client.ex.resp_hdrs_len as usize;
-    let mut ct = [0u8; RESP_CT_MAX];
-    ct[..ct_len].copy_from_slice(&s.client.ex.resp_ct[..ct_len]);
-    let mut hdrs = [0u8; RESP_HDRS_MAX];
-    hdrs[..hl].copy_from_slice(&s.client.ex.resp_hdrs[..hl]);
-    head(s, code, &ct[..ct_len], &hdrs[..hl])
+    let ml = s.client.ex.resp_meta_len as usize;
+    let mut meta = [0u8; RESP_META_MAX];
+    meta[..ml].copy_from_slice(&s.client.ex.resp_meta[..ml]);
+    head(s, code, &meta[..ml])
 }
 
 /// Offer the record in hand with MORE set or not. It leaves now or is held,
@@ -1010,7 +963,7 @@ unsafe fn refuse_live(s: &mut HttpState, code: u16) {
     let x = &mut s.client.ex;
     x.out_len = 0;
     x.ended = 1;
-    if let Some(n) = write_refusal(&x.id, code, &mut x.out_rec) {
+    if let Some(n) = exchange_http::write_refusal(&x.id, code, &mut x.out_rec) {
         x.out_box.send(sys, x.response_chan, &x.out_rec, n);
     }
     if !x.out_box.holding() {
@@ -1048,7 +1001,7 @@ pub(crate) unsafe fn fail(s: &mut HttpState, why: u8) {
         refuse_live(
             s,
             if why == CAUSE_TIMEOUT {
-                status::TIMEOUT
+                status::GATEWAY_TIMEOUT
             } else {
                 status::BAD_GATEWAY
             },
@@ -1196,23 +1149,14 @@ pub(crate) unsafe fn stream_head(
     if x.resp_over != 0 {
         return Some(false);
     }
-    let ct_len = x.resp_ct_len as usize;
-    let hl = x.resp_hdrs_len as usize;
-    let mut ct = [0u8; RESP_CT_MAX];
-    ct[..ct_len].copy_from_slice(&x.resp_ct[..ct_len]);
-    let mut hdrs = [0u8; RESP_HDRS_MAX];
-    hdrs[..hl].copy_from_slice(&x.resp_hdrs[..hl]);
-    let Some(n) = write_response_head(
-        &ResponseHead {
-            id: *id,
-            flags,
-            status: code,
-            content_type: &ct[..ct_len],
-            headers: &hdrs[..hl],
-            body: &[],
-        },
-        &mut x.out_rec,
-    ) else {
+    let ml = x.resp_meta_len as usize;
+    let mut meta = [0u8; RESP_META_MAX];
+    meta[..ml].copy_from_slice(&x.resp_meta[..ml]);
+    let Some(mut h) = exchange_http::head(*id, code, &meta[..ml], &[]) else {
+        return Some(false);
+    };
+    h.flags = flags;
+    let Some(n) = write_response_head::<Http>(&h, &mut x.out_rec) else {
         return Some(false);
     };
     out_send(s, n);
@@ -1223,8 +1167,7 @@ pub(crate) unsafe fn stream_head(
 #[cfg(feature = "h2")]
 pub(crate) fn clear_fields(s: &mut HttpState) {
     let x = &mut s.client.ex;
-    x.resp_ct_len = 0;
-    x.resp_hdrs_len = 0;
+    x.resp_meta_len = 0;
     x.resp_over = 0;
 }
 
@@ -1262,7 +1205,7 @@ pub(crate) unsafe fn stream_refuse(s: &mut HttpState, id: &ExchangeId, code: u16
     if !out_free(s) {
         return false;
     }
-    if let Some(n) = write_refusal(id, code, &mut s.client.ex.out_rec) {
+    if let Some(n) = exchange_http::write_refusal(id, code, &mut s.client.ex.out_rec) {
         out_send(s, n);
     }
     true
@@ -1328,12 +1271,16 @@ pub(crate) unsafe fn drain(s: &mut HttpState) {
             x.abort_owed = abort::DRAINING;
             service_abort(s);
         } else {
-            refuse_live(s, status::BUSY);
+            refuse_live(s, status::SERVICE_UNAVAILABLE);
         }
     }
     if s.client.ex.queued != 0 && !s.client.ex.ctl_box.holding() {
         let id = s.client.ex.queued_id;
-        if ctl_refuse(s, id, Refuse::Busy.status()) {
+        if ctl_refuse(
+            s,
+            id,
+            exchange_http::canonical_status(Refuse::Busy.outcome()),
+        ) {
             let x = &mut s.client.ex;
             x.collector = RequestCollector::new();
             x.queued = 0;

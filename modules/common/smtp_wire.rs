@@ -1,10 +1,11 @@
 // The answer the `smtp` connector gives a submission, and how it is
 // classified.
 //
-// The connector is an exchange provider (`abi::contracts::exchange`): a
-// submission arrives as a request — method POST, `target` the one recipient,
-// a `mail-from` header naming the envelope sender, the message (headers and
-// body) as the request body — and is answered once. The answer's body is the
+// The connector is an exchange provider (`abi::contracts::exchange`) speaking
+// its HTTP binding: a submission arrives as a request — a CALL with the verb
+// POST, `target` the one recipient, a `mail-from` meta field naming the
+// envelope sender, the message (headers and body) as the request body — and is
+// answered once. The answer's body is the
 // `SmtpResult` below.
 //
 // The result carries more than a status because SMTP failure is not one fact.

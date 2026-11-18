@@ -156,6 +156,7 @@ canonical request, which is built in fixed scratch: 64 query parameters and
 | `S3_CHUNK_LINE_MAX` | `16 + 17 + 64 + 2` | `IncompleteBody` |
 | `MAX_EXCHANGES` (`s3_serve`) | 32 | `503 SlowDown` |
 | `MAX_UPLOADS` | 64 | `503 SlowDown` |
+| `HEAD_META_MAX` (`s3_serve`) | 1024 | the meta of a response HEAD this module writes: the content type's field and the module's own header lines; the module's fixed headers stay far below it, and a head whose meta would not fit is not written |
 | `MAX_COMPLETIONS` | 4 | `503 SlowDown` |
 | `ETAG_MAX` | 32 | `InternalError`; a listed part's longer tag is `InvalidPart` |
 | `UPLOAD_TTL_S` | 24 h | the upload's staging is reclaimed |
@@ -195,7 +196,7 @@ loading part of a file would hand out an authority nobody wrote down.
 | `MAX_CALLER_HEADERS` | 2048 | `400` |
 | `RESP_HEAD_MAX` | 4096 | `502`, the connection closed |
 | `CT_MAX` (`s3`) | 255 | the content type is forwarded among the headers |
-| `SEND_MAX` | `net_proto::MAX_DATA_FRAGMENT` | the request is split across frames |
+| `SEND_MAX` | `net_proto::data_capacity(NET_OUT_MAX_RECORD)` | the request is split across frames |
 
 The target and caller headers bound what the connector signs, in the fixed
 scratch the canonical request is built in. `RESP_HEAD_MAX` bounds what it
@@ -205,7 +206,7 @@ each frame within `net_out`'s record.
 
 ## Not ceilings
 
-Four constants in the named files match the naming convention without being
+Eight constants in the named files match the naming convention without being
 policy. They are exempted in the second block below, each with its reason:
 `WS_BUF_SIZE` is per-stream reassembly scratch, `H3_VARINT_MAX` is the width
 RFC 9000 gives a QUIC varint — a wire fact, not a decision this project made
@@ -275,11 +276,12 @@ STASH_CAP | modules/foundation/s3_serve/mod.rs | BODY_WINDOW as usize
 MAX_CREDENTIALS | modules/foundation/s3_serve/mod.rs | 16
 CREDS_FILE_MAX | modules/foundation/s3_serve/mod.rs | 16 * 1024
 OBJECT_VOLUME_MAX | modules/foundation/s3_serve/mod.rs | 64
+HEAD_META_MAX | modules/foundation/s3_serve/mod.rs | 1024
 MAX_TARGET | modules/foundation/s3/mod.rs | 2048
 MAX_CALLER_HEADERS | modules/foundation/s3/mod.rs | 2048
 RESP_HEAD_MAX | modules/foundation/s3/mod.rs | 4096
 CT_MAX | modules/foundation/s3/mod.rs | 255
-SEND_MAX | modules/foundation/s3/mod.rs | net_proto::MAX_DATA_FRAGMENT
+SEND_MAX | modules/foundation/s3/mod.rs | net_proto::data_capacity(NET_OUT_MAX_RECORD)
 ```
 
 ```limit-register-exempt
@@ -287,4 +289,8 @@ ROUTE_KEY_CANON_BYTES | modules/common/http_route_key.rs | the digest input at i
 PORT_SUFFIX_MAX | modules/common/http_route_key.rs | the width of a `:65535` suffix, a wire fact rather than a choice
 WS_BUF_SIZE | modules/foundation/http/server/h2.rs | per-stream WebSocket reassembly scratch, sized to the frame codec rather than chosen as a limit
 H3_VARINT_MAX | modules/foundation/http/server/h3.rs | the width RFC 9000 gives a QUIC varint, not a choice this project makes
+ROUTE_META_MAX | modules/foundation/http/server/app.rs | the `:route` meta field at its widest, derived from the exchange meta layout rather than chosen
+META_MAX | modules/foundation/s3/mod.rs | the content type's meta field plus RESP_HEAD_MAX of header fields, derived from the exchange meta layout and registered ceilings
+HEADER_LINES_MAX | modules/foundation/s3_serve/mod.rs | a record's meta rendered as header lines, derived from RECORD_MAX and the meta field's fixed bytes
+DELETE_ARG_MAX | modules/foundation/s3_serve/mod.rs | the storage.object DELETE argument at NAME_MAX, derived from the contract's layout
 ```

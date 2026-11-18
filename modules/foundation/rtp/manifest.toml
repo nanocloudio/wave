@@ -18,6 +18,7 @@ timer_class = "agnostic"
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
+accepts_record = 2048
 
 # Media to send (in[1] or in[2] — one, never both: one instance is one RTP
 # stream). The fluxor encoded-media record stream; its STREAM record must name
@@ -50,6 +51,9 @@ max_payload = 4096
 name = "net_out"
 direction = "output"
 content_type = "NetProto"
+# A datagram of the largest packet sent (header, `TX_MTU`, SRTP tag and a
+# TURN envelope) under the longest named destination fits it.
+max_record = 1603
 
 # Validated receive records (out[1]): metadata-bearing `[seq,timestamp,ssrc,PT,
 # marker,codec][payload…]`, with a MID extension variant when RFC 8285 supplies
