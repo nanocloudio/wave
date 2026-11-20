@@ -194,10 +194,10 @@ echo "── building $GRAPH ──"
   --param cert=target/pki/server_cert.der --param key=target/pki/server_key.der ) \
   >/dev/null || fail "fluxor build $GRAPH"
 out="$ROOT/target/linux/$NAME"
-[ -s "$out/config.bin" ] && [ -s "$out/modules.bin" ] || fail "graph artefacts missing"
+[ -s "$out/graph.img" ] || fail "graph image missing"
 
 echo "── booting on udp:$PORT ──"
-"$RUNTIME" --config "$out/config.bin" --modules "$out/modules.bin" >"$WORK/runtime.log" 2>&1 &
+"$RUNTIME" --image "$out/graph.img" >"$WORK/runtime.log" 2>&1 &
 RUNTIME_PID=$!
 for _ in $(seq 1 60); do
   ss -ulnp 2>/dev/null | grep -q ":$PORT " && break

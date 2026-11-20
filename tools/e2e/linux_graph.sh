@@ -98,11 +98,10 @@ boot_graph() {
   ( cd "$ROOT" && fluxor build "$yaml" "$@" ) >/dev/null || fail "fluxor build $yaml"
 
   local out="$ROOT/target/linux/$name"
-  [ -s "$out/config.bin" ] || fail "$out/config.bin missing or empty"
-  [ -s "$out/modules.bin" ] || fail "$out/modules.bin missing or empty"
+  [ -s "$out/graph.img" ] || fail "$out/graph.img missing or empty"
 
   echo "── booting $name on :$port ──"
-  "$RUNTIME" --config "$out/config.bin" --modules "$out/modules.bin" \
+  "$RUNTIME" --image "$out/graph.img" \
     >"$WORK/runtime.log" 2>&1 &
   RUNTIME_PID=$!
   sleep 0.3

@@ -200,7 +200,9 @@ pub(crate) unsafe fn peek(s: &mut HttpState, buf: &mut [u8], at: usize) -> Resul
     }
     let done = next.is_done();
     if d.consumed == 0 && !done {
-        return Err(if wedged(s) {
+        // With no room to decode into, the body waits on credit, however
+        // full `recv_buf` is.
+        return Err(if take > 0 && wedged(s) {
             BodyStep::Bad
         } else {
             BodyStep::Wait

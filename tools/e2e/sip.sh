@@ -43,8 +43,7 @@ echo "── building examples/linux/wave_sip.yaml ──"
 ( cd "$ROOT" && fluxor build examples/linux/wave_sip.yaml ) >/dev/null || fail "graph build"
 
 echo "── booting the voice-echo graph ──"
-( cd "$ROOT" && "$RUNTIME" --config target/linux/wave_sip/config.bin \
-  --modules target/linux/wave_sip/modules.bin ) > "$WORK/dut.log" 2>&1 &
+( cd "$ROOT" && "$RUNTIME" --image target/linux/wave_sip/graph.img ) > "$WORK/dut.log" 2>&1 &
 DUT=$!
 sleep 4
 

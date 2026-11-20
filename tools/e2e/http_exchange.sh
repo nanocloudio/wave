@@ -63,8 +63,7 @@ echo "── building examples/linux/wave_http_exchange.yaml ──"
 ( cd "$ROOT" && fluxor build examples/linux/wave_http_exchange.yaml ) >/dev/null \
   || fail "fluxor build"
 OUT="$ROOT/target/linux/wave_http_exchange"
-[ -s "$OUT/config.bin" ] || fail "$OUT/config.bin missing or empty"
-[ -s "$OUT/modules.bin" ] || fail "$OUT/modules.bin missing or empty"
+[ -s "$OUT/graph.img" ] || fail "$OUT/graph.img missing or empty"
 
 echo "── starting the origin on :$PORT ──"
 python3 "$ROOT/tools/peers/http_origin.py" "$WORK/req.txt" "$PORT" >"$WORK/origin.log" 2>&1 &
@@ -109,7 +108,7 @@ run_one() {
   rm -f "$WORK/req.txt" "$WORK/reply.bin"
   set +e
   printf '%s' "$hex" | xxd -r -p \
-    | timeout -k 2 20 "$RUNTIME" --config "$OUT/config.bin" --modules "$OUT/modules.bin" \
+    | timeout -k 2 20 "$RUNTIME" --image "$OUT/graph.img" \
       >"$WORK/reply.bin" 2>"$WORK/runtime.log"
   local rc=$?
   set -e

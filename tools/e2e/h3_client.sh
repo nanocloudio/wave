@@ -62,8 +62,7 @@ for _ in $(seq 1 40); do ss -ulnp 2>/dev/null | grep -q ":$PORT " && break; slee
 ss -ulnp 2>/dev/null | grep -q ":$PORT " || fail "aioquic server never bound"
 
 echo "── booting Wave's h3 client ──"
-( cd "$ROOT" && "$RUNTIME" --config target/linux/wave_h3_client/config.bin \
-  --modules target/linux/wave_h3_client/modules.bin ) > "$WORK/client.log" 2>&1 &
+( cd "$ROOT" && "$RUNTIME" --image target/linux/wave_h3_client/graph.img ) > "$WORK/client.log" 2>&1 &
 CLI=$!
 sleep 10
 

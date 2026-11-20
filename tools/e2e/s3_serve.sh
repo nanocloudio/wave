@@ -266,7 +266,7 @@ echo "== wave's s3 connector against it =="
 (cd "$ROOT" && "$FLUXOR" build examples/linux/wave_s3_client.yaml) >"$D/client-build.log" 2>&1 \
   || { cat "$D/client-build.log"; fail "build the client graph"; }
 CG="$ROOT/target/linux/wave_s3_client"
-"$RUNTIME" --config "$CG/config.bin" --modules "$CG/modules.bin" >"$D/client.log" 2>&1 &
+"$RUNTIME" --image "$CG/graph.img" >"$D/client.log" 2>&1 &
 CLIENT_PID=$!
 for _ in $(seq 1 40); do
   curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$CLIENT_PORT/" && break
