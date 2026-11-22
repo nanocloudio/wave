@@ -114,7 +114,7 @@ scripts = ["tools/ci/dev_certs.sh"]
 #   8. http_app_reply.sh — the application fan-out's reply half. A forwarded
 #      request whose answer is never composed leaves the connection open and
 #      silent, which reaches a client as a timeout and names no component.
-#   9. s3_serve.sh — the `wave-s3` service bundle published, pinned, synced
+#   9. s3_serve.sh — the `wave-s3` service package published, pinned, synced
 #      and run through `fluxor run`, then driven with real S3 traffic and by
 #      Wave's own `s3` connector. The guarantees it checks — acknowledged only
 #      at the provider's fence, refusals rather than clamps, one slow body

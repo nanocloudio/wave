@@ -3,7 +3,7 @@
 target: linux
 tick_us: 100
 
-# The bundle's params: `fluxor run wave-s3 --param <name>=<value>`.
+# The package's params: `fluxor run wave-s3 --param <name>=<value>`.
 params:
   port:
     type: integer

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # THE `wave-s3` SERVICE, END TO END, WITH REAL S3 TRAFFIC.
 #
-#   publish packaging/service/wave-s3 as a bundle (+ the fluxor-linux
+#   publish packaging/service/wave-s3 as a package (+ the fluxor-linux
 #   runtime) into an isolated store
 #   → a scratch consumer declares wave and fluxor as dependencies and the
-#     bundle under `[uses] bundles`, updates (which pins both), syncs, and
-#     checks the materialised bundle carries exactly the pinned .fmod bytes
+#     package under `[uses] packages`, updates (which pins both), syncs, and
+#     checks the materialised package carries exactly the pinned .fmod bytes
 #   → an unknown param, a missing required param and a wrong type each refuse
 #     the run before anything starts
 #   → `fluxor run` serves it over the node's `storage.object` store, holding
@@ -24,7 +24,7 @@
 #   → a credentials file holding a chain no root signed serves nothing.
 #
 # The run is launched from this project: `fluxor run` resolves the manifests
-# of a bundle's modules from the project that built them.
+# of a package's modules from the project that built them.
 set -euo pipefail
 
 # The connector stage imports s3_traffic.py by path, and Python caches the
@@ -128,8 +128,8 @@ export FLUXOR_INSTALL_ROOT="$FLUXOR_ROOT"
 unset FLUXOR_PROJECT_ROOT
 
 echo "== publish =="
-(cd "$ROOT" && "$FLUXOR" publish bundle packaging/service/wave-s3/workload.toml) >"$D/publish.log" 2>&1 \
-  || { cat "$D/publish.log"; fail "publish bundle"; }
+(cd "$ROOT" && "$FLUXOR" publish package packaging/service/wave-s3/workload.toml) >"$D/publish.log" 2>&1 \
+  || { cat "$D/publish.log"; fail "publish package"; }
 (cd "$FLUXOR_ROOT" && "$FLUXOR" publish runtime) >>"$D/publish.log" 2>&1 \
   || { cat "$D/publish.log"; fail "publish runtime"; }
 
@@ -148,27 +148,27 @@ wave = "0.0.1"
 
 # Run by name from this script, which no graph names: a reference.
 [uses]
-bundles = ["wave-s3"]
+packages = ["wave-s3"]
 TOML
 (
   cd "$C"
   export FLUXOR_PROJECT_ROOT="$C"
   "$FLUXOR" update >"$D/update.log" 2>&1 || { cat "$D/update.log"; fail "update"; }
-  grep -q 'kind = "bundle"' fluxor.lock || fail "fluxor.lock has no bundle pin"
+  grep -q 'kind = "package"' fluxor.lock || fail "fluxor.lock has no package pin"
   "$FLUXOR" sync >"$D/sync.log" 2>&1 || { cat "$D/sync.log"; fail "sync"; }
 )
-B="$C/target/fluxor/bundles/wave-s3"
+B="$C/target/fluxor/packages/wave-s3"
 RUNTIME="$C/target/aarch64-unknown-linux-gnu/release/fluxor-linux"
 [ -x "$RUNTIME" ] || fail "sync materialised no runtime"
 for f in workload.json graph.yaml resources.json modules/http.fmod modules/s3_serve.fmod; do
-  [ -f "$B/$f" ] || fail "materialised bundle lacks $f"
+  [ -f "$B/$f" ] || fail "materialised package lacks $f"
 done
 python3 - "$B" <<'PY' || fail "materialised fmods do not match the pinned digests"
 import hashlib, json, sys, pathlib
 b = pathlib.Path(sys.argv[1])
 m = json.loads((b / "workload.json").read_text())
 imp = next(i for i in m["implementations"] if i["target"]["family"] == "linux")
-assert m["role"] == "service", "not a service bundle"
+assert m["role"] == "service", "not a service package"
 for p in ("port", "credentials", "mesh_roots", "max_object_mib", "part_min_kib"):
     assert p in m["params"], f"schema lacks {p}"
 for mod in imp["modules"]:
@@ -204,7 +204,7 @@ refuse() {
     fail "run $* succeeded; expected a refusal"
   fi
   grep -q "$want" "$D/refuse.log" || { cat "$D/refuse.log"; fail "run $*: refusal does not say '$want'"; }
-  if grep -q "Running bundle" "$D/refuse.log"; then fail "run $* started the graph before refusing"; fi
+  if grep -q "Running package" "$D/refuse.log"; then fail "run $* started the graph before refusing"; fi
   echo "  refused: $*"
 }
 refuse "unknown param 'bogus'" --param credentials=/x --param mesh_roots=x --param bogus=1
@@ -266,7 +266,7 @@ echo "== wave's s3 connector against it =="
 (cd "$ROOT" && "$FLUXOR" build examples/linux/wave_s3_client.yaml) >"$D/client-build.log" 2>&1 \
   || { cat "$D/client-build.log"; fail "build the client graph"; }
 CG="$ROOT/target/linux/wave_s3_client"
-"$RUNTIME" --image "$CG/graph.img" >"$D/client.log" 2>&1 &
+"$RUNTIME" --image "$CG/node.img" >"$D/client.log" 2>&1 &
 CLIENT_PID=$!
 for _ in $(seq 1 40); do
   curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$CLIENT_PORT/" && break

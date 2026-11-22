@@ -67,7 +67,7 @@ pico2w_build() {
   # ONE flashable image: kernel, trailer, modules and config blob. A
   # kernel-only UF2 boots and then finds nothing to load, which on a board
   # with no display is indistinguishable from a dead one.
-  "$FLUXOR" build "$CONFIG" --emit=combined \
+  "$FLUXOR" build "$CONFIG" --emit=firmware \
     --firmware target/pico2w/firmware.uf2 \
     -o target/pico2w/packed.uf2
   bash tools/rig/preflight.sh artifact target/pico2w/packed.uf2 "$RIG_STARTED"

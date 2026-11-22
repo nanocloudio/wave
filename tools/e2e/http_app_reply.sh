@@ -55,10 +55,10 @@ WORK="$(mktemp -d /tmp/wave-appreply-XXXXXX)"
 echo "── building examples/linux/wave_http_app.yaml ──"
 ( cd "$ROOT" && fluxor build examples/linux/wave_http_app.yaml ) >/dev/null || fail "fluxor build"
 OUT="$ROOT/target/linux/wave_http_app"
-[ -s "$OUT/graph.img" ] || fail "$OUT/graph.img missing or empty"
+[ -s "$OUT/node.img" ] || fail "$OUT/node.img missing or empty"
 
 echo "── booting on :$PORT ──"
-"$RUNTIME" --image "$OUT/graph.img" >"$WORK/runtime.log" 2>&1 &
+"$RUNTIME" --image "$OUT/node.img" >"$WORK/runtime.log" 2>&1 &
 PID=$!
 for _ in $(seq 1 80); do ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done
 ss -ltn 2>/dev/null | grep -q ":$PORT " || fail "never bound :$PORT"

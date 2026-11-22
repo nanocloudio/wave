@@ -4,7 +4,7 @@
 # (linux.yaml).
 #
 #   fluxor publish                               # in this project
-#   # in the consumer: [dependencies] wave = "…", [uses] bundles = ["wave-s3"]
+#   # in the consumer: [dependencies] wave = "…", [uses] packages = ["wave-s3"]
 #   fluxor update && fluxor sync
 #   FLUXOR_STORE_DIR=… FLUXOR_MESH_ROOTS=<root> \
 #     fluxor run wave-s3 --param credentials=/etc/s3/credentials --param mesh_roots=<root>
