@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # THE `wave-s3` SERVICE, END TO END, WITH REAL S3 TRAFFIC.
 #
-#   publish packaging/service/wave-s3 as a package (+ the fluxor-linux
-#   runtime) into an isolated store
+#   publish wave's modules and packaging/service/wave-s3 as a package, which
+#   ships those modules (+ the fluxor-linux runtime), into an isolated store
 #   → a scratch consumer declares wave and fluxor as dependencies and the
 #     package under `[uses] packages`, updates (which pins both), syncs, and
 #     checks the materialised package carries exactly the pinned .fmod bytes
@@ -128,7 +128,7 @@ export FLUXOR_INSTALL_ROOT="$FLUXOR_ROOT"
 unset FLUXOR_PROJECT_ROOT
 
 echo "== publish =="
-(cd "$ROOT" && "$FLUXOR" publish package packaging/service/wave-s3/workload.toml) >"$D/publish.log" 2>&1 \
+(cd "$ROOT" && "$FLUXOR" publish --only fmod --only package) >"$D/publish.log" 2>&1 \
   || { cat "$D/publish.log"; fail "publish package"; }
 (cd "$FLUXOR_ROOT" && "$FLUXOR" publish runtime) >>"$D/publish.log" 2>&1 \
   || { cat "$D/publish.log"; fail "publish runtime"; }

@@ -671,12 +671,14 @@ const H2_STATE_SIZE: u32 = 0;
 pub struct ArenaFeatures {
     pub h2: bool,
     pub app: bool,
+    pub ws: bool,
 }
 
 /// This build's [`ArenaFeatures`].
 pub const COMPILED_FEATURES: ArenaFeatures = ArenaFeatures {
     h2: cfg!(feature = "h2"),
     app: cfg!(feature = "app"),
+    ws: cfg!(feature = "ws"),
 };
 
 /// Heap arena size — sized for the **working set**, not the slot
@@ -737,15 +739,30 @@ pub(crate) const fn arena_non_body_reserve() -> u32 {
 }
 
 const fn arena_non_body_reserve_for(f: ArenaFeatures) -> u32 {
-    arena_construction_reserve().saturating_add(arena_runtime_reserve(f))
+    arena_construction_reserve_for(f).saturating_add(arena_runtime_reserve(f))
 }
 
 /// What `module_new` allocates besides the body pool: the WebSocket
-/// retention buffer (allocated only when `ws_in` is wired, but reserved by the
-/// type's cap so an instance that wires it never takes it from the
-/// connection working set), plus slack for headers and the pool's own block.
+/// retention buffer, plus slack for headers and the pool's own block.
+///
+/// The buffer is allocated only when `ws_in` is wired, and reserved by the
+/// type's cap so an instance that wires it never takes it from the connection
+/// working set. A build without `ws` has no such instance to reserve for, so
+/// it reserves only the slack — the retention buffer is a WebSocket facility
+/// and a variant that cannot speak WebSocket should not be sized as if it
+/// could.
+pub(crate) const fn arena_construction_reserve_for(f: ArenaFeatures) -> u32 {
+    let retained = if f.ws {
+        server::RETAINED_BUF_CAP as u32
+    } else {
+        0
+    };
+    retained.saturating_add(2048)
+}
+
+/// [`arena_construction_reserve_for`] for this build.
 pub(crate) const fn arena_construction_reserve() -> u32 {
-    (server::RETAINED_BUF_CAP as u32).saturating_add(2048)
+    arena_construction_reserve_for(COMPILED_FEATURES)
 }
 
 /// What serving allocates: the connection working set, h2 state, the

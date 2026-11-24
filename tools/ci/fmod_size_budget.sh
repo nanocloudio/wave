@@ -66,7 +66,7 @@ thumbv8m|rtcp.fmod|17570|16728 (2026-11-13, +3227 B since the previous measureme
 aarch64|rtp.fmod|32700|31096 (2026-09-24, +3.7K: the encoded-media record stream in, and the RFC 3551/7587/6184/7741 payload formats packetizing it; the private media record and its codec table are gone; ceiling re-based 5% above measured)
 aarch64|rtcp.fmod|15700|14485 (2026-09-08, +7.1K: SRTCP protection over the RFC 3550 §6 control plane, both report directions, plus RFC 4585 NACK and PLI feedback)
 aarch64|sip.fmod|22300|20651 (2026-09-08, first row)
-thumbv8m|sip.fmod|17000|16295 (2026-08-23, +2.7K: the application command/event contract — a call is offered and decided rather than auto-answered, and every terminal outcome is reported)
+thumbv8m|sip.fmod|18100|17234 (2026-11-23, +939 B since the 2026-08-23 row: the SDK linked as crates, whose shared helpers are called rather than inlined; ceiling re-based 5% above measured)
 thumbv8m|stun.fmod|10830|10312 (2026-11-13, +1770 B since the previous measurement, chiefly because the SDK becomes linked crates (Fluxor 9fb61099): contract and runtime helpers are out-of-line calls into fluxor_abi/fluxor_rt instead of include!-inlined, plus the 32 B FLUXOR_ABI_SURFACE digest; ceiling re-based 5% above measured)
 aarch64|stun.fmod|12330|11736 (2026-11-13, +2354 B since the previous measurement, chiefly because the SDK becomes linked crates (Fluxor 9fb61099): contract and runtime helpers are out-of-line calls into fluxor_abi/fluxor_rt instead of include!-inlined, plus the 32 B FLUXOR_ABI_SURFACE digest; ceiling re-based 5% above measured)
 aarch64|mail.fmod|24000|21081 (2026-08-23, first row; RFC 5322 + MIME assembly over the smtp connector)

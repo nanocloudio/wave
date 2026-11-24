@@ -40,13 +40,23 @@ use super::{
 
 // ── Retention buffer sizing ───────────────────────────────────────────────
 
-/// Server-wide retention buffer capacity. Sized for one decoded
-/// 800×480 RGB565 frame (~750 KiB) plus headroom for envelope
-/// headers and a small margin; multi-MiB images won't fit and will
-/// reset capture mid-stream — that's fine for the demo (single
-/// fan-out producer + browser size cap), and the value can grow on
-/// large-host profiles when a richer use case lands.
+/// Server-wide retention buffer capacity, per target class as every other
+/// capacity is.
+///
+/// **aarch64** — 2 MiB: one decoded 800×480 RGB565 frame (~750 KiB) plus
+/// headroom for envelope headers and a margin. An envelope past the cap
+/// resets capture mid-stream rather than being retained in part, so the
+/// figure bounds what a late subscriber can be shown, never correctness.
+///
+/// **rp2350 / rp2040 / wasm32** — 16 KiB: ten `NET_BUF_SIZE` envelopes. A
+/// board whose whole state arena is a few hundred kilobytes cannot hold a
+/// decoded frame, and reserving as though it could costs the arena every
+/// connection is served from — the retained bytes are a convenience for a
+/// subscriber that arrives late, and the connections are the service.
+#[cfg(target_arch = "aarch64")]
 pub(crate) const RETAINED_BUF_CAP: usize = 2 * 1024 * 1024;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const RETAINED_BUF_CAP: usize = 16 * 1024;
 /// Per-envelope header in `retained_buf`:
 /// `[opcode:u8][fin:u8][payload_len:u16 LE]`.
 pub(crate) const RETAINED_ENVELOPE_HDR: usize = 4;

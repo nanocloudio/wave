@@ -63,11 +63,13 @@ name = "web"
 features = ["h1", "ws"]
 omit_ports = ["request_out", "response_in", "request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
-# Heap rule for a variant without `h2` or `app`: no per-connection h2 state and
-# no application buffer budget, so its default cap is smaller. See
+# Heap rule for a variant without `h2` or `app`: no per-connection h2 state
+# and no application buffer budget, so its cap is smaller. It speaks
+# WebSocket, so it carries the retention buffer — the whole of the cap on an
+# embedded ABI, where that buffer is 16 KiB rather than a frame's worth. See
 # `[capacities] heap_from_params` below.
 [variant.capacities.heap_from_params]
-base = { default = 5782528, aarch64 = 5782528, thumbv8m = 2156752, thumbv6m = 2113588 }
+base = { default = 5782528, aarch64 = 5782528, thumbv8m = 75984, thumbv6m = 32820 }
 
 # h1 + the HANDLER_APP request/response fan-out, nothing else — the ingress
 # for graphs whose application IS downstream modules (chronicle's reverser
@@ -78,9 +80,11 @@ name = "app"
 features = ["h1", "app"]
 omit_ports = ["request_in", "response_out", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in"]
 omit_capabilities = ["stream.ordered_ack.exchange"]
-# Heap rule for `app` without `h2`: the application buffer budget, no h2 state.
+# Heap rule for `app` without `h2`: the application buffer budget, no h2
+# state, and no WebSocket retention buffer — this variant cannot speak
+# WebSocket, so it reserves nothing for one.
 [variant.capacities.heap_from_params]
-base = { default = 22559744, aarch64 = 22559744, thumbv8m = 2181320, thumbv6m = 2138156 }
+base = { default = 20462592, aarch64 = 20462592, thumbv8m = 84168, thumbv6m = 41004 }
 
 # h1 + h2 + ws — everything but HTTP/3.
 #
@@ -108,11 +112,12 @@ omit_capabilities = ["stream.ordered_ack.exchange"]
 name = "h1_exchange"
 features = ["h1", "exchange"]
 omit_ports = ["request_out", "response_in", "ctrl_in", "ctrl_out", "ctrl2_in", "ctrl2_out", "ws2_out", "ws2_in"]
-# Heap rule for `h1_exchange`, which has neither `h2` nor `app`: no per-connection h2 state and
-# no application buffer budget, so its default cap is smaller. See
-# `[capacities] heap_from_params` below.
+# Heap rule for `h1_exchange`, which has none of `h2`, `app` or `ws`: no
+# per-connection h2 state, no application buffer budget and no WebSocket
+# retention buffer, which leaves the connection working set and the body
+# pool. See `[capacities] heap_from_params` below.
 [variant.capacities.heap_from_params]
-base = { default = 5782528, aarch64 = 5782528, thumbv8m = 2156752, thumbv6m = 2113588 }
+base = { default = 3685376, aarch64 = 3685376, thumbv8m = 59600, thumbv6m = 16436 }
 
 # Every protocol generation, the server's application fan-out, and the client
 # as an exchange provider over HTTP/1.1, h2c or HTTP/3.
@@ -154,7 +159,7 @@ default = true
 # `tests/harness/tests/manifest_contract.rs` checks the aarch64 rows against
 # `arena_size` on the host. A refusal names the figure to write.
 [capacities]
-heap_from_params = { tags = [2, 11, 21, 31, 41, 51, 61, 71, 81], base = { default = 24144896, aarch64 = 24144896, thumbv8m = 2193800, thumbv6m = 2141276 }, included = { default = 262144, aarch64 = 262144, thumbv8m = 16384, thumbv6m = 4096 } }
+heap_from_params = { tags = [2, 11, 21, 31, 41, 51, 61, 71, 81], base = { default = 24144896, aarch64 = 24144896, thumbv8m = 113032, thumbv6m = 60508 }, included = { default = 262144, aarch64 = 262144, thumbv8m = 16384, thumbv6m = 4096 } }
 
 [[ports]]
 name = "net_in"
