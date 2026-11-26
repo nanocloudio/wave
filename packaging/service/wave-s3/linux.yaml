@@ -1,5 +1,6 @@
 # The `wave-s3` service graph: `http` hands every request to `s3_serve`, which
-# stores through the node's `storage.object` provider.
+# stores through the graph's own `store`: a durable log in `store_dir`, every
+# operation under a grant verified against the mesh roots.
 target: linux
 tick_us: 100
 
@@ -21,13 +22,24 @@ params:
     required: true
     example: 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29
     description: The mesh root (or two, comma-separated) the credentials' capabilities verify against
+  store_dir:
+    type: string
+    required: true
+    example: /var/lib/wave-s3
+    description: Directory the object store keeps its log in (at most 96 bytes)
+  store_bytes:
+    type: integer
+    default: 268435456
+    min: 65536
+    max: 4294967295
+    description: Memory the object store holds every object's bytes in, and the most one upload may stage; bytes
   region:
     type: string
     default: us-east-1
     description: Region requests must be signed for
   max_object_mib:
     type: integer
-    default: 5120
+    default: 256
     min: 1
     max: 5242880
     description: Largest object accepted, MiB
@@ -60,6 +72,20 @@ modules:
       # reaches `s3_serve` with its full target.
       - path: "/"
         app: true
+
+  # The object store: a durable log in `store_dir`, every object's bytes held
+  # in memory, every operation under a grant `s3_serve` presents and the store
+  # verifies against the same mesh roots. Each of `s3_serve`'s 32 exchanges
+  # may hold a read or a streamed write at once.
+  - name: store
+    dir: ${param:store_dir}
+    durable: on
+    roots: ${param:mesh_roots}
+    objects: 4096
+    value_bytes: ${param:store_bytes}
+    stage_max: ${param:store_bytes}
+    reads: 32
+    writes: 32
 
   - name: s3_serve
     credentials: ${param:credentials}

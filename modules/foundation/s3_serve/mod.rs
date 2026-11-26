@@ -1079,13 +1079,17 @@ unsafe fn reclaim(s: &mut State) {
                 for e in p.entries() {
                     let mut arg = [0u8; DELETE_ARG_MAX];
                     if let Some(n) = delete_arg(&mut arg, e.key) {
-                        let _ = obj::write_answer(call(
+                        if !delete_settled(obj::write_answer(call(
                             s.syscalls,
                             c.grant,
                             obj::DELETE,
                             arg.as_mut_ptr(),
                             n,
-                        ));
+                        ))) {
+                            // The page is asked again from the same cursor
+                            // on a later step, this key first.
+                            return;
+                        }
                     }
                 }
                 last = p.is_last();
@@ -2421,7 +2425,9 @@ unsafe fn put_commit(s: &mut State, i: usize) -> bool {
         e.arg.as_mut_ptr(),
         e.arg_len,
     )) {
-        obj::WriteAnswer::Pending => false,
+        // The store takes one write at a time and refuses another (`EBUSY`)
+        // meanwhile: nothing was taken, and the same request goes again.
+        obj::WriteAnswer::Pending | obj::WriteAnswer::Decided(errno::EBUSY) => false,
         obj::WriteAnswer::Decided(0) => {
             let e = &mut s.ex[i];
             keep_fence(&mut e.fence, &e.arg[..e.arg_len]);
@@ -2814,7 +2820,9 @@ unsafe fn delete_step(s: &mut State, i: usize) -> bool {
         s.ex[i].arg.as_mut_ptr(),
         s.ex[i].arg_len,
     )) {
-        obj::WriteAnswer::Pending => false,
+        // The store takes one write at a time and refuses another (`EBUSY`)
+        // meanwhile: nothing was taken, and the same request goes again.
+        obj::WriteAnswer::Pending | obj::WriteAnswer::Decided(errno::EBUSY) => false,
         obj::WriteAnswer::Decided(rc) if rc == 0 || rc == errno::ENXIO || rc == errno::ENOENT => {
             // S3 answers a delete of a missing key as done.
             let e = &mut s.ex[i];
@@ -3262,7 +3270,9 @@ unsafe fn upload_create(s: &mut State, i: usize) -> bool {
         e.name.as_mut_ptr(),
         e.name_len,
     )) {
-        obj::WriteAnswer::Pending => false,
+        // The store takes one write at a time and refuses another (`EBUSY`)
+        // meanwhile: nothing was taken, and the same request goes again.
+        obj::WriteAnswer::Pending | obj::WriteAnswer::Decided(errno::EBUSY) => false,
         obj::WriteAnswer::Decided(0) => {
             let slot = s.ex[i].upload_slot as usize;
             s.uploads[slot].busy = false;
@@ -3655,7 +3665,9 @@ unsafe fn complete_commit(s: &mut State, i: usize) -> bool {
         e.arg.as_mut_ptr(),
         e.arg_len,
     )) {
-        obj::WriteAnswer::Pending => false,
+        // The store takes one write at a time and refuses another (`EBUSY`)
+        // meanwhile: nothing was taken, and the same request goes again.
+        obj::WriteAnswer::Pending | obj::WriteAnswer::Decided(errno::EBUSY) => false,
         obj::WriteAnswer::Decided(0) => {
             let e = &mut s.ex[i];
             keep_fence(&mut e.fence, &e.arg[..e.arg_len]);
@@ -3827,14 +3839,18 @@ unsafe fn sweep(s: &mut State) {
             for e in p.entries() {
                 let mut arg = [0u8; DELETE_ARG_MAX];
                 if let Some(n) = delete_arg(&mut arg, e.key) {
-                    let _ = obj::write_answer(call(
+                    s.reap_dirty = true;
+                    if !delete_settled(obj::write_answer(call(
                         s.syscalls,
                         grant,
                         obj::DELETE,
                         arg.as_mut_ptr(),
                         n,
-                    ));
-                    s.reap_dirty = true;
+                    ))) {
+                        // The page is asked again from the same cursor on a
+                        // later step, this key first.
+                        return;
+                    }
                 }
             }
             next_len = p.cursor().len().min(NAME_MAX);
@@ -3855,9 +3871,28 @@ unsafe fn sweep(s: &mut State) {
     }
     let mut arg = [0u8; DELETE_ARG_MAX];
     if let Some(n) = delete_arg(&mut arg, &marker[..ml]) {
-        let _ = obj::write_answer(call(s.syscalls, grant, obj::DELETE, arg.as_mut_ptr(), n));
+        if !delete_settled(obj::write_answer(call(
+            s.syscalls,
+            grant,
+            obj::DELETE,
+            arg.as_mut_ptr(),
+            n,
+        ))) {
+            return;
+        }
     }
     pop_reap(s);
+}
+
+/// A housekeeping delete's answer: false while it is still to be asked
+/// again with the same request — not decided yet, or refused `EBUSY` because
+/// the store is deciding another write. Any decision settles it: a key
+/// already gone, or one the grant cannot reach, is not asked again.
+fn delete_settled(a: obj::WriteAnswer) -> bool {
+    !matches!(
+        a,
+        obj::WriteAnswer::Pending | obj::WriteAnswer::Decided(errno::EBUSY)
+    )
 }
 
 unsafe fn pop_reap(s: &mut State) {

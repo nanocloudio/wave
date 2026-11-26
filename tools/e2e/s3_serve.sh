@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # THE `wave-s3` SERVICE, END TO END, WITH REAL S3 TRAFFIC.
 #
-#   publish wave's modules and packaging/service/wave-s3 as a package, which
-#   ships those modules (+ the fluxor-linux runtime), into an isolated store
+#   publish fluxor's modules, then wave's and packaging/service/wave-s3 as a
+#   package, which ships the modules it composes (wave's and fluxor's
+#   `store`) (+ the fluxor-linux runtime), into an isolated store
 #   → a scratch consumer declares wave and fluxor as dependencies and the
 #     package under `[uses] packages`, updates (which pins both), syncs, and
 #     checks the materialised package carries exactly the pinned .fmod bytes
 #   → an unknown param, a missing required param and a wrong type each refuse
 #     the run before anything starts
-#   → `fluxor run` serves it over the node's `storage.object` store, holding
-#     a mesh root this script mints, with two access keys whose capabilities
+#   → `fluxor run` serves it over the package's own `store`, guarded by a
+#     mesh root this script mints, with two access keys whose capabilities
 #     name two buckets
 #   → tools/e2e/s3_traffic.py drives it: object lifecycle, ranges, listings
 #     and their pagination, multipart complete and abort, large bodies
@@ -128,7 +129,11 @@ export FLUXOR_INSTALL_ROOT="$FLUXOR_ROOT"
 unset FLUXOR_PROJECT_ROOT
 
 echo "== publish =="
-(cd "$ROOT" && "$FLUXOR" publish --only fmod --only package) >"$D/publish.log" 2>&1 \
+# The package composes fluxor's `store` beside wave's modules, so fluxor's
+# modules are in the isolated store before the package that pins them.
+(cd "$FLUXOR_ROOT" && "$FLUXOR" publish fmod) >"$D/publish.log" 2>&1 \
+  || { cat "$D/publish.log"; fail "publish fluxor modules"; }
+(cd "$ROOT" && "$FLUXOR" publish --only fmod --only package) >>"$D/publish.log" 2>&1 \
   || { cat "$D/publish.log"; fail "publish package"; }
 (cd "$FLUXOR_ROOT" && "$FLUXOR" publish runtime) >>"$D/publish.log" 2>&1 \
   || { cat "$D/publish.log"; fail "publish runtime"; }
@@ -160,7 +165,7 @@ TOML
 B="$C/target/fluxor/packages/wave-s3"
 RUNTIME="$C/target/aarch64-unknown-linux-gnu/release/fluxor-linux"
 [ -x "$RUNTIME" ] || fail "sync materialised no runtime"
-for f in workload.json graph.yaml resources.json modules/http.fmod modules/s3_serve.fmod; do
+for f in workload.json graph.yaml resources.json modules/http.fmod modules/s3_serve.fmod modules/store.fmod; do
   [ -f "$B/$f" ] || fail "materialised package lacks $f"
 done
 python3 - "$B" <<'PY' || fail "materialised fmods do not match the pinned digests"
@@ -169,7 +174,7 @@ b = pathlib.Path(sys.argv[1])
 m = json.loads((b / "workload.json").read_text())
 imp = next(i for i in m["implementations"] if i["target"]["family"] == "linux")
 assert m["role"] == "service", "not a service package"
-for p in ("port", "credentials", "mesh_roots", "max_object_mib", "part_min_kib"):
+for p in ("port", "credentials", "mesh_roots", "store_dir", "store_bytes", "max_object_mib", "part_min_kib"):
     assert p in m["params"], f"schema lacks {p}"
 for mod in imp["modules"]:
     got = "sha256:" + hashlib.sha256((b / "modules" / f"{mod['name']}.fmod").read_bytes()).hexdigest()
@@ -207,10 +212,11 @@ refuse() {
   if grep -q "Running package" "$D/refuse.log"; then fail "run $* started the graph before refusing"; fi
   echo "  refused: $*"
 }
-refuse "unknown param 'bogus'" --param credentials=/x --param mesh_roots=x --param bogus=1
-refuse "missing required param 'credentials'" --param mesh_roots="$MESH_ROOT"
-refuse "missing required param 'mesh_roots'" --param credentials="$D/credentials"
-refuse "'max_object_mib' is an integer" --param credentials=/x --param mesh_roots=x --param max_object_mib=big
+refuse "unknown param 'bogus'" --param credentials=/x --param mesh_roots=x --param store_dir=/x --param bogus=1
+refuse "missing required param 'credentials'" --param mesh_roots="$MESH_ROOT" --param store_dir="$D/objects"
+refuse "missing required param 'mesh_roots'" --param credentials="$D/credentials" --param store_dir="$D/objects"
+refuse "missing required param 'store_dir'" --param credentials="$D/credentials" --param mesh_roots="$MESH_ROOT"
+refuse "'max_object_mib' is an integer" --param credentials=/x --param mesh_roots=x --param store_dir=/x --param max_object_mib=big
 
 # Fixed, because examples/linux/wave_s3_client.yaml dials it.
 PORT=18093
@@ -227,9 +233,9 @@ CLIENT_PID=""
 run() {
   await_port_free "$PORT" || fail "port $PORT is still held; the previous server has not let it go"
   rm -rf "$D/objects" && mkdir -p "$D/objects"
-  (cd "$ROOT" && FLUXOR_STORE_DIR="$D/objects" FLUXOR_MESH_ROOTS="$MESH_ROOT" \
-    exec "$FLUXOR" run "$B" --param "port=$PORT" --param "credentials=$1" \
-      --param "mesh_roots=$MESH_ROOT" --param "max_object_mib=$2" --param "part_min_kib=$3") \
+  (cd "$ROOT" && exec "$FLUXOR" run "$B" --param "port=$PORT" --param "credentials=$1" \
+      --param "mesh_roots=$MESH_ROOT" --param "store_dir=$D/objects" \
+      --param "max_object_mib=$2" --param "part_min_kib=$3") \
     >"$D/run.log" 2>&1 &
   RUN_PID=$!
   for _ in $(seq 1 60); do
